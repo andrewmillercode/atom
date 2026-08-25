@@ -1,0 +1,24 @@
+[package]
+name = "atom-tools"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+atom-core = { workspace = true }
+atom-sandbox = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+once_cell = { workspace = true }
+dirs = { workspace = true }
+base64 = { workspace = true }
+image = { workspace = true }
+tempfile = { workspace = true }
+libc = { workspace = true }
+serde_yaml = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }

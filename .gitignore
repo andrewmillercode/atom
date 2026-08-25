@@ -1,0 +1,12 @@
+# Rust
+target/
+
+# macOS
+.DS_Store
+
+# Environment / secrets
+.env
+.env.*
+
+# Local scratch
+*.log

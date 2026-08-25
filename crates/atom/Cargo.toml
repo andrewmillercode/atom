@@ -1,0 +1,19 @@
+[package]
+name = "atom"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "atom"
+path = "src/main.rs"
+
+[dependencies]
+atom-core = { workspace = true }
+atom-server = { workspace = true }
+atom-tui = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+libc = { workspace = true }

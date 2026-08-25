@@ -1,0 +1,871 @@
+//! Dispatch bridge + sandbox approval bridge, ported from dispatch.go
+//! and the server-side approval flow. The dispatch tool routes here via
+//! atom_tools' SubagentHandle; the sandbox pipeline consults the
+//! ServerApprover, which surfaces an `approval_request` event on the
+//! active turn and session streams and awaits POST /approval/:session (60s timeout ->
+//! Deny).
+
+use crate::instructions::load_instructions_from;
+use crate::state::AppState;
+use async_trait::async_trait;
+use atom_core::session::store::{first_line_trunc, DelegateStatus, Session, SessionInfo};
+use atom_sandbox::approvals::{ApprovalRequest, Approver, Decision};
+use atom_tools::{DispatchPlan, SubagentHandle};
+use serde_json::json;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// How long an approval prompt waits for POST /approval before denying.
+pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// dispatch result: how long `wait:true` blocks for a subagent's turn to
+/// finish before returning the current state.
+const RESULT_WAIT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// dispatch result: poll interval while waiting.
+const RESULT_WAIT_POLL: Duration = Duration::from_millis(200);
+/// dispatch result: longest transcript tail returned to the main agent.
+const RESULT_TAIL_LIMIT: usize = 8000;
+
+/// formatChildResult renders a subagent's status and latest answer for the
+/// dispatch `get_result` tool. The tail is the final non-empty assistant
+/// message, so an aggregation parent can read what the child produced.
+fn child_result(child: &Session, include_result: bool) -> serde_json::Value {
+    let mut tail = String::new();
+    for m in child.messages.iter().rev() {
+        if m.role == "assistant" && !m.content.trim().is_empty() {
+            tail = m.content.clone();
+            break;
+        }
+        if m.role == "error" && !m.content.trim().is_empty() {
+            tail = format!("error: {}", m.content);
+            break;
+        }
+    }
+    if tail.is_empty() {
+        tail = "(no assistant reply yet)".to_string();
+    }
+    if tail.len() > RESULT_TAIL_LIMIT {
+        let mut cut = RESULT_TAIL_LIMIT.saturating_sub(1);
+        while cut > 0 && !tail.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        tail = format!("{}…", &tail[..cut]);
+    }
+    let mut value = json!({
+        "index": child.batch_index,
+        "id": child.id,
+        "model": child.model,
+        "thinking": child.thinking,
+        "status": child.status.as_str(),
+        "message_count": child.messages.len(),
+    });
+    if include_result {
+        value["result"] = json!(tail);
+    }
+    value
+}
+
+fn status_snapshot(batch_id: &str, children: &[Session], include_results: bool) -> String {
+    let mut counts = serde_json::Map::new();
+    for name in ["queued", "working", "sandbox", "error", "done", "cancelled"] {
+        counts.insert(
+            name.into(),
+            json!(children
+                .iter()
+                .filter(|child| child.status.as_str() == name)
+                .count()),
+        );
+    }
+    json!({
+        "batch_id": batch_id,
+        "counts": counts,
+        "delegates": children.iter().map(|child| child_result(child, include_results)).collect::<Vec<_>>(),
+    })
+    .to_string()
+}
+
+fn status_snapshot_info(batch_id: &str, children: &[SessionInfo]) -> String {
+    let mut counts = serde_json::Map::new();
+    for name in ["queued", "working", "sandbox", "error", "done", "cancelled"] {
+        counts.insert(
+            name.into(),
+            json!(children
+                .iter()
+                .filter(|child| child.status.as_str() == name)
+                .count()),
+        );
+    }
+    json!({
+        "batch_id": batch_id,
+        "counts": counts,
+        "delegates": children.iter().map(|child| json!({
+            "index": child.batch_index,
+            "id": child.id,
+            "model": child.model,
+            "thinking": child.thinking,
+            "status": child.status.as_str(),
+            "message_count": child.message_count,
+        })).collect::<Vec<_>>(),
+    })
+    .to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Approval bridge.
+// ---------------------------------------------------------------------------
+
+/// The Approver implementation the server hands to every bash tool call:
+/// broadcasts `{"type":"approval_request","id","session_id","command",
+/// "cwd","rule_id","reason"}` on the session channel (and the parent's,
+/// when the session is a dispatched subagent) and awaits the user's
+/// decision. AllowGlobal recording happens in the sandbox's shared
+/// ApprovalStore when this decision flows back through its gate.
+pub struct ServerApprover {
+    state: Arc<AppState>,
+    session_id: String,
+    out: crate::turn::EventOut,
+    pub timeout: Duration,
+}
+
+/// Builds the `approval_request` event for one pending prompt. When the
+/// session is a dispatched subagent, the event carries the child's
+/// identity (`from_subagent`, `child_title`) so the parent view can
+/// surface the prompt and answer it without navigating into the child.
+pub fn approval_request_event(
+    state: &AppState,
+    session_id: &str,
+    id: &str,
+    req: &ApprovalRequest,
+) -> serde_json::Value {
+    let mut ev = json!({
+        "type": "approval_request",
+        "id": id,
+        "session_id": session_id,
+        "command": req.command,
+        "cwd": req.cwd.display().to_string(),
+        "rule_id": req.rule_id,
+        "reason": req.reason,
+    });
+    if let Some(child) = state.store.get(session_id) {
+        if !child.parent_id.is_empty() {
+            ev["from_subagent"] = json!(true);
+            let title = if !child.title.is_empty() {
+                child.title.clone()
+            } else if !child.model.is_empty() {
+                child.model.clone()
+            } else {
+                let short: String = child.id.chars().take(8).collect();
+                short
+            };
+            ev["child_title"] = json!(title);
+        }
+    }
+    ev
+}
+
+impl ServerApprover {
+    pub fn new(state: Arc<AppState>, session_id: String) -> Self {
+        ServerApprover {
+            state,
+            session_id,
+            out: crate::turn::EventOut::Discard,
+            timeout: APPROVAL_TIMEOUT,
+        }
+    }
+
+    pub fn for_turn(state: Arc<AppState>, session_id: String, out: crate::turn::EventOut) -> Self {
+        ServerApprover {
+            state,
+            session_id,
+            out,
+            timeout: APPROVAL_TIMEOUT,
+        }
+    }
+
+    /// Test/short-timeout variant.
+    pub fn with_timeout(state: Arc<AppState>, session_id: String, timeout: Duration) -> Self {
+        ServerApprover {
+            state,
+            session_id,
+            out: crate::turn::EventOut::Discard,
+            timeout,
+        }
+    }
+}
+
+#[async_trait]
+impl Approver for ServerApprover {
+    async fn decide(&self, req: ApprovalRequest) -> Decision {
+        let id = atom_core::session::store::new_session_id();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.state
+            .approvals
+            .register(&self.session_id, &id, req.clone(), tx);
+        let child = self.state.store.get(&self.session_id);
+        let parent_id = child
+            .as_ref()
+            .filter(|session| !session.parent_id.is_empty())
+            .map(|session| session.parent_id.clone());
+        if let Some(parent_id) = &parent_id {
+            self.state
+                .store
+                .update_delegate_status(&self.session_id, DelegateStatus::Sandbox);
+            self.state
+                .subs
+                .broadcast(parent_id, &json!({"type": "children"}));
+        }
+        let ev = approval_request_event(&self.state, &self.session_id, &id, &req);
+        crate::turn::emit(&self.state, &self.out, &self.session_id, &ev).await;
+        // The parent hears about the request too, so the user can answer
+        // it without navigating into the subagent.
+        if let Some(parent_id) = &parent_id {
+            self.state.subs.broadcast(parent_id, &ev);
+        }
+        let decision = match tokio::time::timeout(self.timeout, rx).await {
+            Ok(Ok(decision)) => decision,
+            // Timeout or dropped waiter -> Deny.
+            _ => Decision::Deny,
+        };
+        self.state.approvals.remove(&self.session_id, &id);
+        if let Some(child) = self.state.store.get(&self.session_id) {
+            if !child.parent_id.is_empty() && !child.cancelled {
+                self.state
+                    .store
+                    .update_delegate_status(&self.session_id, DelegateStatus::Working);
+                self.state
+                    .subs
+                    .broadcast(&child.parent_id, &json!({"type": "children"}));
+            }
+        }
+        decision
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch bridge.
+// ---------------------------------------------------------------------------
+
+/// The server's SubagentHandle: creates child sessions, posts follow-ups,
+/// cancels active turns. `parent_id` is the session whose turn is running
+/// the dispatch tool; key/base_url/reasoning_field carry the caller's
+/// provider plumbing to the detached child turn.
+pub struct DispatchBridge {
+    state: Arc<AppState>,
+    parent_id: String,
+    parent_cancel: crate::cancel::CancelToken,
+    key: String,
+    base_url: String,
+    reasoning_field: String,
+}
+
+impl DispatchBridge {
+    pub fn new(
+        state: Arc<AppState>,
+        parent_id: String,
+        parent_cancel: crate::cancel::CancelToken,
+        key: String,
+        base_url: String,
+        reasoning_field: String,
+    ) -> Self {
+        DispatchBridge {
+            state,
+            parent_id,
+            parent_cancel,
+            key,
+            base_url,
+            reasoning_field,
+        }
+    }
+
+    /// ownedDispatchChild validates shape, existence, and ownership.
+    fn owned_child(&self, child_id: &str) -> Result<atom_core::session::store::Session, String> {
+        if !atom_tools::is_dispatch_session_id(child_id) {
+            return Err("error: session_id must be a 16-character hex session id".into());
+        }
+        let Some(child) = self.state.store.get(child_id) else {
+            return Err("error: subagent not found".into());
+        };
+        if !self.state.store.is_descendant_of(child_id, &self.parent_id) {
+            return Err("error: not your subagent".into());
+        }
+        Ok(child)
+    }
+
+    fn current_provider(&self) -> atom_core::providers::Provider {
+        let name = atom_core::providers::provider_name_for_url(&self.base_url);
+        let id = if matches!(name.as_str(), "custom" | "ollama-local") {
+            String::new()
+        } else {
+            atom_core::providers::modelsdev::models_dev_provider_id(&name)
+        };
+        atom_core::providers::Provider {
+            name,
+            id,
+            base_url: self.base_url.clone(),
+            key: self.key.clone(),
+            reasoning_field: self.reasoning_field.clone(),
+        }
+    }
+
+    async fn resolve_provider(
+        &self,
+        requested: &str,
+    ) -> Result<atom_core::providers::Provider, String> {
+        let current = self.current_provider();
+        if requested.is_empty() || requested == current.name || requested == current.id {
+            return Ok(current);
+        }
+        atom_core::providers::providers::build_providers()
+            .await
+            .into_iter()
+            .find(|provider| provider.name == requested || provider.id == requested)
+            .ok_or_else(|| format!("error: provider \"{requested}\" is not configured"))
+    }
+
+    fn catalog_provider(provider: &atom_core::providers::Provider) -> Option<String> {
+        if matches!(provider.name.as_str(), "custom" | "ollama-local") {
+            return None;
+        }
+        let catalog_id = atom_core::providers::modelsdev::provider_catalog_id(provider);
+        atom_core::providers::modelsdev::models_dev_provider_ids()
+            .iter()
+            .any(|id| id == &catalog_id)
+            .then_some(provider.name.clone())
+    }
+
+    async fn validate_model(provider: &atom_core::providers::Provider, model: &str) -> String {
+        let Some(catalog_provider) = Self::catalog_provider(provider) else {
+            return String::new();
+        };
+        if atom_core::providers::modelsdev::find_catalog_model(&catalog_provider, model).is_some() {
+            return String::new();
+        }
+        if atom_core::providers::providers::fetch_models(provider)
+            .await
+            .is_ok_and(|models| models.iter().any(|candidate| candidate == model))
+        {
+            return String::new();
+        }
+        let suggestions = atom_core::providers::modelsdev::suggest_catalog_model_ids(model, 3);
+        if suggestions.is_empty() {
+            format!("error: unknown model \"{model}\"")
+        } else {
+            format!(
+                "error: unknown model \"{model}\" (did you mean {}?)",
+                suggestions.join(", ")
+            )
+        }
+    }
+}
+
+#[async_trait]
+impl SubagentHandle for DispatchBridge {
+    /// executeDispatch spawn path: inherit the caller's model, validate,
+    /// create the child with fresh instructions, append the prompt, and
+    /// kick off a detached turn.
+    async fn spawn(&self, plan: DispatchPlan) -> String {
+        // The daemon does not retain the multi-megabyte catalog at idle.
+        // Dispatch is the first server-only operation that needs it.
+        atom_core::providers::modelsdev::ensure_models_dev_catalog().await;
+        let Some(parent) = self.state.store.get(&self.parent_id) else {
+            return "error: dispatch requires an active session".into();
+        };
+
+        // Go inherits the caller's model BEFORE validating it.
+        let model = if plan.model.is_empty() {
+            parent.model.trim().to_string()
+        } else {
+            plan.model.clone()
+        };
+        if model.is_empty() {
+            return "error: model is required (no caller model to inherit)".into();
+        }
+        let provider = match self.resolve_provider(&plan.provider).await {
+            Ok(provider) => provider,
+            Err(err) => return err,
+        };
+        let err = Self::validate_model(&provider, &model).await;
+        if !err.is_empty() {
+            return err;
+        }
+        let catalog_provider = Self::catalog_provider(&provider).unwrap_or_default();
+        if !atom_tools::dispatch::valid_thinking_level(&catalog_provider, &model, &plan.thinking) {
+            let levels = atom_tools::dispatch::reasoning_levels_for(&catalog_provider, &model);
+            if !levels.is_empty() {
+                return format!("error: thinking must be one of {}", levels.join(", "));
+            }
+            return "error: thinking must be a reasoning_effort value for this model".into();
+        }
+        if !parent.parent_id.is_empty() {
+            return "error: subagents cannot dispatch nested subagents".into();
+        }
+        let mut cwd = parent.cwd.clone();
+        if cwd.is_empty() {
+            cwd = std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+        }
+        let instr = load_instructions_from(&cwd);
+        let title = first_line_trunc(&plan.prompt, 60);
+        let mut child =
+            self.state
+                .store
+                .create_child(&parent.id, &model, &cwd, &plan.thinking, &title, instr);
+        self.state.store.update_provider(&child.id, &provider.name);
+        self.state
+            .store
+            .update_delegate_batch(&child.id, &plan.batch_id, plan.batch_index);
+        child.provider = provider.name.clone();
+        child.batch_id = plan.batch_id.clone();
+        child.batch_index = plan.batch_index as i64;
+        let messages = vec![atom_core::types::Message {
+            role: "user".into(),
+            content: plan.prompt.clone(),
+            ..Default::default()
+        }];
+        self.state.store.update(&child.id, messages, &child.title);
+        crate::turn::kickoff_title_generation(&self.state, child.id.clone());
+        self.state.turns.prepare_session_turn(&child.id);
+        kickoff_dispatch_turn(
+            &self.state,
+            &child.id,
+            &plan.thinking,
+            &provider.key,
+            &provider.base_url,
+            &provider.reasoning_field,
+        );
+        json!({
+            "index": child.batch_index,
+            "id": child.id,
+            "provider": provider.name,
+            "model": child.model,
+            "thinking": child.thinking,
+            "status": "queued",
+        })
+        .to_string()
+    }
+
+    /// continueDispatch posts a follow-up prompt to an owned, idle child.
+    async fn cont(&self, plan: DispatchPlan) -> String {
+        atom_core::providers::modelsdev::ensure_models_dev_catalog().await;
+        let child = match self.owned_child(&plan.session_id) {
+            Ok(c) => c,
+            Err(e) => return e,
+        };
+        if plan.prompt.is_empty() {
+            return "error: prompt is required".into();
+        }
+        let mut thinking = plan.thinking.clone();
+        if thinking.is_empty() {
+            thinking = child.thinking.trim().to_string();
+        }
+        let provider = match self.resolve_provider(&child.provider).await {
+            Ok(provider) => provider,
+            Err(err) => return err,
+        };
+        let catalog_provider = Self::catalog_provider(&provider).unwrap_or_default();
+        if !thinking.is_empty()
+            && !atom_tools::dispatch::valid_thinking_level(
+                &catalog_provider,
+                &child.model,
+                &thinking,
+            )
+        {
+            let levels =
+                atom_tools::dispatch::reasoning_levels_for(&catalog_provider, &child.model);
+            if !levels.is_empty() {
+                return format!("error: thinking must be one of {}", levels.join(", "));
+            }
+            return "error: thinking must be a reasoning_effort value for this model".into();
+        }
+        if child.status.is_active() || self.state.turns.session_has_active_turn(&child.id) {
+            return "error: subagent is still active; cancel it before sending a follow-up".into();
+        }
+        self.state.turns.clear_pending_pauses(&child.id);
+        // A follow-up explicitly revives a previously killed subagent.
+        if child.cancelled {
+            self.state.store.set_cancelled(&child.id, false);
+        }
+        if !thinking.is_empty() && thinking != child.thinking {
+            self.state.store.update_thinking(&child.id, &thinking);
+        }
+        let mut messages = child.messages.clone();
+        messages.push(atom_core::types::Message {
+            role: "user".into(),
+            content: plan.prompt.clone(),
+            ..Default::default()
+        });
+        self.state.store.update(&child.id, messages, "");
+        self.state.turns.prepare_session_turn(&child.id);
+        self.state
+            .store
+            .update_delegate_status(&child.id, DelegateStatus::Queued);
+        kickoff_dispatch_turn(
+            &self.state,
+            &child.id,
+            &thinking,
+            &provider.key,
+            &provider.base_url,
+            &provider.reasoning_field,
+        );
+        format!(
+            "ok: continued\nid: {}\nmessage_count: {}",
+            child.id,
+            child.messages.len() + 1
+        )
+    }
+
+    async fn result(&self, plan: DispatchPlan) -> String {
+        let load_target_infos = || -> Result<Vec<SessionInfo>, String> {
+            if !plan.session_id.is_empty() {
+                return self
+                    .owned_child(&plan.session_id)
+                    .map(|child| vec![child.info()]);
+            }
+            let mut children: Vec<SessionInfo> = self
+                .state
+                .store
+                .children_info(&self.parent_id)
+                .into_iter()
+                .filter(|child| plan.batch_id.is_empty() || child.batch_id == plan.batch_id)
+                .filter(|child| plan.ids.is_empty() || plan.ids.iter().any(|id| id == &child.id))
+                .collect();
+            children.sort_by_key(|child| child.batch_index);
+            if !plan.ids.is_empty() && children.len() != plan.ids.len() {
+                return Err("error: one or more subagents were not found or are not yours".into());
+            }
+            Ok(children)
+        };
+        let wait_mode = plan.wait_mode.as_str();
+        if matches!(wait_mode, "any" | "all") {
+            let deadline = Instant::now() + RESULT_WAIT_TIMEOUT;
+            loop {
+                let targets = match load_target_infos() {
+                    Ok(children) => children,
+                    Err(error) => return error,
+                };
+                let terminal = targets
+                    .iter()
+                    .filter(|child| !child.status.is_active())
+                    .count();
+                if (wait_mode == "any" && terminal > 0)
+                    || (wait_mode == "all" && terminal == targets.len())
+                {
+                    break;
+                }
+                if self.parent_cancel.is_cancelled() || Instant::now() > deadline {
+                    break;
+                }
+                tokio::select! {
+                    _ = self.parent_cancel.cancelled() => break,
+                    _ = tokio::time::sleep(RESULT_WAIT_POLL) => {}
+                }
+            }
+        }
+        let infos = match load_target_infos() {
+            Ok(children) => children,
+            Err(error) => return error,
+        };
+        if !plan.include_results {
+            return status_snapshot_info(&plan.batch_id, &infos);
+        }
+        let children: Vec<Session> = infos
+            .iter()
+            .filter_map(|info| self.state.store.get(&info.id))
+            .collect();
+        status_snapshot(&plan.batch_id, &children, true)
+    }
+
+    /// cancelDispatch pauses the owned child so its turn stops, then
+    /// records it as killed so it drops out of the parent's children
+    /// listing. The session record stays on disk (and revivable via a
+    /// follow-up), but the TUI only shows subagents that were never
+    /// explicitly killed.
+    async fn cancel(&self, sid: &str) -> String {
+        if let Err(e) = self.owned_child(sid) {
+            return e;
+        }
+        pause_dispatch_session(&self.state, sid);
+        self.state.store.set_cancelled(sid, true);
+        self.state
+            .store
+            .update_delegate_status(sid, DelegateStatus::Cancelled);
+        self.state
+            .subs
+            .broadcast(&self.parent_id, &json!({"type": "children"}));
+        format!("ok: cancelled\nid: {sid}")
+    }
+}
+
+/// pauseDispatchSession cancels a live turn outright, or records the
+/// pending "dispatch-<id>" pause so a just-kickoff'd child dies at once.
+fn pause_dispatch_session(state: &AppState, id: &str) {
+    if state.turns.session_has_active_turn(id) {
+        state.turns.pause_session(id, "");
+        return;
+    }
+    state.turns.pause_session(id, &format!("dispatch-{id}"));
+}
+
+/// kickoffDispatchTurn runs the child turn detached from any HTTP
+/// request: other viewers may subscribe normally, but the detached task
+/// itself does not create an undrained subscriber queue. It writes nothing
+/// to a response and never cancels via parent context (context.Background()).
+pub fn kickoff_dispatch_turn(
+    state: &Arc<AppState>,
+    id: &str,
+    thinking: &str,
+    key: &str,
+    base_url: &str,
+    reasoning_field: &str,
+) {
+    let state = state.clone();
+    let id = id.to_string();
+    let opts = crate::turn::TurnOpts {
+        message: String::new(),
+        thinking: thinking.to_string(),
+        key: key.to_string(),
+        base_url: base_url.to_string(),
+        reasoning_field: reasoning_field.to_string(),
+        turn_id: format!("dispatch-{id}"),
+        images: Vec::new(),
+        compact: false,
+        compact_instructions: String::new(),
+        skip_append: true,
+    };
+    tokio::spawn(async move {
+        if state.store.get(&id).is_none() {
+            return;
+        }
+        let out = crate::turn::EventOut::Discard;
+        let mut sess = match state.store.get(&id) {
+            Some(s) => s,
+            None => return,
+        };
+        crate::turn::run_session_turn(
+            &state,
+            &mut sess,
+            &id,
+            opts,
+            out,
+            crate::cancel::CancelToken::new(),
+        )
+        .await;
+        // The child turn has finished: notify the parent session so the
+        // main agent (and the TUI) learn about completion without polling.
+        let parent_id = sess.parent_id.clone();
+        if !parent_id.is_empty() {
+            let status = state
+                .store
+                .get(&id)
+                .map(|child| child.status.as_str())
+                .unwrap_or("error");
+            state.subs.broadcast(
+                &parent_id,
+                &json!({"type": "dispatch_result", "child": id, "status": status}),
+            );
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use atom_core::session::store::SessionStore;
+    use std::sync::Arc;
+
+    fn test_state(dir: &std::path::Path) -> Arc<AppState> {
+        let store = Arc::new(SessionStore::open_in_dir(dir).unwrap());
+        Arc::new(AppState::new(
+            store,
+            atom_sandbox::policy::SandboxConfig::default(),
+            Arc::new(crate::state::ConnTracker::default()),
+        ))
+    }
+
+    #[tokio::test]
+    async fn dispatch_result_returns_tail_and_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        let parent = state.store.create("m", "/tmp", vec![]);
+        let child = state
+            .store
+            .create_child(&parent.id, "m", "/tmp", "low", "child", vec![]);
+        state.store.update(
+            &child.id,
+            vec![atom_core::types::Message {
+                role: "assistant".into(),
+                content: "The answer is 42".into(),
+                ..Default::default()
+            }],
+            "",
+        );
+        state
+            .store
+            .update_delegate_status(&child.id, DelegateStatus::Done);
+
+        let bridge = DispatchBridge::new(
+            state.clone(),
+            parent.id.clone(),
+            crate::cancel::CancelToken::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        );
+        let plan = DispatchPlan {
+            session_id: child.id.clone(),
+            include_results: true,
+            ..Default::default()
+        };
+        let out = bridge.result(plan).await;
+        assert!(out.contains("\"status\":\"done\""), "{}", out);
+        assert!(out.contains("The answer is 42"), "{}", out);
+
+        // A non-owner must not read a child's result.
+        let other_parent = state.store.create("m", "/tmp", vec![]);
+        let other_child =
+            state
+                .store
+                .create_child(&other_parent.id, "m", "/tmp", "low", "other", vec![]);
+        let foreign = DispatchBridge::new(
+            state.clone(),
+            parent.id.clone(),
+            crate::cancel::CancelToken::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        );
+        let out = foreign
+            .result(DispatchPlan {
+                session_id: other_child.id.clone(),
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(out, "error: not your subagent");
+    }
+
+    #[test]
+    fn format_result_surfaces_persisted_provider_error() {
+        let mut child = atom_core::session::store::Session {
+            id: "0123456789abcdef".into(),
+            ..Default::default()
+        };
+        child.messages.push(atom_core::types::Message {
+            role: "error".into(),
+            content: "provider returned 400".into(),
+            ..Default::default()
+        });
+
+        child.status = DelegateStatus::Error;
+        let result = child_result(&child, true);
+        assert_eq!(result["result"], "error: provider returned 400");
+    }
+
+    #[tokio::test]
+    async fn inspect_returns_all_children_with_status_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        let parent = state.store.create("m", "/tmp", vec![]);
+        let done = state
+            .store
+            .create_child(&parent.id, "m1", "/tmp", "low", "done", vec![]);
+        let working = state
+            .store
+            .create_child(&parent.id, "m2", "/tmp", "high", "working", vec![]);
+        state.store.update_delegate_batch(&done.id, "batch", 1);
+        state.store.update_delegate_batch(&working.id, "batch", 2);
+        state
+            .store
+            .update_delegate_status(&done.id, DelegateStatus::Done);
+        state
+            .store
+            .update_delegate_status(&working.id, DelegateStatus::Working);
+
+        let bridge = DispatchBridge::new(
+            state,
+            parent.id,
+            crate::cancel::CancelToken::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        );
+        let out = bridge
+            .result(DispatchPlan {
+                batch_id: "batch".into(),
+                include_results: false,
+                ..Default::default()
+            })
+            .await;
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["counts"]["done"], 1);
+        assert_eq!(value["counts"]["working"], 1);
+        assert_eq!(value["delegates"].as_array().unwrap().len(), 2);
+        assert_eq!(value["delegates"][0]["index"], 1);
+    }
+
+    #[test]
+    fn approval_event_tags_dispatch_children_with_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        let parent = state.store.create("m", "/tmp", vec![]);
+        let child =
+            state
+                .store
+                .create_child(&parent.id, "m", "/tmp", "low", "verify build", vec![]);
+        let req = ApprovalRequest {
+            session_id: child.id.clone(),
+            command: "git push".into(),
+            cwd: "/repo".into(),
+            rule_id: "git-push".into(),
+            reason: "push to remote".into(),
+        };
+
+        // A plain session's event carries no subagent identity.
+        let plain = approval_request_event(&state, &parent.id, "a1", &req);
+        assert_eq!(plain["session_id"], parent.id);
+        assert_ne!(plain.get("from_subagent"), Some(&json!(true)));
+
+        // A dispatch child's event names it so the parent view can
+        // surface the prompt.
+        let ev = approval_request_event(&state, &child.id, "a2", &req);
+        assert_eq!(ev["session_id"], child.id);
+        assert_eq!(ev["from_subagent"], json!(true));
+        assert_eq!(ev["child_title"], "verify build");
+        assert_eq!(ev["command"], "git push");
+        assert_eq!(ev["id"], "a2");
+    }
+
+    #[tokio::test]
+    async fn pending_approvals_replay_request_details() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        let parent = state.store.create("m", "/tmp", vec![]);
+        let child = state
+            .store
+            .create_child(&parent.id, "m", "/tmp", "low", "child", vec![]);
+        let req = ApprovalRequest {
+            session_id: child.id.clone(),
+            command: "rm -rf build".into(),
+            cwd: "/work".into(),
+            rule_id: "rm-rf".into(),
+            reason: "clean build dir".into(),
+        };
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        state
+            .approvals
+            .register(&child.id, "pending-1", req.clone(), tx);
+
+        // The parent session sees nothing pending.
+        assert!(state.approvals.pending(&parent.id).is_empty());
+        let pending = state.approvals.pending(&child.id);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, "pending-1");
+        assert_eq!(pending[0].1, req);
+
+        // Completing the approval empties the replay set.
+        assert!(state
+            .approvals
+            .complete(&child.id, "pending-1", Decision::AllowOnce));
+        assert!(state.approvals.pending(&child.id).is_empty());
+    }
+}

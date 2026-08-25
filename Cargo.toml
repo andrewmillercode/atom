@@ -1,0 +1,61 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/atom-core",
+    "crates/atom-sandbox",
+    "crates/atom-tools",
+    "crates/atom-server",
+    "crates/atom-tui",
+    "crates/atom",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+atom-core = { path = "crates/atom-core" }
+atom-sandbox = { path = "crates/atom-sandbox" }
+atom-tools = { path = "crates/atom-tools" }
+atom-server = { path = "crates/atom-server" }
+atom-tui = { path = "crates/atom-tui" }
+
+tokio = { version = "1", default-features = false, features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+futures = { version = "0.3", default-features = false, features = ["async-await", "std"] }
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
+crossterm = { version = "0.28", default-features = false, features = ["bracketed-paste", "event-stream", "events"] }
+anyhow = "1"
+thiserror = "2"
+regex = "1"
+once_cell = "1"
+dirs = "5"
+libc = "0.2"
+rand = "0.8"
+base64 = "0.22"
+sha2 = "0.10"
+hex = "0.4"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+chrono = { version = "0.4", features = ["serde"] }
+glob = "0.3"
+tempfile = "3"
+unicode-width = "0.2"
+syntect = { version = "5", default-features = false, features = ["default-syntaxes", "plist-load", "regex-onig"] }
+similar = { version = "2", features = ["text"] }
+serde_yaml = "0.9"
+notify = "8"
+toml = "0.9"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"
+strip = true

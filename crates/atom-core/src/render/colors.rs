@@ -1,0 +1,304 @@
+//! Shared CLI/TUI theme defaults and runtime theme override support.
+
+use once_cell::sync::Lazy;
+use serde::Deserialize;
+use std::path::Path;
+use std::sync::RwLock;
+
+/// The canonical theme shipped with atom, embedded at compile time so the
+/// binary is self-contained and `ui/theme.toml` is the single source of
+/// truth for the default palette. Runtime overrides (hot reload) layer on
+/// top via `load_theme_file`.
+const EMBEDDED_THEME_TOML: &str = include_str!("../../../../ui/theme.toml");
+
+pub const COLOR_BORDER: &str = "#272b33";
+pub const COLOR_CARD_DARK: &str = "#151516";
+pub const COLOR_CARD_LIGHT: &str = "#1b1b1b";
+pub const COLOR_SECONDARY: &str = "#b491b0";
+pub const COLOR_PRIMARY: &str = "#8cadd1";
+pub const COLOR_PRIMARY_DARK: &str = "#545e69";
+pub const COLOR_SELECT: &str = "#354455";
+pub const COLOR_BACKGROUND: &str = "#111112";
+pub const COLOR_FOREGROUND: &str = "#dee3e8";
+pub const COLOR_MUTED: &str = "#666666";
+pub const COLOR_MUTED_EXTRA: &str = "#3d3d3d";
+pub const COLOR_DIFF_ADD: &str = "#032615";
+pub const COLOR_DIFF_DEL: &str = "#260307";
+pub const COLOR_DIFF_ADD_BG: &str = "#10241d";
+pub const COLOR_DIFF_DEL_BG: &str = "#271518";
+pub const COLOR_SYNTAX_TYPE: &str = "#e8a07a";
+pub const COLOR_SYNTAX_STRING: &str = "#d8c9b0";
+
+#[derive(Debug, Clone, Copy)]
+pub enum ThemeColor {
+    Border,
+    CardDark,
+    CardLight,
+    Secondary,
+    Primary,
+    PrimaryDark,
+    Select,
+    Background,
+    Foreground,
+    Muted,
+    MutedExtra,
+    DiffAdd,
+    DiffDel,
+    DiffAddBg,
+    DiffDelBg,
+    SyntaxType,
+    SyntaxString,
+}
+
+#[derive(Debug, Clone)]
+struct Theme {
+    border: String,
+    card_dark: String,
+    card_light: String,
+    secondary: String,
+    primary: String,
+    primary_dark: String,
+    select: String,
+    background: String,
+    foreground: String,
+    muted: String,
+    muted_extra: String,
+    diff_add: String,
+    diff_del: String,
+    diff_add_bg: String,
+    diff_del_bg: String,
+    syntax_type: String,
+    syntax_string: String,
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Self {
+            border: COLOR_BORDER.into(),
+            card_dark: COLOR_CARD_DARK.into(),
+            card_light: COLOR_CARD_LIGHT.into(),
+            secondary: COLOR_SECONDARY.into(),
+            primary: COLOR_PRIMARY.into(),
+            primary_dark: COLOR_PRIMARY_DARK.into(),
+            select: COLOR_SELECT.into(),
+            background: COLOR_BACKGROUND.into(),
+            foreground: COLOR_FOREGROUND.into(),
+            muted: COLOR_MUTED.into(),
+            muted_extra: COLOR_MUTED_EXTRA.into(),
+            diff_add: COLOR_DIFF_ADD.into(),
+            diff_del: COLOR_DIFF_DEL.into(),
+            diff_add_bg: COLOR_DIFF_ADD_BG.into(),
+            diff_del_bg: COLOR_DIFF_DEL_BG.into(),
+            syntax_type: COLOR_SYNTAX_TYPE.into(),
+            syntax_string: COLOR_SYNTAX_STRING.into(),
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ThemeFile {
+    border: Option<String>,
+    card_dark: Option<String>,
+    card_light: Option<String>,
+    secondary: Option<String>,
+    primary: Option<String>,
+    primary_dark: Option<String>,
+    select: Option<String>,
+    background: Option<String>,
+    foreground: Option<String>,
+    muted: Option<String>,
+    muted_extra: Option<String>,
+    diff_add: Option<String>,
+    diff_del: Option<String>,
+    diff_add_bg: Option<String>,
+    diff_del_bg: Option<String>,
+    syntax_type: Option<String>,
+    syntax_string: Option<String>,
+}
+
+static THEME: Lazy<RwLock<Theme>> =
+    Lazy::new(|| RwLock::new(embedded_theme().unwrap_or_else(|_| Theme::default())));
+
+/// Parses the compile-time-embedded `ui/theme.toml` into the default
+/// theme. Falls back to the constant-derived `Theme::default()` only if
+/// the embedded file is somehow malformed (it never should be).
+fn embedded_theme() -> Result<Theme, String> {
+    let file: ThemeFile = toml::from_str(EMBEDDED_THEME_TOML).map_err(|e| e.to_string())?;
+    theme_from_file(file)
+}
+
+pub fn theme_color(role: ThemeColor) -> String {
+    let theme = THEME.read().unwrap_or_else(|error| error.into_inner());
+    match role {
+        ThemeColor::Border => &theme.border,
+        ThemeColor::CardDark => &theme.card_dark,
+        ThemeColor::CardLight => &theme.card_light,
+        ThemeColor::Secondary => &theme.secondary,
+        ThemeColor::Primary => &theme.primary,
+        ThemeColor::PrimaryDark => &theme.primary_dark,
+        ThemeColor::Select => &theme.select,
+        ThemeColor::Background => &theme.background,
+        ThemeColor::Foreground => &theme.foreground,
+        ThemeColor::Muted => &theme.muted,
+        ThemeColor::MutedExtra => &theme.muted_extra,
+        ThemeColor::DiffAdd => &theme.diff_add,
+        ThemeColor::DiffDel => &theme.diff_del,
+        ThemeColor::DiffAddBg => &theme.diff_add_bg,
+        ThemeColor::DiffDelBg => &theme.diff_del_bg,
+        ThemeColor::SyntaxType => &theme.syntax_type,
+        ThemeColor::SyntaxString => &theme.syntax_string,
+    }
+    .clone()
+}
+
+/// Loads a partial TOML theme over the compiled defaults. Validation occurs
+/// before replacing the active theme, so a bad save leaves the last theme.
+pub fn load_theme_file(path: &Path) -> Result<(), String> {
+    let source = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
+    let file: ThemeFile = toml::from_str(&source).map_err(|error| error.to_string())?;
+    let theme = theme_from_file(file)?;
+    *THEME.write().unwrap_or_else(|error| error.into_inner()) = theme;
+    Ok(())
+}
+
+fn theme_from_file(file: ThemeFile) -> Result<Theme, String> {
+    let mut theme = Theme::default();
+    macro_rules! apply {
+        ($field:ident) => {
+            if let Some(value) = file.$field {
+                validate_hex(stringify!($field), &value)?;
+                theme.$field = value;
+            }
+        };
+    }
+    apply!(border);
+    apply!(card_dark);
+    apply!(card_light);
+    apply!(secondary);
+    apply!(primary);
+    apply!(primary_dark);
+    apply!(select);
+    apply!(background);
+    apply!(foreground);
+    apply!(muted);
+    apply!(muted_extra);
+    apply!(diff_add);
+    apply!(diff_del);
+    apply!(diff_add_bg);
+    apply!(diff_del_bg);
+    apply!(syntax_type);
+    apply!(syntax_string);
+    Ok(theme)
+}
+
+fn validate_hex(name: &str, value: &str) -> Result<(), String> {
+    let hex = value.strip_prefix('#').unwrap_or(value);
+    if hex.len() != 6 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!("{name} must be a #RRGGBB color, got {value:?}"));
+    }
+    Ok(())
+}
+
+fn resolve_color(hex: &str) -> String {
+    let role = match hex {
+        COLOR_BORDER => ThemeColor::Border,
+        COLOR_CARD_DARK => ThemeColor::CardDark,
+        COLOR_CARD_LIGHT => ThemeColor::CardLight,
+        COLOR_SECONDARY => ThemeColor::Secondary,
+        COLOR_PRIMARY => ThemeColor::Primary,
+        COLOR_PRIMARY_DARK => ThemeColor::PrimaryDark,
+        COLOR_SELECT => ThemeColor::Select,
+        COLOR_BACKGROUND => ThemeColor::Background,
+        COLOR_FOREGROUND => ThemeColor::Foreground,
+        COLOR_MUTED => ThemeColor::Muted,
+        COLOR_MUTED_EXTRA => ThemeColor::MutedExtra,
+        COLOR_DIFF_ADD => ThemeColor::DiffAdd,
+        COLOR_DIFF_DEL => ThemeColor::DiffDel,
+        COLOR_DIFF_ADD_BG => ThemeColor::DiffAddBg,
+        COLOR_DIFF_DEL_BG => ThemeColor::DiffDelBg,
+        COLOR_SYNTAX_TYPE => ThemeColor::SyntaxType,
+        COLOR_SYNTAX_STRING => ThemeColor::SyntaxString,
+        _ => return hex.to_string(),
+    };
+    theme_color(role)
+}
+
+fn parse_hex(hex: &str) -> (u8, u8, u8) {
+    let resolved = resolve_color(hex);
+    let value = resolved.strip_prefix('#').unwrap_or(&resolved);
+    if value.len() != 6 {
+        return (0, 0, 0);
+    }
+    let r = u8::from_str_radix(&value[0..2], 16).unwrap_or(0);
+    let g = u8::from_str_radix(&value[2..4], 16).unwrap_or(0);
+    let b = u8::from_str_radix(&value[4..6], 16).unwrap_or(0);
+    (r, g, b)
+}
+
+pub fn ansi_fg(hex: &str) -> String {
+    let (r, g, b) = parse_hex(hex);
+    format!("\x1b[38;2;{r};{g};{b}m")
+}
+
+pub fn ansi_bg(hex: &str) -> String {
+    let (r, g, b) = parse_hex(hex);
+    format!("\x1b[48;2;{r};{g};{b}m")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fg_sequences_match_embedded_theme() {
+        assert_eq!(ansi_fg(COLOR_PRIMARY), "\x1b[38;2;140;173;209m");
+        assert_eq!(ansi_fg(COLOR_MUTED), "\x1b[38;2;102;102;102m");
+        assert_eq!(ansi_fg(COLOR_FOREGROUND), "\x1b[38;2;222;227;232m");
+        assert_eq!(ansi_fg(COLOR_SECONDARY), "\x1b[38;2;180;145;176m");
+        assert_eq!(ansi_fg(COLOR_SYNTAX_TYPE), "\x1b[38;2;232;160;122m");
+        assert_eq!(ansi_fg(COLOR_SYNTAX_STRING), "\x1b[38;2;216;201;176m");
+    }
+
+    #[test]
+    fn bg_sequences_match_embedded_theme() {
+        assert_eq!(ansi_bg(COLOR_CARD_DARK), "\x1b[48;2;21;21;22m");
+        assert_eq!(ansi_bg(COLOR_CARD_LIGHT), "\x1b[48;2;27;27;27m");
+        assert_eq!(ansi_bg(COLOR_DIFF_ADD_BG), "\x1b[48;2;16;36;29m");
+        assert_eq!(ansi_bg(COLOR_DIFF_DEL_BG), "\x1b[48;2;39;21;24m");
+        assert_eq!(ansi_bg(COLOR_BORDER), "\x1b[48;2;39;43;51m");
+    }
+
+    #[test]
+    fn embedded_theme_toml_parses_and_matches_constants() {
+        let theme = embedded_theme().expect("embedded theme.toml must parse");
+        assert_eq!(theme.border, COLOR_BORDER);
+        assert_eq!(theme.card_dark, COLOR_CARD_DARK);
+        assert_eq!(theme.card_light, COLOR_CARD_LIGHT);
+        assert_eq!(theme.secondary, COLOR_SECONDARY);
+        assert_eq!(theme.primary, COLOR_PRIMARY);
+        assert_eq!(theme.primary_dark, COLOR_PRIMARY_DARK);
+        assert_eq!(theme.select, COLOR_SELECT);
+        assert_eq!(theme.background, COLOR_BACKGROUND);
+        assert_eq!(theme.foreground, COLOR_FOREGROUND);
+        assert_eq!(theme.muted, COLOR_MUTED);
+        assert_eq!(theme.muted_extra, COLOR_MUTED_EXTRA);
+        assert_eq!(theme.diff_add, COLOR_DIFF_ADD);
+        assert_eq!(theme.diff_del, COLOR_DIFF_DEL);
+        assert_eq!(theme.diff_add_bg, COLOR_DIFF_ADD_BG);
+        assert_eq!(theme.diff_del_bg, COLOR_DIFF_DEL_BG);
+        assert_eq!(theme.syntax_type, COLOR_SYNTAX_TYPE);
+        assert_eq!(theme.syntax_string, COLOR_SYNTAX_STRING);
+    }
+
+    #[test]
+    fn partial_theme_uses_defaults_and_validates_colors() {
+        let file: ThemeFile = toml::from_str("primary = '#010203'").unwrap();
+        let theme = theme_from_file(file).unwrap();
+        assert_eq!(theme.primary, "#010203");
+        assert_eq!(theme.background, COLOR_BACKGROUND);
+
+        let file: ThemeFile = toml::from_str("primary = 'blue'").unwrap();
+        assert!(theme_from_file(file).unwrap_err().contains("#RRGGBB"));
+    }
+}

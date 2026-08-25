@@ -1,0 +1,1490 @@
+//! models.dev catalog: fetch, cache, reasoning levels per model, and
+//! context windows. Ported from modelsdev.go (plus the contextWindowTokens
+//! helper from main.go, which is catalog-derived).
+
+use serde::de::{MapAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::HashMap;
+use std::fmt;
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, SystemTime};
+
+pub const MODELS_DEV_URL: &str = "https://models.dev/api.json";
+pub const MODELS_DEV_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+pub const MODELS_DEV_USER_AGENT: &str = "atom";
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModelsDevCost {
+    #[serde(default, deserialize_with = "crate::serde_null::null_as_default")]
+    pub input: f64,
+    #[serde(default, deserialize_with = "crate::serde_null::null_as_default")]
+    pub output: f64,
+}
+
+/// modelsDevCatalog is providers -> models from models.dev/api.json.
+pub type ModelsDevCatalog = HashMap<String, ModelsDevProvider>;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelsDevProvider {
+    #[serde(default, deserialize_with = "crate::serde_null::null_as_default")]
+    pub name: String,
+    #[serde(default, deserialize_with = "crate::serde_null::null_as_default")]
+    pub api: String,
+    /// AI SDK package from models.dev; "@ai-sdk/anthropic" marks providers
+    /// spoken to with the Anthropic Messages wire style.
+    #[serde(default, deserialize_with = "crate::serde_null::null_as_default")]
+    pub npm: String,
+    #[serde(
+        default,
+        deserialize_with = "crate::serde_null::null_elements_as_default"
+    )]
+    pub env: Vec<String>,
+    #[serde(default, deserialize_with = "crate::serde_null::null_as_default")]
+    pub doc: String,
+    #[serde(
+        default,
+        deserialize_with = "crate::serde_null::null_map_values_as_default"
+    )]
+    pub models: HashMap<String, ModelsDevModel>,
+}
+
+/// modelsDevBaseURLFallback covers well-known hosts whose models.dev
+/// entries omit `api`. Anthropic native speaks the Messages wire style
+/// (see provider_is_anthropic_style); openai stays OpenAI-compatible.
+/// amazon-bedrock has no single base URL (endpoints are per-region), so
+/// the entry points at the us-east-1 runtime host; stream_bedrock
+/// rebuilds the real regional URL per request from AWS_REGION / the
+/// model id's geo prefix.
+fn models_dev_base_url_fallback(id: &str) -> Option<&'static str> {
+    match id {
+        "openai" => Some("https://api.openai.com/v1"),
+        "anthropic" => Some("https://api.anthropic.com/v1"),
+        "amazon-bedrock" => Some("https://bedrock-runtime.us-east-1.amazonaws.com"),
+        _ => None,
+    }
+}
+
+/// The models.dev npm marker for providers spoken to with the Anthropic
+/// Messages API wire style.
+pub const ANTHROPIC_NPM: &str = "@ai-sdk/anthropic";
+
+/// providerIsAnthropicStyle reports whether a models.dev provider id (or
+/// atom display name) is documented to speak the Anthropic Messages wire
+/// style: its catalog entry sets npm = "@ai-sdk/anthropic", or it is the
+/// first-party anthropic fallback.
+pub fn provider_is_anthropic_style(id_or_name: &str) -> bool {
+    if id_or_name == "anthropic" {
+        return true;
+    }
+    let cat = MODELS_DEV_CATALOG.read().unwrap();
+    let Some(p) = cat.as_ref().and_then(|c| c.get(id_or_name)) else {
+        return false;
+    };
+    p.npm.as_ref() == ANTHROPIC_NPM
+}
+
+/// modelsDevStyle returns the wire dialect for a catalog provider:
+/// "anthropic", "bedrock", or "openai" (the default).
+pub fn models_dev_style(id_or_name: &str) -> &'static str {
+    if provider_is_anthropic_style(id_or_name) {
+        "anthropic"
+    } else if provider_is_bedrock(id_or_name) {
+        "bedrock"
+    } else {
+        "openai"
+    }
+}
+
+/// BEDROCK_PROVIDER_ID is the models.dev catalog id whose entry speaks
+/// the Bedrock Converse wire style (npm = "@ai-sdk/amazon-bedrock").
+pub const BEDROCK_PROVIDER_ID: &str = "amazon-bedrock";
+
+/// providerIsBedrock reports whether a models.dev provider id (or atom
+/// display name) is the Amazon Bedrock provider. The Converse API is
+/// model-agnostic, so id equality is the whole check.
+pub fn provider_is_bedrock(id_or_name: &str) -> bool {
+    id_or_name == BEDROCK_PROVIDER_ID
+}
+
+/// anthropicStyleForURL reports whether a base URL looks like an
+/// Anthropic Messages endpoint: api.anthropic.com itself, or any gateway
+/// exposing an /anthropic/ path segment (MiniMax-style mirrors).
+pub fn anthropic_style_for_url(url: &str) -> bool {
+    let lower = url.to_lowercase();
+    if lower.contains("api.anthropic.com") {
+        return true;
+    }
+    // Path segment check: host/path boundary or a leading path component,
+    // so "notanthropic.com" does not match but "/anthropic/v1" does.
+    lower.contains("/anthropic/") || lower.ends_with("/anthropic") || lower.contains("//anthropic.")
+}
+
+/// bedrockStyleForURL reports whether a base URL points at an Amazon
+/// Bedrock runtime endpoint. The Converse API lives on per-region
+/// bedrock-runtime hosts, which is also the shape of the catalog
+/// fallback entry.
+pub fn bedrock_style_for_url(url: &str) -> bool {
+    let lower = url.to_lowercase();
+    lower.contains("//bedrock-runtime.") && lower.contains(".amazonaws.com")
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelsDevModel {
+    #[serde(default, deserialize_with = "crate::serde_null::null_as_default")]
+    pub reasoning: bool,
+    #[serde(default)]
+    pub cost: Option<ModelsDevCost>,
+    #[serde(
+        default,
+        rename = "reasoning_options",
+        deserialize_with = "crate::serde_null::null_elements_as_default"
+    )]
+    pub reasoning_options: Vec<ModelsDevReasoningOpt>,
+    #[serde(default, deserialize_with = "crate::serde_null::null_as_default")]
+    pub limit: ModelsDevLimit,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModelsDevReasoningOpt {
+    #[serde(
+        rename = "type",
+        default,
+        deserialize_with = "crate::serde_null::null_as_default"
+    )]
+    pub kind: String,
+    #[serde(
+        default,
+        deserialize_with = "crate::serde_null::null_elements_as_default"
+    )]
+    pub values: Vec<String>,
+    #[serde(default, deserialize_with = "crate::serde_null::null_as_default")]
+    pub min: i64,
+    #[serde(default, deserialize_with = "crate::serde_null::null_as_default")]
+    pub max: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelsDevLimit {
+    #[serde(default, deserialize_with = "crate::serde_null::null_as_default")]
+    pub context: i64,
+}
+
+#[derive(Default)]
+struct CompactModels {
+    entries: Box<[CompactModelEntry]>,
+    levels: Box<[Box<str>]>,
+    level_ids: Box<[u16]>,
+}
+
+struct CompactModelEntry {
+    id: Box<str>,
+    context: i64,
+    level_start: u32,
+    level_len: u16,
+    reasoning: bool,
+    free: bool,
+}
+
+#[derive(Default, Deserialize)]
+struct CompactModelWire {
+    #[serde(default, deserialize_with = "crate::serde_null::null_as_default")]
+    reasoning: bool,
+    #[serde(default)]
+    cost: Option<ModelsDevCost>,
+    #[serde(
+        default,
+        rename = "reasoning_options",
+        deserialize_with = "crate::serde_null::null_elements_as_default"
+    )]
+    reasoning_options: Vec<ModelsDevReasoningOpt>,
+    #[serde(default, deserialize_with = "crate::serde_null::null_as_default")]
+    limit: ModelsDevLimit,
+}
+
+fn push_compact_model(
+    entries: &mut Vec<CompactModelEntry>,
+    pooled_levels: &mut Vec<Box<str>>,
+    level_ids: &mut Vec<u16>,
+    id: Box<str>,
+    wire: CompactModelWire,
+) -> Result<(), &'static str> {
+    let model = ModelsDevModel {
+        reasoning: wire.reasoning,
+        cost: wire.cost,
+        reasoning_options: wire.reasoning_options,
+        limit: wire.limit,
+    };
+    let level_start = u32::try_from(level_ids.len()).map_err(|_| "models.dev catalog too large")?;
+    if let Some(levels) = derive_reasoning_levels(&model) {
+        for level in levels {
+            let level_id = match pooled_levels
+                .iter()
+                .position(|known| known.as_ref() == level)
+            {
+                Some(i) => i,
+                None => {
+                    pooled_levels.push(level.into_boxed_str());
+                    pooled_levels.len() - 1
+                }
+            };
+            level_ids
+                .push(u16::try_from(level_id).map_err(|_| "too many models.dev reasoning levels")?);
+        }
+    }
+    let level_len = u16::try_from(level_ids.len() - level_start as usize)
+        .map_err(|_| "too many reasoning levels for one model")?;
+    entries.push(CompactModelEntry {
+        id,
+        context: model.limit.context,
+        level_start,
+        level_len,
+        reasoning: model.reasoning,
+        free: model
+            .cost
+            .as_ref()
+            .is_some_and(|cost| cost.input == 0.0 && cost.output == 0.0),
+    });
+    Ok(())
+}
+
+impl<'de> Deserialize<'de> for CompactModels {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct CompactModelsVisitor;
+
+        impl<'de> Visitor<'de> for CompactModelsVisitor {
+            type Value = CompactModels;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a models.dev model map or null")
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(CompactModels::default())
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(CompactModels::default())
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut entries = Vec::with_capacity(map.size_hint().unwrap_or(0));
+                let mut levels = Vec::new();
+                let mut level_ids = Vec::new();
+                while let Some((id, wire)) =
+                    map.next_entry::<Box<str>, Option<CompactModelWire>>()?
+                {
+                    push_compact_model(
+                        &mut entries,
+                        &mut levels,
+                        &mut level_ids,
+                        id,
+                        wire.unwrap_or_default(),
+                    )
+                    .map_err(serde::de::Error::custom)?;
+                }
+                entries.sort_unstable_by(|a, b| a.id.cmp(&b.id));
+                Ok(CompactModels {
+                    entries: entries.into_boxed_slice(),
+                    levels: levels.into_boxed_slice(),
+                    level_ids: level_ids.into_boxed_slice(),
+                })
+            }
+        }
+
+        deserializer.deserialize_any(CompactModelsVisitor)
+    }
+}
+
+impl CompactModels {
+    fn from_raw(models: HashMap<String, ModelsDevModel>) -> Self {
+        let mut entries = Vec::with_capacity(models.len());
+        let mut levels = Vec::new();
+        let mut level_ids = Vec::new();
+        for (id, model) in models {
+            let wire = CompactModelWire {
+                reasoning: model.reasoning,
+                cost: model.cost,
+                reasoning_options: model.reasoning_options,
+                limit: model.limit,
+            };
+            push_compact_model(
+                &mut entries,
+                &mut levels,
+                &mut level_ids,
+                id.into_boxed_str(),
+                wire,
+            )
+            .expect("in-memory models.dev catalog exceeds compact limits");
+        }
+        entries.sort_unstable_by(|a, b| a.id.cmp(&b.id));
+        Self {
+            entries: entries.into_boxed_slice(),
+            levels: levels.into_boxed_slice(),
+            level_ids: level_ids.into_boxed_slice(),
+        }
+    }
+
+    fn get(&self, id: &str) -> Option<&CompactModelEntry> {
+        let index = self
+            .entries
+            .binary_search_by(|entry| entry.id.as_ref().cmp(id))
+            .ok()?;
+        Some(&self.entries[index])
+    }
+
+    fn levels_for(&self, model: &CompactModelEntry) -> Vec<String> {
+        let start = model.level_start as usize;
+        self.level_ids[start..start + model.level_len as usize]
+            .iter()
+            .map(|id| self.levels[*id as usize].to_string())
+            .collect()
+    }
+}
+
+#[derive(Default, Deserialize)]
+struct CompactProvider {
+    #[serde(default, deserialize_with = "crate::serde_null::null_as_default")]
+    name: Box<str>,
+    #[serde(default, deserialize_with = "crate::serde_null::null_as_default")]
+    api: Box<str>,
+    #[serde(default, deserialize_with = "crate::serde_null::null_as_default")]
+    npm: Box<str>,
+    #[serde(
+        default,
+        deserialize_with = "crate::serde_null::null_elements_as_default"
+    )]
+    env: Vec<Box<str>>,
+    #[serde(default)]
+    models: CompactModels,
+}
+
+struct CompactProviderEntry {
+    id: Box<str>,
+    provider: CompactProvider,
+}
+
+#[derive(Default)]
+struct CompactModelsDevCatalog {
+    providers: Box<[CompactProviderEntry]>,
+}
+
+impl<'de> Deserialize<'de> for CompactModelsDevCatalog {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct CompactCatalogVisitor;
+
+        impl<'de> Visitor<'de> for CompactCatalogVisitor {
+            type Value = CompactModelsDevCatalog;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a models.dev provider map or null")
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(CompactModelsDevCatalog::default())
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(CompactModelsDevCatalog::default())
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut providers = Vec::with_capacity(map.size_hint().unwrap_or(0));
+                while let Some((id, provider)) =
+                    map.next_entry::<Box<str>, Option<CompactProvider>>()?
+                {
+                    providers.push(CompactProviderEntry {
+                        id,
+                        provider: provider.unwrap_or_default(),
+                    });
+                }
+                providers.sort_unstable_by(|a, b| a.id.cmp(&b.id));
+                Ok(CompactModelsDevCatalog {
+                    providers: providers.into_boxed_slice(),
+                })
+            }
+        }
+
+        deserializer.deserialize_any(CompactCatalogVisitor)
+    }
+}
+
+impl CompactModelsDevCatalog {
+    fn from_raw(catalog: ModelsDevCatalog) -> Self {
+        let mut providers = Vec::with_capacity(catalog.len());
+        for (id, provider) in catalog {
+            providers.push(CompactProviderEntry {
+                id: id.into_boxed_str(),
+                provider: CompactProvider {
+                    name: provider.name.into_boxed_str(),
+                    api: provider.api.into_boxed_str(),
+                    npm: provider.npm.into_boxed_str(),
+                    env: provider
+                        .env
+                        .into_iter()
+                        .map(String::into_boxed_str)
+                        .collect(),
+                    models: CompactModels::from_raw(provider.models),
+                },
+            });
+        }
+        providers.sort_unstable_by(|a, b| a.id.cmp(&b.id));
+        Self {
+            providers: providers.into_boxed_slice(),
+        }
+    }
+
+    fn get(&self, id: &str) -> Option<&CompactProvider> {
+        let index = self
+            .providers
+            .binary_search_by(|entry| entry.id.as_ref().cmp(id))
+            .ok()?;
+        Some(&self.providers[index].provider)
+    }
+}
+
+static MODELS_DEV_CATALOG: RwLock<Option<Arc<CompactModelsDevCatalog>>> = RwLock::new(None);
+
+pub fn models_dev_cache_path() -> PathBuf {
+    crate::session::store::data_dir().join("models.dev.json")
+}
+
+/// setModelsDevCatalogForTest installs a process-wide catalog without
+/// touching the network. Tests use it so lookups never fetch api.json.
+pub fn set_models_dev_catalog_for_test(cat: Option<ModelsDevCatalog>) {
+    *MODELS_DEV_CATALOG.write().unwrap() = cat.map(CompactModelsDevCatalog::from_raw).map(Arc::new);
+}
+
+fn set_catalog(cat: CompactModelsDevCatalog) {
+    let mut g = MODELS_DEV_CATALOG.write().unwrap();
+    if g.is_none() {
+        *g = Some(Arc::new(cat));
+    }
+}
+
+fn current_models_dev_catalog() -> Option<Arc<CompactModelsDevCatalog>> {
+    MODELS_DEV_CATALOG.read().unwrap().as_ref().map(Arc::clone)
+}
+
+pub fn load_models_dev_catalog_bytes(b: &[u8]) -> anyhow::Result<ModelsDevCatalog> {
+    // Like Go's encoding/json: a null provider value (or a whole-null
+    // document) becomes a zero value / empty map instead of an error.
+    let mut cat = serde_json::Deserializer::from_slice(b);
+    Ok(crate::serde_null::null_map_values_as_default(&mut cat)?)
+}
+
+fn load_compact_models_dev_catalog_bytes(b: &[u8]) -> anyhow::Result<CompactModelsDevCatalog> {
+    Ok(serde_json::from_slice(b)?)
+}
+
+/// catalogHasAPIMetadata reports whether any provider still has an `api`
+/// URL. Older caches were re-marshaled through a models-only struct and
+/// dropped those fields, which left /providers with only the openai
+/// fallback.
+pub fn catalog_has_api_metadata(cat: &ModelsDevCatalog) -> bool {
+    cat.values().any(|p| !p.api.trim().is_empty())
+}
+
+pub fn cache_is_current(cached: &ModelsDevCatalog, mtime: SystemTime) -> bool {
+    cache_is_current_at(cached, mtime, SystemTime::now())
+}
+
+/// Pure variant of cacheIsCurrent with injectable clock.
+pub fn cache_is_current_at(cached: &ModelsDevCatalog, mtime: SystemTime, now: SystemTime) -> bool {
+    // Negative ages (future mtime / clock skew) count as fresh, like
+    // Go's time.Since comparison.
+    let age = now.duration_since(mtime).unwrap_or_default();
+    age < MODELS_DEV_MAX_AGE && catalog_has_api_metadata(cached)
+}
+
+fn compact_cache_is_current(
+    cached: &CompactModelsDevCatalog,
+    mtime: SystemTime,
+    now: SystemTime,
+) -> bool {
+    let age = now.duration_since(mtime).unwrap_or_default();
+    age < MODELS_DEV_MAX_AGE
+        && cached
+            .providers
+            .iter()
+            .any(|entry| !entry.provider.api.trim().is_empty())
+}
+
+/// ensureModelsDevCatalog loads a cached catalog or fetches models.dev.
+/// A cache younger than 24h is used as-is when it still has provider
+/// `api` URLs. On fetch failure, a stale cache is used. Lookups on an
+/// empty catalog return no levels.
+pub async fn ensure_models_dev_catalog() {
+    if current_models_dev_catalog().is_some() {
+        return;
+    }
+    let cache_path = models_dev_cache_path();
+    let mut cached = read_models_dev_cache(&cache_path);
+    if let Some((cat, mtime)) = &cached {
+        if compact_cache_is_current(cat, *mtime, SystemTime::now()) {
+            let (cat, _) = cached.take().unwrap();
+            set_catalog(cat);
+            return;
+        }
+    }
+
+    let fetched = fetch_models_dev_catalog().await;
+    match fetched {
+        Ok((fresh, raw)) => {
+            if current_models_dev_catalog().is_some() {
+                return;
+            }
+            set_catalog(fresh);
+            let _ = write_models_dev_cache(&cache_path, &raw);
+        }
+        Err(_) => {
+            if current_models_dev_catalog().is_none() {
+                if let Some((cat, _)) = cached {
+                    set_catalog(cat);
+                }
+            }
+        }
+    }
+}
+
+fn read_models_dev_cache(path: &PathBuf) -> Option<(CompactModelsDevCatalog, SystemTime)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta.modified().ok()?;
+    let file = std::fs::File::open(path).ok()?;
+    let mut de = serde_json::Deserializer::from_reader(std::io::BufReader::new(file));
+    let cat = CompactModelsDevCatalog::deserialize(&mut de).ok()?;
+    if cat.providers.is_empty() {
+        return None;
+    }
+    Some((cat, mtime))
+}
+
+fn write_models_dev_cache(path: &PathBuf, raw: &[u8]) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, raw)?;
+    Ok(())
+}
+
+async fn fetch_models_dev_catalog() -> anyhow::Result<(CompactModelsDevCatalog, Vec<u8>)> {
+    static CLIENT: once_cell::sync::Lazy<reqwest::Client> = once_cell::sync::Lazy::new(|| {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(30))
+            .build()
+            .expect("reqwest client")
+    });
+    let resp = CLIENT
+        .get(MODELS_DEV_URL)
+        .header("User-Agent", MODELS_DEV_USER_AGENT)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await?;
+    let status = resp.status();
+    let b = resp.bytes().await?;
+    if !status.is_success() || status.as_u16() != 200 {
+        anyhow::bail!("{}", status);
+    }
+    let cat = load_compact_models_dev_catalog_bytes(&b)?;
+    Ok((cat, b.to_vec()))
+}
+
+pub fn models_dev_provider_id(atom_name: &str) -> String {
+    match atom_name {
+        "ollama" | "ollama-local" => "ollama-cloud".to_string(),
+        "opencode-zen" => "opencode".to_string(),
+        "opencode-go" => "opencode-go".to_string(),
+        other => other.to_string(),
+    }
+}
+
+pub fn provider_catalog_id(p: &super::providers::Provider) -> String {
+    if !p.id.is_empty() {
+        return p.id.clone();
+    }
+    models_dev_provider_id(&p.name)
+}
+
+pub fn models_dev_provider_ids() -> Vec<String> {
+    match MODELS_DEV_CATALOG.read().unwrap().as_ref() {
+        Some(cat) => cat
+            .providers
+            .iter()
+            .map(|entry| entry.id.to_string())
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+pub fn models_dev_provider(id: &str) -> Option<ModelsDevProvider> {
+    let cat = MODELS_DEV_CATALOG.read().unwrap();
+    let provider = cat.as_ref()?.get(id)?;
+    Some(ModelsDevProvider {
+        name: provider.name.to_string(),
+        api: provider.api.to_string(),
+        npm: provider.npm.to_string(),
+        env: provider.env.iter().map(ToString::to_string).collect(),
+        ..Default::default()
+    })
+}
+
+/// modelsDevBaseURL is the chat base URL for a catalog provider, with no
+/// trailing slash. Empty means atom cannot talk to it. For
+/// Anthropic-style providers requests append /messages and /models; for
+/// OpenAI-style ones /chat/completions and /models.
+pub fn models_dev_base_url(id: &str) -> String {
+    if let Some(cat) = MODELS_DEV_CATALOG.read().unwrap().as_ref() {
+        if let Some(p) = cat.get(id) {
+            let api = p.api.trim().trim_end_matches('/');
+            if !api.is_empty() {
+                return api.to_string();
+            }
+        }
+    }
+    if let Some(u) = models_dev_base_url_fallback(id) {
+        return u.trim_end_matches('/').to_string();
+    }
+    String::new()
+}
+
+pub fn catalog_model_ids(id: &str) -> Option<Vec<String>> {
+    let cat = MODELS_DEV_CATALOG.read().unwrap();
+    let p = cat.as_ref()?.get(id)?;
+    Some(
+        p.models
+            .entries
+            .iter()
+            .map(|entry| entry.id.to_string())
+            .collect(),
+    )
+}
+
+/// Returns the provider's models whose catalog input and output prices are
+/// both zero. OpenCode uses this same models.dev metadata to expose its
+/// keyless public Zen tier, so this list stays current as promotions rotate.
+pub fn catalog_free_model_ids(id: &str) -> Option<Vec<String>> {
+    let cat = MODELS_DEV_CATALOG.read().unwrap();
+    let p = cat.as_ref()?.get(id)?;
+    Some(
+        p.models
+            .entries
+            .iter()
+            .filter(|entry| entry.free)
+            .map(|entry| entry.id.to_string())
+            .collect(),
+    )
+}
+
+pub fn is_addable_models_dev_provider(id: &str, p: &ModelsDevProvider) -> bool {
+    if !p.api.trim().trim_end_matches('/').is_empty() {
+        return true;
+    }
+    // amazon-bedrock's catalog entry has no api URL (endpoints are
+    // per-region); atom talks to it through the bedrock dialect with the
+    // fallback runtime host from models_dev_base_url.
+    if id == "amazon-bedrock" {
+        return true;
+    }
+    !models_dev_base_url(id).is_empty()
+}
+
+pub fn lookup_models_dev_model(
+    cat: &ModelsDevCatalog,
+    provider_id: &str,
+    model_id: &str,
+) -> Option<ModelsDevModel> {
+    if model_id.is_empty() {
+        return None;
+    }
+    let p = cat.get(provider_id)?;
+    if let Some(m) = p.models.get(model_id) {
+        return Some(m.clone());
+    }
+    if let Some(trimmed) = model_id.strip_suffix(":cloud") {
+        if let Some(m) = p.models.get(trimmed) {
+            return Some(m.clone());
+        }
+    }
+    None
+}
+
+fn lookup_compact_model<'a>(
+    cat: &'a CompactModelsDevCatalog,
+    provider_id: &str,
+    model_id: &str,
+) -> Option<(&'a CompactModels, &'a CompactModelEntry)> {
+    if model_id.is_empty() {
+        return None;
+    }
+    let models = &cat.get(provider_id)?.models;
+    if let Some(model) = models.get(model_id) {
+        return Some((models, model));
+    }
+    let trimmed = model_id.strip_suffix(":cloud")?;
+    Some((models, models.get(trimmed)?))
+}
+
+fn find_compact_model<'a>(
+    cat: &'a CompactModelsDevCatalog,
+    provider_name: &str,
+    model_id: &str,
+) -> Option<(&'a CompactModels, &'a CompactModelEntry)> {
+    if model_id.is_empty() {
+        return None;
+    }
+    if !provider_name.is_empty() {
+        return lookup_compact_model(cat, &models_dev_provider_id(provider_name), model_id);
+    }
+    for provider_id in CATALOG_PREFERRED_PROVIDERS {
+        if let Some(model) = lookup_compact_model(cat, provider_id, model_id) {
+            return Some(model);
+        }
+    }
+    for entry in &cat.providers {
+        if CATALOG_PREFERRED_PROVIDERS.contains(&entry.id.as_ref()) {
+            continue;
+        }
+        if let Some(model) = lookup_compact_model(cat, &entry.id, model_id) {
+            return Some(model);
+        }
+    }
+    None
+}
+
+/// catalogPreferredProviders is the lookup order when the caller does
+/// not name a provider (dispatch, inherited model id).
+const CATALOG_PREFERRED_PROVIDERS: &[&str] = &["opencode-go", "ollama-cloud", "opencode"];
+
+/// findCatalogModel looks up a model in the models.dev catalog. An empty
+/// provider searches preferred hosts first, then every other provider.
+pub fn find_catalog_model(provider_name: &str, model_id: &str) -> Option<ModelsDevModel> {
+    let cat = current_models_dev_catalog()?;
+    let (models, model) = find_compact_model(&cat, provider_name, model_id)?;
+    let levels = models.levels_for(model);
+    let reasoning_options = if levels.is_empty() {
+        Vec::new()
+    } else {
+        vec![ModelsDevReasoningOpt {
+            kind: "effort".into(),
+            values: levels,
+            ..Default::default()
+        }]
+    };
+    Some(ModelsDevModel {
+        reasoning: model.reasoning,
+        cost: Some(if model.free {
+            ModelsDevCost::default()
+        } else {
+            // Compact lookup only needs to preserve whether pricing is zero.
+            ModelsDevCost {
+                input: 1.0,
+                output: 1.0,
+            }
+        }),
+        reasoning_options,
+        limit: ModelsDevLimit {
+            context: model.context,
+        },
+    })
+}
+
+pub fn catalog_contains_model(model_id: &str) -> bool {
+    current_models_dev_catalog()
+        .and_then(|cat| find_compact_model(&cat, "", model_id).map(|_| ()))
+        .is_some()
+}
+
+pub fn normalize_model_id(id: &str) -> String {
+    id.to_lowercase()
+        .chars()
+        .filter(|c| !matches!(c, '-' | '_' | ':' | '.' | '/' | ' '))
+        .collect()
+}
+
+/// suggestCatalogModelIDs returns catalog ids that look like typos of
+/// want (stripped punctuation). Empty when the query is too short to
+/// match safely.
+pub fn suggest_catalog_model_ids(want: &str, limit: usize) -> Vec<String> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let norm = normalize_model_id(want);
+    if norm.len() < 4 {
+        return Vec::new();
+    }
+    let cat = match current_models_dev_catalog() {
+        Some(c) => c,
+        None => return Vec::new(),
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut matches = Vec::new();
+    for provider in &cat.providers {
+        for model in &provider.provider.models.entries {
+            let id = &model.id;
+            if seen.contains(id.as_ref()) {
+                continue;
+            }
+            let nid = normalize_model_id(id);
+            let eq = nid == norm;
+            let close = norm.len() >= 6 && (nid.starts_with(&norm) || norm.starts_with(&nid));
+            if !eq && !close {
+                continue;
+            }
+            seen.insert(id.to_string());
+            matches.push(id.to_string());
+        }
+    }
+    matches.sort();
+    matches.truncate(limit);
+    matches
+}
+
+/// reasoningLevelsFor returns the TUI cycle list for a model, derived
+/// from that model's models.dev reasoning_options. An empty provider
+/// searches preferred hosts, then the rest of the catalog. None means
+/// omit reasoning_effort.
+pub fn reasoning_levels_for(provider_name: &str, model_id: &str) -> Option<Vec<String>> {
+    let cat = current_models_dev_catalog()?;
+    let (models, model) = find_compact_model(&cat, provider_name, model_id)?;
+    if !model.reasoning || model.level_len == 0 {
+        return None;
+    }
+    Some(models.levels_for(model))
+}
+
+pub fn derive_reasoning_levels(m: &ModelsDevModel) -> Option<Vec<String>> {
+    if !m.reasoning {
+        return None;
+    }
+    let mut effort: Vec<String> = Vec::new();
+    let mut has_toggle = false;
+    let mut seen = std::collections::HashSet::new();
+    for opt in &m.reasoning_options {
+        match opt.kind.as_str() {
+            "toggle" => has_toggle = true,
+            "effort" => {
+                for v in &opt.values {
+                    if v.is_empty() || v == "null" || seen.contains(v) {
+                        continue;
+                    }
+                    seen.insert(v.clone());
+                    effort.push(v.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    // models.dev marks off as "none" in effort values. A toggle without
+    // that token still means thinking can be disabled, so prepend it.
+    if has_toggle && effort.is_empty() {
+        return Some(vec!["none".into(), "low".into(), "high".into()]);
+    }
+    if has_toggle && !has_thinking_off(&effort) {
+        effort.insert(0, "none".into());
+    }
+    if effort.is_empty() {
+        return None;
+    }
+    Some(effort)
+}
+
+fn has_thinking_off(levels: &[String]) -> bool {
+    levels.iter().any(|l| l == "none")
+}
+
+pub fn default_thinking_index(levels: &[String]) -> usize {
+    levels.len().saturating_sub(1)
+}
+
+/// thinkingOffValue is the wire token that disables reasoning for the
+/// model (models.dev "none"), or the first catalog level. Empty means omit.
+pub fn thinking_off_value(provider: &str, model: &str) -> String {
+    let levels = reasoning_levels_for(provider, model).unwrap_or_default();
+    for l in &levels {
+        if l == "none" {
+            return l.clone();
+        }
+    }
+    levels.first().cloned().unwrap_or_default()
+}
+
+/// validThinkingLevel reports whether level is allowed for the model.
+/// With no catalog entry, any non-empty string is accepted so dispatch
+/// still works offline.
+pub fn valid_thinking_level(provider: &str, model: &str, level: &str) -> bool {
+    if level.is_empty() {
+        return false;
+    }
+    let levels = reasoning_levels_for(provider, model).unwrap_or_default();
+    if levels.is_empty() {
+        return true;
+    }
+    levels.iter().any(|l| l == level)
+}
+
+/// contextWindowTokens returns the model's context window size in tokens
+/// from the models.dev catalog. Unknown models (or catalog entries with
+/// no limit) fall back to 128K so the status-bar fill still has a
+/// denominator.
+pub fn context_window_tokens(provider_name: &str, model: &str) -> i64 {
+    if let Some(context) = current_models_dev_catalog()
+        .and_then(|cat| find_compact_model(&cat, provider_name, model).map(|(_, m)| m.context))
+    {
+        if context > 0 {
+            return context;
+        }
+    }
+    128000
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture_model(provider: &str, id: &str, reasoning: bool, opts: Vec<ModelsDevReasoningOpt>) {
+        let mut cat = ModelsDevCatalog::new();
+        cat.insert(
+            provider.to_string(),
+            ModelsDevProvider {
+                models: HashMap::from([(
+                    id.to_string(),
+                    ModelsDevModel {
+                        reasoning,
+                        reasoning_options: opts,
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            },
+        );
+        set_models_dev_catalog_for_test(Some(cat));
+    }
+
+    fn effort(values: &[&str]) -> ModelsDevReasoningOpt {
+        ModelsDevReasoningOpt {
+            kind: "effort".into(),
+            values: values.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn toggle() -> ModelsDevReasoningOpt {
+        ModelsDevReasoningOpt {
+            kind: "toggle".into(),
+            ..Default::default()
+        }
+    }
+
+    // Serializes catalog injection across tests (the catalog is global).
+    fn lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::providers::test_lock()
+    }
+
+    #[test]
+    fn reasoning_levels_effort_only() {
+        let _g = lock();
+        fixture_model(
+            "openai",
+            "gpt-5",
+            true,
+            vec![effort(&["low", "medium", "high"])],
+        );
+        assert_eq!(
+            reasoning_levels_for("openai", "gpt-5"),
+            Some(vec![
+                "low".to_string(),
+                "medium".to_string(),
+                "high".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn reasoning_levels_toggle_prepends_none() {
+        let _g = lock();
+        fixture_model(
+            "ollama-cloud",
+            "deepseek-v4-flash:0731",
+            true,
+            vec![toggle(), effort(&["high", "max"])],
+        );
+        assert_eq!(
+            reasoning_levels_for("ollama", "deepseek-v4-flash:0731"),
+            Some(vec![
+                "none".to_string(),
+                "high".to_string(),
+                "max".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn reasoning_levels_toggle_with_none_does_not_prepend() {
+        let _g = lock();
+        fixture_model(
+            "openai",
+            "gpt-5",
+            true,
+            vec![toggle(), effort(&["none", "low", "high"])],
+        );
+        assert_eq!(
+            reasoning_levels_for("openai", "gpt-5"),
+            Some(vec![
+                "none".to_string(),
+                "low".to_string(),
+                "high".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn reasoning_levels_toggle_only() {
+        let _g = lock();
+        fixture_model("opencode-go", "qwen", true, vec![toggle()]);
+        assert_eq!(
+            reasoning_levels_for("opencode-go", "qwen"),
+            Some(vec![
+                "none".to_string(),
+                "low".to_string(),
+                "high".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn reasoning_levels_cloud_suffix() {
+        let _g = lock();
+        fixture_model(
+            "ollama-cloud",
+            "gpt-oss:20b",
+            true,
+            vec![effort(&["low", "high"])],
+        );
+        assert_eq!(
+            reasoning_levels_for("ollama", "gpt-oss:20b:cloud"),
+            Some(vec!["low".to_string(), "high".to_string()])
+        );
+    }
+
+    #[test]
+    fn reasoning_levels_does_not_strip_other_tags() {
+        let _g = lock();
+        fixture_model("ollama-cloud", "gpt-oss", true, vec![effort(&["low"])]);
+        assert_eq!(reasoning_levels_for("ollama", "gpt-oss:20b"), None);
+    }
+
+    #[test]
+    fn reasoning_levels_provider_mapping() {
+        let _g = lock();
+        let mut cat = ModelsDevCatalog::new();
+        cat.insert(
+            "ollama-cloud".into(),
+            ModelsDevProvider {
+                models: HashMap::from([(
+                    "m".to_string(),
+                    ModelsDevModel {
+                        reasoning: true,
+                        reasoning_options: vec![effort(&["low"])],
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            },
+        );
+        cat.insert(
+            "opencode".into(),
+            ModelsDevProvider {
+                models: HashMap::from([(
+                    "z".to_string(),
+                    ModelsDevModel {
+                        reasoning: true,
+                        reasoning_options: vec![effort(&["high"])],
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            },
+        );
+        set_models_dev_catalog_for_test(Some(cat));
+        assert_eq!(
+            reasoning_levels_for("ollama", "m"),
+            Some(vec!["low".to_string()]),
+            "ollama maps to ollama-cloud"
+        );
+        assert_eq!(
+            reasoning_levels_for("ollama-local", "m"),
+            Some(vec!["low".to_string()]),
+            "ollama-local maps to ollama-cloud"
+        );
+        assert_eq!(
+            reasoning_levels_for("opencode-zen", "z"),
+            Some(vec!["high".to_string()]),
+            "opencode-zen maps to opencode"
+        );
+    }
+
+    #[test]
+    fn reasoning_levels_unknown_model() {
+        let _g = lock();
+        fixture_model("ollama-cloud", "known", true, vec![effort(&["low"])]);
+        assert_eq!(reasoning_levels_for("ollama", "unknown"), None);
+    }
+
+    #[test]
+    fn reasoning_levels_empty_catalog() {
+        let _g = lock();
+        set_models_dev_catalog_for_test(None);
+        assert_eq!(reasoning_levels_for("ollama", "anything"), None);
+    }
+
+    #[test]
+    fn reasoning_false_returns_nil() {
+        let _g = lock();
+        fixture_model("openai", "m", false, vec![effort(&["low", "high"])]);
+        assert_eq!(reasoning_levels_for("openai", "m"), None);
+    }
+
+    #[test]
+    fn default_thinking_index_is_last() {
+        let levels = vec!["none".to_string(), "high".to_string(), "max".to_string()];
+        assert_eq!(default_thinking_index(&levels), 2);
+        assert_eq!(default_thinking_index(&[]), 0);
+    }
+
+    #[test]
+    fn thinking_off_value_uses_none() {
+        let _g = lock();
+        fixture_model(
+            "ollama-cloud",
+            "deepseek-v4-flash:0731",
+            true,
+            vec![toggle(), effort(&["high", "max"])],
+        );
+        assert_eq!(
+            thinking_off_value("ollama", "deepseek-v4-flash:0731"),
+            "none"
+        );
+    }
+
+    #[test]
+    fn valid_thinking_level_offline() {
+        let _g = lock();
+        set_models_dev_catalog_for_test(None);
+        assert!(valid_thinking_level("", "m", "extreme"));
+        assert!(!valid_thinking_level("", "m", ""));
+    }
+
+    #[test]
+    fn load_models_dev_catalog_bytes_fixture() {
+        let _g = lock();
+        let cat = load_models_dev_catalog_bytes(
+            br#"{"openai":{"models":{"gpt-5":{"reasoning":true,"reasoning_options":[{"type":"effort","values":["low","high"]}]}}}}"#,
+        )
+        .unwrap();
+        set_models_dev_catalog_for_test(Some(cat));
+        assert_eq!(
+            reasoning_levels_for("openai", "gpt-5"),
+            Some(vec!["low".to_string(), "high".to_string()])
+        );
+    }
+
+    #[test]
+    fn compact_catalog_preserves_runtime_fields() {
+        let _g = lock();
+        let cat = load_compact_models_dev_catalog_bytes(
+            br#"{"openai":{"name":"OpenAI","api":"https://api.openai.com/v1/","env":["OPENAI_API_KEY"],"doc":"ignored","models":{"gpt-5":{"reasoning":true,"reasoning_options":[{"type":"toggle"},{"type":"effort","values":["low","high"]}],"limit":{"context":400000}},"plain":null}}}"#,
+        )
+        .unwrap();
+        set_models_dev_catalog_for_test(None);
+        set_catalog(cat);
+
+        let provider = models_dev_provider("openai").unwrap();
+        assert_eq!(provider.name, "OpenAI");
+        assert_eq!(provider.env, vec!["OPENAI_API_KEY"]);
+        assert_eq!(models_dev_base_url("openai"), "https://api.openai.com/v1");
+        assert_eq!(
+            reasoning_levels_for("openai", "gpt-5"),
+            Some(vec!["none".into(), "low".into(), "high".into()])
+        );
+        assert_eq!(context_window_tokens("openai", "gpt-5"), 400000);
+        assert_eq!(
+            catalog_model_ids("openai"),
+            Some(vec!["gpt-5".into(), "plain".into()])
+        );
+    }
+
+    #[test]
+    fn reasoning_levels_search_by_model_id() {
+        let _g = lock();
+        fixture_model(
+            "opencode-go",
+            "qwen",
+            true,
+            vec![toggle(), effort(&["low", "high"])],
+        );
+        let got = reasoning_levels_for("", "qwen").unwrap();
+        assert!(
+            got.join(",").contains("none"),
+            "dispatch lookup by model id: {:?}",
+            got
+        );
+    }
+
+    #[test]
+    fn reasoning_levels_search_all_providers() {
+        let _g = lock();
+        fixture_model("openai", "gpt-5", true, vec![effort(&["low", "high"])]);
+        assert_eq!(
+            reasoning_levels_for("", "gpt-5"),
+            Some(vec!["low".to_string(), "high".to_string()]),
+            "empty provider should find openai models"
+        );
+    }
+
+    #[test]
+    fn suggest_catalog_model_ids_matches_typos() {
+        let _g = lock();
+        fixture_model(
+            "ollama-cloud",
+            "deepseek-v4-flash:0731",
+            true,
+            vec![effort(&["max"])],
+        );
+        let got = suggest_catalog_model_ids("deepseekv4flash", 3);
+        assert_eq!(got, vec!["deepseek-v4-flash:0731".to_string()]);
+        assert!(!catalog_contains_model("deepseekv4flash"));
+        assert!(catalog_contains_model("deepseek-v4-flash:0731"));
+    }
+
+    #[test]
+    fn load_models_dev_catalog_provider_metadata() {
+        let cat = load_models_dev_catalog_bytes(
+            br#"{"openrouter":{"name":"OpenRouter","api":"https://openrouter.ai/api/v1","env":["OPENROUTER_API_KEY"],"doc":"https://openrouter.ai","models":{"x":{"reasoning":false}}}}"#,
+        )
+        .unwrap();
+        let p = &cat["openrouter"];
+        assert_eq!(p.name, "OpenRouter");
+        assert_eq!(p.api, "https://openrouter.ai/api/v1");
+        assert_eq!(p.env, vec!["OPENROUTER_API_KEY"]);
+    }
+
+    #[test]
+    fn models_dev_base_url_fallbacks() {
+        let _g = lock();
+        let mut cat = ModelsDevCatalog::new();
+        cat.insert(
+            "openai".into(),
+            ModelsDevProvider {
+                name: "OpenAI".into(),
+                ..Default::default()
+            },
+        );
+        cat.insert(
+            "openrouter".into(),
+            ModelsDevProvider {
+                api: "https://openrouter.ai/api/v1/".into(),
+                ..Default::default()
+            },
+        );
+        cat.insert(
+            "anthropic".into(),
+            ModelsDevProvider {
+                name: "Anthropic".into(),
+                ..Default::default()
+            },
+        );
+        set_models_dev_catalog_for_test(Some(cat));
+        assert_eq!(models_dev_base_url("openai"), "https://api.openai.com/v1");
+        assert_eq!(
+            models_dev_base_url("openrouter"),
+            "https://openrouter.ai/api/v1"
+        );
+        // Anthropic native has no catalog `api` but is reachable through
+        // the Messages-style fallback.
+        assert_eq!(
+            models_dev_base_url("anthropic"),
+            "https://api.anthropic.com/v1"
+        );
+        assert!(is_addable_models_dev_provider(
+            "anthropic",
+            &ModelsDevProvider::default()
+        ));
+        assert!(is_addable_models_dev_provider(
+            "openai",
+            &ModelsDevProvider::default()
+        ));
+    }
+
+    #[test]
+    fn anthropic_style_detection() {
+        let _g = lock();
+        let mut cat = ModelsDevCatalog::new();
+        cat.insert(
+            "anthropic".into(),
+            ModelsDevProvider {
+                name: "Anthropic".into(),
+                ..Default::default()
+            },
+        );
+        cat.insert(
+            "minimax".into(),
+            ModelsDevProvider {
+                name: "MiniMax".into(),
+                api: "https://api.minimax.io/anthropic/v1".into(),
+                npm: "@ai-sdk/anthropic".into(),
+                env: vec!["MINIMAX_API_KEY".to_string()],
+                ..Default::default()
+            },
+        );
+        cat.insert(
+            "openrouter".into(),
+            ModelsDevProvider {
+                name: "OpenRouter".into(),
+                api: "https://openrouter.ai/api/v1".into(),
+                npm: "@ai-sdk/openai-compatible".into(),
+                ..Default::default()
+            },
+        );
+        set_models_dev_catalog_for_test(Some(cat));
+        // First-party fallback plus the npm marker.
+        assert!(provider_is_anthropic_style("anthropic"));
+        assert!(provider_is_anthropic_style("minimax"));
+        assert!(!provider_is_anthropic_style("openrouter"));
+        assert!(!provider_is_anthropic_style("unknown-provider"));
+        assert!(!provider_is_anthropic_style(""));
+        assert_eq!(models_dev_style("minimax"), "anthropic");
+        assert_eq!(models_dev_style("openrouter"), "openai");
+
+        // An old cache without npm data must still load and simply be
+        // treated as openai style (except first-party anthropic).
+        let raw = br#"{"gateway":{"name":"Gateway","api":"https://gw.example/v1","models":{}}}"#;
+        let cat = load_models_dev_catalog_bytes(raw).unwrap();
+        assert!(cat["gateway"].npm.is_empty());
+        set_models_dev_catalog_for_test(Some(cat));
+        assert_eq!(models_dev_style("gateway"), "openai");
+    }
+
+    #[test]
+    fn catalog_has_api_metadata_and_cache_freshness() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000_000_000);
+        let mut stripped = ModelsDevCatalog::new();
+        stripped.insert(
+            "openai".into(),
+            ModelsDevProvider {
+                models: HashMap::from([("gpt-5".to_string(), ModelsDevModel::default())]),
+                ..Default::default()
+            },
+        );
+        assert!(!catalog_has_api_metadata(&stripped));
+        assert!(!cache_is_current_at(&stripped, now, now));
+
+        let mut full = ModelsDevCatalog::new();
+        full.insert(
+            "openrouter".into(),
+            ModelsDevProvider {
+                api: "https://openrouter.ai/api/v1".into(),
+                ..Default::default()
+            },
+        );
+        assert!(catalog_has_api_metadata(&full));
+        assert!(cache_is_current_at(&full, now, now));
+        assert!(!cache_is_current_at(
+            &full,
+            now,
+            now + MODELS_DEV_MAX_AGE + Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn write_models_dev_cache_preserves_api() {
+        let _g = lock();
+        let d = crate::providers::isolate_data_dir("modelsdev-cache");
+
+        let raw =
+            br#"{"openrouter":{"name":"OpenRouter","api":"https://openrouter.ai/api/v1","models":{}}}"#;
+        write_models_dev_cache(&models_dev_cache_path(), raw).unwrap();
+        let (cat, _) = read_models_dev_cache(&models_dev_cache_path()).unwrap();
+        assert_eq!(
+            cat.get("openrouter").unwrap().api.as_ref(),
+            "https://openrouter.ai/api/v1"
+        );
+        drop(d);
+    }
+
+    #[test]
+    fn catalog_model_ids_sorted() {
+        let _g = lock();
+        let mut cat = ModelsDevCatalog::new();
+        cat.insert(
+            "openai".into(),
+            ModelsDevProvider {
+                api: "https://api.openai.com/v1".into(),
+                models: HashMap::from([
+                    ("z".to_string(), ModelsDevModel::default()),
+                    ("a".to_string(), ModelsDevModel::default()),
+                ]),
+                ..Default::default()
+            },
+        );
+        set_models_dev_catalog_for_test(Some(cat));
+        assert_eq!(
+            catalog_model_ids("openai"),
+            Some(vec!["a".to_string(), "z".to_string()])
+        );
+    }
+
+    #[test]
+    fn context_window_tokens_from_limit() {
+        let _g = lock();
+        let mut cat = ModelsDevCatalog::new();
+        cat.insert(
+            "openai".into(),
+            ModelsDevProvider {
+                models: HashMap::from([
+                    (
+                        "big".to_string(),
+                        ModelsDevModel {
+                            limit: ModelsDevLimit { context: 400000 },
+                            ..Default::default()
+                        },
+                    ),
+                    ("small".to_string(), ModelsDevModel::default()),
+                ]),
+                ..Default::default()
+            },
+        );
+        set_models_dev_catalog_for_test(Some(cat));
+        assert_eq!(context_window_tokens("openai", "big"), 400000);
+        assert_eq!(context_window_tokens("openai", "small"), 128000);
+        assert_eq!(context_window_tokens("openai", "unknown"), 128000);
+    }
+
+    #[test]
+    fn normalize_strips_punctuation_and_lowercases() {
+        assert_eq!(
+            normalize_model_id("GPT-OSS:20B_Cloud/Fast"),
+            "gptoss20bcloudfast"
+        );
+    }
+
+    #[test]
+    fn current_catalog_snapshots_share_storage() {
+        let _g = lock();
+        fixture_model("openai", "gpt-5", false, vec![]);
+        let first = current_models_dev_catalog().unwrap();
+        let second = current_models_dev_catalog().unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+}

@@ -116,14 +116,14 @@ impl FileSeen {
 
 /// rememberFile on the ctx's session cache; a missing cache mirrors Go's
 /// nil-Session no-op.
-pub(crate) fn remember_file(ctx: &ToolCtx<'_>, path: &str, data: &[u8]) {
+pub(crate) fn remember_file(ctx: &ToolCtx<'_>, path: &Path, data: &[u8]) {
     if let Some(fs) = ctx.file_seen {
-        fs.remember(Path::new(path), data);
+        fs.remember(path, data);
     }
 }
 
-fn seen_file(ctx: &ToolCtx<'_>, path: &str) -> Option<FileSeenEntry> {
-    ctx.file_seen.and_then(|fs| fs.seen(Path::new(path)))
+fn seen_file(ctx: &ToolCtx<'_>, path: &Path) -> Option<FileSeenEntry> {
+    ctx.file_seen.and_then(|fs| fs.seen(path))
 }
 
 /// canonicalFilePath resolves symlinks; falls back to the absolute path.
@@ -443,15 +443,16 @@ fn with_file_lock<R>(target: &str, f: impl FnOnce() -> R) -> Result<R, String> {
 /// observeOrDrift verifies the on-disk content matches what the session
 /// last observed. On drift it refreshes the last-seen snapshot and
 /// returns the compact-diff error.
-fn observe_or_drift(ctx: &ToolCtx<'_>, path: &str, disk: &[u8]) -> Result<(), String> {
+fn observe_or_drift(ctx: &ToolCtx<'_>, path: &Path, disk: &[u8]) -> Result<(), String> {
+    let display = path.display().to_string();
     match seen_file(ctx, path) {
-        None => Err(not_read_error(path)),
+        None => Err(not_read_error(&display)),
         Some(seen) => {
             if seen.hash != sha256_hash(disk) {
                 remember_file(ctx, path, disk);
                 return Err(match seen.data {
-                    Some(data) => file_changed_error(path, &data, disk),
-                    None => file_changed_without_snapshot_error(path),
+                    Some(data) => file_changed_error(&display, &data, disk),
+                    None => file_changed_without_snapshot_error(&display),
                 });
             }
             Ok(())
@@ -462,8 +463,8 @@ fn observe_or_drift(ctx: &ToolCtx<'_>, path: &str, disk: &[u8]) -> Result<(), St
 /// Gate helper shared by write_file/edit_file: paths inside ctx.cwd pass
 /// untouched; anything else asks the approver (rule "fs_write_outside").
 pub(crate) async fn gate_fs_write(ctx: &ToolCtx<'_>, abs: &Path) -> Result<(), String> {
-    let cwd_norm = normalize(&ctx.cwd);
-    let target_norm = normalize(abs);
+    let cwd_norm = canonicalize_with_missing(&ctx.cwd);
+    let target_norm = canonicalize_with_missing(abs);
     if target_norm.starts_with(&cwd_norm) {
         return Ok(());
     }
@@ -482,6 +483,30 @@ pub(crate) async fn gate_fs_write(ctx: &ToolCtx<'_>, abs: &Path) -> Result<(), S
     } else {
         Err("error: write outside the workspace was not approved".to_string())
     }
+}
+
+/// Canonicalize the nearest existing ancestor, then restore any missing
+/// suffix. This catches workspace symlinks that point outside the cwd while
+/// still supporting creation of new nested paths.
+fn canonicalize_with_missing(path: &Path) -> PathBuf {
+    let path = normalize(path);
+    let mut ancestor = path.as_path();
+    let mut suffix = Vec::new();
+    while !ancestor.exists() {
+        let Some(name) = ancestor.file_name() else {
+            break;
+        };
+        suffix.push(name.to_os_string());
+        let Some(parent) = ancestor.parent() else {
+            break;
+        };
+        ancestor = parent;
+    }
+    let mut out = std::fs::canonicalize(ancestor).unwrap_or_else(|_| ancestor.to_path_buf());
+    for component in suffix.into_iter().rev() {
+        out.push(component);
+    }
+    out
 }
 
 fn normalize(p: &Path) -> PathBuf {
@@ -535,16 +560,18 @@ pub async fn execute_write_file(arguments: &str, ctx: &ToolCtx<'_>) -> ToolOutco
         Ok(a) => a,
         Err(e) => return parse_err(e),
     };
-    let abs = absolute_arg(&ctx.cwd, &args.path);
+    let abs = crate::exec::resolve_tool_path(&ctx.cwd, &args.path);
     if let Err(msg) = gate_fs_write(ctx, &abs).await {
         return ToolOutcome {
             text: msg,
             ..Default::default()
         };
     }
-    let path = args.path.clone();
+    let path = abs;
+    let display = args.path.clone();
     let content = args.content.clone();
-    let result = with_file_lock(&args.path, move || {
+    let lock_target = path.display().to_string();
+    let result = with_file_lock(&lock_target, move || {
         let existing = match std::fs::read(&path) {
             Ok(c) => Some(c),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -563,7 +590,7 @@ pub async fn execute_write_file(arguments: &str, ctx: &ToolCtx<'_>) -> ToolOutco
                 };
             }
         }
-        if let Err(e) = write_file_atomic(&path, content.as_bytes()) {
+        if let Err(e) = write_file_atomic(&path.display().to_string(), content.as_bytes()) {
             return ToolOutcome {
                 text: format!("error writing file: {e}"),
                 ..Default::default()
@@ -571,8 +598,11 @@ pub async fn execute_write_file(arguments: &str, ctx: &ToolCtx<'_>) -> ToolOutco
         }
         remember_file(ctx, &path, content.as_bytes());
         let prior = existing.unwrap_or_default();
-        let diff = file_diff(&path, &prior, content.as_bytes());
-        outcome(format!("wrote {} bytes to {}", content.len(), path), diff)
+        let diff = file_diff(&display, &prior, content.as_bytes());
+        outcome(
+            format!("wrote {} bytes to {}", content.len(), display),
+            diff,
+        )
     });
     match result {
         Ok(out) => out,
@@ -597,17 +627,19 @@ pub async fn execute_edit_file(arguments: &str, ctx: &ToolCtx<'_>) -> ToolOutcom
         Ok(a) => a,
         Err(e) => return parse_err(e),
     };
-    let abs = absolute_arg(&ctx.cwd, &args.path);
+    let abs = crate::exec::resolve_tool_path(&ctx.cwd, &args.path);
     if let Err(msg) = gate_fs_write(ctx, &abs).await {
         return ToolOutcome {
             text: msg,
             ..Default::default()
         };
     }
-    let path = args.path.clone();
+    let path = abs;
+    let display = args.path.clone();
     let old_text = args.old_text.clone();
     let new_text = args.new_text.clone();
-    let result = with_file_lock(&args.path, move || {
+    let lock_target = path.display().to_string();
+    let result = with_file_lock(&lock_target, move || {
         let content = match std::fs::read(&path) {
             Ok(c) => c,
             Err(e) => {
@@ -638,18 +670,18 @@ pub async fn execute_edit_file(arguments: &str, ctx: &ToolCtx<'_>) -> ToolOutcom
             };
         }
         let updated = text.replacen(&old_text, &new_text, 1);
-        if let Err(e) = write_file_atomic(&path, updated.as_bytes()) {
+        if let Err(e) = write_file_atomic(&path.display().to_string(), updated.as_bytes()) {
             return ToolOutcome {
                 text: format!("error writing file: {e}"),
                 ..Default::default()
             };
         }
         remember_file(ctx, &path, updated.as_bytes());
-        let diff = file_diff(&path, &content, updated.as_bytes());
+        let diff = file_diff(&display, &content, updated.as_bytes());
         outcome(
             format!(
                 "edited {}: replaced {} bytes with {} bytes",
-                path,
+                display,
                 old_text.len(),
                 new_text.len()
             ),
@@ -662,15 +694,6 @@ pub async fn execute_edit_file(arguments: &str, ctx: &ToolCtx<'_>) -> ToolOutcom
             text: msg,
             ..Default::default()
         },
-    }
-}
-
-fn absolute_arg(cwd: &Path, arg: &str) -> PathBuf {
-    let p = Path::new(arg);
-    if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        cwd.join(p)
     }
 }
 
@@ -748,7 +771,6 @@ mod tests {
     fn oversized_file_keeps_hash_and_degrades_drift_diagnostic() {
         let env = FileEnv::new();
         let path = env.ws.path().join("large.txt");
-        let path_string = path.display().to_string();
         let data = vec![b'a'; MAX_FILE_SEEN_BYTES + 1];
         env.seen.remember(&path, &data);
 
@@ -756,14 +778,14 @@ mod tests {
         assert_eq!(entry.hash, sha256_hash(&data));
         assert!(entry.data.is_none());
         assert_eq!(env.seen.cache_usage(), (1, 0));
-        assert!(observe_or_drift(&env.ctx(), &path_string, &data).is_ok());
+        assert!(observe_or_drift(&env.ctx(), &path, &data).is_ok());
 
         let mut changed = data;
         changed[0] = b'b';
-        let err = observe_or_drift(&env.ctx(), &path_string, &changed).unwrap_err();
+        let err = observe_or_drift(&env.ctx(), &path, &changed).unwrap_err();
         assert!(err.starts_with("error: file changed since last observation."));
         assert!(err.contains("no diff is available"));
-        assert!(observe_or_drift(&env.ctx(), &path_string, &changed).is_ok());
+        assert!(observe_or_drift(&env.ctx(), &path, &changed).is_ok());
         assert_eq!(env.seen.cache_usage(), (1, 0));
     }
 
@@ -1014,6 +1036,27 @@ mod tests {
         .await;
         assert!(allowed.text.starts_with("wrote "), "{}", allowed.text);
         assert!(path.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_symlink_to_outside_requires_approval() {
+        let outside = tempfile::tempdir().unwrap();
+        let env = FileEnv::new();
+        std::os::unix::fs::symlink(outside.path(), env.ws.path().join("outside-link")).unwrap();
+
+        let denied = execute_write_file(
+            r#"{"path":"outside-link/new.txt","content":"x"}"#,
+            &env.ctx_with(&AutoApprover(Decision::Deny)),
+        )
+        .await;
+
+        assert!(
+            denied.text.contains("outside the workspace"),
+            "{}",
+            denied.text
+        );
+        assert!(!outside.path().join("new.txt").exists());
     }
 
     // ---- pure helpers ported from file_edit_test coverage ----

@@ -399,11 +399,9 @@ impl SubagentHandle for DispatchBridge {
         if !parent.parent_id.is_empty() {
             return "error: subagents cannot dispatch nested subagents".into();
         }
-        let mut cwd = parent.cwd.clone();
-        if cwd.is_empty() {
-            cwd = std::env::current_dir()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default();
+        let cwd = parent.cwd.clone();
+        if !std::path::Path::new(&cwd).is_absolute() {
+            return "error: parent session has no absolute cwd".into();
         }
         let instr = load_instructions_from(&cwd);
         let title = first_line_trunc(&plan.prompt, 60);

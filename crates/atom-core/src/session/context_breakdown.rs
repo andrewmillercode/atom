@@ -197,24 +197,24 @@ pub fn builtin_tool_definitions() -> Vec<ToolDef> {
             json!({"type":"object","properties":{"path":{"type":"string","description":"Absolute or relative path to the file to edit"},"old_text":{"type":"string","description":"The exact text to find in the file"},"new_text":{"type":"string","description":"The replacement text"}},"required":["path","old_text","new_text"]})
         ),
         def!(
-            "bash",
-            "Last resort. Run a shell command only when no other built-in tool can do the job (tests, git, package installs). Do not use bash for file search, reading, editing, or web search.",
-            json!({"type":"object","properties":{"command":{"type":"string","description":"The shell command to execute"}},"required":["command"]})
-        ),
-        def!(
             "vector_search",
             "Search a local directory or git URL for relevant code by meaning or identifier. Returns matching snippets with file paths and line ranges. Prefer this over grep when looking for how something works. Does not search the web.",
             json!({"type":"object","properties":{"query":{"type":"string","description":"Natural-language or identifier query"},"path":{"type":"string","description":"Local directory or https git URL. Defaults to the current directory."},"content":{"type":"string","enum":["code","docs","config","all"],"description":"What to search. Defaults to code."},"top_k":{"type":"integer","description":"Maximum number of snippets to return"},"max_snippet_lines":{"type":"integer","description":"Show only the first N lines of each snippet. 0 returns path and line range only."}},"required":["query"]})
         ),
         def!(
             "grep",
-            "Find every literal or regex occurrence of a string in files. Honors .gitignore. Use this instead of bash grep/rg when you need exact matches. Prefer vector_search when looking up how something works.",
-            json!({"type":"object","properties":{"pattern":{"type":"string","description":"Text to search for. Literal by default; set regex true for a regex."},"path":{"type":"string","description":"File or directory to search. Defaults to the current directory."},"glob":{"type":"string","description":"Only search files matching this glob, e.g. *.go"},"regex":{"type":"boolean","description":"Treat pattern as a regex. Default false (faster literal search)."},"case_insensitive":{"type":"boolean","description":"Case-insensitive search. Default false; otherwise smart-case."},"head_limit":{"type":"integer","description":"Maximum matches to return. Defaults to 100."}},"required":["pattern"]})
+            "Fast exact text search with path, line number, and matching text. Use for identifiers, error strings, config keys, and regexes instead of running grep or rg in bash. The session workspace is searched by default and .gitignore is honored.",
+            json!({"type":"object","properties":{"pattern":{"type":"string","description":"Text to find. Literal by default, so common code symbols need no escaping."},"path":{"type":"string","description":"Optional file or directory, relative to the session workspace. Omit to search the workspace."},"glob":{"type":"string","description":"Optional file filter such as *.rs or **/*.test.ts"},"regex":{"type":"boolean","description":"Enable regular-expression matching. Defaults to false for fast literal search."},"case_insensitive":{"type":"boolean","description":"Force case-insensitive matching. Otherwise smart-case is used."},"head_limit":{"type":"integer","description":"Maximum matches returned. Defaults to 100."}},"required":["pattern"]})
         ),
         def!(
             "glob",
-            "Find files by glob pattern (e.g. **/*.go, src/**/*.md). Honors .gitignore. Use this instead of bash find/fd/ls.",
-            json!({"type":"object","properties":{"pattern":{"type":"string","description":"Glob to match, e.g. **/*_test.go"},"path":{"type":"string","description":"Directory to search. Defaults to the current directory."},"head_limit":{"type":"integer","description":"Maximum paths to return. Defaults to 200."}},"required":["pattern"]})
+            "Fast file discovery by pattern. Use instead of find, fd, or ls in bash. Searches the session workspace recursively by default and honors .gitignore.",
+            json!({"type":"object","properties":{"pattern":{"type":"string","description":"File glob such as **/*.rs, src/**/*.md, or Cargo.toml"},"path":{"type":"string","description":"Optional directory relative to the session workspace. Omit to search the workspace."},"head_limit":{"type":"integer","description":"Maximum paths returned. Defaults to 200."}},"required":["pattern"]})
+        ),
+        def!(
+            "bash",
+            "Run commands that require a shell, such as tests, builds, git, and package managers. File discovery and text search are faster and safer with glob and grep; file reads and changes belong in read_file, write_file, and edit_file.",
+            json!({"type":"object","properties":{"command":{"type":"string","description":"Command to execute from the session workspace"}},"required":["command"]})
         ),
         def!(
             "dispatch",

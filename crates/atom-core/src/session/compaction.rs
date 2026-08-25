@@ -590,15 +590,22 @@ fn is_retryable_provider_error(status: u16, body: &str) -> bool {
     false
 }
 
-/// sanitizeMessages returns the messages to send to the model API with
-/// tool calls that would make the request invalid removed: assistant
-/// tool calls whose arguments aren't valid JSON (or have no function
-/// name), and the tool responses that answered them (server.go). The
-/// input slice is not modified.
+/// sanitizeMessages returns protocol-safe messages for the model API.
+/// Every retained tool call has a matching result, malformed calls and
+/// orphaned results are removed, and local error records are not sent as
+/// unsupported provider message roles. The input slice is not modified.
 pub fn sanitize_messages(msgs: &[Message]) -> Vec<Message> {
+    let answered_ids: std::collections::HashSet<&str> = msgs
+        .iter()
+        .filter(|m| m.role == "tool" && !m.tool_call_id.is_empty())
+        .map(|m| m.tool_call_id.as_str())
+        .collect();
     let mut out = Vec::with_capacity(msgs.len());
     let mut valid_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     for m in msgs {
+        if m.role == "error" {
+            continue;
+        }
         if m.role == "tool" {
             if valid_ids.contains(&m.tool_call_id) {
                 out.push(m.clone());
@@ -608,7 +615,11 @@ pub fn sanitize_messages(msgs: &[Message]) -> Vec<Message> {
         if m.role == "assistant" && !m.tool_calls.is_empty() {
             let mut calls = Vec::new();
             for tc in &m.tool_calls {
-                if tc.function.name.is_empty() || !json_valid(&tc.function.arguments) {
+                if tc.id.is_empty()
+                    || tc.function.name.is_empty()
+                    || !json_valid(&tc.function.arguments)
+                    || !answered_ids.contains(tc.id.as_str())
+                {
                     continue;
                 }
                 valid_ids.insert(tc.id.clone());
@@ -1228,5 +1239,42 @@ mod tests {
         assert_eq!(out.len(), 3);
         assert_eq!(out[1].tool_calls.len(), 1);
         assert_eq!(out[1].tool_calls[0].id, "t1");
+    }
+
+    #[test]
+    fn sanitize_messages_drops_unanswered_calls_and_errors() {
+        let call = |id: &str, name: &str, arguments: &str| ToolCall {
+            id: id.into(),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: name.into(),
+                arguments: arguments.into(),
+            },
+        };
+        let msgs = vec![
+            msg("user", "go"),
+            Message {
+                role: "assistant".into(),
+                tool_calls: vec![
+                    call("answered", "grep", r#"{"pattern":"needle"}"#),
+                    call("unanswered", "glob", r#"{"pattern":"**/*.rs"}"#),
+                ],
+                ..Default::default()
+            },
+            Message {
+                role: "tool".into(),
+                tool_call_id: "answered".into(),
+                content: "hit".into(),
+                ..Default::default()
+            },
+            msg("error", "provider-local failure"),
+            msg("user", "continue"),
+        ];
+
+        let out = sanitize_messages(&msgs);
+        assert_eq!(out.len(), 4, "{out:?}");
+        assert_eq!(out[1].tool_calls.len(), 1);
+        assert_eq!(out[1].tool_calls[0].id, "answered");
+        assert!(out.iter().all(|m| m.role != "error"));
     }
 }

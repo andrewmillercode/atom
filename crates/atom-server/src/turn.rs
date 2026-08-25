@@ -36,6 +36,19 @@ use std::time::{Duration, Instant};
 /// calls queued, the turn ended with no done event, and a later "?" got
 /// "I'm mid-implementation".
 pub const MAX_TOOL_ROUNDS: usize = 500;
+pub const MAX_TOOL_OUTPUT_BYTES: usize = 128 * 1024;
+
+fn cap_tool_output(text: &mut String) {
+    if text.len() <= MAX_TOOL_OUTPUT_BYTES {
+        return;
+    }
+    let mut end = MAX_TOOL_OUTPUT_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text.push_str("\n... truncated at tool output byte limit");
+}
 
 // ---------------------------------------------------------------------------
 // NDJSON output sink.
@@ -981,7 +994,7 @@ pub async fn run_session_turn(
         persist_session(state, sess, id).await;
 
         // Execute each tool and feed the result back to the model.
-        for tc in &result.tool_calls {
+        for (tool_index, tc) in result.tool_calls.iter().enumerate() {
             let ev = event(vec![
                 ("type", json!("tool")),
                 ("name", json!(tc.function.name)),
@@ -1014,9 +1027,10 @@ pub async fn run_session_turn(
                 spawner: Some(&bridge),
                 file_seen: Some(seen.as_ref()),
             };
-            let outcome =
+            let mut outcome =
                 atom_tools::execute_tool(&tool_ctx, &tc.function.name, &tc.function.arguments)
                     .await;
+            cap_tool_output(&mut outcome.text);
 
             sess.messages.push(Message {
                 role: "tool".into(),
@@ -1045,6 +1059,15 @@ pub async fn run_session_turn(
             }
             // Stop between tools when the turn was paused.
             if ctx.err() {
+                for skipped in &result.tool_calls[tool_index + 1..] {
+                    sess.messages.push(Message {
+                        role: "tool".into(),
+                        tool_call_id: skipped.id.clone(),
+                        content: "error: tool execution cancelled before it started".into(),
+                        ..Default::default()
+                    });
+                }
+                persist_session(state, sess, id).await;
                 finish_paused_turn(state, sess, &out, id).await;
                 end_of_turn(state, id, &ctx.handle, &parent_id);
                 return;
@@ -1392,6 +1415,15 @@ mod tests {
         assert_eq!(ev["prompt"], "10");
         assert_eq!(ev["prompt_all"], "22");
         assert_eq!(ev["cache_read"], "18");
+    }
+
+    #[test]
+    fn tool_output_is_byte_bounded_at_utf8_boundary() {
+        let mut text = "é".repeat(MAX_TOOL_OUTPUT_BYTES);
+        cap_tool_output(&mut text);
+        assert!(text.len() < MAX_TOOL_OUTPUT_BYTES + 100);
+        assert!(text.contains("truncated at tool output byte limit"));
+        assert!(text.is_char_boundary(text.len()));
     }
 
     #[test]

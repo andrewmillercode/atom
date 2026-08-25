@@ -30,6 +30,17 @@ pub struct ToolCtx<'a> {
     pub file_seen: Option<&'a FileSeen>,
 }
 
+/// Resolve a model-supplied path against the session workspace. Tool code
+/// must never let relative paths fall through to the server process cwd.
+pub(crate) fn resolve_tool_path(cwd: &std::path::Path, path: &str) -> PathBuf {
+    let path = std::path::Path::new(path);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    }
+}
+
 /// Result of one tool call: model-visible text, optional image
 /// attachments (read_file on an image file), plus a unified diff of any
 /// file change ("" when the tool didn't change a file).
@@ -83,9 +94,11 @@ pub async fn execute_tool(ctx: &ToolCtx<'_>, name: &str, args_json: &str) -> Too
             };
             ToolOutcome::from_text(web_search::web_search(&args.query, &ctx.cwd).await)
         }
-        "vector_search" => ToolOutcome::from_text(vector_search::vector_search(args_json).await),
-        "grep" => ToolOutcome::from_text(search::grep_search(args_json).await),
-        "glob" => ToolOutcome::from_text(search::glob_search(args_json).await),
+        "vector_search" => {
+            ToolOutcome::from_text(vector_search::vector_search(args_json, &ctx.cwd).await)
+        }
+        "grep" => ToolOutcome::from_text(search::grep_search(args_json, &ctx.cwd).await),
+        "glob" => ToolOutcome::from_text(search::glob_search(args_json, &ctx.cwd).await),
         "read_file" => read_file::execute_read_file(args_json, ctx),
         "write_file" => file_edit::execute_write_file(args_json, ctx).await,
         "edit_file" => file_edit::execute_edit_file(args_json, ctx).await,
@@ -314,6 +327,31 @@ mod tests {
         assert!(out.text.starts_with("wrote 4 bytes to "), "{}", out.text);
         assert!(!out.diff.is_empty());
         let _ = pjson;
+    }
+
+    #[tokio::test]
+    async fn relative_file_tools_resolve_from_session_cwd() {
+        let env = FileEnv::new();
+        let path = env.ws.path().join("relative.txt");
+        std::fs::write(&path, "old\n").unwrap();
+        let ctx = env.ctx_with(&atom_sandbox::approvals::AutoApprover(
+            atom_sandbox::approvals::Decision::AllowSession,
+        ));
+
+        let read = execute_tool(&ctx, "read_file", r#"{"path":"relative.txt"}"#).await;
+        assert_eq!(read.text, "old\n");
+        let edit = execute_tool(
+            &ctx,
+            "edit_file",
+            r#"{"path":"relative.txt","old_text":"old","new_text":"new"}"#,
+        )
+        .await;
+        assert!(
+            edit.text.starts_with("edited relative.txt"),
+            "{}",
+            edit.text
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "new\n");
     }
 
     #[tokio::test]

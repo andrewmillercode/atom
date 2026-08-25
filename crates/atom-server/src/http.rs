@@ -306,6 +306,9 @@ async fn sessions_index(
             } else {
                 body.cwd.clone()
             };
+            if !std::path::Path::new(&cwd).is_absolute() {
+                return error_resp(StatusCode::BAD_REQUEST, "cwd must be an absolute path");
+            }
             let instructions = load_instructions_from(&cwd);
             let mut sess = state.store.create(&body.model, &cwd, instructions);
             if !body.provider.is_empty() {
@@ -605,6 +608,13 @@ async fn handle_send(
         };
     }
     let base_url = base_url.trim_end_matches('/').to_string();
+
+    if !state.turns.try_prepare_session_turn(id) {
+        return error_resp(
+            StatusCode::CONFLICT,
+            "session already has an active turn; pause it before sending another message",
+        );
+    }
 
     let (resp, tx) = ndjson_response();
 

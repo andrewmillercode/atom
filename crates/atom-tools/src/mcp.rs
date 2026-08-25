@@ -8,7 +8,7 @@ use atom_core::types::ToolDef;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -57,6 +57,10 @@ pub struct McpTool {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn cache_key(name: &str, cwd: &str) -> String {
+    let cwd = std::fs::canonicalize(cwd)
+        .unwrap_or_else(|_| PathBuf::from(cwd))
+        .to_string_lossy()
+        .into_owned();
     format!("{name}\x00{cwd}")
 }
 
@@ -665,14 +669,14 @@ async fn connect_transport(
             if cfg.command.is_empty() {
                 return Err("missing command".to_string());
             }
+            let cwd = Path::new(cwd);
+            if !cwd.is_absolute() {
+                return Err("MCP stdio requires an absolute session cwd".to_string());
+            }
             use tokio::io::AsyncBufReadExt;
             let mut cmd = tokio::process::Command::new(&cfg.command);
             cmd.args(&cfg.args)
-                .current_dir(if cwd.is_empty() {
-                    Path::new(".")
-                } else {
-                    Path::new(cwd)
-                })
+                .current_dir(cwd)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null())

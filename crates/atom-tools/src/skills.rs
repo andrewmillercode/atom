@@ -43,18 +43,14 @@ pub fn walk_project_dirs(cwd: &str) -> Vec<PathBuf> {
 
 pub fn walk_project_dirs_in(cwd: &str, home: Option<&Path>) -> Vec<PathBuf> {
     let mut cwd = if cwd.is_empty() {
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
+        PathBuf::from("/")
     } else {
         PathBuf::from(cwd)
     };
     let Some(home) = home else {
         return vec![cwd];
     };
-    let inside_home = cwd == home
-        || cwd
-            .strip_prefix(home)
-            .map(|rest| rest.to_string_lossy().starts_with('/'))
-            .unwrap_or(false);
+    let inside_home = cwd.starts_with(home);
     let mut dirs = Vec::new();
     loop {
         dirs.push(cwd.clone());

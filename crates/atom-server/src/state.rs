@@ -249,6 +249,7 @@ impl TurnHandle {
 #[derive(Default)]
 struct TurnMaps {
     turns: HashMap<String, Vec<Arc<TurnHandle>>>,
+    reserved: std::collections::HashSet<String>,
     pending_pauses: HashMap<String, Vec<String>>,
     /// Sessions whose most recently prepared turn reached end_turn. This
     /// closes the race where a detached dispatch turn starts and finishes
@@ -276,6 +277,7 @@ impl TurnTable {
             }),
         });
         let mut maps = self.0.lock().unwrap();
+        maps.reserved.remove(id);
         maps.completed.remove(id);
         if let Some(pauses) = maps.pending_pauses.get_mut(id) {
             if let Some(pos) = pauses.iter().position(|p| p == turn_id) {
@@ -326,7 +328,7 @@ impl TurnTable {
     pub fn cancel_session_turns(&self, id: &str) {
         let turns = {
             let mut maps = self.0.lock().unwrap();
-            let turns = maps.turns.remove(id).unwrap_or_default();
+            let turns = maps.turns.get(id).cloned().unwrap_or_default();
             maps.pending_pauses.remove(id);
             turns
         };
@@ -342,19 +344,12 @@ impl TurnTable {
     pub fn pause_session(&self, id: &str, turn_id: &str) {
         let mut maps = self.0.lock().unwrap();
         let mut cancelled = false;
-        if let Some(turns) = maps.turns.get_mut(id) {
-            let mut remaining = Vec::new();
-            for t in turns.drain(..) {
+        if let Some(turns) = maps.turns.get(id) {
+            for t in turns {
                 if turn_id.is_empty() || t.turn_id == turn_id {
                     t.cancel.cancel();
                     cancelled = true;
-                } else {
-                    remaining.push(t);
                 }
-            }
-            *turns = remaining;
-            if turns.is_empty() {
-                maps.turns.remove(id);
             }
         }
         if !cancelled && !turn_id.is_empty() {
@@ -366,13 +361,8 @@ impl TurnTable {
     }
 
     pub fn session_has_active_turn(&self, id: &str) -> bool {
-        self.0
-            .lock()
-            .unwrap()
-            .turns
-            .get(id)
-            .map(|t| !t.is_empty())
-            .unwrap_or(false)
+        let maps = self.0.lock().unwrap();
+        maps.reserved.contains(id) || maps.turns.get(id).map(|t| !t.is_empty()).unwrap_or(false)
     }
 
     pub fn session_turn_completed(&self, id: &str) -> bool {
@@ -383,7 +373,28 @@ impl TurnTable {
     /// prevents result(wait:true) from treating a previous completion as the
     /// completion of a just-started follow-up.
     pub fn prepare_session_turn(&self, id: &str) {
-        self.0.lock().unwrap().completed.remove(id);
+        let mut maps = self.0.lock().unwrap();
+        maps.completed.remove(id);
+        maps.reserved.insert(id.to_string());
+    }
+
+    /// Atomically reserves an idle session before its detached turn task is
+    /// spawned. This closes the gap where two sends could load independent
+    /// session snapshots before either registered an active TurnHandle.
+    pub fn try_prepare_session_turn(&self, id: &str) -> bool {
+        let mut maps = self.0.lock().unwrap();
+        if maps.reserved.contains(id)
+            || maps
+                .turns
+                .get(id)
+                .map(|turns| !turns.is_empty())
+                .unwrap_or(false)
+        {
+            return false;
+        }
+        maps.completed.remove(id);
+        maps.reserved.insert(id.to_string());
+        true
     }
 
     pub fn clear_pending_pauses(&self, id: &str) {
@@ -573,9 +584,13 @@ mod tests {
 
         // Empty turn_id pauses every active turn.
         let a = tt.start_turn("s2", "a");
-        let _b = tt.start_turn("s2", "b");
+        let b = tt.start_turn("s2", "b");
         tt.pause_session("s2", "");
         assert!(a.is_cancelled());
+        assert!(b.is_cancelled());
+        assert!(tt.session_has_active_turn("s2"));
+        tt.end_turn("s2", &a);
+        tt.end_turn("s2", &b);
         assert!(!tt.session_has_active_turn("s2"));
 
         // Non-matching id records another pending pause.
@@ -603,6 +618,21 @@ mod tests {
 
         tt.prepare_session_turn("child");
         assert!(!tt.session_turn_completed("child"));
+    }
+
+    #[test]
+    fn turn_table_reserves_only_one_pending_turn_per_session() {
+        let tt = TurnTable::default();
+        assert!(tt.try_prepare_session_turn("s"));
+        assert!(!tt.try_prepare_session_turn("s"));
+        assert!(tt.session_has_active_turn("s"));
+
+        let handle = tt.start_turn("s", "t");
+        assert!(tt.session_has_active_turn("s"));
+        assert!(!tt.try_prepare_session_turn("s"));
+
+        tt.end_turn("s", &handle);
+        assert!(tt.try_prepare_session_turn("s"));
     }
 
     #[test]

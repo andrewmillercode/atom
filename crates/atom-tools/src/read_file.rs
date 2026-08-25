@@ -30,7 +30,8 @@ pub fn execute_read_file(arguments: &str, ctx: &ToolCtx<'_>) -> ToolOutcome {
             }
         }
     };
-    let content = match std::fs::read(&args.path) {
+    let path = crate::exec::resolve_tool_path(&ctx.cwd, &args.path);
+    let content = match std::fs::read(&path) {
         Ok(c) => c,
         Err(e) => {
             return ToolOutcome {
@@ -39,7 +40,7 @@ pub fn execute_read_file(arguments: &str, ctx: &ToolCtx<'_>) -> ToolOutcome {
             }
         }
     };
-    file_edit::remember_file(ctx, &args.path, &content);
+    file_edit::remember_file(ctx, &path, &content);
     if sniff_image_mime(&content).is_some() {
         if content.len() > atom_core::types::MAX_IMAGE_SOURCE_BYTES {
             return ToolOutcome {

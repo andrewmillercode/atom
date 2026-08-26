@@ -63,7 +63,7 @@ dependencies = [
 
 [[package]]
 name = "atom"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "atom-core",
@@ -78,7 +78,7 @@ dependencies = [
 
 [[package]]
 name = "atom-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -107,7 +107,7 @@ dependencies = [
 
 [[package]]
 name = "atom-sandbox"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -126,7 +126,7 @@ dependencies = [
 
 [[package]]
 name = "atom-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -149,7 +149,7 @@ dependencies = [
 
 [[package]]
 name = "atom-tools"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "atom-core",
@@ -170,7 +170,7 @@ dependencies = [
 
 [[package]]
 name = "atom-tui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "atom-core",

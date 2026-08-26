@@ -54,8 +54,8 @@ pub const SCROLLBAR_WIDTH: usize = 2;
 /// splashTickInterval drives the empty-session atom animation.
 pub const SPLASH_TICK_MS: u64 = 33;
 
-/// MiniDot runs at 12 fps (bubbles).
-pub const SPINNER_TICK_MS: u64 = 83;
+/// MiniDot runs at ~24 fps for smooth animation.
+pub const SPINNER_TICK_MS: u64 = 42;
 
 /// outputTestSceneDuration backs the --output-test scene timer.
 pub const TEST_SCENE_TICK_SECS: u64 = 3;

@@ -169,7 +169,20 @@ async fn event_loop(
         sub_sid: String::new(),
         last_title: String::new(),
     };
-    let mut crossterm_stream = crossterm::event::EventStream::new();
+
+    // Terminal input lives in its own task so the EventStream is only ever
+    // polled by one persistent future with a real waker.  Polling it via
+    // now_or_never() (no-op waker) or dropping it mid-poll from select!
+    // can permanently wedge crossterm's single-slot task protocol.
+    let (input_tx, mut input_rx) = mpsc::unbounded_channel::<crossterm::event::Event>();
+    tokio::spawn(async move {
+        let mut stream = crossterm::event::EventStream::new();
+        while let Some(Ok(ev)) = stream.next().await {
+            if input_tx.send(ev).is_err() {
+                break;
+            }
+        }
+    });
 
     let mut effects = initial_effects(app, test_mode);
 
@@ -265,12 +278,12 @@ async fn event_loop(
 
         let msg: Option<AppMsg> = tokio::select! {
             m = rx.recv() => m,
-            ev = crossterm_stream.next() => match ev {
-                Some(Ok(crossterm::event::Event::Key(k))) => Some(AppMsg::Key(k)),
-                Some(Ok(crossterm::event::Event::Mouse(m))) => Some(AppMsg::Mouse(m)),
-                Some(Ok(crossterm::event::Event::Resize(w, h))) => Some(AppMsg::Resize(w, h)),
-                Some(Ok(crossterm::event::Event::Paste(s))) => Some(AppMsg::Paste(s)),
-                Some(Ok(crossterm::event::Event::FocusGained)) => Some(AppMsg::Redraw),
+            ev = input_rx.recv() => match ev {
+                Some(crossterm::event::Event::Key(k)) => Some(AppMsg::Key(k)),
+                Some(crossterm::event::Event::Mouse(m)) => Some(AppMsg::Mouse(m)),
+                Some(crossterm::event::Event::Resize(w, h)) => Some(AppMsg::Resize(w, h)),
+                Some(crossterm::event::Event::Paste(s)) => Some(AppMsg::Paste(s)),
+                Some(crossterm::event::Event::FocusGained) => Some(AppMsg::Redraw),
                 _ => None,
             },
             v = send_next(&mut st.send_rx) => v,
@@ -316,19 +329,24 @@ async fn event_loop(
 
         // Drain further pending messages (up to a budget per frame).
         //
-        // Only the app-internal channel is drained here. The crossterm
-        // EventStream must NEVER be polled outside tokio::select!:
-        // now_or_never() polls with a no-op waker, and crossterm 0.28 arms
-        // its single background poll task with whatever waker it last saw.
-        // A no-op waker installed that way swallows every future keypress —
-        // the TUI freezes permanently with the input thread parked. Input
-        // bursts are coalesced by select! itself: buffered events complete
-        // the crossterm branch immediately on the next loop pass.
+        // Both the app-internal channel AND the input channel are drained
+        // here so input (Esc, Enter) is picked up instantly even during
+        // heavy streaming bursts. The input channel is a regular tokio mpsc
+        // fed by a dedicated task — try_recv is always safe (no waker
+        // involvement, unlike the raw EventStream).
         const MAX_DRAIN: usize = 128;
         for _ in 0..MAX_DRAIN {
-            let Some(extra) = rx.try_recv().ok() else {
-                break;
-            };
+            let next = rx.try_recv().ok().or_else(|| {
+                input_rx.try_recv().ok().and_then(|ev| match ev {
+                    crossterm::event::Event::Key(k) => Some(AppMsg::Key(k)),
+                    crossterm::event::Event::Mouse(m) => Some(AppMsg::Mouse(m)),
+                    crossterm::event::Event::Resize(w, h) => Some(AppMsg::Resize(w, h)),
+                    crossterm::event::Event::Paste(s) => Some(AppMsg::Paste(s)),
+                    crossterm::event::Event::FocusGained => Some(AppMsg::Redraw),
+                    _ => None,
+                })
+            });
+            let Some(extra) = next else { break };
             dispatch_msg(app, &mut st, &mut effects, extra, terminal, hot_enabled)?;
         }
     }

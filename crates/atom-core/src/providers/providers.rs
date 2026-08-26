@@ -554,6 +554,40 @@ where
 /// auth when the key is non-empty and parses the response into
 /// StreamChunks. Establishing the request uses the common provider retry
 /// policy, including transport failures and transient gateway responses.
+/// Strip atom-internal fields from serialized messages and rename the
+/// `reasoning` key to match what the upstream provider expects on input
+/// assistant messages. Without this, providers that use
+/// `reasoning_content` (e.g. DeepSeek via OpenCode Go) never see prior
+/// reasoning and loop with reasoning-only replies.
+fn fixup_wire_messages(body: &mut serde_json::Value, reasoning_field: &str) {
+    let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return;
+    };
+    for msg in messages {
+        let Some(obj) = msg.as_object_mut() else {
+            continue;
+        };
+        // These fields are atom-internal bookkeeping and must not be sent
+        // to the upstream provider.
+        obj.remove("reasoning_signature");
+        obj.remove("reasoning_ms");
+        obj.remove("diff");
+        obj.remove("provider");
+        obj.remove("model");
+        obj.remove("duration_ms");
+        obj.remove("usage");
+        // Rename `reasoning` → `reasoning_content` for providers that
+        // expect the latter (DeepSeek / OpenCode Go).
+        if reasoning_field == "reasoning_content" {
+            if let Some(r) = obj.remove("reasoning") {
+                if r.as_str().map(|s| !s.is_empty()).unwrap_or(false) {
+                    obj.insert("reasoning_content".to_string(), r);
+                }
+            }
+        }
+    }
+}
+
 /// SSE "data:" lines are decoded; empty payloads, comments, and [DONE]
 /// terminate/skip per main.go's sseData + streamModelToClient semantics;
 /// undecodable JSON lines are skipped.
@@ -561,9 +595,12 @@ pub async fn stream_chat(
     base_url: &str,
     api_key: &str,
     req: ChatRequest,
+    reasoning_field: &str,
 ) -> anyhow::Result<impl futures::Stream<Item = anyhow::Result<types::StreamChunk>>> {
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
-    let body = serde_json::to_vec(&req)?;
+    let mut body_value = serde_json::to_value(&req)?;
+    fixup_wire_messages(&mut body_value, reasoning_field);
+    let body = serde_json::to_vec(&body_value)?;
     let resp = super::retry::do_http_with_retry(|| {
         let mut builder = super::retry::long_timeout_client()
             .post(url.clone())
@@ -1375,7 +1412,7 @@ mod tests {
         base: &str,
         key: &str,
     ) -> Vec<anyhow::Result<crate::types::StreamChunk>> {
-        let stream = stream_chat(base, key, test_chat_request()).await.unwrap();
+        let stream = stream_chat(base, key, test_chat_request(), "reasoning").await.unwrap();
         stream.collect::<Vec<_>>().await
     }
 
@@ -1481,7 +1518,7 @@ mod tests {
                 .to_string()
         });
         let req = test_chat_request();
-        let res = stream_chat(&format!("http://{}/v1", srv.addr), "", req).await;
+        let res = stream_chat(&format!("http://{}/v1", srv.addr), "", req, "reasoning").await;
         let err = match res {
             Ok(_) => panic!("expected error"),
             Err(e) => e,

@@ -19,6 +19,7 @@ pub mod overlays;
 pub mod preview;
 pub mod prompt;
 pub mod settings;
+pub mod spinner;
 pub mod statusbar;
 pub mod view;
 

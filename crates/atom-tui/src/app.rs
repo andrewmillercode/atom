@@ -52,7 +52,7 @@ pub const TUI_HPAD: usize = 1;
 pub const SPLASH_TICK_MS: u64 = 33;
 
 /// MiniDot runs at 12 fps (bubbles).
-pub const SPINNER_TICK_MS: u64 = 83;
+pub const SPINNER_TICK_MS: u64 = 42;
 
 /// outputTestSceneDuration backs the --output-test scene timer.
 pub const TEST_SCENE_TICK_SECS: u64 = 3;
@@ -104,6 +104,12 @@ pub struct App {
     pub following: bool,
     /// viewport YOffset analog
     pub scroll_y: usize,
+
+    // scrollbar mouse interaction
+    pub scrollbar_dragging: bool,
+
+    // performance: skip redundant refresh_viewport work during pure scrolls
+    pub viewport_dirty: bool,
 
     // mouse text selection over the viewport ((line,col) pairs)
     pub sel_anchor: Option<(usize, usize)>,
@@ -231,6 +237,8 @@ impl App {
             content_width: 0,
             following: true,
             scroll_y: 0,
+            scrollbar_dragging: false,
+            viewport_dirty: true,
             sel_anchor: None,
             sel_end: None,
             selecting: false,
@@ -493,16 +501,19 @@ impl App {
                 BlockKind::Reasoning => {
                     if b.active {
                         b.lines = None;
+                        self.viewport_dirty = true;
                     }
                 }
                 BlockKind::Compaction => {
                     if b.active {
                         b.lines = None;
+                        self.viewport_dirty = true;
                     }
                 }
                 BlockKind::Tool => {
                     if !b.tool_done {
                         b.lines = None;
+                        self.viewport_dirty = true;
                     }
                 }
                 _ => {}
@@ -514,6 +525,7 @@ impl App {
         for block in &mut self.blocks {
             block.lines = None;
         }
+        self.viewport_dirty = true;
     }
 
     pub fn refresh_viewport(&mut self) {
@@ -527,7 +539,7 @@ impl App {
             }
             self.content_width = width;
             self.rebuild_content_from(0, width);
-        } else {
+        } else if self.viewport_dirty || self.block_start.len() != self.blocks.len() {
             let first = self
                 .blocks
                 .iter()
@@ -541,6 +553,7 @@ impl App {
                 }
             }
         }
+        self.viewport_dirty = false;
         let max_scroll = self
             .content_lines
             .len()
@@ -714,6 +727,7 @@ impl App {
                     let last = self.blocks.last_mut().unwrap();
                     last.text.push_str(&ev.text);
                     last.lines = None;
+                    self.viewport_dirty = true;
                 } else {
                     self.blocks.push(Block {
                         kind: BlockKind::Assistant,
@@ -731,6 +745,7 @@ impl App {
                     let last = self.blocks.last_mut().unwrap();
                     last.text.push_str(&ev.text);
                     last.lines = None;
+                    self.viewport_dirty = true;
                 } else {
                     self.blocks.push(Block {
                         kind: BlockKind::Reasoning,
@@ -781,6 +796,7 @@ impl App {
                     if b.kind == BlockKind::Tool && b.diff.is_empty() {
                         b.diff = ev.diff.clone();
                         b.lines = None;
+                        self.viewport_dirty = true;
                         break;
                     }
                 }
@@ -877,6 +893,7 @@ impl App {
                         block.model = ev.model.clone();
                         block.turn_duration = ev.duration;
                         block.lines = None;
+                        self.viewport_dirty = true;
                     }
                 }
             }
@@ -906,6 +923,7 @@ impl App {
             dur.unwrap_or_else(|| b.started_at.map(|t| t.elapsed()).unwrap_or(Duration::ZERO)),
         );
         b.lines = None;
+        self.viewport_dirty = true;
     }
 
     pub fn finalize_compaction(&mut self) {
@@ -918,6 +936,7 @@ impl App {
             b.active = false;
             b.dur = Some(b.started_at.map(|t| t.elapsed()).unwrap_or(Duration::ZERO));
             b.lines = None;
+            self.viewport_dirty = true;
         }
     }
 
@@ -926,6 +945,7 @@ impl App {
             if b.kind == BlockKind::Tool && !b.tool_done {
                 b.tool_done = true;
                 b.lines = None;
+                self.viewport_dirty = true;
             }
         }
     }
@@ -1240,6 +1260,7 @@ impl App {
                     if block.kind == BlockKind::Reasoning {
                         block.expanded = self.show_reasoning;
                         block.lines = None;
+                        self.viewport_dirty = true;
                     }
                 }
                 self.refresh_viewport();
@@ -1581,7 +1602,7 @@ impl App {
                 Vec::new()
             }
             AppMsg::TickSpinner => {
-                self.spinner_frame = (self.spinner_frame + 1) % MINIDOT_FRAMES.len();
+                self.spinner_frame = self.spinner_frame.wrapping_add(1);
                 if self.streaming || self.remote_working || self.test_mode {
                     self.invalidate_live_blocks();
                 }
@@ -2212,6 +2233,31 @@ impl App {
         let max = (total - vp).max(0);
         self.scroll_y = (self.scroll_y as i64 + delta).clamp(0, max.max(0)) as usize;
         self.following = self.scroll_y as i64 >= max.max(0);
+    }
+
+    /// Jumps scroll position so the scrollbar thumb tracks the given screen Y.
+    /// Used for click/drag on the scrollbar track.
+    fn scroll_to_scrollbar_y(&mut self, y: usize) {
+        let track = self.viewport_height();
+        if track == 0 {
+            return;
+        }
+        let content_visible = self.content_viewport_height();
+        let total = self.content_lines.len();
+        let max_scroll = total.saturating_sub(content_visible);
+        if max_scroll == 0 {
+            return;
+        }
+        // Map y (screen row) to a position within the track [0, track-1].
+        let row_in_track = y.saturating_sub(VIEWPORT_VPAD).min(track.saturating_sub(1));
+        // Proportional scroll: row_in_track / (track - 1) ≈ scroll_y / max_scroll.
+        let new_scroll = if track <= 1 {
+            0
+        } else {
+            row_in_track * max_scroll / (track - 1)
+        };
+        self.scroll_y = new_scroll.min(max_scroll);
+        self.following = self.scroll_y >= max_scroll;
     }
 
     /// Returns None for keys the menu does not own (they fall through).
@@ -2914,6 +2960,16 @@ impl App {
     }
 
     fn click(&mut self, x: usize, y: usize) -> Vec<Effect> {
+        // Scrollbar click: rightmost column within the viewport region.
+        if x == self.width.saturating_sub(1) as usize
+            && y >= VIEWPORT_VPAD
+            && y < VIEWPORT_VPAD + self.viewport_height()
+            && !self.content_lines.is_empty()
+        {
+            self.scrollbar_dragging = true;
+            self.scroll_to_scrollbar_y(y);
+            return Vec::new();
+        }
         let viewport_y = y.checked_sub(VIEWPORT_VPAD);
         if self.context_visible {
             if let Some(row) = viewport_y.and_then(|y| overlays::context_row_at_y(self, y)) {
@@ -2976,6 +3032,7 @@ impl App {
             if on_reasoning_header {
                 self.blocks[bi].expanded = !self.blocks[bi].expanded;
                 self.blocks[bi].lines = None;
+                self.viewport_dirty = true;
                 self.refresh_viewport();
                 return Vec::new();
             }
@@ -2991,6 +3048,7 @@ impl App {
             if self.blocks[bi].kind == BlockKind::User && self.blocks[bi].user_collapsible(inner) {
                 self.blocks[bi].expanded = !self.blocks[bi].expanded;
                 self.blocks[bi].lines = None;
+                self.viewport_dirty = true;
                 self.refresh_viewport();
                 return Vec::new();
             }
@@ -2998,6 +3056,7 @@ impl App {
                 if self.blocks[bi].tool_collapsible(inner, inner) {
                     self.blocks[bi].expanded = !self.blocks[bi].expanded;
                     self.blocks[bi].lines = None;
+                    self.viewport_dirty = true;
                     self.refresh_viewport();
                     return Vec::new();
                 }
@@ -3011,6 +3070,10 @@ impl App {
     }
 
     fn drag(&mut self, x: usize, y: usize) -> Vec<Effect> {
+        if self.scrollbar_dragging {
+            self.scroll_to_scrollbar_y(y);
+            return Vec::new();
+        }
         if self.prompt_selecting {
             return Vec::new();
         }
@@ -3041,6 +3104,10 @@ impl App {
     }
 
     fn release(&mut self, _x: usize, _y: usize) -> Vec<Effect> {
+        if self.scrollbar_dragging {
+            self.scrollbar_dragging = false;
+            return Vec::new();
+        }
         if self.selecting {
             self.selecting = false;
             if self.sel_active {

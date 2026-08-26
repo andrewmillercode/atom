@@ -861,7 +861,7 @@ pub async fn run_session_turn(
                 }),
             };
 
-            let chunks = match stream_chat(&base_url, &key, req_body).await {
+            let chunks = match stream_chat(&base_url, &key, req_body, &reasoning_field).await {
                 Ok(c) => c,
                 Err(err) => {
                     ctx.handle.set_round_cancel(None);

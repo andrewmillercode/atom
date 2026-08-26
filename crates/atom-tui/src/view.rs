@@ -205,6 +205,10 @@ pub fn draw(app: &mut App, area: Rect, buf: &mut Buffer) -> Option<(u16, u16)> {
 
 /// Footer line showing the directory the agent was invoked from.
 fn cwd_footer_line(app: &App, width: usize) -> Line<'static> {
+    // Show the Knight Rider loader bar while streaming (main + subagents)
+    if app.streaming || app.remote_working {
+        return crate::spinner::loader_line(app.spinner_frame);
+    }
     let path = if app.cwd.is_empty() {
         ".".to_string()
     } else {
@@ -296,11 +300,8 @@ fn draw_viewport(app: &mut App, rect: Rect, buf: &mut Buffer) {
     if app.blocks.is_empty() {
         // Empty-conversation atom animation fills the content rows; the
         // remaining bottom padding row(s) stay blank (base background).
-        let art = atom_core::render::atom3d::render_atom3d(
-            rect.width as i64,
-            vp_h as i64,
-            app.splash_t,
-        );
+        let art =
+            atom_core::render::atom3d::render_atom3d(rect.width as i64, vp_h as i64, app.splash_t);
         let lines = ansi::ansi_to_lines(&art);
         for (i, line) in lines.iter().take(vp_h).enumerate() {
             write_line(buf, rect.x, rect.y + i as u16, rect.width as usize, line);
@@ -353,7 +354,11 @@ fn draw_scrollbar(app: &App, rect: Rect, buf: &mut Buffer) {
     // The track spans the full viewport height, but the thumb represents
     // the visible *content* (which is padded short of the track when no
     // footer menu is open), so its proportion reflects content_viewport.
-    let content_visible = app.content_viewport_height();
+    let content_visible = if crate::overlays::footer_menu_height(app) > 0 {
+        track
+    } else {
+        track.saturating_sub(crate::app::VIEWPORT_BOTTOM_PAD)
+    };
     let thumb_h = (track.saturating_mul(content_visible))
         .div_ceil(total)
         .max(1)
@@ -362,10 +367,7 @@ fn draw_scrollbar(app: &App, rect: Rect, buf: &mut Buffer) {
     let thumb_top = if max_scroll == 0 {
         0
     } else {
-        app.scroll_y
-            .min(max_scroll)
-            .saturating_mul(track - thumb_h)
-            / max_scroll
+        app.scroll_y.min(max_scroll).saturating_mul(track - thumb_h) / max_scroll
     };
 
     for row in 0..track {
@@ -1576,7 +1578,7 @@ mod tests {
         assert_eq!(top[(9, 5)].symbol(), "█");
         assert_eq!(top[(9, 5)].fg, ansi::c_card_dark());
 
-        app.scroll_y = 14;
+        app.scroll_y = 15;
         let mut bottom = Buffer::empty(Rect::new(0, 0, 10, 6));
         draw_scrollbar(&app, rect, &mut bottom);
         assert_eq!(bottom[(9, 0)].symbol(), "█");

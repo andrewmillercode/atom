@@ -7,7 +7,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -241,7 +241,8 @@ pub fn new_session_id() -> String {
 pub struct SessionStore {
     dir: PathBuf,
     db: Mutex<Connection>,
-    index: Mutex<HashMap<String, SessionInfo>>,
+    index: RwLock<HashMap<String, SessionInfo>>,
+    mutation: Mutex<()>,
     /// Per-session file observations (session ID -> canonical path ->
     /// entry). Mirrors Session.fileSeen; never persisted.
     file_seen: Mutex<HashMap<String, HashMap<String, FileSeenEntry>>>,
@@ -303,7 +304,8 @@ impl SessionStore {
         let s = SessionStore {
             dir,
             db: Mutex::new(db),
-            index: Mutex::new(HashMap::new()),
+            index: RwLock::new(HashMap::new()),
+            mutation: Mutex::new(()),
             file_seen: Mutex::new(HashMap::new()),
         };
         s.load_all()?;
@@ -325,7 +327,7 @@ impl SessionStore {
              FROM sessions",
         )?;
         let rows = stmt.query_map([], session_info_from_row)?;
-        let mut index = self.index.lock().unwrap();
+        let mut index = self.index.write().unwrap();
         for info in rows {
             let info = info?;
             index.insert(info.id.clone(), info);
@@ -336,6 +338,7 @@ impl SessionStore {
     /// Create makes a new session with the given model, cwd, and
     /// instructions, persists it, and returns it.
     pub fn create(&self, model: &str, cwd: &str, instructions: Vec<Message>) -> Session {
+        let _mutation = self.mutation.lock().unwrap();
         let sess = Session {
             id: new_session_id(),
             model: model.into(),
@@ -343,9 +346,11 @@ impl SessionStore {
             instructions,
             ..Default::default()
         };
-        let mut index = self.index.lock().unwrap();
         self.save(&sess);
-        index.insert(sess.id.clone(), sess.info());
+        self.index
+            .write()
+            .unwrap()
+            .insert(sess.id.clone(), sess.info());
         sess
     }
 
@@ -362,6 +367,7 @@ impl SessionStore {
         title: &str,
         instructions: Vec<Message>,
     ) -> Session {
+        let _mutation = self.mutation.lock().unwrap();
         let mut title = title.to_string();
         if title.is_empty() {
             if let Some(last) = instructions.last() {
@@ -379,9 +385,11 @@ impl SessionStore {
             status: DelegateStatus::Queued,
             ..Default::default()
         };
-        let mut index = self.index.lock().unwrap();
         self.save(&sess);
-        index.insert(sess.id.clone(), sess.info());
+        self.index
+            .write()
+            .unwrap()
+            .insert(sess.id.clone(), sess.info());
         sess
     }
 
@@ -391,7 +399,7 @@ impl SessionStore {
         if child_id.is_empty() || ancestor_id.is_empty() || child_id == ancestor_id {
             return false;
         }
-        let index = self.index.lock().unwrap();
+        let index = self.index.read().unwrap();
         let mut seen = std::collections::HashSet::new();
         let mut id = child_id.to_string();
         for _ in 0..32 {
@@ -417,10 +425,13 @@ impl SessionStore {
     /// Children returns sessions whose ParentID matches, newest
     /// CreatedAt first. Empty (0-message) children are included.
     pub fn children(&self, parent_id: &str) -> Vec<Session> {
-        let index = self.index.lock().unwrap();
-        let mut children: Vec<&SessionInfo> = index
+        let mut children: Vec<SessionInfo> = self
+            .index
+            .read()
+            .unwrap()
             .values()
             .filter(|info| info.parent_id == parent_id)
+            .cloned()
             .collect();
         children.sort_by_key(|info| std::cmp::Reverse(info.created_at));
         children
@@ -434,7 +445,7 @@ impl SessionStore {
     pub fn children_info(&self, parent_id: &str) -> Vec<SessionInfo> {
         let mut children: Vec<SessionInfo> = self
             .index
-            .lock()
+            .read()
             .unwrap()
             .values()
             .filter(|info| info.parent_id == parent_id)
@@ -446,16 +457,22 @@ impl SessionStore {
 
     /// Get loads a full session by ID, or returns None if not found.
     pub fn get(&self, id: &str) -> Option<Session> {
-        let index = self.index.lock().unwrap();
-        index.contains_key(id).then(|| self.load(id)).flatten()
+        if !self.index.read().unwrap().contains_key(id) {
+            return None;
+        }
+        self.load(id)
+    }
+
+    /// GetInfo returns listing metadata without loading the transcript.
+    pub fn get_info(&self, id: &str) -> Option<SessionInfo> {
+        self.index.read().unwrap().get(id).cloned()
     }
 
     /// List returns all sessions sorted by UpdatedAt descending (most
     /// recent first). Full sessions are loaded from disk for the caller but
     /// are not retained by the store.
     pub fn list(&self) -> Vec<Session> {
-        let index = self.index.lock().unwrap();
-        let mut infos: Vec<&SessionInfo> = index.values().collect();
+        let mut infos: Vec<SessionInfo> = self.index.read().unwrap().values().cloned().collect();
         infos.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         infos
             .into_iter()
@@ -466,7 +483,7 @@ impl SessionStore {
     /// ListInfo returns compact listing metadata without loading session
     /// transcripts, sorted by UpdatedAt descending.
     pub fn list_info(&self) -> Vec<SessionInfo> {
-        let mut list: Vec<SessionInfo> = self.index.lock().unwrap().values().cloned().collect();
+        let mut list: Vec<SessionInfo> = self.index.read().unwrap().values().cloned().collect();
         list.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         list
     }
@@ -488,13 +505,32 @@ impl SessionStore {
         });
     }
 
+    /// Persists the fields owned by an in-flight turn in one transaction.
+    /// Metadata that may change concurrently (provider, generated title,
+    /// cancellation, and delegate state) remains sourced from the store.
+    pub fn update_turn_snapshot(&self, id: &str, snapshot: &Session, title: &str) -> bool {
+        self.mutate(id, |sess| {
+            sess.messages = snapshot.messages.clone();
+            sess.usage = snapshot.usage.clone();
+            sess.compaction_summary = snapshot.compaction_summary.clone();
+            sess.compacted_through = snapshot.compacted_through;
+            sess.thinking = snapshot.thinking.clone();
+            if !title.is_empty() && !sess.title_generated {
+                sess.title = title.to_string();
+            } else if sess.title.is_empty() {
+                sess.title = session_name(&sess.messages);
+            }
+            sess.updated_at = Utc::now();
+        })
+    }
+
     /// UpdateTitle sets Title, marks TitleGenerated, and saves. Messages
     /// are left unchanged.
     pub fn update_title(&self, id: &str, title: &str) {
-        let mut index = self.index.lock().unwrap();
-        let Some(info) = index.get_mut(id) else {
+        let _mutation = self.mutation.lock().unwrap();
+        if !self.index.read().unwrap().contains_key(id) {
             return;
-        };
+        }
         let now = Utc::now();
         if self
             .db
@@ -506,8 +542,10 @@ impl SessionStore {
             )
             .is_ok()
         {
-            info.title = title.to_string();
-            info.updated_at = now;
+            if let Some(info) = self.index.write().unwrap().get_mut(id) {
+                info.title = title.to_string();
+                info.updated_at = now;
+            }
         }
     }
 
@@ -515,10 +553,10 @@ impl SessionStore {
     /// session. The conversation history is kept; only the model used
     /// for new turns changes. It's a no-op if the session doesn't exist.
     pub fn update_model(&self, id: &str, model: &str) {
-        let mut index = self.index.lock().unwrap();
-        let Some(info) = index.get_mut(id) else {
+        let _mutation = self.mutation.lock().unwrap();
+        if !self.index.read().unwrap().contains_key(id) {
             return;
-        };
+        }
         let now = Utc::now();
         if self
             .db
@@ -530,17 +568,19 @@ impl SessionStore {
             )
             .is_ok()
         {
-            info.model = model.to_string();
-            info.updated_at = now;
+            if let Some(info) = self.index.write().unwrap().get_mut(id) {
+                info.model = model.to_string();
+                info.updated_at = now;
+            }
         }
     }
 
     /// UpdateProvider records the backend selected for a dispatched child.
     pub fn update_provider(&self, id: &str, provider: &str) {
-        let mut index = self.index.lock().unwrap();
-        let Some(info) = index.get_mut(id) else {
+        let _mutation = self.mutation.lock().unwrap();
+        if !self.index.read().unwrap().contains_key(id) {
             return;
-        };
+        }
         let now = Utc::now();
         if self
             .db
@@ -552,18 +592,20 @@ impl SessionStore {
             )
             .is_ok()
         {
-            info.provider = provider.to_string();
-            info.updated_at = now;
+            if let Some(info) = self.index.write().unwrap().get_mut(id) {
+                info.provider = provider.to_string();
+                info.updated_at = now;
+            }
         }
     }
 
     /// UpdateThinking stores the TUI's current reasoning_effort for this
     /// session so Tab/Ctrl+T cycles survive reloads after a turn saves.
     pub fn update_thinking(&self, id: &str, thinking: &str) {
-        let mut index = self.index.lock().unwrap();
-        let Some(info) = index.get_mut(id) else {
+        let _mutation = self.mutation.lock().unwrap();
+        if !self.index.read().unwrap().contains_key(id) {
             return;
-        };
+        }
         let now = Utc::now();
         if self
             .db
@@ -575,18 +617,20 @@ impl SessionStore {
             )
             .is_ok()
         {
-            info.thinking = thinking.to_string();
-            info.updated_at = now;
+            if let Some(info) = self.index.write().unwrap().get_mut(id) {
+                info.thinking = thinking.to_string();
+                info.updated_at = now;
+            }
         }
     }
 
     /// SetCancelled records whether a dispatched subagent was explicitly
     /// killed by its parent (true) or revived by a follow-up (false).
     pub fn set_cancelled(&self, id: &str, cancelled: bool) -> bool {
-        let mut index = self.index.lock().unwrap();
-        let Some(info) = index.get_mut(id) else {
+        let _mutation = self.mutation.lock().unwrap();
+        if !self.index.read().unwrap().contains_key(id) {
             return false;
-        };
+        }
         let now = Utc::now();
         if self
             .db
@@ -600,16 +644,18 @@ impl SessionStore {
         {
             return false;
         }
-        info.cancelled = cancelled;
-        info.updated_at = now;
+        if let Some(info) = self.index.write().unwrap().get_mut(id) {
+            info.cancelled = cancelled;
+            info.updated_at = now;
+        }
         true
     }
 
     pub fn update_delegate_status(&self, id: &str, status: DelegateStatus) -> bool {
-        let mut index = self.index.lock().unwrap();
-        let Some(info) = index.get_mut(id) else {
+        let _mutation = self.mutation.lock().unwrap();
+        if !self.index.read().unwrap().contains_key(id) {
             return false;
-        };
+        }
         let now = Utc::now();
         if self
             .db
@@ -623,16 +669,18 @@ impl SessionStore {
         {
             return false;
         }
-        info.status = status;
-        info.updated_at = now;
+        if let Some(info) = self.index.write().unwrap().get_mut(id) {
+            info.status = status;
+            info.updated_at = now;
+        }
         true
     }
 
     pub fn update_delegate_batch(&self, id: &str, batch_id: &str, batch_index: usize) -> bool {
-        let mut index = self.index.lock().unwrap();
-        let Some(info) = index.get_mut(id) else {
+        let _mutation = self.mutation.lock().unwrap();
+        if !self.index.read().unwrap().contains_key(id) {
             return false;
-        };
+        }
         let now = Utc::now();
         if self
             .db
@@ -646,9 +694,11 @@ impl SessionStore {
         {
             return false;
         }
-        info.batch_id = batch_id.to_string();
-        info.batch_index = batch_index as i64;
-        info.updated_at = now;
+        if let Some(info) = self.index.write().unwrap().get_mut(id) {
+            info.batch_id = batch_id.to_string();
+            info.batch_index = batch_index as i64;
+            info.updated_at = now;
+        }
         true
     }
 
@@ -658,7 +708,7 @@ impl SessionStore {
     pub fn reconcile_delegate_statuses(&self) {
         let ids: Vec<String> = self
             .index
-            .lock()
+            .read()
             .unwrap()
             .values()
             .filter(|info| !info.parent_id.is_empty() && info.status.is_active())
@@ -671,8 +721,7 @@ impl SessionStore {
 
     /// Delete removes a session and its related rows.
     pub fn delete(&self, id: &str) {
-        self.index.lock().unwrap().remove(id);
-        self.file_seen.lock().unwrap().remove(id);
+        let _mutation = self.mutation.lock().unwrap();
         let mut db = self.db.lock().unwrap();
         if let Ok(tx) = db.transaction() {
             if tx
@@ -682,6 +731,9 @@ impl SessionStore {
                 let _ = tx.commit();
             }
         };
+        drop(db);
+        self.index.write().unwrap().remove(id);
+        self.file_seen.lock().unwrap().remove(id);
     }
 
     /// modify loads the stored session, applies f, and persists the result.
@@ -755,16 +807,21 @@ impl SessionStore {
     /// mutate serializes a full-session read/modify/write with all other
     /// session operations and refreshes the compact index.
     fn mutate<F: FnOnce(&mut Session)>(&self, id: &str, f: F) -> bool {
-        let mut index = self.index.lock().unwrap();
-        if !index.contains_key(id) {
+        let _mutation = self.mutation.lock().unwrap();
+        if !self.index.read().unwrap().contains_key(id) {
             return false;
         }
         let Some(mut sess) = self.load(id) else {
             return false;
         };
         f(&mut sess);
-        self.save(&sess);
-        index.insert(id.to_string(), sess.info());
+        if self.save_result(&sess).is_err() {
+            return false;
+        }
+        self.index
+            .write()
+            .unwrap()
+            .insert(id.to_string(), sess.info());
         true
     }
 
@@ -1436,6 +1493,62 @@ mod tests {
         assert_eq!(got.thinking, "high");
         assert_eq!(got.messages.len(), 1);
         assert_eq!(got.messages[0].content, "new turn");
+    }
+
+    #[test]
+    fn metadata_listing_does_not_wait_for_transcript_mutation() {
+        let (_d, store) = temp_store("metadata-during-mutation");
+        let store = std::sync::Arc::new(store);
+        let sess = store.create("m", "/tmp", vec![]);
+        let id = sess.id.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let writer_store = store.clone();
+        let writer = std::thread::spawn(move || {
+            writer_store.modify(&id, |_| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+        });
+        entered_rx.recv().unwrap();
+
+        let (listed_tx, listed_rx) = std::sync::mpsc::channel();
+        let list_store = store.clone();
+        let reader = std::thread::spawn(move || {
+            listed_tx.send(list_store.list_info()).unwrap();
+        });
+        let listed = listed_rx.recv_timeout(Duration::from_millis(250));
+        release_tx.send(()).unwrap();
+        assert!(writer.join().unwrap());
+        reader.join().unwrap();
+
+        let listed = listed.expect("metadata listing blocked behind transcript work");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, sess.id);
+    }
+
+    #[test]
+    fn turn_snapshot_preserves_concurrent_metadata() {
+        let (_d, store) = temp_store("turn-snapshot");
+        let child = store.create_child("parent", "m", "/tmp", "low", "fallback", vec![]);
+        store.update_title(&child.id, "Generated title");
+        store.update_delegate_status(&child.id, DelegateStatus::Working);
+
+        let mut snapshot = store.get(&child.id).unwrap();
+        snapshot.messages = vec![user_msg("new transcript")];
+        snapshot.compaction_summary = "summary".into();
+        snapshot.compacted_through = 3;
+        snapshot.thinking = "high".into();
+        assert!(store.update_turn_snapshot(&child.id, &snapshot, "new fallback"));
+
+        let got = store.get(&child.id).unwrap();
+        assert_eq!(got.title, "Generated title");
+        assert!(got.title_generated);
+        assert_eq!(got.status, DelegateStatus::Working);
+        assert_eq!(got.messages[0].content, "new transcript");
+        assert_eq!(got.compaction_summary, "summary");
+        assert_eq!(got.compacted_through, 3);
+        assert_eq!(got.thinking, "high");
     }
 
     #[test]

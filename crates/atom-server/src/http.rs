@@ -197,7 +197,9 @@ async fn route(
                 })
                 .unwrap_or(0);
             drop(guard);
-            let report = atom_core::session::stats::aggregate_stats(&state.store, days);
+            let report = state
+                .store_call(move |store| atom_core::session::stats::aggregate_stats(store, days))
+                .await;
             return full_body(serde_json::to_value(report).unwrap_or(Value::Null));
         }
         "/api/keepalive" => {
@@ -314,16 +316,24 @@ async fn sessions_index(
             if !std::path::Path::new(&cwd).is_absolute() {
                 return error_resp(StatusCode::BAD_REQUEST, "cwd must be an absolute path");
             }
-            let instructions = load_instructions_from(&cwd);
-            let mut sess = state.store.create(&body.model, &cwd, instructions);
-            if !body.provider.is_empty() {
-                state.store.update_provider(&sess.id, &body.provider);
-                sess.provider = body.provider.clone();
-            }
-            if !body.thinking.is_empty() {
-                state.store.update_thinking(&sess.id, &body.thinking);
-                sess.thinking = body.thinking.clone();
-            }
+            let model = body.model.clone();
+            let provider = body.provider.clone();
+            let thinking = body.thinking.clone();
+            let sess = state
+                .store_call(move |store| {
+                    let instructions = load_instructions_from(&cwd);
+                    let mut sess = store.create(&model, &cwd, instructions);
+                    if !provider.is_empty() {
+                        store.update_provider(&sess.id, &provider);
+                        sess.provider = provider;
+                    }
+                    if !thinking.is_empty() {
+                        store.update_thinking(&sess.id, &thinking);
+                        sess.thinking = thinking;
+                    }
+                    sess
+                })
+                .await;
             full_body(serde_json::to_value(sess.info()).unwrap_or(Value::Null))
         }
         "GET" => {
@@ -351,11 +361,17 @@ async fn session_item(
     req: &mut Request<Incoming>,
     id: &str,
 ) -> Resp {
-    let Some(sess) = state.store.get(id) else {
+    if state.store.get_info(id).is_none() {
         return error_resp(StatusCode::NOT_FOUND, "session not found");
-    };
+    }
     match method {
-        "GET" => full_body(serde_json::to_value(&sess).unwrap_or(Value::Null)),
+        "GET" => {
+            let id = id.to_string();
+            let Some(sess) = state.store_call(move |store| store.get(&id)).await else {
+                return error_resp(StatusCode::NOT_FOUND, "session not found");
+            };
+            full_body(serde_json::to_value(&sess).unwrap_or(Value::Null))
+        }
         "PATCH" => {
             // Change the model and/or thinking level the session uses.
             // The conversation history stays; only future turns change.
@@ -366,22 +382,30 @@ async fn session_item(
                     "model, provider, or thinking is required",
                 );
             }
-            if !body.model.is_empty() {
-                state.store.update_model(id, &body.model);
-            }
-            if !body.provider.is_empty() {
-                state.store.update_provider(id, &body.provider);
-            }
-            if let Some(t) = &body.thinking {
-                state.store.update_thinking(id, t);
-            }
+            let patch_id = id.to_string();
+            state
+                .store_call(move |store| {
+                    if !body.model.is_empty() {
+                        store.update_model(&patch_id, &body.model);
+                    }
+                    if !body.provider.is_empty() {
+                        store.update_provider(&patch_id, &body.provider);
+                    }
+                    if let Some(t) = &body.thinking {
+                        store.update_thinking(&patch_id, t);
+                    }
+                })
+                .await;
             // Tell other instances viewing this session to reload so they
             // show the new model too.
             state.subs.broadcast(id, &json!({"type": "saved"}));
             no_content()
         }
         "DELETE" => {
-            state.store.delete(id);
+            let delete_id = id.to_string();
+            state
+                .store_call(move |store| store.delete(&delete_id))
+                .await;
             state.remove_file_seen(id);
             no_content()
         }
@@ -394,8 +418,14 @@ async fn handle_pause(state: &Arc<AppState>, req: &mut Request<Incoming>, id: &s
     let body: PauseBody = decode(req).await.unwrap_or_default();
     state.turns.pause_session(id, &body.turn_id);
     state.subs.broadcast(id, &json!({"type": "paused"}));
-    state.turns.wait_idle(id, PAUSE_WAIT_TIMEOUT).await;
-    no_content()
+    if state.turns.wait_idle(id, PAUSE_WAIT_TIMEOUT).await {
+        no_content()
+    } else {
+        error_resp(
+            StatusCode::GATEWAY_TIMEOUT,
+            "turn did not stop within the pause timeout",
+        )
+    }
 }
 
 /// POST /approval/{session_id} {id, decision} completes a pending
@@ -430,7 +460,7 @@ async fn handle_approval(state: &Arc<AppState>, req: &mut Request<Incoming>, sid
 /// kill drops it from the list. Missing parent yields 404; no children is
 /// an empty array.
 fn handle_session_children(state: &Arc<AppState>, id: &str) -> Resp {
-    if state.store.get(id).is_none() {
+    if state.store.get_info(id).is_none() {
         return error_resp(StatusCode::NOT_FOUND, "session not found");
     }
     let infos: Vec<Value> = state
@@ -546,7 +576,7 @@ fn handle_events(state: &Arc<AppState>, id: &str, guard: ConnGuard) -> Resp {
         // away must not kill it mid-approval or mid-turn.
         let is_dispatch_child = state
             .store
-            .get(&id)
+            .get_info(&id)
             .is_some_and(|session| !session.parent_id.is_empty());
         if !is_dispatch_child && state.subs.unsubscribe(&id, sub.id) {
             state.turns.cancel_session_turns(&id);
@@ -563,7 +593,8 @@ async fn handle_send(
     id: &str,
     guard: ConnGuard,
 ) -> Resp {
-    let Some(mut sess) = state.store.get(id) else {
+    let load_id = id.to_string();
+    let Some(mut sess) = state.store_call(move |store| store.get(&load_id)).await else {
         return error_resp(StatusCode::NOT_FOUND, "session not found");
     };
 
@@ -666,7 +697,8 @@ async fn handle_send(
 /// the auto path it ignores the token threshold. Optional JSON field
 /// "instructions" is forwarded to the summarizer as extra focus.
 async fn handle_compact(state: &Arc<AppState>, req: &mut Request<Incoming>, id: &str) -> Resp {
-    let Some(mut sess) = state.store.get(id) else {
+    let load_id = id.to_string();
+    let Some(mut sess) = state.store_call(move |store| store.get(&load_id)).await else {
         return error_resp(StatusCode::NOT_FOUND, "session not found");
     };
     let body: CompactBody = decode(req).await.unwrap_or_default();

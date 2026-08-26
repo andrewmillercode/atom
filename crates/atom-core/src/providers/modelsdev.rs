@@ -494,6 +494,7 @@ impl CompactModelsDevCatalog {
 }
 
 static MODELS_DEV_CATALOG: RwLock<Option<Arc<CompactModelsDevCatalog>>> = RwLock::new(None);
+static MODELS_DEV_INIT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 pub fn models_dev_cache_path() -> PathBuf {
     crate::session::store::data_dir().join("models.dev.json")
@@ -568,8 +569,16 @@ pub async fn ensure_models_dev_catalog() {
     if current_models_dev_catalog().is_some() {
         return;
     }
+    let _init = MODELS_DEV_INIT.lock().await;
+    if current_models_dev_catalog().is_some() {
+        return;
+    }
     let cache_path = models_dev_cache_path();
-    let mut cached = read_models_dev_cache(&cache_path);
+    let read_path = cache_path.clone();
+    let mut cached = tokio::task::spawn_blocking(move || read_models_dev_cache(&read_path))
+        .await
+        .ok()
+        .flatten();
     if let Some((cat, mtime)) = &cached {
         if compact_cache_is_current(cat, *mtime, SystemTime::now()) {
             let (cat, _) = cached.take().unwrap();
@@ -580,12 +589,26 @@ pub async fn ensure_models_dev_catalog() {
 
     let fetched = fetch_models_dev_catalog().await;
     match fetched {
-        Ok((fresh, raw)) => {
+        Ok(raw) => {
+            let parsed = tokio::task::spawn_blocking(move || {
+                load_compact_models_dev_catalog_bytes(&raw).map(|fresh| (fresh, raw))
+            })
+            .await
+            .ok()
+            .and_then(Result::ok);
+            let Some((fresh, raw)) = parsed else {
+                if let Some((cat, _)) = cached {
+                    set_catalog(cat);
+                }
+                return;
+            };
             if current_models_dev_catalog().is_some() {
                 return;
             }
             set_catalog(fresh);
-            let _ = write_models_dev_cache(&cache_path, &raw);
+            tokio::task::spawn_blocking(move || write_models_dev_cache(&cache_path, &raw))
+                .await
+                .ok();
         }
         Err(_) => {
             if current_models_dev_catalog().is_none() {
@@ -617,7 +640,7 @@ fn write_models_dev_cache(path: &PathBuf, raw: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn fetch_models_dev_catalog() -> anyhow::Result<(CompactModelsDevCatalog, Vec<u8>)> {
+async fn fetch_models_dev_catalog() -> anyhow::Result<Vec<u8>> {
     static CLIENT: once_cell::sync::Lazy<reqwest::Client> = once_cell::sync::Lazy::new(|| {
         reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(30))
@@ -635,8 +658,7 @@ async fn fetch_models_dev_catalog() -> anyhow::Result<(CompactModelsDevCatalog, 
     if !status.is_success() || status.as_u16() != 200 {
         anyhow::bail!("{}", status);
     }
-    let cat = load_compact_models_dev_catalog_bytes(&b)?;
-    Ok((cat, b.to_vec()))
+    Ok(b.to_vec())
 }
 
 pub fn models_dev_provider_id(atom_name: &str) -> String {

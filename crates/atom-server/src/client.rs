@@ -10,6 +10,8 @@ use std::path::PathBuf;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
+const LOCAL_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// The server's Unix socket path.
 pub fn socket_path() -> PathBuf {
     atom_core::session::store::socket_path()
@@ -200,19 +202,26 @@ async fn read_chunk_size(stream: &mut UnixStream, buf: &mut Vec<u8>) -> std::io:
 
 /// One-shot request returning (status, body bytes).
 async fn request(method: &str, path: &str, body: Option<&[u8]>) -> Result<(u16, Vec<u8>)> {
-    let mut stream = dial()
-        .await
-        .with_context(|| format!("dial {}", socket_path().display()))?;
-    write_request(&mut stream, method, path, body).await?;
-    let mut buf = Vec::new();
-    let head = read_head(&mut stream, &mut buf)
-        .await
-        .context("read response head")?;
-    let framing = framing_for(&head.headers);
-    let body = read_body(&mut stream, &mut buf, framing)
-        .await
-        .context("read response body")?;
-    Ok((head.status, body))
+    match tokio::time::timeout(LOCAL_REQUEST_TIMEOUT, async {
+        let mut stream = dial()
+            .await
+            .with_context(|| format!("dial {}", socket_path().display()))?;
+        write_request(&mut stream, method, path, body).await?;
+        let mut buf = Vec::new();
+        let head = read_head(&mut stream, &mut buf)
+            .await
+            .context("read response head")?;
+        let framing = framing_for(&head.headers);
+        let body = read_body(&mut stream, &mut buf, framing)
+            .await
+            .context("read response body")?;
+        Ok::<_, anyhow::Error>((head.status, body))
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(anyhow!("local server request timed out: {method} {path}")),
+    }
 }
 
 fn decode_json(status: u16, body: &[u8]) -> Result<serde_json::Value> {
@@ -412,14 +421,20 @@ async fn open_stream(
     path: &str,
     body: Option<&[u8]>,
 ) -> Result<tokio::sync::mpsc::Receiver<serde_json::Value>> {
-    let mut stream = dial()
-        .await
-        .with_context(|| format!("dial {}", socket_path().display()))?;
-    write_request(&mut stream, method, path, body).await?;
-    let mut buf = Vec::new();
-    let head = read_head(&mut stream, &mut buf)
-        .await
-        .context("read response head")?;
+    let handshake = tokio::time::timeout(LOCAL_REQUEST_TIMEOUT, async {
+        let mut stream = dial()
+            .await
+            .with_context(|| format!("dial {}", socket_path().display()))?;
+        write_request(&mut stream, method, path, body).await?;
+        let mut buf = Vec::new();
+        let head = read_head(&mut stream, &mut buf)
+            .await
+            .context("read response head")?;
+        Ok::<_, anyhow::Error>((stream, buf, head))
+    })
+    .await
+    .map_err(|_| anyhow!("local server stream timed out: {method} {path}"))?;
+    let (mut stream, mut buf, head) = handshake?;
     if head.status >= 400 {
         let framing = framing_for(&head.headers);
         let err_body = read_body(&mut stream, &mut buf, framing)

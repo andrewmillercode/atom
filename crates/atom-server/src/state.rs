@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::sync::{mpsc, oneshot, Notify, Semaphore};
 
 /// idleShutdownAfter: the server exits when no client connections have
 /// been open for this long. Every running TUI holds a long-lived /events
@@ -74,17 +74,16 @@ impl SessionSubs {
     }
 
     /// broadcastSession sends an event to all subscribers of a session.
-    /// It never blocks — if a subscriber's channel is full, the event is
-    /// dropped.
+    /// It never blocks. A lagging subscriber is disconnected instead of
+    /// silently losing terminal events; the client reconnects and reloads.
     pub fn broadcast(&self, id: &str, event: &Value) {
-        let senders: Vec<EventTx> = {
-            let subs = self.subs.lock().unwrap();
-            subs.get(id)
-                .map(|l| l.iter().map(|(_, tx)| tx.clone()).collect())
-                .unwrap_or_default()
+        let mut subs = self.subs.lock().unwrap();
+        let Some(list) = subs.get_mut(id) else {
+            return;
         };
-        for tx in senders {
-            let _ = tx.try_send(event.clone());
+        list.retain(|(_, tx)| tx.try_send(event.clone()).is_ok());
+        if list.is_empty() {
+            subs.remove(id);
         }
     }
 
@@ -519,6 +518,7 @@ impl PendingApprovals {
 
 pub struct AppState {
     pub store: Arc<SessionStore>,
+    store_io: Arc<Semaphore>,
     pub subs: SessionSubs,
     pub turns: TurnTable,
     pub approvals: PendingApprovals,
@@ -534,6 +534,7 @@ impl AppState {
         store.reconcile_delegate_statuses();
         AppState {
             store,
+            store_io: Arc::new(Semaphore::new(1)),
             subs: SessionSubs::default(),
             turns: TurnTable::default(),
             approvals: PendingApprovals::default(),
@@ -541,6 +542,29 @@ impl AppState {
             tracker,
             files: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Runs synchronous SQLite/session work away from Tokio's workers.
+    /// The permit is moved into the blocking task so cancellation cannot
+    /// release it while the underlying operation is still running.
+    pub async fn store_call<T, F>(&self, f: F) -> T
+    where
+        T: Send + 'static,
+        F: FnOnce(&SessionStore) -> T + Send + 'static,
+    {
+        let permit = self
+            .store_io
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("session store semaphore closed");
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            f(&store)
+        })
+        .await
+        .expect("session store task panicked")
     }
 
     /// Get-or-create the FileSeen cache for a session.
@@ -739,6 +763,57 @@ mod tests {
         );
         assert_eq!(subs.subscriber_count("sess"), 0);
         assert!(!subs.unsubscribe("sess", 999));
+    }
+
+    #[test]
+    fn lagging_subscriber_is_disconnected_instead_of_losing_events() {
+        let subs = SessionSubs::default();
+        let mut subscriber = subs.subscribe("sess");
+        for i in 0..64 {
+            subs.broadcast("sess", &serde_json::json!({"seq": i}));
+        }
+        assert_eq!(subs.subscriber_count("sess"), 1);
+
+        subs.broadcast("sess", &serde_json::json!({"type": "done"}));
+        assert_eq!(subs.subscriber_count("sess"), 0);
+        for _ in 0..64 {
+            subscriber.rx.try_recv().unwrap();
+        }
+        assert!(matches!(
+            subscriber.rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn store_call_keeps_runtime_workers_available() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(AppState::new(
+            Arc::new(SessionStore::open_in_dir(dir.path()).unwrap()),
+            SandboxConfig::default(),
+            Arc::new(ConnTracker::default()),
+        ));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker_state = state.clone();
+        let worker = tokio::spawn(async move {
+            worker_state
+                .store_call(move |_| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+                .await;
+        });
+        entered_rx.await.unwrap();
+
+        let heartbeat = tokio::time::timeout(
+            Duration::from_millis(250),
+            tokio::time::sleep(Duration::from_millis(10)),
+        )
+        .await;
+        release_tx.send(()).unwrap();
+        worker.await.unwrap();
+        assert!(heartbeat.is_ok(), "blocking store work starved Tokio");
     }
 
     #[test]

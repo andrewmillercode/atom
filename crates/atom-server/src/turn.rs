@@ -18,7 +18,7 @@ use atom_core::session::compaction::{
     llm_messages, should_compact_with_threshold, COMPACTION_MODEL_ID,
 };
 use atom_core::session::store::{usage_for_display, Session};
-use atom_core::session::title::{generate_and_store_title, title_provider};
+use atom_core::session::title::{generate_title, title_provider};
 use atom_core::types::{
     ChatRequest, Message, StreamOptions, StreamResult, StreamToolCallDelta, ToolCall,
 };
@@ -27,6 +27,7 @@ use chrono::Local;
 use futures::{Stream, StreamExt};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -266,6 +267,7 @@ pub async fn stream_model_to_client<S>(
     chunks: S,
     turn_cancel: &CancelToken,
     parent_cancel: &CancelToken,
+    round_cancel: &CancelToken,
     reasoning_field: &str,
 ) -> anyhow::Result<StreamResult>
 where
@@ -283,12 +285,14 @@ where
     loop {
         // Stop reading when the turn was paused. The cancelled request
         // also closes the body, so this is just a fast path.
-        if turn_cancel.is_cancelled() || parent_cancel.is_cancelled() {
+        if turn_cancel.is_cancelled() || parent_cancel.is_cancelled() || round_cancel.is_cancelled()
+        {
             break;
         }
         let item = tokio::select! {
             _ = turn_cancel.cancelled() => None,
             _ = parent_cancel.cancelled() => None,
+            _ = round_cancel.cancelled() => None,
             item = chunks.next() => item,
         };
         let chunk = match item {
@@ -378,25 +382,22 @@ fn empty_response(result: &StreamResult) -> bool {
 // Persistence helpers.
 // ---------------------------------------------------------------------------
 
-/// Propagates the fields Go mutated through the shared *Session pointer
-/// onto the stored session so the next save persists them (the Rust
-/// store hands out clones).
-fn sync_back(store: &atom_core::session::store::SessionStore, id: &str, sess: &Session) {
-    store.modify(id, |s| {
-        s.usage = sess.usage.clone();
-        s.compaction_summary = sess.compaction_summary.clone();
-        s.compacted_through = sess.compacted_through;
-        s.thinking = sess.thinking.clone();
-    });
+async fn save_turn_snapshot(state: &Arc<AppState>, sess: &Session, id: &str) -> bool {
+    let snapshot = sess.clone();
+    let title = fallback_title(sess);
+    let id = id.to_string();
+    state
+        .store_call(move |store| store.update_turn_snapshot(&id, &snapshot, &title))
+        .await
 }
 
 /// persistSession saves a session's messages. A generated LLM title is
 /// kept; otherwise the first user message (truncated) is used so the
 /// picker has a name immediately. Title generation runs in the background.
 pub async fn persist_session(state: &Arc<AppState>, sess: &Session, id: &str) {
-    let title = fallback_title(sess);
-    sync_back(&state.store, id, sess);
-    state.store.update(id, sess.messages.clone(), &title);
+    if !save_turn_snapshot(state, sess, id).await {
+        return;
+    }
     state.subs.broadcast(id, &json!({"type": "saved"}));
     if !sess.title_generated {
         kickoff_title_generation(state, id.to_string());
@@ -410,9 +411,7 @@ pub async fn persist_session(state: &Arc<AppState>, sess: &Session, id: &str) {
 /// once. Viewing clients learn about the user message from the
 /// dedicated `user_message` event broadcast at turn start.
 async fn persist_session_now(state: &Arc<AppState>, sess: &Session, id: &str) {
-    let title = fallback_title(sess);
-    sync_back(&state.store, id, sess);
-    state.store.update(id, sess.messages.clone(), &title);
+    save_turn_snapshot(state, sess, id).await;
 }
 
 /// fallbackTitle derives the picker name from the first user message.
@@ -448,15 +447,36 @@ pub fn kickoff_title_generation(state: &Arc<AppState>, id: String) {
     let state = state.clone();
     tokio::spawn(async move {
         let target = title_provider().await;
-        if let Some(title) = generate_and_store_title(
-            &state.store,
-            &id,
-            &target.base_url,
-            &target.key,
-            &target.model,
-        )
-        .await
-        {
+        let load_id = id.clone();
+        let Some(sess) = state.store_call(move |store| store.get(&load_id)).await else {
+            return;
+        };
+        if sess.title_generated {
+            return;
+        }
+        let Ok(title) =
+            generate_title(&sess, None, &target.base_url, &target.key, &target.model).await
+        else {
+            return;
+        };
+        if title.is_empty() {
+            return;
+        }
+        let update_id = id.clone();
+        let stored_title = title.clone();
+        let stored = state
+            .store_call(move |store| {
+                if store
+                    .get(&update_id)
+                    .is_none_or(|session| session.title_generated)
+                {
+                    return false;
+                }
+                store.update_title(&update_id, &stored_title);
+                true
+            })
+            .await;
+        if stored {
             state
                 .subs
                 .broadcast(&id, &json!({"type": "title", "text": title}));
@@ -504,7 +524,6 @@ pub async fn fold_session(
         let ev = usage_event(&shown);
         emit(state, out, id, &ev).await;
     }
-    persist_session(state, sess, id).await;
     Ok(())
 }
 
@@ -539,6 +558,23 @@ impl TurnCtx {
     /// turnCtx.Err() != nil
     pub fn err(&self) -> bool {
         self.handle.is_cancelled() || self.parent.is_cancelled()
+    }
+}
+
+async fn await_round<F, T>(
+    future: F,
+    turn_cancel: &CancelToken,
+    parent_cancel: &CancelToken,
+    round_cancel: &CancelToken,
+) -> Option<T>
+where
+    F: Future<Output = T>,
+{
+    tokio::select! {
+        _ = turn_cancel.cancelled() => None,
+        _ = parent_cancel.cancelled() => None,
+        _ = round_cancel.cancelled() => None,
+        output = future => Some(output),
     }
 }
 
@@ -612,9 +648,15 @@ pub async fn run_session_turn(
     let ctx = TurnCtx { handle, parent };
     let parent_id = sess.parent_id.clone();
     if !parent_id.is_empty() {
+        let child_id = id.to_string();
         state
-            .store
-            .update_delegate_status(id, atom_core::session::store::DelegateStatus::Working);
+            .store_call(move |store| {
+                store.update_delegate_status(
+                    &child_id,
+                    atom_core::session::store::DelegateStatus::Working,
+                )
+            })
+            .await;
         state
             .subs
             .broadcast(&parent_id, &json!({"type": "children"}));
@@ -635,10 +677,10 @@ pub async fn run_session_turn(
         if let Err(err) = fold_session(state, sess, &out, id, &opts.compact_instructions).await {
             emit(state, &out, id, &fold_error_event(&err)).await;
         }
+        persist_session(state, sess, id).await;
         let done = done_event(turn_duration_ms(started_at), "");
         emit(state, &out, id, &done).await;
-        persist_session(state, sess, id).await;
-        end_of_turn(state, id, &ctx.handle, &parent_id);
+        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
         return;
     }
 
@@ -649,7 +691,7 @@ pub async fn run_session_turn(
         // Stop immediately when the turn was paused.
         if ctx.err() {
             finish_paused_turn(state, sess, &out, id).await;
-            end_of_turn(state, id, &ctx.handle, &parent_id);
+            end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
             return;
         }
 
@@ -714,23 +756,43 @@ pub async fn run_session_turn(
             reasoning_field_for_url(&base_url)
         };
         let round_cancel = CancelToken::new();
-        ctx.handle.set_round_cancel(Some(round_cancel));
+        let turn_cancel = ctx.handle.cancel_token();
+        ctx.handle.set_round_cancel(Some(round_cancel.clone()));
 
         let result: StreamResult = if bedrock_style_for_url(&base_url) {
             // Bedrock Converse: bearer-token auth, per-request regional
             // endpoint, binary eventstream response. Chunks come back in
             // the shared OpenAI-delta shape, so the relay below is
             // unchanged.
-            let chunks =
-                match stream_bedrock(&base_url, &key, &sess.model, &msgs, &tools, &opts.thinking)
-                    .await
-                {
+            let opened = await_round(
+                stream_bedrock(&base_url, &key, &sess.model, &msgs, &tools, &opts.thinking),
+                &turn_cancel,
+                &ctx.parent,
+                &round_cancel,
+            )
+            .await;
+            let chunks = match opened {
+                None => {
+                    ctx.handle.set_round_cancel(None);
+                    if ctx.err() {
+                        finish_paused_turn(state, sess, &out, id).await;
+                        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                        return;
+                    }
+                    if let Some(extra) = ctx.handle.take_compact() {
+                        if let Err(ferr) = fold_session(state, sess, &out, id, &extra).await {
+                            emit(state, &out, id, &fold_error_event(&ferr)).await;
+                        }
+                    }
+                    continue 'rounds;
+                }
+                Some(result) => match result {
                     Ok(c) => c,
                     Err(err) => {
                         ctx.handle.set_round_cancel(None);
                         if ctx.err() {
                             finish_paused_turn(state, sess, &out, id).await;
-                            end_of_turn(state, id, &ctx.handle, &parent_id);
+                            end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
                             return;
                         }
                         if let Some(extra) = ctx.handle.take_compact() {
@@ -751,17 +813,19 @@ pub async fn run_session_turn(
                             ..Default::default()
                         });
                         persist_session(state, sess, id).await;
-                        end_of_turn(state, id, &ctx.handle, &parent_id);
+                        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
                         return;
                     }
-                };
+                },
+            };
             let r = stream_model_to_client(
                 state,
                 &out,
                 id,
                 chunks,
-                &ctx.handle.cancel_token(),
+                &turn_cancel,
                 &ctx.parent,
+                &round_cancel,
                 &reasoning_field,
             )
             .await;
@@ -771,7 +835,7 @@ pub async fn run_session_turn(
                 Err(err) => {
                     if ctx.err() {
                         finish_paused_turn(state, sess, &out, id).await;
-                        end_of_turn(state, id, &ctx.handle, &parent_id);
+                        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
                         return;
                     }
                     let msg = provider_error_message(&err, &base_url);
@@ -786,7 +850,7 @@ pub async fn run_session_turn(
                         ..Default::default()
                     });
                     persist_session(state, sess, id).await;
-                    end_of_turn(state, id, &ctx.handle, &parent_id);
+                    end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
                     return;
                 }
             }
@@ -808,23 +872,44 @@ pub async fn run_session_turn(
                             ..Default::default()
                         });
                         persist_session(state, sess, id).await;
-                        end_of_turn(state, id, &ctx.handle, &parent_id);
+                        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
                         return;
                     }
                 };
-            match do_openai_codex_round(&key, &codex_body).await {
-                Ok(outcome) => {
+            let opened = await_round(
+                do_openai_codex_round(&key, &codex_body),
+                &turn_cancel,
+                &ctx.parent,
+                &round_cancel,
+            )
+            .await;
+            match opened {
+                None => {
+                    ctx.handle.set_round_cancel(None);
+                    if ctx.err() {
+                        finish_paused_turn(state, sess, &out, id).await;
+                        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                        return;
+                    }
+                    if let Some(extra) = ctx.handle.take_compact() {
+                        if let Err(ferr) = fold_session(state, sess, &out, id, &extra).await {
+                            emit(state, &out, id, &fold_error_event(&ferr)).await;
+                        }
+                    }
+                    continue 'rounds;
+                }
+                Some(Ok(outcome)) => {
                     key = outcome.key;
                     for ev in &outcome.events {
                         emit(state, &out, id, ev).await;
                     }
                     outcome.result
                 }
-                Err(round_err) => {
+                Some(Err(round_err)) => {
                     ctx.handle.set_round_cancel(None);
                     if ctx.err() {
                         finish_paused_turn(state, sess, &out, id).await;
-                        end_of_turn(state, id, &ctx.handle, &parent_id);
+                        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
                         return;
                     }
                     if let Some(extra) = ctx.handle.take_compact() {
@@ -845,7 +930,7 @@ pub async fn run_session_turn(
                         ..Default::default()
                     });
                     persist_session(state, sess, id).await;
-                    end_of_turn(state, id, &ctx.handle, &parent_id);
+                    end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
                     return;
                 }
             }
@@ -861,13 +946,34 @@ pub async fn run_session_turn(
                 }),
             };
 
-            let chunks = match stream_chat(&base_url, &key, req_body, &reasoning_field).await {
-                Ok(c) => c,
-                Err(err) => {
+            let opened = await_round(
+                stream_chat(&base_url, &key, req_body, &reasoning_field),
+                &turn_cancel,
+                &ctx.parent,
+                &round_cancel,
+            )
+            .await;
+            let chunks = match opened {
+                None => {
                     ctx.handle.set_round_cancel(None);
                     if ctx.err() {
                         finish_paused_turn(state, sess, &out, id).await;
-                        end_of_turn(state, id, &ctx.handle, &parent_id);
+                        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                        return;
+                    }
+                    if let Some(extra) = ctx.handle.take_compact() {
+                        if let Err(ferr) = fold_session(state, sess, &out, id, &extra).await {
+                            emit(state, &out, id, &fold_error_event(&ferr)).await;
+                        }
+                    }
+                    continue 'rounds;
+                }
+                Some(Ok(c)) => c,
+                Some(Err(err)) => {
+                    ctx.handle.set_round_cancel(None);
+                    if ctx.err() {
+                        finish_paused_turn(state, sess, &out, id).await;
+                        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
                         return;
                     }
                     if let Some(extra) = ctx.handle.take_compact() {
@@ -888,7 +994,7 @@ pub async fn run_session_turn(
                         ..Default::default()
                     });
                     persist_session(state, sess, id).await;
-                    end_of_turn(state, id, &ctx.handle, &parent_id);
+                    end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
                     return;
                 }
             };
@@ -900,8 +1006,9 @@ pub async fn run_session_turn(
                 &out,
                 id,
                 chunks,
-                &ctx.handle.cancel_token(),
+                &turn_cancel,
                 &ctx.parent,
+                &round_cancel,
                 &reasoning_field,
             )
             .await;
@@ -911,7 +1018,7 @@ pub async fn run_session_turn(
                 Err(err) => {
                     if ctx.err() {
                         finish_paused_turn(state, sess, &out, id).await;
-                        end_of_turn(state, id, &ctx.handle, &parent_id);
+                        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
                         return;
                     }
                     let msg = provider_error_message(&err, &base_url);
@@ -926,7 +1033,7 @@ pub async fn run_session_turn(
                         ..Default::default()
                     });
                     persist_session(state, sess, id).await;
-                    end_of_turn(state, id, &ctx.handle, &parent_id);
+                    end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
                     return;
                 }
             }
@@ -948,7 +1055,7 @@ pub async fn run_session_turn(
                 emit(state, &out, id, &retry_ev).await;
                 if sleep_ctx(ctx.handle.cancel_token(), &ctx.parent, delay).await {
                     finish_paused_turn(state, sess, &out, id).await;
-                    end_of_turn(state, id, &ctx.handle, &parent_id);
+                    end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
                     return;
                 }
                 continue 'rounds;
@@ -968,7 +1075,7 @@ pub async fn run_session_turn(
                 ..Default::default()
             });
             persist_session(state, sess, id).await;
-            end_of_turn(state, id, &ctx.handle, &parent_id);
+            end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
             return;
         }
         empty_response_attempt = 0;
@@ -992,7 +1099,7 @@ pub async fn run_session_turn(
                     .push(assistant_message(&sess.model, &base_url, &result, None));
             }
             finish_paused_turn(state, sess, &out, id).await;
-            end_of_turn(state, id, &ctx.handle, &parent_id);
+            end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
             return;
         }
 
@@ -1031,7 +1138,7 @@ pub async fn run_session_turn(
                     .unwrap_or(Duration::from_secs(15));
                 if sleep_ctx(ctx.handle.cancel_token(), &ctx.parent, delay).await {
                     finish_paused_turn(state, sess, &out, id).await;
-                    end_of_turn(state, id, &ctx.handle, &parent_id);
+                    end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
                     return;
                 }
                 nudge_attempt += 1;
@@ -1046,8 +1153,6 @@ pub async fn run_session_turn(
                     emit(state, &out, id, &fold_error_event(&ferr)).await;
                 }
             }
-            let done = done_event(duration_ms, &sess.model);
-            emit(state, &out, id, &done).await;
             finished = true;
             break;
         }
@@ -1063,7 +1168,7 @@ pub async fn run_session_turn(
             &result,
             Some(&result.tool_calls),
         ));
-        persist_session(state, sess, id).await;
+        persist_session_now(state, sess, id).await;
 
         // Execute each tool and feed the result back to the model.
         for (tool_index, tc) in result.tool_calls.iter().enumerate() {
@@ -1114,7 +1219,7 @@ pub async fn run_session_turn(
             });
             // Save each tool result immediately. Besides crash safety, this
             // makes an in-progress blocking dispatch visible after navigation.
-            persist_session(state, sess, id).await;
+            persist_session_now(state, sess, id).await;
             let result_ev = event(vec![
                 ("type", json!("tool_result")),
                 ("text", json!(outcome.text)),
@@ -1139,9 +1244,8 @@ pub async fn run_session_turn(
                         ..Default::default()
                     });
                 }
-                persist_session(state, sess, id).await;
                 finish_paused_turn(state, sess, &out, id).await;
-                end_of_turn(state, id, &ctx.handle, &parent_id);
+                end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
                 return;
             }
         }
@@ -1163,35 +1267,45 @@ pub async fn run_session_turn(
             ),
         ]);
         emit(state, &out, id, &ev).await;
-        let done = done_event(turn_duration_ms(started_at), "");
-        emit(state, &out, id, &done).await;
     }
 
     persist_session(state, sess, id).await;
-    end_of_turn(state, id, &ctx.handle, &parent_id);
+    let done = done_event(
+        turn_duration_ms(started_at),
+        if finished { &sess.model } else { "" },
+    );
+    emit(state, &out, id, &done).await;
+    end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
 }
 
 /// Shared tail of run_session_turn: deregister the turn and notify the
 /// parent session's viewers (Go's deferred endTurn/children broadcast).
-fn end_of_turn(state: &Arc<AppState>, id: &str, handle: &Arc<TurnHandle>, parent_id: &str) {
+async fn end_of_turn(
+    state: &Arc<AppState>,
+    sess: &Session,
+    id: &str,
+    handle: &Arc<TurnHandle>,
+    parent_id: &str,
+) {
     state.turns.end_turn(id, handle);
     if !parent_id.is_empty() {
-        if let Some(child) = state.store.get(id) {
-            let status = if child.cancelled {
-                atom_core::session::store::DelegateStatus::Cancelled
-            } else if child
-                .messages
-                .iter()
-                .rev()
-                .find(|message| matches!(message.role.as_str(), "assistant" | "error"))
-                .is_some_and(|message| message.role == "error")
-            {
-                atom_core::session::store::DelegateStatus::Error
-            } else {
-                atom_core::session::store::DelegateStatus::Done
-            };
-            state.store.update_delegate_status(id, status);
-        }
+        let status = if sess.cancelled {
+            atom_core::session::store::DelegateStatus::Cancelled
+        } else if sess
+            .messages
+            .iter()
+            .rev()
+            .find(|message| matches!(message.role.as_str(), "assistant" | "error"))
+            .is_some_and(|message| message.role == "error")
+        {
+            atom_core::session::store::DelegateStatus::Error
+        } else {
+            atom_core::session::store::DelegateStatus::Done
+        };
+        let child_id = id.to_string();
+        state
+            .store_call(move |store| store.update_delegate_status(&child_id, status))
+            .await;
         state
             .subs
             .broadcast(parent_id, &json!({"type": "children"}));
@@ -1601,6 +1715,7 @@ mod tests {
             futures::stream::iter(chunks),
             &CancelToken::new(),
             &CancelToken::new(),
+            &CancelToken::new(),
             "reasoning_content",
         )
         .await
@@ -1656,6 +1771,7 @@ mod tests {
             futures::stream::iter(chunks),
             &CancelToken::new(),
             &CancelToken::new(),
+            &CancelToken::new(),
             "reasoning",
         )
         .await
@@ -1705,11 +1821,32 @@ mod tests {
             futures::stream::iter(chunks),
             &CancelToken::new(),
             &CancelToken::new(),
+            &CancelToken::new(),
             "reasoning",
         )
         .await
         .unwrap_err();
 
         assert_eq!(err.to_string(), "connection reset");
+    }
+
+    #[tokio::test]
+    async fn provider_handshake_wait_observes_round_cancellation() {
+        let turn = CancelToken::new();
+        let parent = CancelToken::new();
+        let round = CancelToken::new();
+        let cancel = round.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            cancel.cancel();
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(250),
+            await_round(std::future::pending::<()>(), &turn, &parent, &round),
+        )
+        .await
+        .expect("provider handshake ignored cancellation");
+        assert!(result.is_none());
     }
 }

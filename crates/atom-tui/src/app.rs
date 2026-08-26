@@ -55,7 +55,7 @@ pub const SCROLLBAR_WIDTH: usize = 2;
 pub const SPLASH_TICK_MS: u64 = 33;
 
 /// MiniDot runs at 12 fps (bubbles).
-pub const SPINNER_TICK_MS: u64 = 42;
+pub const SPINNER_TICK_MS: u64 = 83;
 
 /// outputTestSceneDuration backs the --output-test scene timer.
 pub const TEST_SCENE_TICK_SECS: u64 = 3;
@@ -571,9 +571,11 @@ impl App {
         }
     }
 
-    pub fn rebuild_content_from(&mut self, _idx: usize, width: usize) {
+    pub fn rebuild_content_from(&mut self, idx: usize, width: usize) {
         let frame = MINIDOT_FRAMES[self.spinner_frame % MINIDOT_FRAMES.len()].to_string();
-        for i in 0..self.blocks.len() {
+
+        // Re-render any blocks whose cached lines are stale.
+        for i in idx..self.blocks.len() {
             let show_r = self.show_reasoning;
             let b = &mut self.blocks[i];
             if !b.lines_valid(width, show_r) {
@@ -588,10 +590,44 @@ impl App {
             }
         }
 
-        self.content_lines.clear();
-        self.block_start.clear();
-        let mut has_visible_block = false;
-        for block in &self.blocks {
+        // Incremental content_lines assembly: truncate back to `idx` and
+        // rebuild only the tail.  For the common streaming case (only the
+        // last block changed) this avoids re-cloning thousands of Arc lines.
+        if idx > 0 && idx <= self.block_start.len() {
+            // block_start[idx] is where block idx's content begins.
+            // The separator line between block idx-1 and block idx (if any)
+            // sits one position before that, so we truncate to the end of
+            // block idx-1's content (i.e. where block idx's separator would
+            // start).  We detect the separator by checking the slot just
+            // before block_start[idx].
+            let raw = if idx < self.block_start.len() {
+                self.block_start[idx]
+            } else {
+                self.content_lines.len()
+            };
+            // Remove the separator line that was inserted before block idx.
+            let keep_lines = if raw > 0
+                && idx < self.block_start.len()
+                && self
+                    .content_lines
+                    .get(raw.wrapping_sub(1))
+                    .map_or(false, |l| l.spans.is_empty())
+            {
+                raw - 1
+            } else {
+                raw
+            };
+            self.content_lines.truncate(keep_lines);
+            self.block_start.truncate(idx);
+        } else {
+            self.content_lines.clear();
+            self.block_start.clear();
+        }
+
+        let start_block = if self.block_start.is_empty() { 0 } else { idx };
+        let mut has_visible_block = !self.content_lines.is_empty();
+        for i in start_block..self.blocks.len() {
+            let block = &self.blocks[i];
             let lines = block.lines.as_deref().unwrap_or_default();
             let visible = lines
                 .iter()
@@ -789,6 +825,7 @@ impl App {
             }
             "tool_result" => {
                 blocks::attach_tool_result(&mut self.blocks, &ev.text, "");
+                self.viewport_dirty = true;
                 if !self.session.id.is_empty()
                     && !atom_tools::parse_dispatch_session_id(&ev.text).is_empty()
                 {
@@ -1221,7 +1258,7 @@ impl App {
                 self.overlay_scroll = 0;
                 self.pending_model_provider.clear();
                 self.working_msg = "loading models...".into();
-                vec![Effect::ReloadProviders]
+                vec![Effect::FetchModels]
             }
             "/reasoning" => {
                 self.reasoning_visible = true;
@@ -1421,6 +1458,9 @@ impl App {
             AppMsg::Resize(w, h) => self.resize(w, h),
             AppMsg::Paste(content) => self.paste(content),
             AppMsg::ModelsLoaded(entries) => {
+                if self.overlay != Some(OverlayKind::Model) {
+                    return Vec::new();
+                }
                 self.overlay_entries = entries;
                 self.overlay_sel = overlays::first_model_row(self);
                 self.overlay_scroll = 0;
@@ -1430,14 +1470,15 @@ impl App {
                 Vec::new()
             }
             AppMsg::SessionsLoaded(sessions) => {
+                if self.overlay != Some(OverlayKind::Session) {
+                    return Vec::new();
+                }
                 self.overlay_sessions = sessions;
                 self.overlay_q.clear();
                 self.overlay_sel = 0;
                 self.overlay_scroll = 0;
-                if self.overlay == Some(OverlayKind::Session) {
-                    self.overlay_sel = overlays::first_session_row(self);
-                    overlays::sync_session_scroll(self);
-                }
+                self.overlay_sel = overlays::first_session_row(self);
+                overlays::sync_session_scroll(self);
                 self.working_msg.clear();
                 Vec::new()
             }
@@ -1600,10 +1641,16 @@ impl App {
             AppMsg::SubEvent(v) => self.sub_event(v),
             AppMsg::SubEnded { sid } => {
                 if sid == self.session.id && !self.session.id.is_empty() {
-                    return vec![Effect::SubscribeAfter {
-                        id: sid,
+                    let mut effects = vec![Effect::SubscribeAfter {
+                        id: sid.clone(),
                         delay_ms: 1000,
                     }];
+                    if self.streaming {
+                        self.pending_saved = true;
+                    } else {
+                        effects.push(Effect::LoadSession { id: sid });
+                    }
+                    return effects;
                 }
                 Vec::new()
             }
@@ -1633,6 +1680,7 @@ impl App {
             | AppMsg::HotRebuilt(_)
             | AppMsg::ThemeReloaded(_)
             | AppMsg::Redraw
+            | AppMsg::Heartbeat
             | AppMsg::SendReady { .. }
             | AppMsg::SubReady { .. } => Vec::new(),
         }
@@ -1805,6 +1853,7 @@ impl App {
             let prev2 = prev.clone();
             blocks::restore_reasoning_durations(&mut self.blocks, &prev2);
         }
+        self.viewport_dirty = true;
         self.refresh_viewport();
 
         let mut fx = Vec::new();
@@ -2879,7 +2928,7 @@ impl App {
                     self.overlay_sel = 0;
                     self.overlay_scroll = 0;
                     self.working_msg = "loading models...".into();
-                    vec![Effect::ReloadProviders]
+                    vec![Effect::FetchModels]
                 }
                 1 => {
                     self.overlay = Some(OverlayKind::WebSearch);
@@ -3538,7 +3587,7 @@ mod tests {
         );
         assert!(effects
             .iter()
-            .any(|effect| matches!(effect, Effect::ReloadProviders)));
+            .any(|effect| matches!(effect, Effect::FetchModels)));
 
         app.overlay_entries = vec![model_entry("openai", "compact-model")];
         app.overlay_sel = overlays::first_model_row(&app);
@@ -3852,6 +3901,72 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(app.sel_provider.name, "ollama");
+    }
+
+    #[test]
+    fn loading_same_sized_session_rebuilds_cached_viewport() {
+        fn session(id: &str, user: &str, assistant: &str) -> atom_core::session::store::Session {
+            atom_core::session::store::Session {
+                id: id.into(),
+                messages: vec![
+                    atom_core::types::Message {
+                        role: "user".into(),
+                        content: user.into(),
+                        ..Default::default()
+                    },
+                    atom_core::types::Message {
+                        role: "assistant".into(),
+                        content: assistant.into(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }
+        }
+        fn viewport_text(app: &App) -> String {
+            app.content_lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .map(|span| span.content.as_ref())
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+
+        let mut app = App::new_test(80, 20);
+        app.session_loaded(session("a", "first user", "first answer"));
+        assert!(viewport_text(&app).contains("first answer"));
+
+        app.session_loaded(session("b", "second user", "second answer"));
+        let text = viewport_text(&app);
+        assert!(text.contains("second answer"));
+        assert!(!text.contains("first answer"));
+    }
+
+    #[test]
+    fn tool_result_invalidates_cached_viewport() {
+        let mut app = App::new_test(80, 20);
+        app.blocks.push(Block {
+            kind: BlockKind::Tool,
+            title: "Read".into(),
+            text: "file".into(),
+            ..Default::default()
+        });
+        app.refresh_viewport();
+        assert!(!app.viewport_dirty);
+
+        app.handle_stream_event(&StreamEvent {
+            event_type: "tool_result".into(),
+            text: "new result".into(),
+            ..Default::default()
+        });
+
+        assert!(app.viewport_dirty);
+        app.refresh_viewport();
+        assert!(app.content_lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.content.contains("new result"))
+        }));
     }
 
     #[test]

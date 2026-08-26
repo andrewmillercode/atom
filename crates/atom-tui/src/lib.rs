@@ -92,6 +92,10 @@ pub async fn run_output_test(
 
 type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
 
+/// Heartbeat interval: bounds the damage of any lost wakeup to one hiccup
+/// instead of a permanent freeze. See event_loop.
+const HEARTBEAT_TICK_MS: u64 = 250;
+
 fn setup_terminal() -> Result<Term> {
     use crossterm::event::{
         EnableBracketedPaste, EnableFocusChange, EnableMouseCapture, KeyboardEnhancementFlags,
@@ -175,7 +179,19 @@ async fn event_loop(
         tokio::time::interval(tokio::time::Duration::from_millis(app::SPLASH_TICK_MS));
     let mut scene_tick =
         tokio::time::interval(tokio::time::Duration::from_secs(app::TEST_SCENE_TICK_SECS));
-    for tick in [&mut spinner_tick, &mut splash_tick, &mut scene_tick] {
+    // Safety net against lost wakeups: any future that permanently fails to
+    // fire would otherwise freeze the TUI with no way to detect or recover.
+    // A 250ms heartbeat bounds the worst case to a brief input hiccup while
+    // costing ~4 idle wakes/sec (ratatui's diff emits no bytes for a static
+    // frame). The select! re-arms every wakeup source on each heartbeat.
+    let mut heartbeat_tick =
+        tokio::time::interval(tokio::time::Duration::from_millis(HEARTBEAT_TICK_MS));
+    for tick in [
+        &mut spinner_tick,
+        &mut splash_tick,
+        &mut scene_tick,
+        &mut heartbeat_tick,
+    ] {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         tick.reset();
     }
@@ -282,22 +298,68 @@ async fn event_loop(
                     std::future::pending::<()>().await;
                 }
             } => Some(AppMsg::TestSceneTick),
+            _ = heartbeat_tick.tick() => Some(AppMsg::Heartbeat),
         };
 
         let Some(msg) = msg else { continue };
 
-        if matches!(msg, AppMsg::Redraw) {
-            terminal.clear()?;
+        // Process this first message, then drain any other immediately
+        // available events before rendering.  This coalesces bursts of
+        // scroll / key events into a single frame, making input feel
+        // instant even under heavy streaming load.
+        if dispatch_msg(app, &mut st, &mut effects, msg, terminal, hot_enabled)? {
             continue;
         }
+        if !effects.is_empty() {
+            run_effects(app, &tx, &mut st, &mut effects).await;
+        }
 
-        // --hot rebuild finished: save state + exec the new binary.
-        if let AppMsg::HotRebuilt(result) = msg {
-            match result {
-                Ok(build) => {
-                    if !hot_enabled {
-                        continue;
-                    }
+        // Drain further pending messages (up to a budget per frame).
+        //
+        // Only the app-internal channel is drained here. The crossterm
+        // EventStream must NEVER be polled outside tokio::select!:
+        // now_or_never() polls with a no-op waker, and crossterm 0.28 arms
+        // its single background poll task with whatever waker it last saw.
+        // A no-op waker installed that way swallows every future keypress —
+        // the TUI freezes permanently with the input thread parked. Input
+        // bursts are coalesced by select! itself: buffered events complete
+        // the crossterm branch immediately on the next loop pass.
+        const MAX_DRAIN: usize = 128;
+        for _ in 0..MAX_DRAIN {
+            let Some(extra) = rx.try_recv().ok() else {
+                break;
+            };
+            dispatch_msg(app, &mut st, &mut effects, extra, terminal, hot_enabled)?;
+        }
+    }
+}
+
+/// Dispatch a single AppMsg.  Returns Ok(true) when the caller should
+/// `continue` (skip rendering this iteration - e.g. Redraw cleared the
+/// terminal and the next loop pass will repaint).
+fn dispatch_msg(
+    app: &mut App,
+    st: &mut LoopState,
+    effects: &mut Vec<Effect>,
+    msg: AppMsg,
+    terminal: &mut Term,
+    hot_enabled: bool,
+) -> Result<bool> {
+    // Heartbeat exists purely to re-arm the select! wakeup sources; no
+    // state change, no redraw request.
+    if matches!(msg, AppMsg::Heartbeat) {
+        return Ok(false);
+    }
+    if matches!(msg, AppMsg::Redraw) {
+        terminal.clear()?;
+        return Ok(true);
+    }
+
+    // --hot rebuild finished: save state + exec the new binary.
+    if let AppMsg::HotRebuilt(result) = msg {
+        match result {
+            Ok(build) => {
+                if hot_enabled {
                     let path = app
                         .hot_state_path
                         .clone()
@@ -306,62 +368,62 @@ async fn event_loop(
                         app.err_msg = e.to_string();
                         app.refresh_viewport();
                     } else {
-                        return Ok(()); // unreachable: exec replaced us
+                        return Ok(true); // unreachable: exec replaced us
                     }
                 }
-                Err(build_err) => {
-                    // A failed build keeps the old binary running and
-                    // shows the compiler output; watch_sources keeps
-                    // polling so the next save retries.
-                    app.err_msg = build_err;
-                    app.refresh_viewport();
-                }
             }
-            continue;
-        }
-        if let AppMsg::ThemeReloaded(result) = msg {
-            match result {
-                Ok(elapsed) => {
-                    if app.err_msg.starts_with("theme:") {
-                        app.err_msg.clear();
-                    }
-                    app.invalidate_all_blocks();
-                    app.preview_dirty = true;
-                    app.refresh_viewport();
-                    app.copied_msg = format!("theme reloaded in {} ms", elapsed.as_millis());
-                    app.copied_at = Some(std::time::Instant::now());
-                    effects.push(Effect::PaintPreviews);
-                    terminal.clear()?;
-                }
-                Err(error) => {
-                    app.err_msg = error;
-                    app.refresh_viewport();
-                }
+            Err(build_err) => {
+                app.err_msg = build_err;
+                app.refresh_viewport();
             }
-            continue;
         }
-        if let AppMsg::SubscribeNow(id) = msg {
-            effects.push(Effect::Subscribe { id });
-            continue;
-        }
-        // A spawned dial finished: install its channel, then drive the
-        // state machine with the corresponding *Started msg so the working
-        // state flips on the instant the stream is ready (not when the
-        // first chunk arrives).
-        if let AppMsg::SendReady { sid, rx } = msg {
-            st.send_rx = Some(rx);
-            effects = app.handle_msg(AppMsg::SendStarted { sid });
-            continue;
-        }
-        if let AppMsg::SubReady { sid, rx } = msg {
-            st.sub_rx = Some(rx);
-            st.sub_sid = sid.clone();
-            effects = app.handle_msg(AppMsg::SubStarted { sid });
-            continue;
-        }
-
-        effects = app.handle_msg(msg);
+        return Ok(false);
     }
+    if let AppMsg::ThemeReloaded(result) = msg {
+        match result {
+            Ok(elapsed) => {
+                if app.err_msg.starts_with("theme:") {
+                    app.err_msg.clear();
+                }
+                app.invalidate_all_blocks();
+                app.preview_dirty = true;
+                app.refresh_viewport();
+                app.copied_msg = format!("theme reloaded in {} ms", elapsed.as_millis());
+                app.copied_at = Some(std::time::Instant::now());
+                effects.push(Effect::PaintPreviews);
+                terminal.clear()?;
+            }
+            Err(error) => {
+                app.err_msg = error;
+                app.refresh_viewport();
+            }
+        }
+        return Ok(false);
+    }
+    if let AppMsg::SubscribeNow(id) = msg {
+        effects.push(Effect::Subscribe { id });
+        return Ok(false);
+    }
+    if let AppMsg::SendReady { sid, rx } = msg {
+        if sid != app.session.id {
+            return Ok(false);
+        }
+        st.send_rx = Some(rx);
+        effects.extend(app.handle_msg(AppMsg::SendStarted { sid }));
+        return Ok(false);
+    }
+    if let AppMsg::SubReady { sid, rx } = msg {
+        if sid != app.session.id {
+            return Ok(false);
+        }
+        st.sub_rx = Some(rx);
+        st.sub_sid = sid.clone();
+        effects.extend(app.handle_msg(AppMsg::SubStarted { sid }));
+        return Ok(false);
+    }
+
+    effects.extend(app.handle_msg(msg));
+    Ok(false)
 }
 
 fn initial_effects(app: &App, test_mode: bool) -> Vec<Effect> {
@@ -558,7 +620,12 @@ async fn run_effects(
                 let providers = app.providers.clone();
                 let tx = tx.clone();
                 tokio::spawn(async move {
-                    let pairs = api::fetch_all_models(&providers).await;
+                    let pairs = tokio::time::timeout(
+                        tokio::time::Duration::from_secs(7),
+                        api::fetch_all_models(&providers),
+                    )
+                    .await
+                    .unwrap_or_default();
                     let entries: Vec<atom_core::providers::providers::ModelEntry> = pairs
                         .into_iter()
                         .map(

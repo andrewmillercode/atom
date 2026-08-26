@@ -105,9 +105,10 @@ pub fn draw(app: &mut App, area: Rect, buf: &mut Buffer) -> Option<(u16, u16)> {
     }
 
     let geo = Layout::compute(app);
-    let inner_w = app
-        .inner_width()
-        .min((area.width as usize).saturating_sub(2 * crate::app::TUI_HPAD + crate::app::SCROLLBAR_WIDTH));
+    let inner_w = app.inner_width().min(
+        (area.width as usize)
+            .saturating_sub(2 * crate::app::TUI_HPAD + crate::app::SCROLLBAR_WIDTH),
+    );
 
     // --- conversation viewport -------------------------------------------
     let vp_rect = Rect::new(
@@ -131,7 +132,8 @@ pub fn draw(app: &mut App, area: Rect, buf: &mut Buffer) -> Option<(u16, u16)> {
     draw_scrollbar(
         app,
         Rect::new(
-            area.right().saturating_sub(crate::app::SCROLLBAR_WIDTH as u16),
+            area.right()
+                .saturating_sub(crate::app::SCROLLBAR_WIDTH as u16),
             vp_rect.y,
             crate::app::SCROLLBAR_WIDTH as u16,
             vp_rect.height,
@@ -384,11 +386,10 @@ fn draw_scrollbar(app: &App, rect: Rect, buf: &mut Buffer) {
         } else {
             ansi::c_card_dark()
         };
-        for col in 0..rect.width {
-            buf[(rect.x + col, rect.y + row as u16)]
-                .set_symbol("█")
-                .set_fg(fg);
-        }
+        // Draw only the first column; remaining width is right padding.
+        buf[(rect.x, rect.y + row as u16)]
+            .set_symbol("█")
+            .set_fg(fg);
     }
 }
 
@@ -918,7 +919,9 @@ fn blank() -> Line<'static> {
 
 fn render_overlay(app: &mut App, kind: OverlayKind) -> Vec<Line<'static>> {
     if !app.working_msg.is_empty() {
-        return vec![header_line(&app.working_msg)];
+        let frame =
+            crate::app::MINIDOT_FRAMES[app.spinner_frame % crate::app::MINIDOT_FRAMES.len()];
+        return vec![header_line(&format!("{frame} {}", app.working_msg))];
     }
     match kind {
         OverlayKind::Model => render_model_selector(app),
@@ -1296,6 +1299,23 @@ mod tests {
     }
 
     #[test]
+    fn loading_overlay_visibly_animates() {
+        let mut app = App::new_test(80, 24);
+        app.working_msg = "loading models...".into();
+        let first = render_overlay(&mut app, OverlayKind::Model)[0].spans[0]
+            .content
+            .to_string();
+        app.spinner_frame += 1;
+        let second = render_overlay(&mut app, OverlayKind::Model)[0].spans[0]
+            .content
+            .to_string();
+
+        assert_ne!(first, second);
+        assert!(first.contains("loading models..."));
+        assert!(second.contains("loading models..."));
+    }
+
+    #[test]
     fn frame_draws_prompt_chrome_and_status() {
         let mut app = App::new_test(80, 24);
         app.sel_model = "test-model".into();
@@ -1582,11 +1602,10 @@ mod tests {
 
         let mut top = Buffer::empty(Rect::new(0, 0, 10, 6));
         draw_scrollbar(&app, rect, &mut top);
-        // Both scrollbar columns should be painted.
+        // First scrollbar column should be painted; second is padding.
         assert_eq!(top[(8, 0)].symbol(), "█");
         assert_eq!(top[(8, 0)].fg, ansi::c_muted());
-        assert_eq!(top[(9, 0)].symbol(), "█");
-        assert_eq!(top[(9, 0)].fg, ansi::c_muted());
+        assert_eq!(top[(9, 0)].symbol(), " ");
         assert_eq!(top[(8, 1)].symbol(), "█");
         assert_eq!(top[(8, 5)].symbol(), "█");
         assert_eq!(top[(8, 5)].fg, ansi::c_card_dark());

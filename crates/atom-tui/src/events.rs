@@ -258,6 +258,9 @@ pub enum AppMsg {
     TickSpinner,
     TickSplash(f64),
     TestSceneTick,
+    /// Periodic safety-net: re-arms all select! wakeup sources so a lost
+    /// crossterm wakeup self-heals within one heartbeat interval.
+    Heartbeat,
     /// Internal: the terminal view regained focus and needs a full repaint.
     Redraw,
     OAuthDone(Result<AuthEntry, String>),
@@ -301,6 +304,7 @@ impl std::fmt::Debug for AppMsg {
             AppMsg::TickSpinner => write!(f, "TickSpinner"),
             AppMsg::TickSplash(t) => write!(f, "TickSplash({t})"),
             AppMsg::TestSceneTick => write!(f, "TestSceneTick"),
+            AppMsg::Heartbeat => write!(f, "Heartbeat"),
             AppMsg::Redraw => write!(f, "Redraw"),
             AppMsg::OAuthDone(r) => write!(f, "OAuthDone({r:?})"),
             AppMsg::HotRebuilt(r) => write!(f, "HotRebuilt({r:?})"),

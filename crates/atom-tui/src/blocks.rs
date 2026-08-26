@@ -26,6 +26,50 @@ pub const USER_PREVIEW_LINES: usize = 8;
 /// The last row of a collapsed user card.
 pub const USER_EXPAND_HINT: &str = "… click to expand";
 
+/// A rendered Mermaid diagram attached to a visualize tool block.
+///
+/// `png`/`html` are artifact paths from the tool's marker line. `id` is
+/// the kitty image id used for the virtual placement (0 until assigned
+/// by the app; diagrams use the 17..=255 range so they never collide
+/// with the 1..=16 slots the prompt previews own). `cols`/`rows` size
+/// the placeholder grid, preserving aspect at the approximate cell
+/// geometry from preview.rs (32x64 px per cell).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DiagramRef {
+    pub png: String,
+    pub html: String,
+    pub w: u32,
+    pub h: u32,
+    pub id: usize,
+    pub cols: usize,
+    pub rows: usize,
+}
+
+/// Inline sandbox approval state attached to a Tool block.
+#[derive(Debug, Clone)]
+pub struct InlineApproval {
+    /// Server-assigned approval id for the response.
+    pub id: String,
+    /// Session the approval decision must be posted to.
+    pub session_id: String,
+    pub command: String,
+    pub cwd: String,
+    pub rule_id: String,
+    pub reason: String,
+    pub from_subagent: bool,
+    pub child_title: String,
+}
+
+/// Button regions (col_start..col_end) within the rendered approval block,
+/// relative to the block's content area left edge.
+#[derive(Debug, Clone)]
+pub struct ApprovalButton {
+    pub label: &'static str,
+    pub decision: &'static str,
+    pub col_start: usize,
+    pub col_end: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockKind {
     User,
@@ -66,6 +110,10 @@ pub struct Block {
     pub tool_done: bool,
     /// dispatch child session; empty for other tools
     pub session_id: String,
+    /// Pending sandbox approval rendered inline as a tool block.
+    /// Contains (approval_id, session_id, rule_id, reason, cwd, command).
+    /// `None` for regular tool blocks.
+    pub approval: Option<InlineApproval>,
     /// expanded shows the full tool result/diff.
     pub expanded: bool,
     /// active marks a reasoning/compaction block still streaming;
@@ -80,9 +128,14 @@ pub struct Block {
     /// in `text` render as kitty placeholder grids (or chip text on
     /// terminals without kitty support).
     pub images: Vec<PendingImage>,
+    /// Rendered mermaid diagram (visualize tool results).
+    pub diagram: Option<DiagramRef>,
 
     // Render cache: wrapped lines at line_width. None is a miss.
     pub lines: Option<Vec<Arc<Line<'static>>>>,
+    /// OSC 8 link regions per rendered line (parallel to `lines`);
+    /// refilled together with `lines`.
+    pub line_links: Vec<Vec<crate::ansi::LinkRegion>>,
     pub line_width: usize,
     pub line_show_r: bool,
     pub line_expanded: bool,
@@ -99,6 +152,7 @@ impl Default for Block {
             result: String::new(),
             tool_done: false,
             session_id: String::new(),
+            approval: None,
             expanded: false,
             active: false,
             started_at: None,
@@ -106,7 +160,9 @@ impl Default for Block {
             model: String::new(),
             turn_duration: None,
             images: Vec::new(),
+            diagram: None,
             lines: None,
+            line_links: Vec::new(),
             line_width: 0,
             line_show_r: true,
             line_expanded: false,
@@ -153,6 +209,11 @@ impl Block {
     }
 
     pub fn tool_collapsible(&self, result_inner: usize, diff_width: usize) -> bool {
+        // A visualize block renders its diagram inline (plus the "⤢ open"
+        // hint); there is no extra output behind an expand toggle.
+        if self.diagram.is_some() {
+            return false;
+        }
         if hidden_output_tool(&self.resolved_tool_name()) {
             return !self.result.is_empty() || !self.diff.is_empty();
         }
@@ -164,7 +225,10 @@ impl Block {
     /// budget. One extremely long pasted line wraps into many rows and
     /// therefore collapses like a multi-line message would.
     pub fn user_collapsible(&self, inner: usize) -> bool {
-        render_user_body(&self.text, &self.images, inner, None).len() > USER_PREVIEW_LINES
+        render_user_body_linked(&self.text, &self.images, inner, None)
+            .rows
+            .len()
+            > USER_PREVIEW_LINES
     }
 }
 
@@ -415,6 +479,14 @@ pub fn tool_action(name: &str, arguments: &str) -> String {
                 }
             }
         }
+        "visualize" => {
+            let v = ok(&args);
+            if let Some(t) = v.get("title").and_then(|t| t.as_str()) {
+                if !t.is_empty() {
+                    return t.to_string();
+                }
+            }
+        }
         "dispatch" => {
             let v = ok(&args);
             let action = v.get("action").and_then(|a| a.as_str()).unwrap_or("");
@@ -514,14 +586,136 @@ fn truncate_bytes(s: &str, n: usize) -> String {
     s[..end].to_string()
 }
 
-/// attachToolResult puts a tool's output on the oldest unfinished tool
+// ---------------------------------------------------------------------------
+// visualize diagram markers.
+// ---------------------------------------------------------------------------
+
+/// Parses the `[atom-diagram] png=… html=… width=… height=…` marker line
+/// the visualize tool embeds in its result. Returns (png, html, w, h).
+pub fn parse_diagram_marker(result: &str) -> Option<(String, String, u32, u32)> {
+    static RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(r"\[atom-diagram\] png=(\S+) html=(\S+) width=(\d+) height=(\d+)")
+            .expect("static regex")
+    });
+    let caps = RE.captures(result)?;
+    Some((
+        caps[1].to_string(),
+        caps[2].to_string(),
+        caps[3].parse().ok()?,
+        caps[4].parse().ok()?,
+    ))
+}
+
+/// strip_diagram_marker removes the machine-readable `[atom-diagram]`
+/// line (and any trailing blank it leaves) from a tool result before
+/// rendering, so the artifact paths don't show twice in the transcript.
+pub fn strip_diagram_marker(s: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for line in s.split('\n') {
+        if line.trim_start().starts_with("[atom-diagram]") {
+            continue;
+        }
+        out.push(line);
+    }
+    // Drop a single trailing blank left behind by the removed line.
+    while out.len() > 1 && out[out.len() - 1].trim().is_empty() {
+        out.pop();
+    }
+    out.join("\n")
+}
+
+// ---------------------------------------------------------------------------
+// visualize diagram helpers.
+// ---------------------------------------------------------------------------
+
+/// The right-aligned header hint that opens a diagram in the browser.
+pub const DIAGRAM_OPEN_HINT: &str = "⤢ open";
+
+/// Kitty image id range owned by diagrams. 1..=16 stays reserved for the
+/// prompt/message image previews (MAX_KITTY_PREVIEW_ID), so the two
+/// paint passes never fight over a slot.
+pub const MIN_KITTY_DIAGRAM_ID: usize = 17;
+pub const MAX_KITTY_DIAGRAM_ID: usize = 255;
+
+/// assign_block_diagram_ids gives every diagram a unique kitty image id,
+/// wrapping inside MIN..=MAX_KITTY_DIAGRAM_ID so paint_kitty_diagrams can
+/// reclaim orphaned slots after scrolls/reloads. Existing ids in range
+/// are preserved; unassigned (0) or out-of-range ids get fresh slots.
+/// Returns true when any id changed.
+pub fn assign_block_diagram_ids(blocks: &mut [Block]) -> bool {
+    let mut used: std::collections::HashSet<usize> = blocks
+        .iter()
+        .filter_map(|b| b.diagram.as_ref())
+        .map(|d| d.id)
+        .filter(|id| (MIN_KITTY_DIAGRAM_ID..=MAX_KITTY_DIAGRAM_ID).contains(id))
+        .collect();
+    let mut changed = false;
+    let mut next = MIN_KITTY_DIAGRAM_ID;
+    for b in blocks.iter_mut() {
+        let Some(d) = b.diagram.as_mut() else {
+            continue;
+        };
+        if !(MIN_KITTY_DIAGRAM_ID..=MAX_KITTY_DIAGRAM_ID).contains(&d.id) {
+            let mut guard = 0;
+            while used.contains(&next) && guard <= MAX_KITTY_DIAGRAM_ID - MIN_KITTY_DIAGRAM_ID {
+                next = if next >= MAX_KITTY_DIAGRAM_ID {
+                    MIN_KITTY_DIAGRAM_ID
+                } else {
+                    next + 1
+                };
+                guard += 1;
+            }
+            d.id = next;
+            changed = true;
+        }
+        used.insert(d.id);
+    }
+    changed
+}
+
+/// diagram_geometry sizes the placeholder grid for a diagram, preserving
+/// its aspect at the approximate terminal cell geometry from preview.rs
+/// (PREVIEW_CELL_W x PREVIEW_CELL_H px per cell). The grid width tracks
+/// the render width; rows are capped so a very tall diagram never floods
+/// the viewport (kitty stretches the PNG to the placement box).
+/// Returns true when the geometry changed.
+pub fn diagram_geometry(d: &mut DiagramRef, inner: usize) -> bool {
+    if d.w == 0 || d.h == 0 {
+        return false;
+    }
+    let cols = inner.saturating_sub(2 * PAD_CELL).clamp(10, 60);
+    // Displayed px: cols*CELL_W wide, rows*CELL_H tall; keep the w/h
+    // ratio, i.e. rows = cols * (h/w) * (CELL_W/CELL_H).
+    let cell_ratio = preview::PREVIEW_CELL_W as f64 / preview::PREVIEW_CELL_H as f64;
+    let rows = ((cols as f64 * d.h as f64 / d.w as f64) * cell_ratio).round() as usize;
+    let rows = rows.clamp(1, 48);
+    if d.cols == cols && d.rows == rows {
+        return false;
+    }
+    d.cols = cols;
+    d.rows = rows;
+    true
+}
+
 /// call; an unmatched result becomes its own block.
 pub fn attach_tool_result(blocks: &mut Vec<Block>, content: &str, diff: &str) {
     let id = atom_tools::parse_dispatch_session_id(content);
+    let diagram = if content.contains("[atom-diagram]") {
+        parse_diagram_marker(content).map(|(png, html, w, h)| DiagramRef {
+            png,
+            html,
+            w,
+            h,
+            ..Default::default()
+        })
+    } else {
+        None
+    };
     for b in blocks.iter_mut() {
         if b.kind == BlockKind::Tool && !b.tool_done {
             b.result = content.to_string();
             b.tool_done = true;
+            b.diagram = diagram;
             if !diff.is_empty() {
                 b.diff = diff.to_string();
             }
@@ -538,6 +732,7 @@ pub fn attach_tool_result(blocks: &mut Vec<Block>, content: &str, diff: &str) {
         tool_done: true,
         diff: diff.to_string(),
         session_id: id,
+        diagram,
         ..Default::default()
     });
 }
@@ -642,9 +837,43 @@ pub fn collapse_lines(
     lines
 }
 
+/// [`collapse_lines`] for the paired link tables: truncates both so
+/// they stay parallel.
+fn collapse_linked(
+    lines: Vec<Line<'static>>,
+    mut links: Vec<Vec<crate::ansi::LinkRegion>>,
+    preview: usize,
+    expanded: bool,
+) -> (Vec<Line<'static>>, Vec<Vec<crate::ansi::LinkRegion>>) {
+    let lines = collapse_lines(lines, preview, expanded);
+    if links.len() > lines.len() {
+        links.truncate(lines.len());
+    }
+    (lines, links)
+}
+
 // ---------------------------------------------------------------------------
 // Rendering. Colors come from atom_core::render via ANSI conversion.
 // ---------------------------------------------------------------------------
+
+/// Rendered block plus, per line, the OSC 8 link regions in
+/// visible-column coordinates.
+pub struct RenderedBlock {
+    pub lines: Vec<Line<'static>>,
+    /// Same length as `lines`.
+    pub links: Vec<Vec<crate::ansi::LinkRegion>>,
+}
+
+impl RenderedBlock {
+    fn push(&mut self, line: Line<'static>, links: Vec<crate::ansi::LinkRegion>) {
+        self.lines.push(line);
+        self.links.push(links);
+    }
+
+    fn push_blank(&mut self, line: Line<'static>) {
+        self.push(line, Vec::new());
+    }
+}
 
 /// Renders one conversation block wrapped to width. The viewport owns
 /// vertical padding and spacing between blocks.
@@ -654,36 +883,59 @@ pub fn render_block(
     _show_reasoning: bool,
     spinner_frame: &str,
 ) -> Vec<Line<'static>> {
+    render_block_linked(b, width, _show_reasoning, spinner_frame).lines
+}
+
+/// Like [`render_block`] but also returns the clickable OSC 8 link
+/// regions for every rendered line.
+pub fn render_block_linked(
+    b: &mut Block,
+    width: usize,
+    _show_reasoning: bool,
+    spinner_frame: &str,
+) -> RenderedBlock {
+    let mut out = RenderedBlock {
+        lines: Vec::new(),
+        links: Vec::new(),
+    };
     match b.kind {
         BlockKind::User => {
             let inner = width.saturating_sub(2 * PAD_CELL).max(1);
             // Render the full body first; collapse only when the wrapped
             // rows exceed the preview budget so short messages stay
             // untouched (and every collapsed card is expandable).
-            let mut body = render_user_body(&b.text, &b.images, inner, None);
-            if !b.expanded && body.len() > USER_PREVIEW_LINES {
+            let mut body = render_user_body_linked(&b.text, &b.images, inner, None);
+            if !b.expanded && body.rows.len() > USER_PREVIEW_LINES {
                 // Re-render capped at the preview budget: the cap applies
                 // to wrapped rows (one extremely long pasted line
                 // collapses) and never splits an image placeholder.
-                body = render_user_body(&b.text, &b.images, inner, Some(USER_PREVIEW_LINES - 1));
-                body.push(vec![Span::styled(
+                body = render_user_body_linked(
+                    &b.text,
+                    &b.images,
+                    inner,
+                    Some(USER_PREVIEW_LINES - 1),
+                );
+                body.rows.push(vec![Span::styled(
                     USER_EXPAND_HINT,
                     ansi::style_user().fg(ansi::c_muted()),
                 )]);
+                body.links.push(Vec::new());
             }
-            let mut out = vec![pad_row(width, ansi::style_user())];
-            for row in body {
-                out.push(box_row(row, width, ansi::style_user()));
+            out.push_blank(pad_row(width, ansi::style_user()));
+            for (row, row_links) in body.rows.into_iter().zip(body.links) {
+                let (line, links) = box_row_linked(row, row_links, width, ansi::style_user());
+                out.push(line, links);
             }
-            out.push(pad_row(width, ansi::style_user()));
-            out
+            out.push_blank(pad_row(width, ansi::style_user()));
         }
         BlockKind::Assistant => {
             if b.text.is_empty() {
-                return Vec::new();
+                return out;
             }
             let md = atom_core::render::markdown::render_markdown(&b.text, width.max(1));
-            let mut out = ansi::ansi_to_lines(&md);
+            let parsed = ansi::ansi_to_lines_linked(&md);
+            out.lines.extend(parsed.lines);
+            out.links.extend(parsed.links);
             if !b.model.is_empty() {
                 let footer = match b.turn_duration {
                     Some(duration) => {
@@ -691,19 +943,16 @@ pub fn render_block(
                     }
                     None => b.model.clone(),
                 };
-                out.extend(
-                    crate::prompt::wrap_plain(&footer, width.max(1))
-                        .into_iter()
-                        .map(|row| Line::from(Span::styled(row, ansi::style_reasoning()))),
-                );
+                for row in crate::prompt::wrap_plain(&footer, width.max(1)) {
+                    out.push_blank(Line::from(Span::styled(row, ansi::style_reasoning())));
+                }
             }
-            out
         }
         BlockKind::Reasoning => {
-            let mut out = vec![Line::from(Span::styled(
+            out.push_blank(Line::from(Span::styled(
                 reasoning_label(b, spinner_frame),
                 ansi::style_reasoning(),
-            ))];
+            )));
             if b.expanded && !b.text.is_empty() {
                 let body = atom_core::render::links::wrap_linked(
                     &b.text,
@@ -716,31 +965,31 @@ pub fn render_block(
                     atom_core::render::colors::ansi_fg(atom_core::render::colors::COLOR_MUTED),
                     body
                 );
-                out.extend(ansi::ansi_to_lines(&styled));
+                let parsed = ansi::ansi_to_lines_linked(&styled);
+                out.lines.extend(parsed.lines);
+                out.links.extend(parsed.links);
             }
-            out
         }
         BlockKind::Compaction => {
             if b.active {
-                return vec![Line::from(Span::styled(
+                out.push_blank(Line::from(Span::styled(
                     compaction_label(b, spinner_frame),
                     ansi::style_reasoning(),
-                ))];
+                )));
+                return out;
             }
-            let mut out = if b.text.is_empty() {
-                Vec::new()
-            } else {
+            if !b.text.is_empty() {
                 let md = atom_core::render::markdown::render_markdown(&b.text, width.max(1));
-                ansi::ansi_to_lines(&md)
-            };
-            out.extend(
-                crate::prompt::wrap_plain(&compaction_label(b, spinner_frame), width.max(1))
-                    .into_iter()
-                    .map(|row| Line::from(Span::styled(row, ansi::style_reasoning()))),
-            );
-            out
+                let parsed = ansi::ansi_to_lines_linked(&md);
+                out.lines.extend(parsed.lines);
+                out.links.extend(parsed.links);
+            }
+            for row in crate::prompt::wrap_plain(&compaction_label(b, spinner_frame), width.max(1))
+            {
+                out.push_blank(Line::from(Span::styled(row, ansi::style_reasoning())));
+            }
         }
-        BlockKind::Tool => render_tool_block(b, width, spinner_frame),
+        BlockKind::Tool => return render_tool_block_linked(b, width, spinner_frame),
         BlockKind::Error => {
             let text = format!("error: {}", b.text);
             let body = atom_core::render::links::wrap_linked(
@@ -754,9 +1003,12 @@ pub fn render_block(
                 atom_core::render::colors::ansi_fg(atom_core::render::colors::COLOR_SECONDARY),
                 body
             );
-            ansi::ansi_to_lines(&styled)
+            let parsed = ansi::ansi_to_lines_linked(&styled);
+            out.lines.extend(parsed.lines);
+            out.links.extend(parsed.links);
         }
     }
+    out
 }
 
 /// Splits text at `[IMG n]` markers. Each piece is either plain text or
@@ -792,6 +1044,25 @@ fn split_user_segments(text: &str) -> Vec<UserSegment> {
     out
 }
 
+/// Wrapped user-body rows plus per-row OSC 8 link regions.
+struct UserBody {
+    rows: Vec<Vec<Span<'static>>>,
+    /// Same length as `rows`; regions in row-local columns.
+    links: Vec<Vec<crate::ansi::LinkRegion>>,
+}
+
+impl UserBody {
+    fn push_text_row(&mut self, row: Line<'static>, links: Vec<crate::ansi::LinkRegion>) {
+        self.rows.push(row.spans);
+        self.links.push(links);
+    }
+
+    fn push_blank_row(&mut self, row: Vec<Span<'static>>) {
+        self.rows.push(row);
+        self.links.push(Vec::new());
+    }
+}
+
 /// renderUserBody wraps text segments individually and splices kitty
 /// preview grids (or chip fallbacks) where `[IMG n]` markers appeared.
 /// Text wrapping ignores image widths so the layout stays tight even
@@ -801,19 +1072,25 @@ fn split_user_segments(text: &str) -> Vec<UserSegment> {
 /// is applied to wrapped rows, so one extremely long pasted line
 /// collapses; images are treated atomically — a placeholder grid that
 /// would straddle the cap is dropped whole rather than cut halfway.
-fn render_user_body(
+fn render_user_body_linked(
     text: &str,
     images: &[PendingImage],
     inner: usize,
     preview: Option<usize>,
-) -> Vec<Vec<Span<'static>>> {
+) -> UserBody {
     let segments = split_user_segments(text);
     if segments.is_empty() {
-        return vec![Vec::new()];
+        return UserBody {
+            rows: vec![Vec::new()],
+            links: vec![Vec::new()],
+        };
     }
     let mut by_num: std::collections::HashMap<usize, &PendingImage> =
         images.iter().map(|p| (p.num, p)).collect();
-    let mut out: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut out = UserBody {
+        rows: Vec::new(),
+        links: Vec::new(),
+    };
     'segments: for seg in segments {
         match seg {
             UserSegment::Text(s) => {
@@ -823,20 +1100,20 @@ fn render_user_body(
                     atom_core::render::colors::COLOR_FOREGROUND,
                     atom_core::render::colors::COLOR_CARD_LIGHT,
                 );
-                let lines = ansi::ansi_to_lines(&body);
-                if lines.is_empty() {
+                let parsed = ansi::ansi_to_lines_linked(&body);
+                if parsed.lines.is_empty() {
                     // Empty text segment still occupies a row so the
                     // surrounding image rows don't collapse together.
-                    if preview.is_some_and(|limit| out.len() >= limit) {
+                    if preview.is_some_and(|limit| out.rows.len() >= limit) {
                         break 'segments;
                     }
-                    out.push(Vec::new());
+                    out.push_blank_row(Vec::new());
                 } else {
-                    for row in lines {
-                        if preview.is_some_and(|limit| out.len() >= limit) {
+                    for (row, row_links) in parsed.lines.into_iter().zip(parsed.links) {
+                        if preview.is_some_and(|limit| out.rows.len() >= limit) {
                             break 'segments;
                         }
-                        out.push(row.spans);
+                        out.push_text_row(row, row_links);
                     }
                 }
             }
@@ -848,19 +1125,21 @@ fn render_user_body(
                             .split('\n')
                             .map(|row| ansi::ansi_to_line(row).spans)
                             .collect();
-                        if preview.is_some_and(|limit| out.len() + rows.len() > limit) {
+                        if preview.is_some_and(|limit| out.rows.len() + rows.len() > limit) {
                             // The placeholder does not fit the preview
                             // whole; drop it rather than splitting it.
                             continue;
                         }
-                        out.extend(rows);
+                        for row in rows {
+                            out.push_blank_row(row);
+                        }
                     } else {
                         // Fallback: inline chip with the same character
                         // count as the marker would have occupied.
-                        if preview.is_some_and(|limit| out.len() + 1 > limit) {
+                        if preview.is_some_and(|limit| out.rows.len() + 1 > limit) {
                             continue;
                         }
-                        out.push(vec![Span::styled(
+                        out.push_blank_row(vec![Span::styled(
                             preview::image_chip(num),
                             ansi::style_img_chip(),
                         )]);
@@ -868,10 +1147,10 @@ fn render_user_body(
                 } else {
                     // Unknown marker (e.g. image stripped from history):
                     // render as a small chip so the user sees something.
-                    if preview.is_some_and(|limit| out.len() + 1 > limit) {
+                    if preview.is_some_and(|limit| out.rows.len() + 1 > limit) {
                         continue;
                     }
-                    out.push(vec![Span::styled(
+                    out.push_blank_row(vec![Span::styled(
                         preview::image_chip(num),
                         ansi::style_img_chip(),
                     )]);
@@ -899,7 +1178,7 @@ fn format_turn_duration(duration: Duration) -> String {
     }
 }
 
-fn render_tool_block(b: &mut Block, width: usize, spinner_frame: &str) -> Vec<Line<'static>> {
+fn render_tool_block_linked(b: &mut Block, width: usize, spinner_frame: &str) -> RenderedBlock {
     const PAD: usize = 1;
     let inner = width.saturating_sub(2 * PAD).max(1);
     let running = !b.tool_done;
@@ -907,11 +1186,22 @@ fn render_tool_block(b: &mut Block, width: usize, spinner_frame: &str) -> Vec<Li
     // Header row spans (built with ratatui styles directly for exact
     // widths), padded to inner then boxed below.
     let mut left: Vec<Span> = Vec::new();
+    let mut left_links: Vec<crate::ansi::LinkRegion> = Vec::new();
     if !b.title.is_empty() {
         left.push(Span::styled(b.title.clone(), ansi::style_tool_name()));
     }
-    let collapsible = b.tool_collapsible(inner, inner);
+    let collapsible = b.diagram.is_none() && b.tool_collapsible(inner, inner);
     let mut right: Vec<Span> = Vec::new();
+    // A finished visualize block swaps the expand toggle for a hint that
+    // opens the browser pan/zoom viewer (top-right corner of the card).
+    if let Some(ref d) = b.diagram {
+        if !running && !d.html.is_empty() {
+            right.push(Span::styled(
+                DIAGRAM_OPEN_HINT.to_string(),
+                ansi::style_tool_hint(),
+            ));
+        }
+    }
     if collapsible {
         right.push(Span::styled(
             if b.expanded {
@@ -946,12 +1236,19 @@ fn render_tool_block(b: &mut Block, width: usize, spinner_frame: &str) -> Vec<Li
             left.push(Span::styled(" ".to_string(), ansi::style_tool_hint()));
         }
         if file_path_tool(&b.resolved_tool_name()) {
+            let action_col: usize = left.iter().map(span_width).sum();
             let linked = atom_core::render::links::linkify_path(
                 &action,
                 atom_core::render::colors::COLOR_FOREGROUND,
                 atom_core::render::colors::COLOR_CARD_DARK,
             );
-            left.extend(split_ansi_spans(&linked, ansi::style_tool()));
+            let (spans, links) = split_ansi_spans_linked(&linked, ansi::style_tool());
+            left.extend(spans);
+            left_links.extend(links.into_iter().map(|mut r| {
+                r.c0 += action_col;
+                r.c1 += action_col;
+                r
+            }));
         } else {
             left.push(Span::styled(action, ansi::style_tool()));
         }
@@ -961,76 +1258,212 @@ fn render_tool_block(b: &mut Block, width: usize, spinner_frame: &str) -> Vec<Li
 
     // Body rows (already wrapped to inner by their producers).
     let mut body: Vec<Line<'static>> = Vec::new();
-    let name = b.resolved_tool_name();
-    let hidden = hidden_output_tool(&name);
-    if hidden {
-        if b.expanded {
-            if !b.diff.is_empty() {
-                let d = atom_core::render::diff::render_diff(&b.diff, &b.text, inner, false);
-                body.extend(ansi::ansi_to_lines(&d));
-            } else if !b.result.is_empty() {
-                if name == "read_file" {
-                    let summary = strip_read_metadata(tool_result_summary(&b.result, &b.diff));
-                    if !summary.is_empty() {
-                        let lang = lang_from_action(&b.text);
-                        let rendered =
-                            atom_core::render::highlight::highlight_code(&summary, lang, inner);
-                        body.extend(ansi::ansi_to_lines(&rendered));
+    let mut body_links: Vec<Vec<crate::ansi::LinkRegion>> = Vec::new();
+
+    // Approval blocks render details + clickable buttons.
+    if let Some(ref appr) = b.approval {
+        // Details rows
+        let details = approval_block_body(appr, inner);
+        for line in details {
+            body.push(line);
+            body_links.push(Vec::new());
+        }
+        // Button row
+        let btn_line = approval_button_line();
+        body.push(btn_line);
+        body_links.push(Vec::new());
+    } else if !b.tool_done && b.tool_name == "sandbox" {
+        // Still pending but somehow approval was removed — shouldn't happen
+    } else {
+        let name = b.resolved_tool_name();
+        let hidden = hidden_output_tool(&name);
+        if hidden {
+            if b.expanded {
+                if !b.diff.is_empty() {
+                    let d = atom_core::render::diff::render_diff(&b.diff, &b.text, inner, false);
+                    let parsed = ansi::ansi_to_lines_linked(&d);
+                    body.extend(parsed.lines);
+                    body_links.extend(parsed.links);
+                } else if !b.result.is_empty() {
+                    if name == "read_file" {
+                        let summary = strip_read_metadata(tool_result_summary(&b.result, &b.diff));
+                        if !summary.is_empty() {
+                            let lang = lang_from_action(&b.text);
+                            let rendered =
+                                atom_core::render::highlight::highlight_code(&summary, lang, inner);
+                            let parsed = ansi::ansi_to_lines_linked(&rendered);
+                            body.extend(parsed.lines);
+                            body_links.extend(parsed.links);
+                        }
+                    } else {
+                        let w = atom_core::render::links::wrap_linked(
+                            &b.result,
+                            inner,
+                            atom_core::render::colors::COLOR_FOREGROUND,
+                            atom_core::render::colors::COLOR_CARD_DARK,
+                        );
+                        let parsed = ansi::ansi_to_lines_linked(&w);
+                        body.extend(parsed.lines);
+                        body_links.extend(parsed.links);
                     }
-                } else {
-                    let w = atom_core::render::links::wrap_linked(
-                        &b.result,
-                        inner,
-                        atom_core::render::colors::COLOR_FOREGROUND,
-                        atom_core::render::colors::COLOR_CARD_DARK,
-                    );
-                    body.extend(ansi::ansi_to_lines(&w));
                 }
             }
-        }
-    } else if !b.diff.is_empty() {
-        let d = atom_core::render::diff::render_diff(&b.diff, &b.text, inner, name == "edit_file");
-        body = collapse_lines(
-            ansi::ansi_to_lines(&d),
-            TOOL_RESULT_PREVIEW_LINES,
-            b.expanded,
-        );
-    } else {
-        let summary = tool_result_summary(&b.result, &b.diff).to_string();
-        if !summary.is_empty() && !file_change_byte_summary(&name, &summary) {
-            let rendered = if name == "read_file" {
-                atom_core::render::highlight::highlight_code(&summary, &b.text, inner)
-            } else {
-                atom_core::render::links::wrap_linked(
-                    &summary,
-                    inner,
-                    atom_core::render::colors::COLOR_FOREGROUND,
-                    atom_core::render::colors::COLOR_CARD_DARK,
-                )
-            };
-            body = collapse_lines(
-                ansi::ansi_to_lines(&rendered),
+        } else if !b.diff.is_empty() {
+            let d =
+                atom_core::render::diff::render_diff(&b.diff, &b.text, inner, name == "edit_file");
+            let parsed = ansi::ansi_to_lines_linked(&d);
+            let (lines, links) = collapse_linked(
+                parsed.lines,
+                parsed.links,
                 TOOL_RESULT_PREVIEW_LINES,
                 b.expanded,
             );
+            body = lines;
+            body_links = links;
+        } else {
+            let mut summary = tool_result_summary(&b.result, &b.diff).to_string();
+            if b.diagram.is_some() {
+                summary = strip_diagram_marker(&summary);
+            }
+            if !summary.is_empty() && !file_change_byte_summary(&name, &summary) {
+                let rendered = if name == "read_file" {
+                    atom_core::render::highlight::highlight_code(&summary, &b.text, inner)
+                } else {
+                    atom_core::render::links::wrap_linked(
+                        &summary,
+                        inner,
+                        atom_core::render::colors::COLOR_FOREGROUND,
+                        atom_core::render::colors::COLOR_CARD_DARK,
+                    )
+                };
+                let parsed = ansi::ansi_to_lines_linked(&rendered);
+                if b.diagram.is_some() {
+                    // Diagram cards never collapse: the summary is short
+                    // and the placeholder grid below it must stay whole.
+                    body = parsed.lines;
+                    body_links = parsed.links;
+                } else {
+                    let (lines, links) = collapse_linked(
+                        parsed.lines,
+                        parsed.links,
+                        TOOL_RESULT_PREVIEW_LINES,
+                        b.expanded,
+                    );
+                    body = lines;
+                    body_links = links;
+                }
+            }
+        }
+    } // end else (non-approval block)
+
+    // Inline diagram: kitty placeholder rows (the real PNG is transmitted
+    // out-of-band by paint_kitty_diagrams). Geometry is refreshed here so
+    // the grid always matches the current render width.
+    if let Some(ref mut d) = b.diagram {
+        diagram_geometry(d, inner);
+        if preview::kitty_terminal() && d.id > 0 && d.cols > 0 && d.rows > 0 {
+            let grid = preview::placeholder_grid(d.id, d.cols, d.rows);
+            for row in grid.split('\n') {
+                body.push(ansi::ansi_to_line(row));
+                body_links.push(Vec::new());
+            }
         }
     }
 
-    let mut out: Vec<Line<'static>> = Vec::with_capacity(body.len() + 3);
-    out.push(pad_row(width, ansi::style_tool()));
+    let mut out = RenderedBlock {
+        lines: Vec::with_capacity(body.len() + 3),
+        links: Vec::with_capacity(body.len() + 3),
+    };
+    out.push_blank(pad_row(width, ansi::style_tool()));
     let mut header_spans = left;
     header_spans.push(Span::styled(" ".repeat(gap), ansi::style_tool_hint()));
     header_spans.extend(right);
-    out.push(box_row(header_spans, width, ansi::style_tool()));
-    for row in body {
+    let (header_line, header_links) =
+        box_row_linked(header_spans, left_links, width, ansi::style_tool());
+    out.push(header_line, header_links);
+    for (row, row_links) in body.into_iter().zip(body_links) {
         let spans = if row.spans.is_empty() {
             vec![Span::styled(String::new(), ansi::style_tool())]
         } else {
             row.spans
         };
-        out.push(box_row(spans, width, ansi::style_tool()));
+        let (line, links) = box_row_linked(spans, row_links, width, ansi::style_tool());
+        out.push(line, links);
     }
-    out.push(pad_row(width, ansi::style_tool()));
+    out.push_blank(pad_row(width, ansi::style_tool()));
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Approval block rendering helpers
+// ---------------------------------------------------------------------------
+
+/// Build the body lines for a pending approval block (details).
+fn approval_block_body(appr: &InlineApproval, width: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if appr.from_subagent {
+        let who = if appr.child_title.is_empty() {
+            "a subagent".to_string()
+        } else {
+            format!("subagent \"{}\"", appr.child_title)
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{who} needs permission"),
+            ansi::style_reasoning(),
+        )));
+    }
+    let fields = [
+        ("rule    ", &appr.rule_id),
+        ("reason  ", &appr.reason),
+        ("cwd     ", &appr.cwd),
+    ];
+    for (label, value) in &fields {
+        if value.is_empty() {
+            continue;
+        }
+        let text = format!("{label}{value}");
+        let truncated = atom_core::render::highlight::truncate_width(&text, width);
+        lines.push(Line::from(Span::styled(truncated, ansi::style_dim())));
+    }
+    lines
+}
+
+/// Produce the clickable button line for an approval block.
+fn approval_button_line() -> Line<'static> {
+    let buttons = approval_buttons();
+    let mut spans = Vec::new();
+    for (i, btn) in buttons.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("  ", ansi::style_tool()));
+        }
+        spans.push(Span::styled(btn.label.to_string(), ansi::style_tool_name()));
+    }
+    Line::from(spans)
+}
+
+/// Button layout constants for approval blocks. Column offsets are relative
+/// to the content area (after left pad).
+pub fn approval_buttons() -> Vec<ApprovalButton> {
+    // Layout: "[a] allow  [s] session  [g] always  [d] deny"
+    let labels: &[(&str, &str)] = &[
+        ("[a] allow", "allow_once"),
+        ("[s] session", "allow_session"),
+        ("[g] always", "allow_global"),
+        ("[d] deny", "deny"),
+    ];
+    let gap = 2usize;
+    let mut col = 0;
+    let mut out = Vec::new();
+    for (label, decision) in labels {
+        let w = unicode_width::UnicodeWidthStr::width(*label);
+        out.push(ApprovalButton {
+            label,
+            decision,
+            col_start: col,
+            col_end: col + w,
+        });
+        col += w + gap;
+    }
     out
 }
 
@@ -1061,17 +1494,37 @@ fn box_row(spans: Vec<Span<'static>>, width: usize, style: ratatui::style::Style
 
 const PAD_CELL: usize = 1;
 
-/// Splits an ANSI string into styled spans using the given base style
-/// for any unstyled runs.
-fn split_ansi_spans(s: &str, base: ratatui::style::Style) -> Vec<Span<'static>> {
-    let line = ansi::ansi_to_line(s);
-    if line.spans.is_empty() {
-        return vec![Span::styled(String::new(), base)];
+/// box_row plus shifting row-local link regions past the leading pad
+/// cell so they stay aligned with the visible text.
+fn box_row_linked(
+    spans: Vec<Span<'static>>,
+    mut links: Vec<crate::ansi::LinkRegion>,
+    width: usize,
+    style: ratatui::style::Style,
+) -> (Line<'static>, Vec<crate::ansi::LinkRegion>) {
+    for region in links.iter_mut() {
+        region.c0 += PAD_CELL;
+        region.c1 += PAD_CELL;
     }
-    line.spans
-        .into_iter()
-        .map(|span| Span::styled(span.content, base.patch(span.style)))
-        .collect()
+    (box_row(spans, width, style), links)
+}
+
+/// Splits an ANSI string into styled spans using the given base style
+/// for any unstyled runs, also returning the OSC 8 link regions.
+fn split_ansi_spans_linked(
+    s: &str,
+    base: ratatui::style::Style,
+) -> (Vec<Span<'static>>, Vec<crate::ansi::LinkRegion>) {
+    let (line, links) = ansi::ansi_to_line_linked(s);
+    let spans = if line.spans.is_empty() {
+        vec![Span::styled(String::new(), base)]
+    } else {
+        line.spans
+            .into_iter()
+            .map(|span| Span::styled(span.content, base.patch(span.style)))
+            .collect()
+    };
+    (spans, links)
 }
 
 // ---------------------------------------------------------------------------
@@ -1120,6 +1573,72 @@ pub fn active_label(label: &str, spinner_frame: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn assistant_markdown_links_produce_clickable_regions() {
+        let mut b = Block {
+            kind: BlockKind::Assistant,
+            text: "see [the docs](https://docs.example.com) for more".into(),
+            ..Default::default()
+        };
+        let out = render_block_linked(&mut b, 80, true, "*");
+        let idx = out
+            .lines
+            .iter()
+            .position(|l| ansi::line_plain(l).contains("the docs"))
+            .expect("link label rendered");
+        assert_eq!(out.links[idx].len(), 1);
+        let r = &out.links[idx][0];
+        assert_eq!(r.uri, "https://docs.example.com");
+        assert_eq!(
+            ansi::cut_line_range(&out.lines[idx], r.c0, r.c1),
+            "the docs"
+        );
+    }
+
+    #[test]
+    fn user_bare_url_regions_account_for_box_pad() {
+        let mut b = Block {
+            kind: BlockKind::User,
+            text: "look at https://example.com/x please".into(),
+            ..Default::default()
+        };
+        let out = render_block_linked(&mut b, 60, true, "*");
+        let idx = out
+            .lines
+            .iter()
+            .position(|l| ansi::line_plain(l).contains("https://example.com/x"))
+            .expect("url rendered");
+        let r = &out.links[idx][0];
+        assert_eq!(r.uri, "https://example.com/x");
+        assert_eq!(
+            ansi::cut_line_range(&out.lines[idx], r.c0, r.c1),
+            "https://example.com/x"
+        );
+        assert_eq!(r.c0, PAD_CELL + "look at ".len());
+    }
+
+    #[test]
+    fn tool_header_path_region_points_at_file_uri() {
+        let mut b = Block {
+            kind: BlockKind::Tool,
+            title: "Edit".into(),
+            tool_name: "edit_file".into(),
+            text: "/tmp/some/file.rs".into(),
+            tool_done: true,
+            result: "done".into(),
+            ..Default::default()
+        };
+        let out = render_block_linked(&mut b, 80, true, "*");
+        // Row 1 is the header box row.
+        assert_eq!(out.links[1].len(), 1);
+        let r = &out.links[1][0];
+        assert_eq!(r.uri, "file:///tmp/some/file.rs");
+        assert_eq!(
+            ansi::cut_line_range(&out.lines[1], r.c0, r.c1),
+            "/tmp/some/file.rs"
+        );
+    }
 
     #[test]
     fn tool_display_name_snake_case() {
@@ -1600,6 +2119,187 @@ mod tests {
         let mut blocks = blocks;
         assign_block_image_nums(&mut blocks, &[]);
         assert_eq!(blocks[0].images[0].num, 1);
+    }
+
+    #[test]
+    fn diagram_marker_parse_and_strip() {
+        let result = "rendered diagram \"Arch\" (400x200 px, saved at 2x density)\n \
+                      inline preview is shown in the atom TUI\n \
+                      [atom-diagram] png=/tmp/d/arch-1a2b3c4d.png \
+                      html=/tmp/d/arch-1a2b3c4d.html width=400 height=200";
+        let (png, html, w, h) = parse_diagram_marker(result).expect("marker parsed");
+        assert_eq!(png, "/tmp/d/arch-1a2b3c4d.png");
+        assert_eq!(html, "/tmp/d/arch-1a2b3c4d.html");
+        assert_eq!((w, h), (400, 200));
+        assert!(parse_diagram_marker("no marker here").is_none());
+        let stripped = strip_diagram_marker(result);
+        assert!(!stripped.contains("atom-diagram"));
+        assert!(stripped.starts_with("rendered diagram"));
+        // Non-marker results pass through unchanged.
+        assert_eq!(strip_diagram_marker("plain output"), "plain output");
+    }
+
+    #[test]
+    fn attach_tool_result_attaches_diagram() {
+        let mut blocks = vec![Block {
+            kind: BlockKind::Tool,
+            title: "Visualize".into(),
+            tool_name: "visualize".into(),
+            ..Default::default()
+        }];
+        attach_tool_result(
+            &mut blocks,
+            "rendered diagram\n [atom-diagram] png=/a.png html=/a.html width=100 height=50",
+            "",
+        );
+        assert!(blocks[0].tool_done);
+        let d = blocks[0].diagram.as_ref().expect("diagram attached");
+        assert_eq!(d.png, "/a.png");
+        assert_eq!(d.html, "/a.html");
+        assert_eq!((d.w, d.h), (100, 50));
+        assert_eq!(d.id, 0, "ids are assigned later by the app");
+        // Results without a marker leave the diagram empty.
+        attach_tool_result(&mut blocks, "plain", "");
+        assert!(blocks[1].diagram.is_none());
+    }
+
+    #[test]
+    fn assign_diagram_ids_stay_in_diagram_range() {
+        let mut blocks = vec![Block::new(BlockKind::Tool), Block::new(BlockKind::Tool)];
+        blocks[0].diagram = Some(DiagramRef {
+            png: "p0".into(),
+            html: "h0".into(),
+            w: 100,
+            h: 50,
+            ..Default::default()
+        });
+        blocks[1].diagram = Some(DiagramRef {
+            png: "p1".into(),
+            html: "h1".into(),
+            w: 100,
+            h: 50,
+            ..Default::default()
+        });
+        assert!(assign_block_diagram_ids(&mut blocks));
+        let ids: Vec<usize> = blocks
+            .iter()
+            .map(|b| b.diagram.as_ref().unwrap().id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![MIN_KITTY_DIAGRAM_ID, MIN_KITTY_DIAGRAM_ID + 1],
+            "fresh ids start at the diagram range and never dip into 1..=16"
+        );
+        // Re-running preserves the existing ids.
+        assert!(!assign_block_diagram_ids(&mut blocks));
+        // A stale id from a previous paint is reclaimed, not kept.
+        blocks[0].diagram.as_mut().unwrap().id = 3;
+        assert!(assign_block_diagram_ids(&mut blocks));
+        let id0 = blocks[0].diagram.as_ref().unwrap().id;
+        assert!((MIN_KITTY_DIAGRAM_ID..=MAX_KITTY_DIAGRAM_ID).contains(&id0));
+    }
+
+    #[test]
+    fn diagram_geometry_preserves_aspect_at_cell_shape() {
+        let mut d = DiagramRef {
+            w: 400,
+            h: 200,
+            ..Default::default()
+        };
+        assert!(diagram_geometry(&mut d, 62));
+        assert_eq!(d.cols, 60);
+        // rows = 60 * (200/400) * (32/64) = 15
+        assert_eq!(d.rows, 15);
+        // Re-running with the same width is a no-op.
+        assert!(!diagram_geometry(&mut d, 62));
+        // Narrower width re-fits the grid.
+        assert!(diagram_geometry(&mut d, 42));
+        assert_eq!(d.cols, 40);
+        assert_eq!(d.rows, 10);
+        // Zero dimensions are left untouched.
+        let mut empty = DiagramRef::default();
+        assert!(!diagram_geometry(&mut empty, 62));
+    }
+
+    #[test]
+    fn diagram_block_renders_open_hint_and_strips_marker() {
+        let mut b = Block {
+            kind: BlockKind::Tool,
+            title: "Visualize".into(),
+            tool_name: "visualize".into(),
+            text: "Login".into(),
+            tool_done: true,
+            result: "rendered diagram \"Login\" (400x200 px, saved at 2x density)\n \
+                     inline preview is shown in the atom TUI\n \
+                     [atom-diagram] png=/a.png html=/a.html width=400 height=200"
+                .into(),
+            diagram: Some(DiagramRef {
+                png: "/a.png".into(),
+                html: "/a.html".into(),
+                w: 400,
+                h: 200,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(
+            !b.tool_collapsible(70, 70),
+            "diagram blocks never collapse behind an expand toggle"
+        );
+        assign_block_diagram_ids(std::slice::from_mut(&mut b));
+        let out = render_block_linked(&mut b, 80, true, "*");
+        // Line 0 is the top pad, line 1 the header.
+        let header = ansi::line_plain(&out.lines[1]);
+        assert!(header.contains("Visualize"), "header: {header:?}");
+        assert!(
+            header.contains("Login"),
+            "action shows the title: {header:?}"
+        );
+        assert!(header.contains("⤢ open"), "hint: {header:?}");
+        assert!(!header.contains("expand"), "no expand toggle: {header:?}");
+        assert!(
+            header.trim_end().ends_with("⤢ open"),
+            "hint is right-aligned: {header:?}"
+        );
+        // The machine marker never reaches the transcript.
+        for line in &out.lines {
+            assert!(!ansi::line_plain(line).contains("atom-diagram"));
+        }
+        assert!(out
+            .lines
+            .iter()
+            .any(|l| ansi::line_plain(l).contains("rendered diagram")));
+        for line in &out.lines {
+            assert_eq!(ansi::line_width(line), 80, "{:?}", ansi::line_plain(line));
+        }
+        // Geometry was filled in during render for the paint pass.
+        let d = b.diagram.as_ref().unwrap();
+        assert_eq!(d.cols, 60);
+        assert_eq!(d.rows, 15);
+        if preview::kitty_terminal() {
+            // Placeholder grid rows follow the summary.
+            let placeholders = out
+                .lines
+                .iter()
+                .filter(|l| ansi::line_plain(l).contains('\u{10EEEE}'))
+                .count();
+            assert_eq!(placeholders, d.rows, "one grid row per rows count");
+        }
+    }
+
+    #[test]
+    fn visualize_action_shows_title() {
+        assert_eq!(
+            tool_action(
+                "visualize",
+                r#"{"code":"graph TD; A-->B","title":"Login flow"}"#
+            ),
+            "Login flow"
+        );
+        assert_eq!(
+            tool_action("visualize", r#"{"code":"graph TD; A-->B"}"#),
+            r#"{"code":"graph TD; A-->B"}"#
+        );
     }
 }
 

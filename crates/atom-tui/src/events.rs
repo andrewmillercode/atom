@@ -198,6 +198,11 @@ pub enum Effect {
     CopyToClipboard {
         text: String,
     },
+    /// Open a clicked OSC 8 hyperlink (http(s) or file URL) with the
+    /// platform opener.
+    OpenLink {
+        uri: String,
+    },
     PaintPreviews,
 }
 

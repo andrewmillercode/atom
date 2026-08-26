@@ -638,7 +638,20 @@ pub async fn ensure_server() -> Result<()> {
             Ok(())
         });
     }
-    cmd.spawn().context("start atoms server")?;
+    let child = cmd.spawn().context("start atoms server")?;
+
+    // Prevent macOS from sleeping while the server is alive. caffeinate
+    // -i (user-idle) -w <pid> exits automatically when the server does.
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("caffeinate")
+            .args(["-i", "-w", &child.id().to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn(); // Best-effort; don't fail if caffeinate is absent.
+    }
+    let _ = child; // suppress unused warning on non-macOS
 
     for _ in 0..50 {
         if is_running().await {

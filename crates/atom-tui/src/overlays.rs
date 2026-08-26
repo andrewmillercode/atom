@@ -264,6 +264,31 @@ pub fn is_slash_query(s: &str) -> bool {
     s.starts_with('/') && !s.contains([' ', '\t', '\n'])
 }
 
+/// Returns true when the submitted text looks like an absolute file path
+/// (e.g. `/Users/me/project/Cargo.toml`) rather than a slash command.
+/// Heuristic: starts with `/`, has at least two path segments, and the
+/// leaf contains a `.` (extension) or the path resolves to an existing
+/// file.
+pub fn looks_like_file_path(text: &str) -> bool {
+    let trimmed = text.trim();
+    if !trimmed.starts_with('/') {
+        return false;
+    }
+    // Must have more than one segment (not just "/foo")
+    let segments: Vec<&str> = trimmed.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.len() < 2 {
+        return false;
+    }
+    // Leaf has an extension (very common for real paths)
+    if let Some(leaf) = segments.last() {
+        if leaf.contains('.') {
+            return true;
+        }
+    }
+    // Fallback: check if the path exists on disk
+    std::path::Path::new(trimmed).exists()
+}
+
 /// isCatalogPrompt reports whether a leading "/name" names a discovered
 /// skill or MCP server (sent as a prompt instead of run locally).
 pub fn is_catalog_prompt(text: &str, dynamic_commands: &[DynamicCommand]) -> bool {
@@ -839,6 +864,9 @@ fn footer_menu_rows(app: &App) -> usize {
     if app.reasoning_visible {
         return app.thinking_levels.len() + 1;
     }
+    if app.at_menu_visible {
+        return app.at_menu_items.len();
+    }
     0
 }
 
@@ -869,6 +897,9 @@ pub fn footer_menu_sel(app: &App) -> (usize, usize) {
     }
     if app.reasoning_visible {
         return (app.reasoning_sel + 1, 1);
+    }
+    if app.at_menu_visible {
+        return (app.at_menu_sel, 0);
     }
     (0, 0)
 }
@@ -1013,6 +1044,21 @@ pub fn reasoning_row_at_y(app: &App, y: usize) -> Option<usize> {
         return None;
     }
     Some(row_idx)
+}
+
+pub fn at_menu_row_at_y(app: &App, y: usize) -> Option<usize> {
+    if !app.at_menu_visible {
+        return None;
+    }
+    let n = app.at_menu_items.len();
+    if n == 0 {
+        return None;
+    }
+    let idx = footer_menu_row_at_y(app, y, n)?;
+    if idx >= n {
+        return None;
+    }
+    Some(idx)
 }
 
 // ---------------------------------------------------------------------------

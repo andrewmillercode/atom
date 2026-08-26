@@ -35,6 +35,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDef> {
         vector_search_def(),
         grep_def(),
         glob_def(),
+        visualize_def(),
         def(
             "bash",
             "Run commands that require a shell, such as tests, builds, git, and package managers. File discovery and text search are faster and safer with glob and grep; file reads and changes belong in read_file, write_file, and edit_file.",
@@ -57,7 +58,7 @@ pub fn grep_def() -> ToolDef {
     def(
         "grep",
         "Fast exact text search with path, line number, and matching text. Use for identifiers, error strings, config keys, and regexes instead of running grep or rg in bash. The session workspace is searched by default and .gitignore is honored.",
-        r#"{"type":"object","properties":{"pattern":{"type":"string","description":"Text to find. Literal by default, so common code symbols need no escaping."},"path":{"type":"string","description":"Optional file or directory, relative to the session workspace. Omit to search the workspace."},"glob":{"type":"string","description":"Optional file filter such as *.rs or **/*.test.ts"},"regex":{"type":"boolean","description":"Enable regular-expression matching. Defaults to false for fast literal search."},"case_insensitive":{"type":"boolean","description":"Force case-insensitive matching. Otherwise smart-case is used."},"head_limit":{"type":"integer","description":"Maximum matches returned. Defaults to 100."}},"required":["pattern"]}"#,
+        r#"{"type":"object","properties":{"pattern":{"type":"string","description":"Text to find. Literal by default, so common code symbols need no escaping."},"path":{"type":"string","description":"Optional file or directory, relative to the session workspace or an absolute path. Omit to search the workspace."},"glob":{"type":"string","description":"Optional file filter such as *.rs or **/*.test.ts"},"regex":{"type":"boolean","description":"Enable regular-expression matching. Defaults to false for fast literal search."},"case_insensitive":{"type":"boolean","description":"Force case-insensitive matching. Otherwise smart-case is used."},"head_limit":{"type":"integer","description":"Maximum matches returned. Defaults to 100."}},"required":["pattern"]}"#,
     )
 }
 
@@ -65,7 +66,15 @@ pub fn glob_def() -> ToolDef {
     def(
         "glob",
         "Fast file discovery by pattern. Use instead of find, fd, or ls in bash. Searches the session workspace recursively by default and honors .gitignore.",
-        r#"{"type":"object","properties":{"pattern":{"type":"string","description":"File glob such as **/*.rs, src/**/*.md, or Cargo.toml"},"path":{"type":"string","description":"Optional directory relative to the session workspace. Omit to search the workspace."},"head_limit":{"type":"integer","description":"Maximum paths returned. Defaults to 200."}},"required":["pattern"]}"#,
+        r#"{"type":"object","properties":{"pattern":{"type":"string","description":"File glob such as **/*.rs, src/**/*.md, or Cargo.toml"},"path":{"type":"string","description":"Optional directory relative to the session workspace or an absolute path. Omit to search the workspace."},"head_limit":{"type":"integer","description":"Maximum paths returned. Defaults to 200."}},"required":["pattern"]}"#,
+    )
+}
+
+pub fn visualize_def() -> ToolDef {
+    def(
+        "visualize",
+        "Render a Mermaid diagram inline in the atom TUI as a high-density image, with an expand button (top-right of the rendered diagram) that opens a pan/zoom viewer in the browser. Use for conceptual thinking, architecture, data flow, function call graphs, sequence diagrams, state machines, ER models, etc. Prefer this over ASCII-art diagrams in replies. Provide standard Mermaid source (flowchart, sequenceDiagram, classDiagram, stateDiagram-v2, erDiagram, mindmap, gantt, pie, journey, gitGraph, and more). Include a short title — it names the browser artifact. If a render fails, the error names the offending line; fix the source and retry rather than giving up.",
+        r#"{"type":"object","properties":{"code":{"type":"string","description":"The Mermaid diagram source, e.g. 'flowchart TD\\n  A[Start] --> B[Done]'"},"title":{"type":"string","description":"Short title for the diagram (used for the browser tab and artifact filename)"}},"required":["code"]}"#,
     )
 }
 
@@ -114,12 +123,13 @@ mod tests {
                 "vector_search",
                 "grep",
                 "glob",
+                "visualize",
                 "bash",
                 "dispatch",
                 "skill",
             ]
         );
-        assert_eq!(crate::tool_definitions().len(), 10);
+        assert_eq!(crate::tool_definitions().len(), 11);
     }
 
     #[test]
@@ -145,7 +155,7 @@ mod tests {
         assert_eq!(without_tool(&tools, "dispatch").len(), tools.len());
         // Stripping everything but keeping order otherwise.
         let no_bash = without_tool(&crate::tool_definitions(), "bash");
-        assert_eq!(no_bash.len(), 9);
+        assert_eq!(no_bash.len(), 10);
         assert_eq!(no_bash[4].function.name, "vector_search");
     }
 }

@@ -26,8 +26,8 @@ pub const PREVIEW_COLS: usize = 6;
 pub const PREVIEW_ROWS: usize = 3;
 pub const PREVIEW_GAP: usize = 1;
 pub const PREVIEW_PROMPT_GAP: usize = 1;
-const PREVIEW_CELL_W: u32 = 32;
-const PREVIEW_CELL_H: u32 = 64;
+pub(crate) const PREVIEW_CELL_W: u32 = 32;
+pub(crate) const PREVIEW_CELL_H: u32 = 64;
 const PREVIEW_BORDER_PX: i64 = 3;
 pub const MAX_KITTY_PREVIEW_ID: usize = 16;
 
@@ -627,7 +627,7 @@ fn kitty_delete_virtual(id: usize) -> String {
     format!("\x1b_Ga=d,d=I,i={id},q=2\x1b\\")
 }
 
-fn kitty_transmit(id: usize, png_data: &[u8]) -> String {
+pub(crate) fn kitty_transmit(id: usize, png_data: &[u8]) -> String {
     let b64 = base64::engine::general_purpose::STANDARD.encode(png_data);
     let mut sb = String::new();
     let opts = format!("a=t,f=100,i={id},q=2");
@@ -664,6 +664,28 @@ pub fn paint_kitty_previews(entries: &[(usize, Vec<u8>)]) {
             "\x1b_Ga=p,U=1,i={num},c={},r={},q=2\x1b\\",
             PREVIEW_COLS, PREVIEW_ROWS
         ));
+    }
+    write_tty(&sb);
+}
+
+/// paint_kitty_diagrams transmits rendered diagram PNGs as virtual
+/// placements sized `cols` x `rows`, and deletes every stale diagram id
+/// the caller reports (ids the previous paint used but the current block
+/// list no longer references). Diagrams own the 17..=255 id range;
+/// 1..=16 stays reserved for image previews above. Each entry's PNG is
+/// read from its artifact path inside this blocking task. Best-effort:
+/// unreadable files are skipped silently.
+pub fn paint_kitty_diagrams(specs: &[(usize, String, usize, usize)], stale_ids: &[usize]) {
+    let mut sb = String::new();
+    for id in stale_ids {
+        sb.push_str(&kitty_delete_virtual(*id));
+    }
+    for (id, path, cols, rows) in specs {
+        let Ok(png) = std::fs::read(path) else {
+            continue;
+        };
+        sb.push_str(&kitty_transmit(*id, &png));
+        sb.push_str(&format!("\x1b_Ga=p,U=1,i={id},c={cols},r={rows},q=2\x1b\\"));
     }
     write_tty(&sb);
 }

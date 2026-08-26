@@ -15,6 +15,7 @@ pub mod read_file;
 pub mod search;
 pub mod skills;
 pub mod vector_search;
+pub mod visualize;
 pub mod web_search;
 
 pub use dispatch::{is_dispatch_session_id, parse_dispatch_session_id, DispatchPlan};

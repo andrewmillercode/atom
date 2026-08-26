@@ -69,3 +69,11 @@ There are two binaries in `crates/atom/Cargo.toml`:
 
 Both are built by `cargo build` and installed together by `make install-dev`
 or `make install`.
+
+## Tool documentation
+
+`TOOLS.md` is the atom system prompt's tools section — it is what agents
+see when they run inside atom. When you add a tool, or change one in a
+substantial way (new parameters, changed semantics, new workflow guidance),
+update `TOOLS.md` in the same change so the model-facing instructions stay
+accurate.

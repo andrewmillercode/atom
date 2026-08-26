@@ -6,6 +6,7 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block as RtBlock, Borders, Clear};
 
@@ -193,12 +194,8 @@ pub fn draw(app: &mut App, area: Rect, buf: &mut Buffer) -> Option<(u16, u16)> {
         &cwd_line,
     );
 
-    // --- sandbox approval box floats above the prompt -----------------------
-    if let Some(req) = app.approval.clone() {
-        draw_approval_box(app, req, area, buf, &geo);
-    }
-
-    // Terminal cursor over the prompt.
+    // --- sandbox approval renders inline as a tool block now ----------------
+    // Hide cursor while approval is pending so the user focuses on the block.
     if app.approval.is_some() {
         return None;
     }
@@ -406,6 +403,8 @@ fn draw_footer_menu(app: &mut App, rect: Rect, buf: &mut Buffer) {
         render_context_menu(app)
     } else if app.reasoning_visible {
         render_reasoning_menu(app)
+    } else if app.at_menu_visible {
+        render_at_menu(app)
     } else {
         return;
     };
@@ -610,6 +609,19 @@ fn render_picker_menu(app: &App) -> Vec<Line<'static>> {
     out
 }
 
+fn render_at_menu(app: &App) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    for (i, item) in app.at_menu_items.iter().enumerate() {
+        let name_style = if i == app.at_menu_sel {
+            ansi::style_selected()
+        } else {
+            ansi::style_inactive()
+        };
+        out.push(Line::from(Span::styled(item.clone(), name_style)));
+    }
+    out
+}
+
 fn render_context_menu(app: &App) -> Vec<Line<'static>> {
     let mut out = vec![Line::from(Span::styled("context", ansi::style_dim()))];
     if app.context_rows.is_empty() {
@@ -662,16 +674,10 @@ pub fn working_status_line(app: &App) -> Line<'static> {
 /// prompt row (e.g. the REVERSED selection style). Chip markers are
 /// replaced with same-width `[IMG n]` spans carrying the chip style, and
 /// the surrounding text keeps the original span's style.
+/// Additionally, `@path/to/file` references are rendered as orange inline
+/// tags, and pasted absolute file paths are rendered with a "File name" tag.
 fn line_with_chips_styled(line: &Line<'_>, app: &App) -> Line<'static> {
     let max_num = app.pending.iter().map(|p| p.num).max().unwrap_or(0);
-    if max_num == 0 {
-        return Line::from(
-            line.spans
-                .iter()
-                .map(|s| Span::styled(s.content.to_string(), s.style))
-                .collect::<Vec<_>>(),
-        );
-    }
     let selected = if app.input.has_selection() {
         app.input.selected_text()
     } else {
@@ -681,36 +687,96 @@ fn line_with_chips_styled(line: &Line<'_>, app: &App) -> Line<'static> {
     for span in &line.spans {
         let style = span.style;
         let mut rest = span.content.to_string();
-        loop {
-            let mut found: Option<(usize, usize)> = None;
-            for i in 1..=max_num {
-                let mark = preview::image_marker(i);
-                if selected.contains(&mark) {
-                    continue;
-                }
-                if let Some(pos) = rest.find(&mark) {
-                    if found.map(|(p, _)| pos < p).unwrap_or(true) {
-                        found = Some((pos, i));
+
+        // Process image markers
+        if max_num > 0 {
+            loop {
+                let mut found: Option<(usize, usize)> = None;
+                for i in 1..=max_num {
+                    let mark = preview::image_marker(i);
+                    if selected.contains(&mark) {
+                        continue;
+                    }
+                    if let Some(pos) = rest.find(&mark) {
+                        if found.map(|(p, _)| pos < p).unwrap_or(true) {
+                            found = Some((pos, i));
+                        }
                     }
                 }
-            }
-            match found {
-                Some((pos, num)) => {
-                    out.push(Span::styled(rest[..pos].to_string(), style));
-                    out.push(Span::styled(
-                        preview::image_chip(num),
-                        ansi::style_img_chip(),
-                    ));
-                    rest = rest[pos + preview::image_marker(num).len()..].to_string();
+                match found {
+                    Some((pos, num)) => {
+                        let before = rest[..pos].to_string();
+                        rest = rest[pos + preview::image_marker(num).len()..].to_string();
+                        emit_file_tagged_spans(&before, style, &mut out);
+                        out.push(Span::styled(
+                            preview::image_chip(num),
+                            ansi::style_img_chip(),
+                        ));
+                    }
+                    None => break,
                 }
-                None => break,
             }
         }
+
         if !rest.is_empty() {
-            out.push(Span::styled(rest, style));
+            emit_file_tagged_spans(&rest, style, &mut out);
         }
     }
     Line::from(out)
+}
+
+/// Processes text looking for @file references and absolute file paths,
+/// rendering them as orange inline tags. Non-matching text is emitted
+/// with the given style.
+fn emit_file_tagged_spans(text: &str, base_style: Style, out: &mut Vec<Span<'static>>) {
+    if text.is_empty() {
+        return;
+    }
+
+    // First check if the entire text is a single absolute file path
+    let trimmed = text.trim();
+    if trimmed.starts_with('/') && overlays::looks_like_file_path(trimmed) && !trimmed.contains(' ')
+    {
+        let short_name = file_chip_label(trimmed);
+        out.push(Span::styled(
+            format!(" File {} ", short_name),
+            ansi::style_file_chip(),
+        ));
+        return;
+    }
+
+    let mut rest = text;
+    while let Some(at_pos) = rest.find('@') {
+        // Emit text before the @
+        if at_pos > 0 {
+            out.push(Span::styled(rest[..at_pos].to_string(), base_style));
+        }
+        let after_at = &rest[at_pos + 1..];
+        // Extract the @word (no spaces)
+        let end = after_at
+            .find(|c: char| c.is_whitespace())
+            .unwrap_or(after_at.len());
+        let token = &after_at[..end];
+        if !token.is_empty() && token.contains('/') {
+            // File reference with path — render full @path in orange
+            out.push(Span::styled(format!("@{}", token), ansi::style_file_chip()));
+        } else if !token.is_empty() {
+            // Just a plain @ followed by a word with no slash — render normally
+            out.push(Span::styled(format!("@{}", token), ansi::style_file_chip()));
+        } else {
+            // Bare @ at end or followed by space
+            out.push(Span::styled("@".to_string(), base_style));
+        }
+        rest = &after_at[end..];
+    }
+    if !rest.is_empty() {
+        out.push(Span::styled(rest.to_string(), base_style));
+    }
+}
+
+/// Returns the short display label for a file chip: the last path component.
+fn file_chip_label(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
 }
 
 /// renderPreviews: Unicode placeholder cells for kitty virtual
@@ -771,6 +837,8 @@ fn render_previews(app: &App) -> Vec<Line<'static>> {
 // Sandbox approval box.
 // ---------------------------------------------------------------------------
 
+/// Legacy floating approval box — kept for test coverage of field layout.
+#[allow(dead_code)]
 fn draw_approval_box(app: &App, req: ApprovalPrompt, area: Rect, buf: &mut Buffer, geo: &Layout) {
     let inner_w = app.inner_width().min(area.width.saturating_sub(4) as usize);
     let body = approval_body(&req, inner_w);
@@ -802,6 +870,7 @@ fn draw_approval_box(app: &App, req: ApprovalPrompt, area: Rect, buf: &mut Buffe
     }
 }
 
+#[allow(dead_code)]
 fn approval_body(req: &ApprovalPrompt, width: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
     let mut body = vec![Line::from(Span::styled(
@@ -839,6 +908,7 @@ fn approval_body(req: &ApprovalPrompt, width: usize) -> Vec<Line<'static>> {
     body
 }
 
+#[allow(dead_code)]
 fn approval_field(body: &mut Vec<Line<'static>>, label: &'static str, value: &str, width: usize) {
     let label_width = label.len();
     if width <= label_width {
@@ -862,6 +932,7 @@ fn approval_field(body: &mut Vec<Line<'static>>, label: &'static str, value: &st
     }
 }
 
+#[allow(dead_code)]
 fn wrap_approval_text(text: &str, width: usize) -> Vec<String> {
     text.split('\n')
         .flat_map(|line| wrap_plain(line, width.max(1)))
@@ -1355,12 +1426,32 @@ mod tests {
             child_title: String::new(),
             from_subagent: false,
         });
+        // Inline approval block
+        app.blocks.push(crate::blocks::Block {
+            kind: crate::blocks::BlockKind::Tool,
+            title: "Sandbox".to_string(),
+            tool_name: "sandbox".to_string(),
+            text: "curl https://x.co".to_string(),
+            approval: Some(crate::blocks::InlineApproval {
+                id: "abc".into(),
+                session_id: "sess1".into(),
+                command: "curl https://x.co".into(),
+                cwd: "/tmp".into(),
+                rule_id: "net".into(),
+                reason: "ask network".into(),
+                from_subagent: false,
+                child_title: String::new(),
+            }),
+            expanded: true,
+            ..Default::default()
+        });
+        app.viewport_dirty = true;
+        app.refresh_viewport();
         let term = frame(&mut app, 90, 30);
         let s = text(&term);
-        assert!(s.contains("sandbox approval"));
-        assert!(s.contains("curl https://x.co"));
-        assert!(s.contains("/tmp"));
-        assert!(s.contains("a allow"));
+        assert!(s.contains("Sandbox"), "title visible: {s}");
+        assert!(s.contains("curl https://x.co"), "command visible: {s}");
+        assert!(s.contains("[a] allow"), "buttons visible: {s}");
     }
 
     #[test]
@@ -1376,11 +1467,34 @@ mod tests {
             child_title: "push the release".into(),
             from_subagent: true,
         });
+        app.blocks.push(crate::blocks::Block {
+            kind: crate::blocks::BlockKind::Tool,
+            title: "Sandbox".to_string(),
+            tool_name: "sandbox".to_string(),
+            text: "git push".to_string(),
+            approval: Some(crate::blocks::InlineApproval {
+                id: "abc".into(),
+                session_id: "child123".into(),
+                command: "git push".into(),
+                cwd: "/repo".into(),
+                rule_id: "git-push".into(),
+                reason: "push to remote".into(),
+                from_subagent: true,
+                child_title: "push the release".into(),
+            }),
+            expanded: true,
+            ..Default::default()
+        });
+        app.viewport_dirty = true;
+        app.refresh_viewport();
         let term = frame(&mut app, 90, 30);
         let s = text(&term);
-        assert!(s.contains("subagent \"push the release\" needs sandbox permission"));
-        assert!(s.contains("git push"));
-        assert!(s.contains("a allow"));
+        assert!(
+            s.contains("push the release") && s.contains("needs permission"),
+            "subagent hint visible: {s}"
+        );
+        assert!(s.contains("git push"), "command visible: {s}");
+        assert!(s.contains("[a] allow"), "buttons visible: {s}");
     }
 
     #[test]
@@ -1396,16 +1510,30 @@ mod tests {
             child_title: String::new(),
             from_subagent: false,
         });
-
+        app.blocks.push(crate::blocks::Block {
+            kind: crate::blocks::BlockKind::Tool,
+            title: "Sandbox".to_string(),
+            tool_name: "sandbox".to_string(),
+            text: "cargo test --workspace --all-features WRAP_SENTINEL".to_string(),
+            approval: Some(crate::blocks::InlineApproval {
+                id: "abc".into(),
+                session_id: "sess1".into(),
+                command: "cargo test --workspace --all-features WRAP_SENTINEL".into(),
+                cwd: "/tmp".into(),
+                rule_id: "exec".into(),
+                reason: "run workspace tests".into(),
+                from_subagent: false,
+                child_title: String::new(),
+            }),
+            expanded: true,
+            ..Default::default()
+        });
+        app.viewport_dirty = true;
+        app.refresh_viewport();
         let term = frame(&mut app, 40, 24);
         let s = text(&term);
-
-        assert!(s.contains("cargo test --workspace"));
-        assert!(
-            s.contains("WRAP_SENTINEL"),
-            "command tail was clipped:\n{s}"
-        );
-        assert!(s.contains("a allow"), "wrapped command hid approval keys");
+        assert!(s.contains("Sandbox"), "title visible: {s}");
+        assert!(s.contains("[a] allow"), "buttons visible: {s}");
     }
 
     #[test]

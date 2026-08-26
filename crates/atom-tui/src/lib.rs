@@ -876,8 +876,28 @@ async fn run_effects(
                     }
                 });
             }
+            Effect::OpenLink { uri } => {
+                atom_core::util::open_url(&uri);
+            }
             Effect::PaintPreviews => {
-                if !preview::kitty_terminal() || !app.preview_dirty {
+                if !preview::kitty_terminal() {
+                    continue;
+                }
+                // Diagram ids and geometry are (re)derived here so freshly
+                // attached diagrams still paint even if a render pass has
+                // not filled them in yet.
+                let inner = app.inner_width().saturating_sub(2).max(1);
+                if crate::blocks::assign_block_diagram_ids(&mut app.blocks) {
+                    app.preview_dirty = true;
+                }
+                for block in app.blocks.iter_mut() {
+                    if let Some(d) = block.diagram.as_mut() {
+                        if crate::blocks::diagram_geometry(d, inner) {
+                            app.preview_dirty = true;
+                        }
+                    }
+                }
+                if !app.preview_dirty {
                     continue;
                 }
                 app.preview_dirty = false;
@@ -903,7 +923,26 @@ async fn run_effects(
                         }
                     }
                 }
-                tokio::task::spawn_blocking(move || preview::paint_kitty_previews(&entries));
+                // Diagrams: current placements plus every diagram id no
+                // longer referenced, which gets deleted on the tty.
+                let mut diagram_specs: Vec<(usize, String, usize, usize)> = Vec::new();
+                let mut diagram_ids: Vec<usize> = Vec::new();
+                for block in app.blocks.iter() {
+                    if let Some(d) = &block.diagram {
+                        if d.id > 0 && d.cols > 0 && d.rows > 0 {
+                            diagram_ids.push(d.id);
+                            diagram_specs.push((d.id, d.png.clone(), d.cols, d.rows));
+                        }
+                    }
+                }
+                let stale: Vec<usize> = (crate::blocks::MIN_KITTY_DIAGRAM_ID
+                    ..=crate::blocks::MAX_KITTY_DIAGRAM_ID)
+                    .filter(|id| !diagram_ids.contains(id))
+                    .collect();
+                tokio::task::spawn_blocking(move || {
+                    preview::paint_kitty_diagrams(&diagram_specs, &stale);
+                    preview::paint_kitty_previews(&entries);
+                });
             }
         }
     }

@@ -10,8 +10,9 @@ use atom_core::providers::codex::{
     do_openai_codex_round, marshal_openai_codex_request, openai_codex_auth_for_key,
 };
 use atom_core::providers::{
-    bedrock_style_for_url, context_window_tokens, model_supports_image_input,
-    provider_name_for_url, reasoning_field_for_url, stream_bedrock, stream_chat,
+    anthropic_style_for_url, bedrock_style_for_url, context_window_tokens,
+    model_supports_image_input, provider_name_for_url, reasoning_field_for_url, stream_anthropic,
+    stream_bedrock, stream_chat,
 };
 use atom_core::session::compaction::{
     compact_session, compact_span, compaction_prompt_text, compaction_target, compaction_threshold,
@@ -687,6 +688,11 @@ pub async fn run_session_turn(
     let mut finished = false;
     let mut nudge_attempt: usize = 0;
     let mut empty_response_attempt: usize = 0;
+    // The "current time" system note is captured once per turn, not per
+    // round: it is folded into the system prefix of every request, and a
+    // per-minute regeneration would rewrite that prefix each round,
+    // invalidating the provider's prompt cache for the whole conversation.
+    let now_note = Local::now().format("%D,%H:%M").to_string();
     'rounds: for _round in 0..MAX_TOOL_ROUNDS {
         // Stop immediately when the turn was paused.
         if ctx.err() {
@@ -732,7 +738,7 @@ pub async fn run_session_turn(
             sess.instructions.len().min(msgs.len()),
             Message {
                 role: "system".into(),
-                content: Local::now().format("%D,%H:%M").to_string(),
+                content: now_note.clone(),
                 ..Default::default()
             },
         );
@@ -766,6 +772,105 @@ pub async fn run_session_turn(
             // unchanged.
             let opened = await_round(
                 stream_bedrock(&base_url, &key, &sess.model, &msgs, &tools, &opts.thinking),
+                &turn_cancel,
+                &ctx.parent,
+                &round_cancel,
+            )
+            .await;
+            let chunks = match opened {
+                None => {
+                    ctx.handle.set_round_cancel(None);
+                    if ctx.err() {
+                        finish_paused_turn(state, sess, &out, id).await;
+                        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                        return;
+                    }
+                    if let Some(extra) = ctx.handle.take_compact() {
+                        if let Err(ferr) = fold_session(state, sess, &out, id, &extra).await {
+                            emit(state, &out, id, &fold_error_event(&ferr)).await;
+                        }
+                    }
+                    continue 'rounds;
+                }
+                Some(result) => match result {
+                    Ok(c) => c,
+                    Err(err) => {
+                        ctx.handle.set_round_cancel(None);
+                        if ctx.err() {
+                            finish_paused_turn(state, sess, &out, id).await;
+                            end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                            return;
+                        }
+                        if let Some(extra) = ctx.handle.take_compact() {
+                            if let Err(ferr) = fold_session(state, sess, &out, id, &extra).await {
+                                emit(state, &out, id, &fold_error_event(&ferr)).await;
+                            }
+                            continue 'rounds;
+                        }
+                        let msg = provider_error_message(&err, &base_url);
+                        let ev = event(vec![
+                            ("type", json!("error")),
+                            ("message", json!(msg.clone())),
+                        ]);
+                        emit(state, &out, id, &ev).await;
+                        sess.messages.push(Message {
+                            role: "error".into(),
+                            content: msg,
+                            ..Default::default()
+                        });
+                        persist_session(state, sess, id).await;
+                        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                        return;
+                    }
+                },
+            };
+            let r = stream_model_to_client(
+                state,
+                &out,
+                id,
+                chunks,
+                &turn_cancel,
+                &ctx.parent,
+                &round_cancel,
+                &reasoning_field,
+            )
+            .await;
+            ctx.handle.set_round_cancel(None);
+            match r {
+                Ok(result) => result,
+                Err(err) => {
+                    if ctx.err() {
+                        finish_paused_turn(state, sess, &out, id).await;
+                        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                        return;
+                    }
+                    let msg = provider_error_message(&err, &base_url);
+                    let ev = event(vec![
+                        ("type", json!("error")),
+                        ("message", json!(msg.clone())),
+                    ]);
+                    emit(state, &out, id, &ev).await;
+                    sess.messages.push(Message {
+                        role: "error".into(),
+                        content: msg,
+                        ..Default::default()
+                    });
+                    persist_session(state, sess, id).await;
+                    end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                    return;
+                }
+            }
+        } else if anthropic_style_for_url(&base_url) {
+            // Anthropic Messages dialect: first-party api.anthropic.com
+            // plus gateways exposing an /anthropic/ path (MiniMax's
+            // /anthropic/v1 mirror). Routing these to stream_chat would
+            // POST {base}/chat/completions — a path the Messages-only
+            // mirrors answer with a plain-text "404 page not found".
+            // stream_anthropic POSTs {base}/messages and translates the
+            // SSE events into the shared OpenAI-delta shape, so the
+            // relay below is unchanged.
+            let opened = await_round(
+                stream_anthropic(&base_url, &key, &sess.model, &msgs, &tools, &opts.thinking),
                 &turn_cancel,
                 &ctx.parent,
                 &round_cancel,
@@ -1183,6 +1288,7 @@ pub async fn run_session_turn(
                 state.clone(),
                 id.to_string(),
                 out.clone(),
+                Some(ctx.handle.cancel_token()),
             );
             let bridge = crate::dispatch::DispatchBridge::new(
                 state.clone(),

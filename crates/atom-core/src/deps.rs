@@ -1,7 +1,8 @@
 //! Startup tool dependency check for the atom client (macOS).
 //!
-//! The grep/glob tools shell out to `rg` and vector search shells out to
-//! `uvx`, so both must exist on PATH before the server or TUI starts.
+//! The grep/glob tools shell out to `rg`, vector search shells out to
+//! `uvx`, and visualize shells out to `merman-cli`, so these must exist
+//! on PATH before the server or TUI starts.
 //! `ensure_on_startup` runs very early in main(), while the terminal is
 //! still in its normal (non-raw) state, and offers to install anything
 //! missing via Homebrew. Detection is a PATH scan plus a `--version`
@@ -22,18 +23,23 @@ pub struct ToolDep {
     pub why: &'static str,
     /// Homebrew package name.
     pub brew: &'static str,
+    /// crates.io crate name for the `cargo install` fallback, if the
+    /// binary is published there.
+    pub cargo: Option<&'static str>,
     /// Human instructions shown when the auto-install fails.
     pub manual: &'static str,
 }
 
 /// The runtime tool dependencies. Keep in sync with the executors in
-/// atom-tools (search.rs uses `rg`, vector_search.rs uses `uvx`).
-pub const REQUIRED_TOOLS: [ToolDep; 2] = [
+/// atom-tools (search.rs uses `rg`, vector_search.rs uses `uvx`,
+/// visualize.rs uses `merman-cli`).
+pub const REQUIRED_TOOLS: [ToolDep; 3] = [
     ToolDep {
         name: "ripgrep",
         bin: "rg",
         why: "grep/glob file search",
         brew: "ripgrep",
+        cargo: Some("ripgrep"),
         manual: "brew install ripgrep (or: cargo install ripgrep)",
     },
     ToolDep {
@@ -41,7 +47,16 @@ pub const REQUIRED_TOOLS: [ToolDep; 2] = [
         bin: "uvx",
         why: "vector search",
         brew: "uv",
+        cargo: None,
         manual: "brew install uv (or: curl -LsSf https://astral.sh/uv/install.sh | sh)",
+    },
+    ToolDep {
+        name: "merman-cli",
+        bin: "merman-cli",
+        why: "diagram rendering (visualize)",
+        brew: "merman-cli",
+        cargo: Some("merman-cli"),
+        manual: "brew install merman-cli (or: cargo install merman-cli)",
     },
 ];
 
@@ -152,16 +167,16 @@ pub async fn run_cmd(prog: &Path, args: &[String], timeout: Duration) -> Result<
 }
 
 /// Chooses how to install `dep` given the PATH `path`: Homebrew first
-/// (user-owned, no sudo), then cargo for ripgrep, then the official uv
-/// installer script. Returns the argv to run, or an error explaining
-/// what to do when no installer is available.
+/// (user-owned, no sudo), then cargo for deps published on crates.io,
+/// then the official uv installer script. Returns the argv to run, or
+/// an error explaining what to do when no installer is available.
 pub fn install_command(dep: &ToolDep, path: &OsStr) -> Result<(PathBuf, Vec<String>), String> {
     if let Some(brew) = find_in_path_with("brew", path) {
         return Ok((brew, vec!["install".to_string(), dep.brew.to_string()]));
     }
-    if dep.bin == "rg" {
+    if let Some(crate_name) = dep.cargo {
         if let Some(cargo) = find_in_path_with("cargo", path) {
-            return Ok((cargo, vec!["install".to_string(), dep.brew.to_string()]));
+            return Ok((cargo, vec!["install".to_string(), crate_name.to_string()]));
         }
         return Err(format!(
             "no Homebrew or cargo on PATH; install Homebrew from https://brew.sh, then: {}",
@@ -385,6 +400,17 @@ mod tests {
         let (prog, args) = install_command(&REQUIRED_TOOLS[1], path).unwrap();
         assert_eq!(prog, PathBuf::from("/bin/sh"));
         assert!(args[1].contains("astral.sh/uv/install.sh"));
+    }
+
+    #[test]
+    fn install_command_falls_back_to_cargo_for_merman() {
+        let dir = tempfile::tempdir().unwrap();
+        let cargo = dir.path().join("cargo");
+        std::fs::write(&cargo, b"fake").unwrap();
+        let path = dir.path().as_os_str(); // no brew on this PATH
+        let (prog, args) = install_command(&REQUIRED_TOOLS[2], path).unwrap();
+        assert_eq!(prog, cargo);
+        assert_eq!(args, vec!["install".to_string(), "merman-cli".to_string()]);
     }
 
     #[test]

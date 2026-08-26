@@ -138,9 +138,9 @@ async fn main() {
 async fn run() -> Result<()> {
     let args = parse_args()?;
 
-    // Ensure required tool dependencies (rg, uvx) exist before the
-    // server spawns or the TUI takes over the terminal, while it is
-    // still in a clean, non-raw state. Interactive on a TTY client;
+    // Ensure required tool dependencies (rg, uvx, merman-cli) exist
+    // before the server spawns or the TUI takes over the terminal, while
+    // it is still in a clean, non-raw state. Interactive on a TTY client;
     // headless (-serve) warns only, unless ATOM_DEPS_AUTOINSTALL=1.
     if !args.no_deps && !args.output_test && !args.stats {
         let interactive = unsafe { libc::isatty(libc::STDIN_FILENO) == 1 };

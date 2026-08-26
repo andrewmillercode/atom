@@ -5,7 +5,7 @@
 use crate::dispatch::{self, DispatchPlan};
 use crate::file_edit::FileSeen;
 use crate::mcp;
-use crate::{file_edit, read_file, search, skills, vector_search, web_search};
+use crate::{file_edit, read_file, search, skills, vector_search, visualize, web_search};
 use atom_core::types::ImageData;
 use atom_sandbox::approvals::Approver;
 use atom_sandbox::policy::SandboxConfig;
@@ -52,7 +52,7 @@ pub struct ToolOutcome {
 }
 
 impl ToolOutcome {
-    fn from_text(text: String) -> Self {
+    pub(crate) fn from_text(text: String) -> Self {
         ToolOutcome {
             text,
             ..Default::default()
@@ -100,6 +100,7 @@ pub async fn execute_tool(ctx: &ToolCtx<'_>, name: &str, args_json: &str) -> Too
         "grep" => ToolOutcome::from_text(search::grep_search(args_json, &ctx.cwd).await),
         "glob" => ToolOutcome::from_text(search::glob_search(args_json, &ctx.cwd).await),
         "read_file" => read_file::execute_read_file(args_json, ctx),
+        "visualize" => visualize::execute_visualize(args_json, ctx).await,
         "write_file" => file_edit::execute_write_file(args_json, ctx).await,
         "edit_file" => file_edit::execute_edit_file(args_json, ctx).await,
         "bash" => execute_bash(args_json, ctx).await,

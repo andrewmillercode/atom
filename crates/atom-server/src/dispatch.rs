@@ -15,7 +15,7 @@ use serde_json::json;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// How long an approval prompt waits for POST /approval before denying.
+/// Default timeout for test approvers (production approvals block indefinitely).
 pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// dispatch result: how long `wait:true` blocks for a subagent's turn to
@@ -124,7 +124,9 @@ pub struct ServerApprover {
     state: Arc<AppState>,
     session_id: String,
     out: crate::turn::EventOut,
-    pub timeout: Duration,
+    /// Cancel token for the current turn — allows Esc/pause to interrupt
+    /// an indefinitely-blocking approval prompt.
+    cancel: Option<crate::cancel::CancelToken>,
 }
 
 /// Builds the `approval_request` event for one pending prompt. When the
@@ -169,26 +171,39 @@ impl ServerApprover {
             state,
             session_id,
             out: crate::turn::EventOut::Discard,
-            timeout: APPROVAL_TIMEOUT,
+            cancel: None,
         }
     }
 
-    pub fn for_turn(state: Arc<AppState>, session_id: String, out: crate::turn::EventOut) -> Self {
+    pub fn for_turn(
+        state: Arc<AppState>,
+        session_id: String,
+        out: crate::turn::EventOut,
+        cancel: Option<crate::cancel::CancelToken>,
+    ) -> Self {
         ServerApprover {
             state,
             session_id,
             out,
-            timeout: APPROVAL_TIMEOUT,
+            cancel,
         }
     }
 
-    /// Test/short-timeout variant.
+    /// Test/short-timeout variant (uses a fixed timeout instead of blocking
+    /// indefinitely).
     pub fn with_timeout(state: Arc<AppState>, session_id: String, timeout: Duration) -> Self {
+        // For tests: use a cancellation token that fires after `timeout`.
+        let cancel = crate::cancel::CancelToken::new();
+        let c2 = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(timeout).await;
+            c2.cancel();
+        });
         ServerApprover {
             state,
             session_id,
             out: crate::turn::EventOut::Discard,
-            timeout,
+            cancel: Some(cancel),
         }
     }
 }
@@ -224,10 +239,18 @@ impl Approver for ServerApprover {
         if let Some(parent_id) = &parent_id {
             self.state.subs.broadcast(parent_id, &ev);
         }
-        let decision = match tokio::time::timeout(self.timeout, rx).await {
-            Ok(Ok(decision)) => decision,
-            // Timeout or dropped waiter -> Deny.
-            _ => Decision::Deny,
+        let decision = match &self.cancel {
+            Some(cancel) => {
+                tokio::select! {
+                    res = rx => res.unwrap_or(Decision::Deny),
+                    _ = cancel.cancelled() => Decision::Deny,
+                }
+            }
+            None => {
+                // No cancel token: block indefinitely until user responds
+                // or the oneshot sender is dropped (session cleanup).
+                rx.await.unwrap_or(Decision::Deny)
+            }
         };
         self.state.approvals.remove(&self.session_id, &id);
         if let Some(child) = self.state.store.get_info(&self.session_id) {
@@ -676,6 +699,11 @@ pub fn kickoff_dispatch_turn(
 ) {
     let state = state.clone();
     let id = id.to_string();
+    // Keep the parent's provider credentials for a potential auto-continue
+    // turn after the child finishes (dispatch inherits the caller's provider).
+    let parent_key = key.to_string();
+    let parent_base_url = base_url.to_string();
+    let parent_reasoning_field = reasoning_field.to_string();
     let opts = crate::turn::TurnOpts {
         message: String::new(),
         thinking: thinking.to_string(),
@@ -708,17 +736,129 @@ pub fn kickoff_dispatch_turn(
         // main agent (and the TUI) learn about completion without polling.
         let parent_id = sess.parent_id.clone();
         if !parent_id.is_empty() {
-            let status = state
+            let child_status = state
                 .store
                 .get_info(&id)
-                .map(|child| child.status.as_str())
-                .unwrap_or("error");
+                .map(|child| child.status)
+                .unwrap_or(DelegateStatus::Error);
             state.subs.broadcast(
                 &parent_id,
-                &json!({"type": "dispatch_result", "child": id, "status": status}),
+                &json!({"type": "dispatch_result", "child": id, "status": child_status.as_str()}),
             );
+            // Auto-continue: when the child reached a terminal state and the
+            // parent session is idle, start a follow-up turn so the parent
+            // agent can inspect results and report to the user.
+            if !child_status.is_active() {
+                maybe_auto_continue_parent(
+                    &state,
+                    &parent_id,
+                    &parent_key,
+                    &parent_base_url,
+                    &parent_reasoning_field,
+                )
+                .await;
+            }
         }
     });
+}
+
+/// Small delay before auto-continuing the parent to batch multiple
+/// near-simultaneous subagent completions into one parent turn.
+const AUTO_CONTINUE_DEBOUNCE: Duration = Duration::from_millis(600);
+
+/// Attempt to auto-continue the parent session when one or more subagents
+/// reach a terminal state. Uses `try_prepare_session_turn` for atomic
+/// reservation so concurrent completions don't race: only the first one
+/// that wins the reservation triggers the turn. Only fires when ALL alive
+/// (non-cancelled) children have reached a terminal state so the parent
+/// gets one clean turn with complete results rather than being woken
+/// repeatedly for partial completions.
+async fn maybe_auto_continue_parent(
+    state: &Arc<AppState>,
+    parent_id: &str,
+    key: &str,
+    base_url: &str,
+    reasoning_field: &str,
+) {
+    // Short debounce: if multiple subagents finish around the same time,
+    // we want one parent turn that sees them all rather than several turns
+    // each seeing only one.
+    tokio::time::sleep(AUTO_CONTINUE_DEBOUNCE).await;
+
+    // Gather children status to decide whether to proceed.
+    let children: Vec<SessionInfo> = state
+        .store
+        .children_info(parent_id)
+        .into_iter()
+        .filter(|child| !child.cancelled)
+        .collect();
+
+    if children.is_empty() {
+        return;
+    }
+
+    // Only auto-continue when ALL alive children are terminal (done/error).
+    let all_terminal = children.iter().all(|c| !c.status.is_active());
+    if !all_terminal {
+        return;
+    }
+
+    // Atomically reserve the parent — if it's already running (user sent
+    // a message, or another auto-continue won the race) we bail out.
+    if !state.turns.try_prepare_session_turn(parent_id) {
+        return;
+    }
+
+    let done_count = children
+        .iter()
+        .filter(|c| c.status == DelegateStatus::Done)
+        .count();
+    let error_count = children
+        .iter()
+        .filter(|c| c.status == DelegateStatus::Error)
+        .count();
+    let total = children.len();
+
+    let status_summary = if error_count > 0 {
+        format!("{done_count} done, {error_count} errored (out of {total})")
+    } else {
+        format!("all {total} done")
+    };
+
+    let notification = format!(
+        "[system: your subagents have finished ({status_summary}). \
+         Use dispatch action=inspect to collect their results and report back to the user.]"
+    );
+
+    let load_id = parent_id.to_string();
+    let Some(mut parent_sess) = state.store_call(move |store| store.get(&load_id)).await else {
+        state.turns.release_prepared(parent_id);
+        return;
+    };
+
+    let parent_thinking = parent_sess.thinking.clone();
+    let parent_id_owned = parent_id.to_string();
+    let opts = crate::turn::TurnOpts {
+        message: notification,
+        thinking: parent_thinking,
+        key: key.to_string(),
+        base_url: base_url.to_string(),
+        reasoning_field: reasoning_field.to_string(),
+        turn_id: format!("auto-continue-{parent_id_owned}"),
+        images: Vec::new(),
+        compact: false,
+        compact_instructions: String::new(),
+        skip_append: false,
+    };
+    crate::turn::run_session_turn(
+        state,
+        &mut parent_sess,
+        &parent_id_owned,
+        opts,
+        crate::turn::EventOut::Discard,
+        crate::cancel::CancelToken::new(),
+    )
+    .await;
 }
 
 #[cfg(test)]

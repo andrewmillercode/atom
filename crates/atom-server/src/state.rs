@@ -426,6 +426,13 @@ impl TurnTable {
         true
     }
 
+    /// Release a reservation made by try_prepare_session_turn without
+    /// starting a turn. Used when auto-continue decides not to proceed.
+    pub fn release_prepared(&self, id: &str) {
+        let mut maps = self.0.lock().unwrap();
+        maps.reserved.remove(id);
+    }
+
     pub fn clear_pending_pauses(&self, id: &str) {
         self.0.lock().unwrap().pending_pauses.remove(id);
     }

@@ -101,6 +101,9 @@ pub struct App {
     // conversation
     pub blocks: Vec<Block>,
     pub content_lines: Vec<Arc<Line<'static>>>,
+    /// Per content line, clickable OSC 8 link regions (parallel to
+    /// content_lines).
+    pub link_lines: Vec<Vec<crate::ansi::LinkRegion>>,
     pub block_start: Vec<usize>,
     pub content_width: usize,
     /// pinned to the newest output until the user scrolls up
@@ -120,6 +123,9 @@ pub struct App {
     pub selecting: bool,
     pub sel_active: bool,
     pub prompt_selecting: bool,
+    /// URI armed by pressing on a link; opened on release unless the
+    /// press turned into a drag selection.
+    pub link_pending: Option<String>,
     pub copied_msg: String,
     pub copied_at: Option<Instant>,
 
@@ -201,6 +207,12 @@ pub struct App {
     pub reasoning_visible: bool,
     pub reasoning_sel: usize,
 
+    // @ file-mention menu
+    pub at_menu_visible: bool,
+    pub at_menu_items: Vec<String>,
+    pub at_menu_sel: usize,
+    pub at_menu_query: String,
+
     // pasted images attached to the pending prompt
     pub pending: Vec<PendingImage>,
     pub preview_dirty: bool,
@@ -236,6 +248,7 @@ impl App {
             show_reasoning: true,
             blocks: Vec::new(),
             content_lines: Vec::new(),
+            link_lines: Vec::new(),
             block_start: Vec::new(),
             content_width: 0,
             following: true,
@@ -247,6 +260,7 @@ impl App {
             selecting: false,
             sel_active: false,
             prompt_selecting: false,
+            link_pending: None,
             copied_msg: String::new(),
             copied_at: None,
             splash_t: 0.0,
@@ -299,6 +313,10 @@ impl App {
             context_sel: 0,
             reasoning_visible: false,
             reasoning_sel: 0,
+            at_menu_visible: false,
+            at_menu_items: Vec::new(),
+            at_menu_sel: 0,
+            at_menu_query: String::new(),
             pending: Vec::new(),
             preview_dirty: false,
             approval: None,
@@ -579,11 +597,10 @@ impl App {
             let show_r = self.show_reasoning;
             let b = &mut self.blocks[i];
             if !b.lines_valid(width, show_r) {
-                let rendered = blocks::render_block(b, width, show_r, &frame)
-                    .into_iter()
-                    .map(Arc::new)
-                    .collect::<Vec<_>>();
-                b.lines = Some(rendered.clone());
+                let rendered = blocks::render_block_linked(b, width, show_r, &frame);
+                let lines = rendered.lines.into_iter().map(Arc::new).collect();
+                b.lines = Some(lines);
+                b.line_links = rendered.links;
                 b.line_width = width;
                 b.line_show_r = show_r;
                 b.line_expanded = b.expanded;
@@ -618,9 +635,11 @@ impl App {
                 raw
             };
             self.content_lines.truncate(keep_lines);
+            self.link_lines.truncate(keep_lines);
             self.block_start.truncate(idx);
         } else {
             self.content_lines.clear();
+            self.link_lines.clear();
             self.block_start.clear();
         }
 
@@ -634,13 +653,18 @@ impl App {
                 .any(|line| line.spans.iter().any(|span| !span.content.is_empty()));
             if !visible {
                 self.block_start.push(self.content_lines.len());
+                self.link_lines.push(Vec::new());
                 continue;
             }
             if has_visible_block {
                 self.content_lines.push(Arc::new(Line::from("")));
+                self.link_lines.push(Vec::new());
             }
             self.block_start.push(self.content_lines.len());
             self.content_lines.extend(lines.iter().cloned());
+            self.link_lines.extend(
+                (0..lines.len()).map(|i| block.line_links.get(i).cloned().unwrap_or_default()),
+            );
             has_visible_block = true;
         }
     }
@@ -826,6 +850,9 @@ impl App {
             "tool_result" => {
                 blocks::attach_tool_result(&mut self.blocks, &ev.text, "");
                 self.viewport_dirty = true;
+                if blocks::assign_block_diagram_ids(&mut self.blocks) {
+                    self.preview_dirty = true;
+                }
                 if !self.session.id.is_empty()
                     && !atom_tools::parse_dispatch_session_id(&ev.text).is_empty()
                 {
@@ -899,23 +926,45 @@ impl App {
                 }
             }
             "approval_request" => {
-                // Pause input behind the sandbox approval box. When the
-                // request comes from a dispatched subagent, `session_id`
-                // names the child session the decision must be posted to.
+                // Render the sandbox approval inline as a tool block with
+                // clickable buttons. The block stays active (tool_done=false)
+                // until the user responds.
+                let sid = if ev.session_id.is_empty() {
+                    self.session.id.clone()
+                } else {
+                    ev.session_id.clone()
+                };
                 self.approval = Some(ApprovalPrompt {
                     id: ev.id.clone(),
                     command: ev.command.clone(),
                     cwd: ev.cwd.clone(),
                     rule_id: ev.rule_id.clone(),
                     reason: ev.reason.clone(),
-                    session_id: if ev.session_id.is_empty() {
-                        self.session.id.clone()
-                    } else {
-                        ev.session_id.clone()
-                    },
+                    session_id: sid.clone(),
                     child_title: ev.child_title.clone(),
                     from_subagent: ev.from_subagent,
                 });
+                self.blocks.push(Block {
+                    kind: BlockKind::Tool,
+                    title: "Sandbox".to_string(),
+                    tool_name: "sandbox".to_string(),
+                    text: ev.command.clone(),
+                    approval: Some(blocks::InlineApproval {
+                        id: ev.id.clone(),
+                        session_id: sid,
+                        command: ev.command.clone(),
+                        cwd: ev.cwd.clone(),
+                        rule_id: ev.rule_id.clone(),
+                        reason: ev.reason.clone(),
+                        from_subagent: ev.from_subagent,
+                        child_title: ev.child_title.clone(),
+                    }),
+                    expanded: true,
+                    ..Default::default()
+                });
+                self.viewport_dirty = true;
+                self.following = true;
+                self.refresh_viewport();
             }
             "paused" => {
                 self.finalize_reasoning(None);
@@ -1034,6 +1083,73 @@ impl App {
         self.reasoning_sel = 0;
     }
 
+    pub fn close_at_menu(&mut self) {
+        self.at_menu_visible = false;
+        self.at_menu_items.clear();
+        self.at_menu_sel = 0;
+        self.at_menu_query.clear();
+    }
+
+    /// Extracts the @-query token at the cursor (the word immediately
+    /// after the last `@` before the cursor that has no spaces).
+    fn at_query_at_cursor(&self) -> Option<String> {
+        let value = &self.input.value;
+        let cursor = self.input.cursor.min(value.len());
+        let before = &value[..cursor];
+        // Find the last `@` before the cursor.
+        let at_pos = before.rfind('@')?;
+        let after_at = &before[at_pos + 1..];
+        // The @-query must not contain spaces (it's a single token).
+        if after_at.contains([' ', '\t', '\n']) {
+            return None;
+        }
+        Some(after_at.to_string())
+    }
+
+    /// Syncs the @-mention file menu based on the current input.
+    fn sync_at_menu(&mut self) {
+        let Some(query) = self.at_query_at_cursor() else {
+            self.close_at_menu();
+            return;
+        };
+        // Build file list from cwd
+        let items = list_project_files(&self.cwd, &query);
+        if items.is_empty() {
+            self.close_at_menu();
+            return;
+        }
+        self.at_menu_query = query;
+        self.at_menu_items = items;
+        if self.at_menu_sel >= self.at_menu_items.len() {
+            self.at_menu_sel = 0;
+        }
+        self.at_menu_visible = true;
+    }
+
+    /// Selects the highlighted @-menu item: replaces the @query with the
+    /// full path.
+    pub fn select_at_menu_item(&mut self) -> Vec<Effect> {
+        if self.at_menu_sel >= self.at_menu_items.len() {
+            self.close_at_menu();
+            return Vec::new();
+        }
+        let selected = self.at_menu_items[self.at_menu_sel].clone();
+        // Replace the @query in the input with @selected
+        let value = &self.input.value;
+        let cursor = self.input.cursor.min(value.len());
+        let before = &value[..cursor];
+        if let Some(at_pos) = before.rfind('@') {
+            let prefix = value[..at_pos].to_string();
+            let suffix = value[cursor..].to_string();
+            let new_value = format!("{}@{}{}", prefix, selected, suffix);
+            let new_cursor = at_pos + 1 + selected.len();
+            self.input.set_value(&new_value);
+            self.input.cursor = new_cursor;
+        }
+        self.close_at_menu();
+        Vec::new()
+    }
+
     pub fn hide_manage_menu(&mut self) {
         self.manage_visible = false;
         self.close_context_menu();
@@ -1104,8 +1220,9 @@ impl App {
             return self.open_picker(kind);
         }
 
-        let passthrough =
-            !text.starts_with('/') || overlays::is_catalog_prompt(text, &self.slash_commands);
+        let passthrough = !text.starts_with('/')
+            || overlays::is_catalog_prompt(text, &self.slash_commands)
+            || overlays::looks_like_file_path(text);
         if passthrough && (self.streaming || self.remote_working) {
             // Mid-stream submit: the interruption rides in the effect.
             // Pause the running turn via the server first, then dial the
@@ -1120,6 +1237,7 @@ impl App {
             self.dismiss_manage_menu();
             self.close_picker();
             self.close_context_menu();
+            self.close_at_menu();
             self.err_msg.clear();
             self.paused = true;
             self.interrupting = true;
@@ -1160,6 +1278,7 @@ impl App {
         self.dismiss_manage_menu();
         self.close_picker();
         self.close_context_menu();
+        self.close_at_menu();
         self.err_msg.clear();
 
         if passthrough {
@@ -1842,6 +1961,9 @@ impl App {
         }
         let reserved: Vec<usize> = self.pending.iter().map(|p| p.num).collect();
         blocks::assign_block_image_nums(&mut self.blocks, &reserved);
+        if blocks::assign_block_diagram_ids(&mut self.blocks) {
+            self.preview_dirty = true;
+        }
         if self
             .blocks
             .iter()
@@ -2050,7 +2172,8 @@ impl App {
         // Slash menu visibility follows the typed prefix; a Ctrl+P-opened
         // menu (menu_virtual) stays open against the prompt as-is.
         let typed = self.menu_typed();
-        if typed.starts_with('/') || self.menu_virtual {
+        if (typed.starts_with('/') && !overlays::looks_like_file_path(&typed)) || self.menu_virtual
+        {
             let n = overlays::match_commands(&typed, &self.slash_commands).len();
             if n > 0 {
                 self.set_menu_visible(true);
@@ -2063,6 +2186,10 @@ impl App {
         } else {
             self.set_menu_visible(false);
         }
+
+        // @ file-mention menu: trigger when the cursor is inside an @word.
+        self.sync_at_menu();
+
         effects
     }
 
@@ -2144,6 +2271,10 @@ impl App {
             }
         } else if self.menu_visible {
             if let Some(fx) = self.menu_key(k.code) {
+                return fx;
+            }
+        } else if self.at_menu_visible {
+            if let Some(fx) = self.at_menu_key(k.code) {
                 return fx;
             }
         }
@@ -2398,6 +2529,29 @@ impl App {
                 }
             }
             KeyCode::Enter => return Some(self.select_manage_agent()),
+            _ => return None,
+        }
+        Some(Vec::new())
+    }
+
+    fn at_menu_key(&mut self, code: KeyCode) -> Option<Vec<Effect>> {
+        match code {
+            KeyCode::Esc => {
+                self.close_at_menu();
+            }
+            KeyCode::Up => {
+                if self.at_menu_sel > 0 {
+                    self.at_menu_sel -= 1;
+                }
+            }
+            KeyCode::Down => {
+                if self.at_menu_sel + 1 < self.at_menu_items.len() {
+                    self.at_menu_sel += 1;
+                }
+            }
+            KeyCode::Enter | KeyCode::Tab => {
+                return Some(self.select_at_menu_item());
+            }
             _ => return None,
         }
         Some(Vec::new())
@@ -2977,6 +3131,7 @@ impl App {
         };
         match decision {
             Some((wire, note)) => {
+                self.resolve_approval_block(&req.id, note);
                 self.approval = None;
                 self.copied_msg = format!("sandbox: {note}");
                 self.copied_at = Some(Instant::now());
@@ -2988,6 +3143,103 @@ impl App {
             }
             None => Vec::new(),
         }
+    }
+
+    /// Mark the inline approval block as resolved (tool_done + result text).
+    fn resolve_approval_block(&mut self, approval_id: &str, note: &str) {
+        for b in self.blocks.iter_mut().rev() {
+            if b.kind == BlockKind::Tool {
+                if let Some(ref appr) = b.approval {
+                    if appr.id == approval_id {
+                        b.tool_done = true;
+                        b.result = format!("sandbox: {note}");
+                        b.approval = None;
+                        b.lines = None;
+                        self.viewport_dirty = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Check if a click at viewport (x, y) lands on the right-aligned
+    /// "⤢ open" hint in a visualize block's header row. The header sits
+    /// one row below the block start (offset 0 is the top pad row); the
+    /// hint is the last `right_w` columns of the boxed header text.
+    fn diagram_open_hit(&self, bi: usize, x: usize, y: usize) -> Option<String> {
+        let d = self.blocks.get(bi)?.diagram.as_ref()?;
+        if d.html.is_empty() {
+            return None;
+        }
+        let block_start = *self.block_start.get(bi)?;
+        let content_row = y.checked_sub(VIEWPORT_VPAD)? + self.scroll_y;
+        if content_row != block_start + 1 {
+            return None;
+        }
+        let inner = self.inner_width().saturating_sub(2).max(1);
+        let right_w = unicode_width::UnicodeWidthStr::width(blocks::DIAGRAM_OPEN_HINT);
+        let col = x.checked_sub(TUI_HPAD)?;
+        // The boxed header starts one pad column in, so the hint occupies
+        // roughly [inner - right_w + 1, inner + 1]; stay a column generous
+        // on each side.
+        let hit_start = inner.saturating_sub(right_w);
+        if col >= hit_start && col <= inner + 1 {
+            Some(d.html.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Check if a click at (content_row, col) falls on an approval button in
+    /// block `bi`. Returns the decision string ("allow_once" etc.) or None.
+    fn approval_button_hit(&self, bi: usize, content_row: usize, col: usize) -> Option<String> {
+        // The buttons are on the last rendered line of the block.
+        // Determine which content line the buttons are on by finding the
+        // block start + offset.
+        let block_start = *self.block_start.get(bi)?;
+        let block_lines = self.blocks[bi].lines.as_ref()?;
+        let button_row = block_start + block_lines.len().saturating_sub(2); // penultimate = buttons row
+        if content_row != button_row {
+            return None;
+        }
+        // Button layout: "  [a] allow   [s] session   [g] always   [d] deny  "
+        let buttons = blocks::approval_buttons();
+        for btn in &buttons {
+            if col >= btn.col_start && col < btn.col_end {
+                return Some(btn.decision.to_string());
+            }
+        }
+        None
+    }
+
+    /// Handle clicking an approval button: resolve the block and emit the
+    /// approval effect.
+    fn resolve_approval_click(&mut self, bi: usize, decision: &str) -> Vec<Effect> {
+        let appr = match self.blocks[bi].approval.take() {
+            Some(a) => a,
+            None => return Vec::new(),
+        };
+        let note = match decision {
+            "allow_once" => "allow once",
+            "allow_session" => "allowed this session",
+            "allow_global" => "always allowed",
+            "deny" => "denied",
+            _ => "denied",
+        };
+        self.blocks[bi].tool_done = true;
+        self.blocks[bi].result = format!("sandbox: {note}");
+        self.blocks[bi].lines = None;
+        self.viewport_dirty = true;
+        self.approval = None;
+        self.copied_msg = format!("sandbox: {note}");
+        self.copied_at = Some(Instant::now());
+        self.refresh_viewport();
+        vec![Effect::RespondApproval {
+            sid: appr.session_id,
+            id: appr.id,
+            decision: decision.to_string(),
+        }]
     }
 
     // -- mouse ---------------------------------------------------------------
@@ -3015,6 +3267,7 @@ impl App {
     }
 
     fn click(&mut self, x: usize, y: usize) -> Vec<Effect> {
+        self.link_pending = None;
         // Scrollbar click: the rightmost SCROLLBAR_WIDTH columns within the
         // viewport region. The wider target also helps in terminal
         // multiplexer splits where the absolute last column's mouse events
@@ -3063,6 +3316,13 @@ impl App {
             }
             return Vec::new();
         }
+        if self.at_menu_visible {
+            if let Some(row) = viewport_y.and_then(|y| overlays::at_menu_row_at_y(self, y)) {
+                self.at_menu_sel = row;
+                return self.select_at_menu_item();
+            }
+            return Vec::new();
+        }
         if self.mouse_in_prompt(y) {
             if self.sel_active {
                 self.clear_selection();
@@ -3073,6 +3333,19 @@ impl App {
         self.input.clear_selection();
         if self.sel_active {
             self.clear_selection();
+        }
+        // A press on an OSC 8 link arms it: opened on release unless the
+        // press turns into a drag selection. Takes priority over the
+        // collapse/expand toggles below so clicking a link inside a
+        // collapsed card opens it instead of toggling.
+        if let Some(uri) = self.link_hit(x, y) {
+            self.link_pending = Some(uri);
+            if let Some(pos) = self.content_pos_at(x, y) {
+                self.selecting = true;
+                self.sel_anchor = Some(pos);
+                self.sel_end = Some(pos);
+            }
+            return Vec::new();
         }
         let mut effects = Vec::new();
         let idx = self.block_index_at_viewport_y(y);
@@ -3111,6 +3384,23 @@ impl App {
                 return Vec::new();
             }
             if self.blocks[bi].kind == BlockKind::Tool {
+                // Approval block: check if click lands on a button.
+                if self.blocks[bi].approval.is_some() {
+                    let col = x.saturating_sub(TUI_HPAD);
+                    if let Some(content_row) =
+                        y.checked_sub(VIEWPORT_VPAD).map(|vy| self.scroll_y + vy)
+                    {
+                        if let Some(decision) = self.approval_button_hit(bi, content_row, col) {
+                            return self.resolve_approval_click(bi, &decision);
+                        }
+                    }
+                    return Vec::new();
+                }
+                if let Some(uri) = self.diagram_open_hit(bi, x, y) {
+                    self.copied_msg = "opening diagram viewer".into();
+                    self.copied_at = Some(Instant::now());
+                    return vec![Effect::OpenLink { uri }];
+                }
                 if self.blocks[bi].tool_collapsible(inner, inner) {
                     self.blocks[bi].expanded = !self.blocks[bi].expanded;
                     self.blocks[bi].lines = None;
@@ -3155,6 +3445,8 @@ impl App {
                 if self.sel_end != Some(pos) {
                     self.sel_end = Some(pos);
                     self.sel_active = true;
+                    // The press became a selection, not a link open.
+                    self.link_pending = None;
                 }
             }
         }
@@ -3165,6 +3457,17 @@ impl App {
         if self.scrollbar_dragging {
             self.scrollbar_dragging = false;
             return Vec::new();
+        }
+        if let Some(uri) = self.link_pending.take() {
+            if !self.sel_active {
+                // Plain click on a link: open it.
+                self.clear_selection();
+                self.copied_msg =
+                    format!("opening {}", atom_core::util::first_line_trunc(&uri, 48));
+                self.copied_at = Some(Instant::now());
+                return vec![Effect::OpenLink { uri }];
+            }
+            // The press turned into a drag selection; copy path below.
         }
         if self.selecting {
             self.selecting = false;
@@ -3229,6 +3532,17 @@ impl App {
         let w = ansi_line_width(&self.content_lines[line]);
         Some((line, col.min(w)))
     }
+
+    /// The OSC 8 URI under a viewport position, if any.
+    pub fn link_hit(&self, x: usize, y: usize) -> Option<String> {
+        let (line, col) = self.content_pos_at(x, y)?;
+        let region = self
+            .link_lines
+            .get(line)?
+            .iter()
+            .find(|r| col >= r.c0 && col < r.c1)?;
+        Some(region.uri.clone())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3245,6 +3559,93 @@ pub(crate) fn new_turn_id() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos().to_string())
         .unwrap_or_default()
+}
+
+/// Lists project files relative to `cwd`, filtered by query.
+/// Walks the directory tree respecting .gitignore and common ignores,
+/// returning up to 50 matches sorted by relevance.
+fn list_project_files(cwd: &str, query: &str) -> Vec<String> {
+    use std::path::Path;
+
+    let root = Path::new(cwd);
+    if !root.is_dir() {
+        return Vec::new();
+    }
+
+    let mut files: Vec<String> = Vec::new();
+    collect_files(root, root, &mut files, 0);
+    files.sort();
+
+    // Filter by query (case-insensitive substring match on any component)
+    let query_lower = query.to_lowercase();
+    let filtered: Vec<String> = if query_lower.is_empty() {
+        files.into_iter().take(50).collect()
+    } else {
+        files
+            .into_iter()
+            .filter(|f| f.to_lowercase().contains(&query_lower))
+            .take(50)
+            .collect()
+    };
+    filtered
+}
+
+/// Recursively collect files, skipping common non-project directories.
+fn collect_files(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    out: &mut Vec<String>,
+    depth: usize,
+) {
+    const MAX_DEPTH: usize = 6;
+    const MAX_FILES: usize = 5000;
+    const IGNORE_DIRS: &[&str] = &[
+        "target",
+        "node_modules",
+        ".git",
+        ".hg",
+        ".svn",
+        "dist",
+        "build",
+        "__pycache__",
+        ".next",
+        ".venv",
+        "venv",
+    ];
+
+    if depth > MAX_DEPTH || out.len() >= MAX_FILES {
+        return;
+    }
+
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        if out.len() >= MAX_FILES {
+            break;
+        }
+        let path = entry.path();
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        // Skip hidden files/dirs (starting with .) except a few
+        if name_str.starts_with('.') && name_str != ".github" {
+            continue;
+        }
+
+        if path.is_dir() {
+            if IGNORE_DIRS.contains(&name_str.as_ref()) {
+                continue;
+            }
+            collect_files(root, &path, out, depth + 1);
+        } else {
+            if let Ok(rel) = path.strip_prefix(root) {
+                out.push(rel.to_string_lossy().to_string());
+            }
+        }
+    }
 }
 
 pub(crate) fn join_prompt(cur: &str, insert: &str) -> String {
@@ -3738,6 +4139,67 @@ mod tests {
     }
 
     #[test]
+    fn click_on_open_hint_launches_diagram_viewer() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = App::new_test(80, 40);
+        app.blocks.push(Block {
+            kind: BlockKind::Tool,
+            title: "Visualize".into(),
+            tool_name: "visualize".into(),
+            tool_done: true,
+            result:
+                "rendered diagram\n [atom-diagram] png=/a.png html=/a.html width=400 height=200"
+                    .into(),
+            diagram: Some(crate::blocks::DiagramRef {
+                png: "/a.png".into(),
+                html: "file:///a.html".into(),
+                w: 400,
+                h: 200,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        app.refresh_viewport();
+
+        // Header row: block start + 1 (offset 0 is the top pad row). The
+        // hint is right-aligned; its x sits at the end of the boxed text.
+        let y = (VIEWPORT_VPAD + app.block_start[0] + 1 - app.scroll_y) as u16;
+        let inner = app.inner_width().saturating_sub(2).max(1);
+        let x_hint = (TUI_HPAD + inner) as u16; // last text column
+        let ev = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x_hint,
+            row: y,
+            modifiers: KeyModifiers::empty(),
+        };
+        let fx = app.mouse(ev);
+        assert!(
+            fx.iter()
+                .any(|e| matches!(e, Effect::OpenLink { uri } if uri == "file:///a.html")),
+            "hint click must open the viewer: {fx:?}"
+        );
+
+        // A click on the left side of the same header row is a no-op.
+        let ev = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 4,
+            row: y,
+            modifiers: KeyModifiers::empty(),
+        };
+        let fx = app.mouse(ev);
+        assert!(!fx.iter().any(|e| matches!(e, Effect::OpenLink { .. })));
+        // And a click one row above (the pad row) does nothing either.
+        let ev = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x_hint,
+            row: y.saturating_sub(1),
+            modifiers: KeyModifiers::empty(),
+        };
+        let fx = app.mouse(ev);
+        assert!(!fx.iter().any(|e| matches!(e, Effect::OpenLink { .. })));
+    }
+
+    #[test]
     fn click_toggles_user_collapse() {
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
         let mut app = App::new_test(80, 40);
@@ -3769,6 +4231,65 @@ mod tests {
         let _ = app.mouse(click(1));
         assert!(!app.blocks[0].expanded, "second click collapsed the card");
         assert_eq!(app.content_lines.len(), blocks::USER_PREVIEW_LINES + 2);
+    }
+
+    #[test]
+    fn click_on_link_opens_and_drag_selects() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = App::new_test(80, 40);
+        app.blocks.push(Block {
+            kind: BlockKind::Assistant,
+            text: "see [the docs](https://docs.example.com) for more".into(),
+            ..Default::default()
+        });
+        app.refresh_viewport();
+        let line_idx = app
+            .content_lines
+            .iter()
+            .position(|l| crate::ansi::line_plain(l).contains("the docs"))
+            .expect("label in content lines");
+        let col = crate::ansi::line_plain(&app.content_lines[line_idx])
+            .find("the docs")
+            .unwrap() as u16;
+        assert_eq!(
+            app.link_lines.len(),
+            app.content_lines.len(),
+            "link table stays parallel to content lines"
+        );
+
+        let press = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: TUI_HPAD as u16 + col,
+            row: (VIEWPORT_VPAD + line_idx - app.scroll_y) as u16,
+            modifiers: KeyModifiers::empty(),
+        };
+        let _ = app.mouse(press);
+        assert_eq!(
+            app.link_pending.as_deref(),
+            Some("https://docs.example.com")
+        );
+        let release = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            ..press
+        };
+        let effects = app.mouse(release);
+        let opened = effects.iter().find_map(|e| match e {
+            Effect::OpenLink { uri } => Some(uri.clone()),
+            _ => None,
+        });
+        assert_eq!(opened.as_deref(), Some("https://docs.example.com"));
+        assert!(app.link_pending.is_none());
+
+        // Press then drag: a selection, not an open.
+        let _ = app.mouse(press);
+        let drag = MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: press.column + 6,
+            ..press
+        };
+        let _ = app.mouse(drag);
+        assert!(app.link_pending.is_none());
+        assert!(app.sel_active);
     }
 
     #[test]

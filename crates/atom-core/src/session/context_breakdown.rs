@@ -212,6 +212,11 @@ pub fn builtin_tool_definitions() -> Vec<ToolDef> {
             json!({"type":"object","properties":{"pattern":{"type":"string","description":"File glob such as **/*.rs, src/**/*.md, or Cargo.toml"},"path":{"type":"string","description":"Optional directory relative to the session workspace. Omit to search the workspace."},"head_limit":{"type":"integer","description":"Maximum paths returned. Defaults to 200."}},"required":["pattern"]})
         ),
         def!(
+            "visualize",
+            "Render a Mermaid diagram inline in the atom TUI as a high-density image, with an expand button (top-right of the rendered diagram) that opens a pan/zoom viewer in the browser. Use for conceptual thinking, architecture, data flow, function call graphs, sequence diagrams, state machines, ER models, etc. Prefer this over ASCII-art diagrams in replies. Provide standard Mermaid source (flowchart, sequenceDiagram, classDiagram, stateDiagram-v2, erDiagram, mindmap, gantt, pie, journey, gitGraph, and more). Include a short title — it names the browser artifact. If a render fails, the error names the offending line; fix the source and retry rather than giving up.",
+            json!({"type":"object","properties":{"code":{"type":"string","description":"The Mermaid diagram source, e.g. 'flowchart TD\\n  A[Start] --> B[Done]'"},"title":{"type":"string","description":"Short title for the diagram (used for the browser tab and artifact filename)"}},"required":["code"]})
+        ),
+        def!(
             "bash",
             "Run commands that require a shell, such as tests, builds, git, and package managers. File discovery and text search are faster and safer with glob and grep; file reads and changes belong in read_file, write_file, and edit_file.",
             json!({"type":"object","properties":{"command":{"type":"string","description":"Command to execute from the session workspace"}},"required":["command"]})

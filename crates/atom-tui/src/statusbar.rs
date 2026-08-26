@@ -613,13 +613,13 @@ mod tests {
         assert_eq!(status_bar_lines(&app).len(), 1);
         assert!(!wrap_status_bar(&app));
 
-        app.width = 12; // inner width 10: "gpt-5  err" fits exactly.
+        app.width = 14; // inner width 10: "gpt-5  err" fits exactly.
         app.sel_model = "gpt-5".into();
         app.err_msg = "err".into();
         assert_eq!(status_bar_rows(&app), 1);
         assert_eq!(ansi::line_width(&status_bar_lines(&app)[0]), 10);
 
-        app.width = 11;
+        app.width = 13;
         assert_eq!(status_bar_rows(&app), 2);
         assert_eq!(status_bar_lines(&app).len(), 2);
         assert!(wrap_status_bar(&app));
@@ -757,7 +757,7 @@ mod tests {
             total_tokens: 8500,
             ..Default::default()
         };
-        let mut app = app_with_subagent(u, 34);
+        let mut app = app_with_subagent(u, 36);
         app.session.parent_id = "parent".into();
         let lines = status_bar_lines(&app);
         assert!(lines.len() >= 3, "hints wrap to extra rows");

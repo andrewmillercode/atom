@@ -550,16 +550,11 @@ where
     }
 }
 
-/// SSE streaming client: POSTs {base_url}/chat/completions with Bearer
-/// auth when the key is non-empty and parses the response into
-/// StreamChunks. Establishing the request uses the common provider retry
-/// policy, including transport failures and transient gateway responses.
-/// Strip atom-internal fields from serialized messages and rename the
-/// `reasoning` key to match what the upstream provider expects on input
-/// assistant messages. Without this, providers that use
-/// `reasoning_content` (e.g. DeepSeek via OpenCode Go) never see prior
-/// reasoning and loop with reasoning-only replies.
-fn fixup_wire_messages(body: &mut serde_json::Value, reasoning_field: &str) {
+/// Remove atom-internal fields from a serialized request body and rename
+/// the reasoning key to match what the upstream provider expects.
+/// DeepSeek / OpenCode Go use `reasoning_content`; Ollama / vLLM use
+/// `reasoning`.
+fn strip_internal_fields(body: &mut serde_json::Value, reasoning_field: &str) {
     let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
         return;
     };
@@ -567,8 +562,6 @@ fn fixup_wire_messages(body: &mut serde_json::Value, reasoning_field: &str) {
         let Some(obj) = msg.as_object_mut() else {
             continue;
         };
-        // These fields are atom-internal bookkeeping and must not be sent
-        // to the upstream provider.
         obj.remove("reasoning_signature");
         obj.remove("reasoning_ms");
         obj.remove("diff");
@@ -576,12 +569,10 @@ fn fixup_wire_messages(body: &mut serde_json::Value, reasoning_field: &str) {
         obj.remove("model");
         obj.remove("duration_ms");
         obj.remove("usage");
-        // Rename `reasoning` → `reasoning_content` for providers that
-        // expect the latter (DeepSeek / OpenCode Go).
-        if reasoning_field == "reasoning_content" {
+        if reasoning_field != "reasoning" {
             if let Some(r) = obj.remove("reasoning") {
                 if r.as_str().map(|s| !s.is_empty()).unwrap_or(false) {
-                    obj.insert("reasoning_content".to_string(), r);
+                    obj.insert(reasoning_field.into(), r);
                 }
             }
         }
@@ -599,7 +590,7 @@ pub async fn stream_chat(
 ) -> anyhow::Result<impl futures::Stream<Item = anyhow::Result<types::StreamChunk>>> {
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let mut body_value = serde_json::to_value(&req)?;
-    fixup_wire_messages(&mut body_value, reasoning_field);
+    strip_internal_fields(&mut body_value, reasoning_field);
     let body = serde_json::to_vec(&body_value)?;
     let resp = super::retry::do_http_with_retry(|| {
         let mut builder = super::retry::long_timeout_client()
@@ -1412,7 +1403,9 @@ mod tests {
         base: &str,
         key: &str,
     ) -> Vec<anyhow::Result<crate::types::StreamChunk>> {
-        let stream = stream_chat(base, key, test_chat_request(), "reasoning").await.unwrap();
+        let stream = stream_chat(base, key, test_chat_request(), "reasoning")
+            .await
+            .unwrap();
         stream.collect::<Vec<_>>().await
     }
 
@@ -1525,5 +1518,70 @@ mod tests {
         };
         assert!(err.to_string().contains("400 Bad Request"));
         assert!(err.to_string().contains("invalid request"));
+    }
+
+    #[test]
+    fn strip_internal_fields_removes_metadata() {
+        let mut body = serde_json::json!({
+            "model": "test",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning": "I am thinking",
+                    "reasoning_signature": "sig-abc",
+                    "reasoning_ms": 1234,
+                    "diff": "--- a\n+++ b",
+                    "provider": "opencode-go",
+                    "model": "deepseek-v4-flash",
+                    "duration_ms": 5000,
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+                }
+            ]
+        });
+        super::strip_internal_fields(&mut body, "reasoning");
+        let msg = &body["messages"][1];
+        assert!(msg.get("reasoning_signature").is_none());
+        assert!(msg.get("reasoning_ms").is_none());
+        assert!(msg.get("diff").is_none());
+        assert!(msg.get("provider").is_none());
+        assert!(msg.get("model").is_none());
+        assert!(msg.get("duration_ms").is_none());
+        assert!(msg.get("usage").is_none());
+        // reasoning kept as-is when field matches
+        assert_eq!(msg["reasoning"], "I am thinking");
+    }
+
+    #[test]
+    fn strip_internal_fields_renames_reasoning_for_deepseek() {
+        let mut body = serde_json::json!({
+            "model": "test",
+            "messages": [{
+                "role": "assistant",
+                "content": "hello",
+                "reasoning": "deep thought",
+                "reasoning_ms": 500,
+                "provider": "opencode-go"
+            }]
+        });
+        super::strip_internal_fields(&mut body, "reasoning_content");
+        let msg = &body["messages"][0];
+        assert!(msg.get("reasoning").is_none());
+        assert_eq!(msg["reasoning_content"], "deep thought");
+        assert!(msg.get("reasoning_ms").is_none());
+        assert!(msg.get("provider").is_none());
+    }
+
+    #[test]
+    fn strip_internal_fields_skips_empty_reasoning() {
+        let mut body = serde_json::json!({
+            "model": "test",
+            "messages": [{"role": "assistant", "content": "hello", "reasoning": ""}]
+        });
+        super::strip_internal_fields(&mut body, "reasoning_content");
+        let msg = &body["messages"][0];
+        assert!(msg.get("reasoning").is_none());
+        assert!(msg.get("reasoning_content").is_none());
     }
 }

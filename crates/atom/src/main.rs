@@ -53,7 +53,7 @@ fn save_last_model_state(provider_name: &str, model: &str, thinking: &str) {
     }
 }
 
-const USAGE: &str = "usage: atom [-serve] [-model id] [-key key] [-url base] [-session id]
+const USAGE: &str = "usage: atom [-model id] [-key key] [-url base] [-session id]
                      [-stats [-stats-days N]] [--output-test] [--hot] [-no-deps]";
 
 fn help_text() -> String {
@@ -65,7 +65,6 @@ fn help_text() -> String {
 }
 
 struct Args {
-    serve: bool,
     model: String,
     key: String,
     url: String,
@@ -80,7 +79,6 @@ struct Args {
 
 fn parse_args() -> Result<Args> {
     let mut a = Args {
-        serve: false,
         model: String::new(),
         key: String::new(),
         url: String::new(),
@@ -109,7 +107,6 @@ fn parse_args() -> Result<Args> {
                 .ok_or_else(|| anyhow!("flag needs an argument: -{name}"))
         };
         match name.as_str() {
-            "serve" => a.serve = true,
             "model" => a.model = next_val()?,
             "key" => a.key = next_val()?,
             "url" => a.url = next_val()?,
@@ -141,22 +138,13 @@ async fn main() {
 async fn run() -> Result<()> {
     let args = parse_args()?;
 
-    if args.serve {
-        set_server_process_name();
-    }
-
     // Ensure required tool dependencies (rg, uvx) exist before the
     // server spawns or the TUI takes over the terminal, while it is
     // still in a clean, non-raw state. Interactive on a TTY client;
     // headless (-serve) warns only, unless ATOM_DEPS_AUTOINSTALL=1.
     if !args.no_deps && !args.output_test && !args.stats {
-        let interactive = !args.serve && unsafe { libc::isatty(libc::STDIN_FILENO) == 1 };
+        let interactive = unsafe { libc::isatty(libc::STDIN_FILENO) == 1 };
         atom_core::deps::ensure_on_startup(interactive, &atom_core::deps::RealInstaller).await;
-    }
-
-    // Server mode: start the server and block until it shuts down.
-    if args.serve {
-        return atom_server::http::run_server().await;
     }
 
     // Output-test mode: canned session demo, no server or key involved.
@@ -311,18 +299,6 @@ async fn run() -> Result<()> {
     };
 
     launch_tui(providers, sel_provider, sel_model, args, Some(session)).await
-}
-
-fn set_server_process_name() {
-    #[cfg(target_os = "macos")]
-    unsafe {
-        libc::pthread_setname_np(c"atoms".as_ptr());
-    }
-
-    #[cfg(target_os = "linux")]
-    unsafe {
-        libc::prctl(libc::PR_SET_NAME, c"atoms".as_ptr(), 0, 0, 0);
-    }
 }
 
 #[cfg(test)]

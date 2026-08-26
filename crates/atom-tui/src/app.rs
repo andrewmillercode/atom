@@ -48,6 +48,9 @@ pub const STATUS_FOOTER_ROWS: usize = 1;
 /// tuiHPad is the left/right inset in cells.
 pub const TUI_HPAD: usize = 1;
 
+/// Width of the scrollbar gutter in columns.
+pub const SCROLLBAR_WIDTH: usize = 2;
+
 /// splashTickInterval drives the empty-session atom animation.
 pub const SPLASH_TICK_MS: u64 = 33;
 
@@ -342,7 +345,10 @@ impl App {
     // -- layout helpers ----------------------------------------------------
 
     pub fn inner_width(&self) -> usize {
-        (self.width as usize).saturating_sub(2 * TUI_HPAD).max(1)
+        // left pad (TUI_HPAD) + content + right pad (1) + scrollbar (SCROLLBAR_WIDTH)
+        (self.width as usize)
+            .saturating_sub(2 * TUI_HPAD + SCROLLBAR_WIDTH)
+            .max(1)
     }
 
     pub fn input_width(&self) -> usize {
@@ -2960,8 +2966,11 @@ impl App {
     }
 
     fn click(&mut self, x: usize, y: usize) -> Vec<Effect> {
-        // Scrollbar click: rightmost column within the viewport region.
-        if x == self.width.saturating_sub(1) as usize
+        // Scrollbar click: the rightmost SCROLLBAR_WIDTH columns within the
+        // viewport region. The wider target also helps in terminal
+        // multiplexer splits where the absolute last column's mouse events
+        // are intercepted for pane-resize handling.
+        if x >= (self.width as usize).saturating_sub(SCROLLBAR_WIDTH)
             && y >= VIEWPORT_VPAD
             && y < VIEWPORT_VPAD + self.viewport_height()
             && !self.content_lines.is_empty()
@@ -4444,5 +4453,67 @@ mod tests {
         assert_eq!(last.images[0].num, 1);
         assert!(fx.iter().any(|e| matches!(e, Effect::PaintPreviews)));
         assert!(fx.iter().any(|e| matches!(e, Effect::SendTurn(_))));
+    }
+
+    #[test]
+    fn scrollbar_track_click_navigates() {
+        let mut app = App::new_test(80, 24);
+        // Fill content with many lines so scrollbar is visible.
+        app.content_lines = (0..200)
+            .map(|i| std::sync::Arc::new(Line::from(format!("line {i}"))))
+            .collect();
+        app.scroll_y = 0;
+        let vp = app.viewport_height();
+        // Click near the bottom of the scrollbar track (left column of the
+        // 2-wide scrollbar gutter: width - SCROLLBAR_WIDTH = 78).
+        let click_row = VIEWPORT_VPAD + vp - 2;
+        let ev = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 78, // left column of scrollbar gutter (width - 2)
+            row: click_row as u16,
+            modifiers: KeyModifiers::empty(),
+        };
+        let _ = app.mouse(ev);
+        // scroll_y should have jumped significantly from 0.
+        assert!(
+            app.scroll_y > 0,
+            "scrollbar track click should scroll: scroll_y = {}",
+            app.scroll_y
+        );
+        // It should be proportional to where we clicked (near the bottom).
+        let max_scroll = app
+            .content_lines
+            .len()
+            .saturating_sub(app.content_viewport_height());
+        assert!(
+            app.scroll_y > max_scroll / 2,
+            "clicking near bottom should scroll past halfway: scroll_y={}, max={}",
+            app.scroll_y,
+            max_scroll
+        );
+    }
+
+    #[test]
+    fn scrollbar_track_click_works_at_rightmost_column() {
+        // Clicking the right column of the 2-wide scrollbar also works.
+        let mut app = App::new_test(80, 24);
+        app.content_lines = (0..200)
+            .map(|i| std::sync::Arc::new(Line::from(format!("line {i}"))))
+            .collect();
+        app.scroll_y = 0;
+        let vp = app.viewport_height();
+        let click_row = VIEWPORT_VPAD + vp - 2;
+        let ev = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 79, // rightmost column (width - 1)
+            row: click_row as u16,
+            modifiers: KeyModifiers::empty(),
+        };
+        let _ = app.mouse(ev);
+        assert!(
+            app.scroll_y > 0,
+            "scrollbar click at width-1 should scroll: scroll_y = {}",
+            app.scroll_y
+        );
     }
 }

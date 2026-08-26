@@ -6,7 +6,7 @@ Guidelines for agents working on the atom codebase.
 
 This is the Rust rewrite of atom. It is a Cargo workspace under `crates/`:
 
-- `crates/atom` — the single `atom` executable (TUI plus `--serve` mode).
+- `crates/atom` — the `atom` TUI client and `atoms` background server binaries.
 - `crates/atom-server` — background session-server library used by `atom`.
 - `crates/atom-tui` — TUI implementation.
 - `crates/atom-core` — shared types and helpers.
@@ -29,9 +29,9 @@ To make `atom` available on your PATH during development:
 make install-dev
 ```
 
-This symlinks `target/debug/atom` into `~/.local/bin`. Make sure
-`~/.local/bin` is on your `PATH`. The client starts its background server by
-re-invoking the same executable with `--serve`.
+This symlinks `target/debug/atom` and `target/debug/atoms` into
+`~/.local/bin`. Make sure `~/.local/bin` is on your `PATH`. The client
+starts the `atoms` server automatically if it isn't already running.
 
 ## Tests
 
@@ -60,6 +60,12 @@ Do not reformat unrelated files in the same commit; keep diffs minimal.
 
 ## Binary name
 
-The only binary is `atom` (`[[bin]] name = "atom"` in
-`crates/atom/Cargo.toml`). It runs the TUI normally and the background server
-when invoked internally with `--serve`.
+There are two binaries in `crates/atom/Cargo.toml`:
+
+- **`atom`** — the TUI client. Automatically starts `atoms` if no server is
+  running.
+- **`atoms`** — the background session server. Cannot be launched directly;
+  it requires a launch token set by `atom` (`_ATOM_LAUNCH=managed`).
+
+Both are built by `cargo build` and installed together by `make install-dev`
+or `make install`.

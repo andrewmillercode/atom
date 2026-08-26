@@ -166,9 +166,9 @@ Stdio servers use `command` + `args` (optional `env`). HTTP servers use `url` (o
 
 ## Build
 
-Atom is distributed as one `atom` executable. The same executable runs the TUI
-normally and re-invokes itself with `--serve` for the detached background
-session server.
+Atom ships two binaries: `atom` (the TUI client) and `atoms` (the background
+session server). Running `atom` automatically starts `atoms` if it isn't
+already running. The `atoms` binary cannot be launched directly.
 
 ### Development
 

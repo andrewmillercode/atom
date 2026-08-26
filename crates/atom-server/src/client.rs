@@ -564,38 +564,25 @@ fn data_dir_pid_path() -> PathBuf {
     atom_core::session::store::data_dir().join("server.pid")
 }
 
-#[cfg(target_os = "macos")]
-fn server_executable(exe: &std::path::Path, data_dir: &std::path::Path) -> Result<PathBuf> {
-    // macOS process viewers: `ps` prints the argv[0] (/proc name), but
-    // Activity Monitor resolves symlinks and labels the process by the
-    // link *target* (`atom`). A hard link keeps the executable's own
-    // path as `atoms` — the kernel's p_comm/p_name is the last path
-    // component of the executable, so both viewers agree.
-    let link = data_dir.join("atoms");
-
-    // Build under a temp name and rename over the target: rename(2)
-    // atomically replaces a stale link or symlink left by an older
-    // client, and a fresh link is needed each launch anyway (an upgrade
-    // replaces the file the binary was linked from, so the old hard link
-    // would keep pointing at the old inode).
-    let temp = data_dir.join(format!(".atoms-link-{}", std::process::id()));
-    let _ = std::fs::remove_file(&temp);
-    if let Err(err) = std::fs::hard_link(exe, &temp) {
-        // Cross-device (EXDEV) or filesystem without hard links: fall
-        // back to a symlink so the server still starts. The process
-        // name then reuses `atom` — matching the pre-hard-link behavior.
-        let _ = std::fs::remove_file(&temp);
-        std::os::unix::fs::symlink(exe, &temp)
-            .context("create atoms server link (hard link unavailable)")?;
-        eprintln!("atom: hard linking server binary failed ({err}); using symlink");
+/// Locate the `atoms` server binary. It lives next to the running `atom`
+/// executable (same directory), which works for both dev-symlink and
+/// release installs.
+fn find_server_binary() -> Result<PathBuf> {
+    let exe = std::env::current_exe().context("find own executable")?;
+    let dir = exe.parent().context("executable has no parent dir")?;
+    let candidate = dir.join("atoms");
+    if candidate.is_file() {
+        return Ok(candidate);
     }
-    std::fs::rename(&temp, &link).context("install atoms server link")?;
-    Ok(link)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn server_executable(exe: &std::path::Path, _data_dir: &std::path::Path) -> Result<PathBuf> {
-    Ok(exe.to_path_buf())
+    // Fallback: look on PATH (handles `cargo install` putting both
+    // binaries in ~/.cargo/bin which is already on PATH).
+    if let Some(found) = atom_core::deps::find_in_path("atoms") {
+        return Ok(found);
+    }
+    Err(anyhow!(
+        "cannot find `atoms` server binary (looked in {} and PATH)",
+        dir.display()
+    ))
 }
 
 /// ensureServer checks whether the atom server is already running. If
@@ -611,21 +598,20 @@ pub async fn ensure_server() -> Result<()> {
         stop_background_server().await;
     }
 
-    // Start the server as a detached background process by re-invoking this
-    // executable in headless server mode. Keeping the server entry point in
-    // `atom` makes installs and release archives single-binary.
-    let exe = std::env::current_exe().context("find executable")?;
+    // Start the server as a detached background process using the
+    // dedicated `atoms` binary. The kernel names the process from the
+    // executable filename, so Activity Monitor / ps show "atoms".
+    let server_exe = find_server_binary()?;
     let log_dir = atom_core::session::store::data_dir();
-    let server_exe = server_executable(&exe, &log_dir)?;
     let log_file = log_dir.join("server.log");
     let log_f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&log_file)
         .context("open log file")?;
-    let mut cmd = std::process::Command::new(server_exe);
+    let mut cmd = std::process::Command::new(&server_exe);
+    cmd.env("_ATOM_LAUNCH", "managed");
     use std::os::unix::process::CommandExt;
-    cmd.arg0("atoms").arg("--serve");
     cmd.stdout(std::process::Stdio::from(
         log_f.try_clone().context("clone log file handle")?,
     ))
@@ -637,7 +623,7 @@ pub async fn ensure_server() -> Result<()> {
             Ok(())
         });
     }
-    cmd.spawn().context("start server")?;
+    cmd.spawn().context("start atoms server")?;
 
     for _ in 0..50 {
         if is_running().await {

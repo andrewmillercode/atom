@@ -7,6 +7,10 @@ edition.workspace = true
 name = "atom"
 path = "src/main.rs"
 
+[[bin]]
+name = "atoms"
+path = "src/atoms.rs"
+
 [dependencies]
 atom-core = { workspace = true }
 atom-server = { workspace = true }

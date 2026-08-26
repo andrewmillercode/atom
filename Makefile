@@ -42,10 +42,12 @@ build-release:
 install-dev: build
 	install -d $(BIN_DIR)
 	ln -sf $(CURDIR)/target/debug/atom $(BIN_DIR)/atom
+	ln -sf $(CURDIR)/target/debug/atoms $(BIN_DIR)/atoms
 
 install: build-release
 	install -d $(BIN_DIR)
 	install -m 755 $(CURDIR)/target/release/atom $(BIN_DIR)/atom
+	install -m 755 $(CURDIR)/target/release/atoms $(BIN_DIR)/atoms
 
 uninstall:
 	@echo "==> stopping background session server"
@@ -53,8 +55,8 @@ uninstall:
 		kill "$$(cat "$(DATA_DIR)/server.pid")" 2>/dev/null || true; \
 		sleep 1; \
 	fi
-	@echo "==> removing $(BIN_DIR)/atom"
-	rm -f $(BIN_DIR)/atom
+	@echo "==> removing $(BIN_DIR)/atom and $(BIN_DIR)/atoms"
+	rm -f $(BIN_DIR)/atom $(BIN_DIR)/atoms
 	@echo "==> removing config $(CONFIG_DIR)"
 	@echo "    and data $(DATA_DIR) (sessions, credentials, logs)"
 	rm -rf $(CONFIG_DIR) $(DATA_DIR)

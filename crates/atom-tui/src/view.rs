@@ -105,7 +105,9 @@ pub fn draw(app: &mut App, area: Rect, buf: &mut Buffer) -> Option<(u16, u16)> {
     }
 
     let geo = Layout::compute(app);
-    let inner_w = app.inner_width().min(area.width.saturating_sub(2) as usize);
+    let inner_w = app
+        .inner_width()
+        .min((area.width as usize).saturating_sub(2 * crate::app::TUI_HPAD + crate::app::SCROLLBAR_WIDTH));
 
     // --- conversation viewport -------------------------------------------
     let vp_rect = Rect::new(
@@ -128,7 +130,12 @@ pub fn draw(app: &mut App, area: Rect, buf: &mut Buffer) -> Option<(u16, u16)> {
     }
     draw_scrollbar(
         app,
-        Rect::new(area.right().saturating_sub(1), vp_rect.y, 1, vp_rect.height),
+        Rect::new(
+            area.right().saturating_sub(crate::app::SCROLLBAR_WIDTH as u16),
+            vp_rect.y,
+            crate::app::SCROLLBAR_WIDTH as u16,
+            vp_rect.height,
+        ),
         buf,
     );
 
@@ -372,13 +379,16 @@ fn draw_scrollbar(app: &App, rect: Rect, buf: &mut Buffer) {
 
     for row in 0..track {
         let thumb = row >= thumb_top && row < thumb_top + thumb_h;
-        buf[(rect.x, rect.y + row as u16)]
-            .set_symbol("█")
-            .set_fg(if thumb {
-                ansi::c_muted()
-            } else {
-                ansi::c_card_dark()
-            });
+        let fg = if thumb {
+            ansi::c_muted()
+        } else {
+            ansi::c_card_dark()
+        };
+        for col in 0..rect.width {
+            buf[(rect.x + col, rect.y + row as u16)]
+                .set_symbol("█")
+                .set_fg(fg);
+        }
     }
 }
 
@@ -1568,28 +1578,32 @@ mod tests {
         app.content_lines = (0..20)
             .map(|i| std::sync::Arc::new(Line::from(i.to_string())))
             .collect();
-        let rect = Rect::new(9, 0, 1, 6);
+        let rect = Rect::new(8, 0, 2, 6);
 
         let mut top = Buffer::empty(Rect::new(0, 0, 10, 6));
         draw_scrollbar(&app, rect, &mut top);
+        // Both scrollbar columns should be painted.
+        assert_eq!(top[(8, 0)].symbol(), "█");
+        assert_eq!(top[(8, 0)].fg, ansi::c_muted());
         assert_eq!(top[(9, 0)].symbol(), "█");
         assert_eq!(top[(9, 0)].fg, ansi::c_muted());
-        assert_eq!(top[(9, 1)].symbol(), "█");
-        assert_eq!(top[(9, 5)].symbol(), "█");
-        assert_eq!(top[(9, 5)].fg, ansi::c_card_dark());
+        assert_eq!(top[(8, 1)].symbol(), "█");
+        assert_eq!(top[(8, 5)].symbol(), "█");
+        assert_eq!(top[(8, 5)].fg, ansi::c_card_dark());
 
         app.scroll_y = 15;
         let mut bottom = Buffer::empty(Rect::new(0, 0, 10, 6));
         draw_scrollbar(&app, rect, &mut bottom);
-        assert_eq!(bottom[(9, 0)].symbol(), "█");
-        assert_eq!(bottom[(9, 0)].fg, ansi::c_card_dark());
-        assert_eq!(bottom[(9, 4)].symbol(), "█");
-        assert_eq!(bottom[(9, 5)].symbol(), "█");
-        assert_eq!(bottom[(9, 5)].fg, ansi::c_muted());
+        assert_eq!(bottom[(8, 0)].symbol(), "█");
+        assert_eq!(bottom[(8, 0)].fg, ansi::c_card_dark());
+        assert_eq!(bottom[(8, 4)].symbol(), "█");
+        assert_eq!(bottom[(8, 5)].symbol(), "█");
+        assert_eq!(bottom[(8, 5)].fg, ansi::c_muted());
 
         app.content_lines.truncate(6);
         let mut hidden = Buffer::empty(Rect::new(0, 0, 10, 6));
         draw_scrollbar(&app, rect, &mut hidden);
+        assert_eq!(hidden[(8, 0)].symbol(), " ");
         assert_eq!(hidden[(9, 0)].symbol(), " ");
     }
 
@@ -1717,13 +1731,13 @@ mod tests {
         assert_eq!(x, 2);
         assert_eq!(cell(&term, x, 2).symbol(), "h");
         assert_eq!(cell(&term, x, 2).fg, ansi::c_foreground());
-        assert_eq!(cell(&term, 98, 2).bg, ansi::c_card_light());
+        assert_eq!(cell(&term, 96, 2).bg, ansi::c_card_light());
         assert_eq!(cell(&term, 1, 24).bg, ansi::c_background());
 
         // Prompt card has full-width card-light wash and one-cell padding.
         for y in 25..=27 {
             assert_eq!(cell(&term, 1, y).bg, ansi::c_card_light());
-            assert_eq!(cell(&term, 98, y).bg, ansi::c_card_light());
+            assert_eq!(cell(&term, 96, y).bg, ansi::c_card_light());
             assert!(!row_text(&term, y).contains('─'));
         }
 

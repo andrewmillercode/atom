@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 
 /// idleShutdownAfter: the server exits when no client connections have
 /// been open for this long. Every running TUI holds a long-lived /events
@@ -255,6 +255,11 @@ struct TurnMaps {
     /// closes the race where a detached dispatch turn starts and finishes
     /// between result(wait:true) polls.
     completed: std::collections::HashSet<String>,
+    /// Notified (one permit) whenever end_turn removes a turn, so a
+    /// caller blocked in wait_idle wakes to re-check whether the session
+    /// is idle. Wrapped in Arc so wait_idle can clone the handle out of
+    /// the lock and register interest without holding the Mutex.
+    notify: Arc<Notify>,
 }
 
 /// Registry of each session's active turns plus pauses that raced ahead
@@ -320,6 +325,7 @@ impl TurnTable {
                 maps.completed.insert(id.to_string());
             }
         }
+        maps.notify.notify_one();
     }
 
     /// cancelSessionTurns cancels every active turn for a session. Used
@@ -363,6 +369,30 @@ impl TurnTable {
     pub fn session_has_active_turn(&self, id: &str) -> bool {
         let maps = self.0.lock().unwrap();
         maps.reserved.contains(id) || maps.turns.get(id).map(|t| !t.is_empty()).unwrap_or(false)
+    }
+
+    /// Block (up to `timeout`) until the session has no active turn —
+    /// i.e. the prior turn has fully unwound and reached end_turn, so a
+    /// follow-up /send won't race it. Returns true if idle, false on
+    /// timeout. Uses notify_one() permits so a wakeup that fires between
+    /// the active-turn check and registering interest is not lost.
+    pub async fn wait_idle(&self, id: &str, timeout: std::time::Duration) -> bool {
+        let notify = self.0.lock().unwrap().notify.clone();
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if !self.session_has_active_turn(id) {
+                return true;
+            }
+            let Some(remain) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                return !self.session_has_active_turn(id);
+            };
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            tokio::select! {
+                _ = &mut notified => continue,
+                _ = tokio::time::sleep(remain) => return !self.session_has_active_turn(id),
+            }
+        }
     }
 
     pub fn session_turn_completed(&self, id: &str) -> bool {
@@ -633,6 +663,51 @@ mod tests {
 
         tt.end_turn("s", &handle);
         assert!(tt.try_prepare_session_turn("s"));
+    }
+
+    #[tokio::test]
+    async fn wait_idle_returns_when_turn_ends() {
+        let tt = Arc::new(TurnTable::default());
+        let h = tt.start_turn("s", "t");
+        assert!(tt.session_has_active_turn("s"));
+
+        let tt2 = tt.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            tt2.end_turn("s", &h);
+        });
+
+        let res = tokio::time::timeout(
+            Duration::from_secs(1),
+            tt.wait_idle("s", Duration::from_secs(2)),
+        )
+        .await;
+        assert!(
+            res.is_ok(),
+            "wait_idle should return well before the timeout"
+        );
+        assert!(
+            res.unwrap(),
+            "wait_idle should report idle once the turn ends"
+        );
+        assert!(!tt.session_has_active_turn("s"));
+    }
+
+    #[tokio::test]
+    async fn wait_idle_times_out_for_never_ending_turn() {
+        let tt = TurnTable::default();
+        let _h = tt.start_turn("x", "t");
+        assert!(tt.session_has_active_turn("x"));
+
+        let start = std::time::Instant::now();
+        let idle = tt.wait_idle("x", Duration::from_millis(100)).await;
+        let elapsed = start.elapsed();
+        assert!(!idle, "never-ending turn must not report idle");
+        assert!(
+            elapsed >= Duration::from_millis(90),
+            "wait_idle should block close to the timeout, took {elapsed:?}"
+        );
+        assert!(tt.session_has_active_turn("x"));
     }
 
     #[test]

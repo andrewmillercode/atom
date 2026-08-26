@@ -10,8 +10,8 @@ use atom_core::providers::codex::{
     do_openai_codex_round, marshal_openai_codex_request, openai_codex_auth_for_key,
 };
 use atom_core::providers::{
-    bedrock_style_for_url, context_window_tokens, provider_name_for_url, reasoning_field_for_url,
-    stream_bedrock, stream_chat,
+    bedrock_style_for_url, context_window_tokens, model_supports_image_input,
+    provider_name_for_url, reasoning_field_for_url, stream_bedrock, stream_chat,
 };
 use atom_core::session::compaction::{
     compact_session, compact_span, compaction_prompt_text, compaction_target, compaction_threshold,
@@ -85,6 +85,23 @@ fn event(map: Vec<(&str, Value)>) -> Value {
         obj.insert(k.to_string(), v);
     }
     Value::Object(obj)
+}
+
+/// strip_images_for_text_only_model removes attached images from every
+/// message so a text-only model does not reject the request with a 400.
+/// Messages that carried only an image (no text) get a placeholder so
+/// their content is not empty, which some APIs reject outright. Only the
+/// outgoing messages are touched; the persisted session keeps the images.
+fn strip_images_for_text_only_model(msgs: &mut [Message]) {
+    for m in msgs.iter_mut() {
+        if m.images.is_empty() {
+            continue;
+        }
+        m.images.clear();
+        if m.content.trim().is_empty() {
+            m.content = "[image attached]".to_string();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -222,6 +239,7 @@ pub fn assistant_message(
         role: "assistant".into(),
         content: result.content.clone(),
         reasoning: result.reasoning.clone(),
+        reasoning_signature: result.reasoning_signature.clone(),
         reasoning_ms: result.reasoning_ms,
         tool_calls: tool_calls.map(|t| t.to_vec()).unwrap_or_default(),
         provider: provider_name_for_url(base_url),
@@ -255,6 +273,7 @@ where
 {
     let mut reply = String::new();
     let mut reasoning = String::new();
+    let mut reasoning_signature = String::new();
     let mut accumulator = ToolCallAccumulator::default();
     let mut usage = None;
     let mut finish_reason = String::new();
@@ -299,6 +318,12 @@ where
             } else if rt.is_empty() && !choice.delta.reasoning_content.is_empty() {
                 rt = choice.delta.reasoning_content.clone();
             }
+            // Claude/Bedrock attach an opaque signature to each thinking
+            // block. Keep the latest one so the assistant turn can be
+            // replayed with it (reasoning preserved across turns).
+            if !choice.delta.reasoning_signature.is_empty() {
+                reasoning_signature = choice.delta.reasoning_signature.clone();
+            }
             if !rt.is_empty() {
                 let ev = event(vec![("type", json!("reasoning")), ("text", json!(rt))]);
                 emit(state, out, session_id, &ev).await;
@@ -337,6 +362,7 @@ where
     Ok(StreamResult {
         content: reply,
         reasoning,
+        reasoning_signature,
         reasoning_ms: 0,
         tool_calls: accumulator.list(),
         usage,
@@ -368,21 +394,38 @@ fn sync_back(store: &atom_core::session::store::SessionStore, id: &str, sess: &S
 /// kept; otherwise the first user message (truncated) is used so the
 /// picker has a name immediately. Title generation runs in the background.
 pub async fn persist_session(state: &Arc<AppState>, sess: &Session, id: &str) {
-    let mut title = String::new();
-    if !sess.title_generated {
-        for m in &sess.messages {
-            if m.role == "user" {
-                title = truncate_bytes_ellipsis(&m.content, 60);
-                break;
-            }
-        }
-    }
+    let title = fallback_title(sess);
     sync_back(&state.store, id, sess);
     state.store.update(id, sess.messages.clone(), &title);
     state.subs.broadcast(id, &json!({"type": "saved"}));
     if !sess.title_generated {
         kickoff_title_generation(state, id.to_string());
     }
+}
+
+/// persistSessionNow saves a session's messages mid-turn without a
+/// `saved` broadcast (that would trigger a racy full reload on viewing
+/// clients while the stream is live) and without scheduling title
+/// generation — the end-of-turn persist still kicks title generation
+/// once. Viewing clients learn about the user message from the
+/// dedicated `user_message` event broadcast at turn start.
+async fn persist_session_now(state: &Arc<AppState>, sess: &Session, id: &str) {
+    let title = fallback_title(sess);
+    sync_back(&state.store, id, sess);
+    state.store.update(id, sess.messages.clone(), &title);
+}
+
+/// fallbackTitle derives the picker name from the first user message.
+fn fallback_title(sess: &Session) -> String {
+    if sess.title_generated {
+        return String::new();
+    }
+    for m in &sess.messages {
+        if m.role == "user" {
+            return truncate_bytes_ellipsis(&m.content, 60);
+        }
+    }
+    String::new()
 }
 
 /// Go slices the title bytes raw (`title[:60]`); truncate at the last
@@ -551,6 +594,18 @@ pub async fn run_session_turn(
             images: opts.images.clone(),
             ..Default::default()
         });
+        // Persist the session log now so the user message is on the
+        // server before generation starts, and tell viewing clients to
+        // show it right away (a dedicated event appends the user block
+        // without forcing a reload that would wipe the live stream).
+        // No `saved` broadcast or title-gen kick here — the end-of-turn
+        // persist handles both, once.
+        persist_session_now(state, sess, id).await;
+        if !opts.message.is_empty() {
+            state
+                .subs
+                .broadcast(id, &json!({"type": "user_message", "text": opts.message}));
+        }
     }
 
     let handle = state.turns.start_turn(id, &opts.turn_id);
@@ -639,6 +694,20 @@ pub async fn run_session_turn(
                 ..Default::default()
             },
         );
+        // A text-only model rejects any request carrying an image with a
+        // 400 ("this model does not support image input"). When the
+        // models.dev catalog explicitly lists the selected model as
+        // text-only, drop attached images so the turn still goes through.
+        // Models the catalog does not know keep their images (a custom
+        // model may be multimodal even if it is not catalogued). Only the
+        // outgoing request is affected; the session log still keeps the
+        // images for display and replay.
+        if matches!(
+            model_supports_image_input(&provider, &sess.model),
+            Some(false)
+        ) {
+            strip_images_for_text_only_model(&mut msgs);
+        }
         let reasoning_field = if !opts.reasoning_field.is_empty() {
             opts.reasoning_field.clone()
         } else {
@@ -652,37 +721,40 @@ pub async fn run_session_turn(
             // endpoint, binary eventstream response. Chunks come back in
             // the shared OpenAI-delta shape, so the relay below is
             // unchanged.
-            let chunks = match stream_bedrock(&base_url, &key, &sess.model, &msgs, &tools).await {
-                Ok(c) => c,
-                Err(err) => {
-                    ctx.handle.set_round_cancel(None);
-                    if ctx.err() {
-                        finish_paused_turn(state, sess, &out, id).await;
+            let chunks =
+                match stream_bedrock(&base_url, &key, &sess.model, &msgs, &tools, &opts.thinking)
+                    .await
+                {
+                    Ok(c) => c,
+                    Err(err) => {
+                        ctx.handle.set_round_cancel(None);
+                        if ctx.err() {
+                            finish_paused_turn(state, sess, &out, id).await;
+                            end_of_turn(state, id, &ctx.handle, &parent_id);
+                            return;
+                        }
+                        if let Some(extra) = ctx.handle.take_compact() {
+                            if let Err(ferr) = fold_session(state, sess, &out, id, &extra).await {
+                                emit(state, &out, id, &fold_error_event(&ferr)).await;
+                            }
+                            continue 'rounds;
+                        }
+                        let msg = provider_error_message(&err, &base_url);
+                        let ev = event(vec![
+                            ("type", json!("error")),
+                            ("message", json!(msg.clone())),
+                        ]);
+                        emit(state, &out, id, &ev).await;
+                        sess.messages.push(Message {
+                            role: "error".into(),
+                            content: msg,
+                            ..Default::default()
+                        });
+                        persist_session(state, sess, id).await;
                         end_of_turn(state, id, &ctx.handle, &parent_id);
                         return;
                     }
-                    if let Some(extra) = ctx.handle.take_compact() {
-                        if let Err(ferr) = fold_session(state, sess, &out, id, &extra).await {
-                            emit(state, &out, id, &fold_error_event(&ferr)).await;
-                        }
-                        continue 'rounds;
-                    }
-                    let msg = provider_error_message(&err, &base_url);
-                    let ev = event(vec![
-                        ("type", json!("error")),
-                        ("message", json!(msg.clone())),
-                    ]);
-                    emit(state, &out, id, &ev).await;
-                    sess.messages.push(Message {
-                        role: "error".into(),
-                        content: msg,
-                        ..Default::default()
-                    });
-                    persist_session(state, sess, id).await;
-                    end_of_turn(state, id, &ctx.handle, &parent_id);
-                    return;
-                }
-            };
+                };
             let r = stream_model_to_client(
                 state,
                 &out,
@@ -1455,6 +1527,43 @@ mod tests {
             truncate_bytes_ellipsis(&long, 60),
             format!("{}...", "x".repeat(60))
         );
+    }
+
+    #[test]
+    fn strip_images_for_text_only_model_drops_images() {
+        let img = || atom_core::types::ImageData {
+            mime: "image/png".into(),
+            data: "AAAA".into(),
+        };
+        let mut msgs = vec![
+            // text + image: image dropped, text kept.
+            Message {
+                role: "user".into(),
+                content: "look".into(),
+                images: vec![img()],
+                ..Default::default()
+            },
+            // image only: becomes a placeholder so content isn't empty.
+            Message {
+                role: "user".into(),
+                content: "".into(),
+                images: vec![img()],
+                ..Default::default()
+            },
+            // no images: untouched.
+            Message {
+                role: "assistant".into(),
+                content: "hi".into(),
+                ..Default::default()
+            },
+        ];
+        strip_images_for_text_only_model(&mut msgs);
+        assert!(msgs[0].images.is_empty());
+        assert_eq!(msgs[0].content, "look");
+        assert!(msgs[1].images.is_empty());
+        assert_eq!(msgs[1].content, "[image attached]");
+        assert!(msgs[2].images.is_empty());
+        assert_eq!(msgs[2].content, "hi");
     }
 
     #[tokio::test]

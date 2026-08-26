@@ -129,7 +129,18 @@ fn parse_tool_input(arguments: &str) -> Value {
 /// become toolUse blocks (only for calls actually answered later), and
 /// OpenAI JSON-schema tools become toolSpec entries. Adjacent same-role
 /// turns are coalesced and the sequence is guaranteed to start with user.
-pub fn marshal_bedrock_request(msgs: &[Message], tools: &[ToolDef]) -> anyhow::Result<Value> {
+///
+/// `model` + `thinking` + `max_tokens` drive Claude extended/adaptive
+/// thinking via `additionalModelRequestFields` (see `bedrock_thinking`);
+/// non-Claude models and an off thinking level omit it entirely, leaving
+/// the request byte-identical to the pre-thinking behavior.
+pub fn marshal_bedrock_request(
+    msgs: &[Message],
+    tools: &[ToolDef],
+    model: &str,
+    thinking: &str,
+    max_tokens: i64,
+) -> anyhow::Result<Value> {
     let mut system_parts: Vec<String> = Vec::new();
 
     // Tool_use ids answered somewhere later in the transcript; unanswered
@@ -202,9 +213,22 @@ pub fn marshal_bedrock_request(msgs: &[Message], tools: &[ToolDef]) -> anyhow::R
                 if !m.content.is_empty() {
                     blocks.push(json!({ "text": m.content }));
                 }
-                if !m.reasoning.is_empty() {
+                // Replay prior reasoning WITH its signature so thinking
+                // survives across turns. Bedrock (like Anthropic) requires
+                // an opaque `signature` on any thinking block it receives
+                // back; without one it 400s with
+                // "thinking.signature: Field required". History saved
+                // before signatures were captured (or a turn that never
+                // thought) has no signature, so we omit the block then —
+                // Bedrock accepts an assistant turn without reasoningContent.
+                if !m.reasoning.is_empty() && !m.reasoning_signature.is_empty() {
                     blocks.push(json!({
-                        "reasoningContent": { "reasoningText": { "text": m.reasoning } }
+                        "reasoningContent": {
+                            "reasoningText": {
+                                "text": m.reasoning,
+                                "signature": m.reasoning_signature,
+                            }
+                        }
                     }));
                 }
                 for tc in &m.tool_calls {
@@ -288,7 +312,131 @@ pub fn marshal_bedrock_request(msgs: &[Message], tools: &[ToolDef]) -> anyhow::R
             }),
         );
     }
+    if let Some(t) = bedrock_thinking(model, thinking, max_tokens) {
+        body.insert("additionalModelRequestFields".into(), t.additional);
+        body.insert("inferenceConfig".into(), t.inference);
+    }
     Ok(Value::Object(body))
+}
+
+/// BedrockThinking bundles the Converse fields atom emits to turn Claude
+/// reasoning on: `additionalModelRequestFields` carries the model-native
+/// `thinking` (and for adaptive models the `effort`), while
+/// `inferenceConfig` sets `maxTokens` (and, for extended thinking,
+/// `temperature: 1`, which Bedrock requires while reasoning is on).
+struct BedrockThinking {
+    additional: Value,
+    inference: Value,
+}
+
+/// bedrockThinkingMaxTokens picks a `maxTokens` that leaves real room for
+/// a thinking budget yet stays within every Claude Bedrock model's output
+/// limit (the smallest is 32K), and within the documented recommendation
+/// to use batch processing above 32K. Derived from the context window.
+fn bedrock_thinking_max_tokens(context: i64) -> i64 {
+    if context <= 0 {
+        return 8192;
+    }
+    // Half the window for completion, clamped to [8K, 32K] (32K is the
+    // smallest Claude Bedrock output limit and the documented batch
+    // threshold), then never larger than the whole window.
+    (context / 2).clamp(8192, 32000).min(context)
+}
+
+/// bedrockClaudeAdaptive reports whether a Bedrock Claude model id speaks
+/// the adaptive-thinking dialect (`thinking.type: "adaptive"` +
+/// `output_config.effort`) instead of the legacy extended-thinking one
+/// (`thinking.type: "enabled"` + `budget_tokens`).
+///
+/// Adaptive: Opus 4.6+, Sonnet 4.6+, Opus/Sonnet 5, Fable, Mythos. The
+/// legacy `enabled`+`budget_tokens` shape is deprecated on Opus/Sonnet
+/// 4.6 and rejected with a 400 on Opus 4.7+/Sonnet 5/Opus 5/Fable/Mythos,
+/// so those MUST use adaptive. Older Claude (3.7, 4, 4.1, 4.5 incl.
+/// Haiku 4.5) keeps extended thinking.
+fn bedrock_claude_adaptive(id_lower: &str) -> bool {
+    if id_lower.contains("fable") || id_lower.contains("mythos") {
+        return true;
+    }
+    for fam in ["opus", "sonnet", "haiku"] {
+        let marker = format!("claude-{fam}");
+        let Some(rest) = id_lower.split_once(&marker).map(|(_, r)| r) else {
+            continue;
+        };
+        let Some(nums) = rest.strip_prefix('-') else {
+            continue;
+        };
+        let mut it = nums.split(['-', '.']);
+        let major = it.next().and_then(|t| t.parse::<u32>().ok()).unwrap_or(0);
+        if major >= 5 {
+            return true;
+        }
+        if major == 4 {
+            // The segment after the major is either a minor version
+            // (4-6) or a release date (4-20250514). A date is many
+            // digits, so only a small number counts as the minor; a
+            // date (or no segment at all) means major-only (Claude 4).
+            let minor = it
+                .next()
+                .and_then(|t| t.parse::<u32>().ok())
+                .filter(|m| *m < 100)
+                .unwrap_or(0);
+            return minor >= 6;
+        }
+        return false;
+    }
+    false
+}
+
+/// bedrockEffort maps an atom thinking level onto a Bedrock adaptive
+/// `effort`. Bedrock accepts low/medium/high/xhigh/max; xhigh and max are
+/// Opus 4.6 / Opus 5 only, so "max" degrades to "high" on other adaptive
+/// models to avoid a ValidationException.
+fn bedrock_effort(model_id_lower: &str, level: &str) -> &'static str {
+    let opus_max = model_id_lower.contains("opus-4-6") || model_id_lower.contains("opus-5");
+    match level {
+        "max" if opus_max => "max",
+        "max" => "high",
+        "minimal" | "low" => "low",
+        "medium" => "medium",
+        _ => "high",
+    }
+}
+
+/// bedrockThinking builds the Converse reasoning fields for a Claude
+/// model from an atom thinking level, or returns None to leave reasoning
+/// off. Non-Claude Bedrock models reason natively and reject the
+/// `thinking` field, so they get None. Off levels ("", "none", "off")
+/// also get None: omitting `thinking` is the off state on 4.6/4.5, and
+/// the always-adaptive models (Opus 5/Sonnet 5/Fable/Mythos) can't be
+/// forced off anyway.
+fn bedrock_thinking(model: &str, level: &str, max_tokens: i64) -> Option<BedrockThinking> {
+    let id = model.to_lowercase();
+    if !id.contains("claude") {
+        return None;
+    }
+    let lvl = level.trim().to_lowercase();
+    if lvl.is_empty() || lvl == "none" || lvl == "off" {
+        return None;
+    }
+    if bedrock_claude_adaptive(&id) {
+        // Adaptive: newer Claude rejects a pinned temperature/topP, so
+        // inferenceConfig carries only maxTokens (thinking room).
+        let effort = bedrock_effort(&id, &lvl);
+        Some(BedrockThinking {
+            additional: json!({
+                "thinking": { "type": "adaptive" },
+                "output_config": { "effort": effort },
+            }),
+            inference: json!({ "maxTokens": max_tokens }),
+        })
+    } else {
+        // Extended thinking (Claude 3.7 / 4 / 4.5): budget must be <
+        // maxTokens, and temperature must be 1 while reasoning is on.
+        super::anthropic::thinking_config(&lvl, max_tokens).map(|t| BedrockThinking {
+            additional: json!({ "thinking": t }),
+            inference: json!({ "maxTokens": max_tokens, "temperature": 1.0 }),
+        })
+    }
 }
 
 fn image_block(mime: &str, data: &str) -> Value {
@@ -633,18 +781,28 @@ impl BedrockStreamState {
                 }
                 if let Some(rc) = delta.get("reasoningContent").filter(|r| r.is_object()) {
                     // Claude-on-Bedrock reasoning deltas carry text under
-                    // reasoningContent.text (and a signature under
-                    // reasoningContent.signature).
+                    // reasoningContent.text and an opaque signature under
+                    // reasoningContent.signature. The signature may arrive
+                    // in the same delta as the text or in a signature-only
+                    // delta; capture both so the assistant turn can be
+                    // replayed with its signature (reasoning preserved
+                    // across turns).
                     let text = rc
                         .get("text")
                         .or_else(|| rc.pointer("/reasoningText/text"))
                         .and_then(Value::as_str)
                         .unwrap_or("");
-                    if !text.is_empty() {
+                    let sig = rc
+                        .get("signature")
+                        .or_else(|| rc.pointer("/reasoningText/signature"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    if !text.is_empty() || !sig.is_empty() {
                         return Some(StreamChunk {
                             choices: vec![crate::types::StreamChunkChoice {
                                 delta: StreamDelta {
                                     reasoning: text.to_string(),
+                                    reasoning_signature: sig.to_string(),
                                     ..Default::default()
                                 },
                                 ..Default::default()
@@ -755,9 +913,13 @@ pub async fn stream_bedrock(
     model: &str,
     msgs: &[Message],
     tools: &[ToolDef],
+    thinking: &str,
 ) -> anyhow::Result<impl futures::Stream<Item = anyhow::Result<StreamChunk>>> {
     let url = converse_stream_url(base_url, model);
-    let body = serde_json::to_vec(&marshal_bedrock_request(msgs, tools)?)?;
+    let max_tokens = bedrock_thinking_max_tokens(super::context_window_tokens("", model));
+    let body = serde_json::to_vec(&marshal_bedrock_request(
+        msgs, tools, model, thinking, max_tokens,
+    )?)?;
     let resp = retry::do_http_with_retry(|| {
         let builder = retry::long_timeout_client()
             .post(url.clone())
@@ -999,7 +1161,7 @@ mod tests {
                 parameters: serde_json::json!({"type":"object"}),
             },
         }];
-        let body = marshal_bedrock_request(&msgs, &tools).unwrap();
+        let body = marshal_bedrock_request(&msgs, &tools, "", "none", 8192).unwrap();
         assert_eq!(body["system"], serde_json::json!([{ "text": "be terse" }]));
         assert_eq!(
             body["toolConfig"]["tools"][0]["toolSpec"]["name"],
@@ -1043,7 +1205,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let body2 = marshal_bedrock_request(&msgs_unanswered, &[]).unwrap();
+        let body2 = marshal_bedrock_request(&msgs_unanswered, &[], "", "none", 8192).unwrap();
         assert_eq!(
             body2["messages"].as_array().unwrap().len(),
             1,
@@ -1059,6 +1221,216 @@ mod tests {
         assert_eq!(map_stop_reason("tool_use"), "tool_calls");
         assert_eq!(map_stop_reason("guardrail_intervened"), "stop");
         assert_eq!(map_stop_reason(""), "stop");
+    }
+
+    #[test]
+    fn bedrock_claude_adaptive_splits_generations() {
+        // Adaptive: Opus/Sonnet 4.6+, 5, Fable, Mythos, 4.7.
+        for id in [
+            "anthropic.claude-opus-4-6-v1",
+            "us.anthropic.claude-opus-4-6-v1",
+            "anthropic.claude-sonnet-4-6",
+            "global.anthropic.claude-sonnet-4-6",
+            "anthropic.claude-opus-4-7-v1",
+            "anthropic.claude-opus-5",
+            "eu.anthropic.claude-opus-5",
+            "anthropic.claude-sonnet-5",
+            "us.anthropic.claude-fable-5",
+            "anthropic.claude-mythos-preview",
+        ] {
+            assert!(
+                bedrock_claude_adaptive(id),
+                "{id} should be adaptive-thinking"
+            );
+        }
+        // Extended thinking: 3.7, 4, 4.1, 4.5 (incl. Haiku 4.5).
+        for id in [
+            "anthropic.claude-3-7-sonnet-20250219-v1:0",
+            "anthropic.claude-opus-4-1-20250805-v1:0",
+            "anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "anthropic.claude-haiku-4-5-20251001-v1:0",
+            "anthropic.claude-opus-4-20250514-v1:0",
+        ] {
+            assert!(
+                !bedrock_claude_adaptive(id),
+                "{id} should use extended thinking"
+            );
+        }
+    }
+
+    #[test]
+    fn bedrock_effort_caps_max_at_opus_46_and_5() {
+        // "max" effort is Opus 4.6 / Opus 5 only; elsewhere it degrades.
+        assert_eq!(bedrock_effort("claude-opus-4-6-v1", "max"), "max");
+        assert_eq!(bedrock_effort("claude-opus-5", "max"), "max");
+        assert_eq!(bedrock_effort("claude-sonnet-5", "max"), "high");
+        assert_eq!(bedrock_effort("claude-sonnet-4-6", "max"), "high");
+        assert_eq!(bedrock_effort("claude-fable-5", "max"), "high");
+        assert_eq!(bedrock_effort("claude-opus-4-7", "max"), "high");
+        // Named levels pass straight through; unknown defaults to high.
+        assert_eq!(bedrock_effort("claude-opus-4-6-v1", "low"), "low");
+        assert_eq!(bedrock_effort("claude-opus-4-6-v1", "minimal"), "low");
+        assert_eq!(bedrock_effort("claude-opus-4-6-v1", "medium"), "medium");
+        assert_eq!(bedrock_effort("claude-opus-4-6-v1", "high"), "high");
+        assert_eq!(bedrock_effort("claude-opus-4-6-v1", "???"), "high");
+    }
+
+    #[test]
+    fn bedrock_thinking_emits_adaptive_for_46_and_max_effort() {
+        // Opus 4.6 + "max" → adaptive thinking, effort max, maxTokens only
+        // (no pinned temperature on the newer models).
+        let t = bedrock_thinking("us.anthropic.claude-opus-4-6-v1", "max", 32000)
+            .expect("opus 4.6 max is adaptive");
+        assert_eq!(t.additional["thinking"]["type"], "adaptive");
+        assert_eq!(t.additional["output_config"]["effort"], "max");
+        assert_eq!(t.inference["maxTokens"], 32000);
+        assert!(t.inference.get("temperature").is_none());
+    }
+
+    #[test]
+    fn bedrock_thinking_emits_extended_for_older_claude() {
+        // Sonnet 4.5 + "high" → enabled + budget, temperature 1, budget <
+        // maxTokens. Reuses anthropic::thinking_config's budget mapping.
+        let t = bedrock_thinking("anthropic.claude-sonnet-4-5-20250929-v1:0", "high", 32000)
+            .expect("sonnet 4.5 high is extended");
+        assert_eq!(t.additional["thinking"]["type"], "enabled");
+        let budget = t.additional["thinking"]["budget_tokens"].as_i64().unwrap();
+        assert!(budget >= 1024 && budget < 32000, "budget {budget} must fit");
+        assert_eq!(t.inference["maxTokens"], 32000);
+        assert_eq!(t.inference["temperature"], 1.0);
+    }
+
+    #[test]
+    fn bedrock_thinking_omits_for_non_claude_and_off() {
+        // Non-Claude models reason natively and reject the thinking field.
+        assert!(bedrock_thinking("deepseek.r1-v1:0", "high", 32000).is_none());
+        assert!(bedrock_thinking("zai.glm-4.7-flash", "max", 32000).is_none());
+        // Off / empty levels leave reasoning off on Claude too.
+        assert!(bedrock_thinking("us.anthropic.claude-opus-4-6-v1", "", 32000).is_none());
+        assert!(bedrock_thinking("us.anthropic.claude-opus-4-6-v1", "none", 32000).is_none());
+        assert!(bedrock_thinking("us.anthropic.claude-opus-4-6-v1", "off", 32000).is_none());
+    }
+
+    #[test]
+    fn marshal_bedrock_request_attaches_thinking_fields() {
+        let msgs = vec![Message {
+            role: "user".into(),
+            content: "hi".into(),
+            ..Default::default()
+        }];
+        // Opus 4.6 max: adaptive thinking reaches the Converse body.
+        let body =
+            marshal_bedrock_request(&msgs, &[], "us.anthropic.claude-opus-4-6-v1", "max", 32000)
+                .unwrap();
+        assert_eq!(
+            body["additionalModelRequestFields"]["thinking"]["type"],
+            "adaptive"
+        );
+        assert_eq!(
+            body["additionalModelRequestFields"]["output_config"]["effort"],
+            "max"
+        );
+        assert_eq!(body["inferenceConfig"]["maxTokens"], 32000);
+        assert!(body["inferenceConfig"].get("temperature").is_none());
+        // Off level: no thinking fields at all (unchanged request shape).
+        let body_off =
+            marshal_bedrock_request(&msgs, &[], "us.anthropic.claude-opus-4-6-v1", "none", 32000)
+                .unwrap();
+        assert!(body_off.get("additionalModelRequestFields").is_none());
+        assert!(body_off.get("inferenceConfig").is_none());
+    }
+
+    #[test]
+    fn marshal_drops_replayed_reasoning_without_signature() {
+        // Bedrock 400s with "thinking.signature: Field required" when a
+        // replayed assistant turn carries reasoningContent but no
+        // signature (atom doesn't persist Claude's signature). The
+        // marshaler must omit reasoningContent from prior assistant
+        // turns entirely; Bedrock accepts an assistant turn without it.
+        let msgs = vec![
+            Message {
+                role: "user".into(),
+                content: "hi".into(),
+                ..Default::default()
+            },
+            Message {
+                role: "assistant".into(),
+                content: "hello".into(),
+                reasoning: "I considered greeting.".into(),
+                ..Default::default()
+            },
+            Message {
+                role: "user".into(),
+                content: "again".into(),
+                ..Default::default()
+            },
+        ];
+        let body =
+            marshal_bedrock_request(&msgs, &[], "us.anthropic.claude-opus-4-6-v1", "max", 32000)
+                .unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        // user + assistant(text only) + user: reasoning was dropped from
+        // the replayed assistant turn, leaving just its text block.
+        assert_eq!(messages.len(), 3);
+        let asst = &messages[1]["content"];
+        let asst_blocks = asst.as_array().unwrap();
+        assert_eq!(asst_blocks.len(), 1, "replayed assistant keeps only text");
+        assert_eq!(asst_blocks[0]["text"], "hello");
+        assert!(
+            !asst_blocks
+                .iter()
+                .any(|b| b.get("reasoningContent").is_some()),
+            "no reasoningContent on a replayed assistant turn (no signature)"
+        );
+        // The current turn's thinking config is still attached.
+        assert_eq!(
+            body["additionalModelRequestFields"]["thinking"]["type"],
+            "adaptive"
+        );
+    }
+
+    #[test]
+    fn marshal_replays_reasoning_with_signature() {
+        // When the prior assistant turn carries a signature (captured
+        // during streaming), reasoning is replayed so thinking survives
+        // across turns — Bedrock requires the signature on any thinking
+        // block it receives back.
+        let msgs = vec![
+            Message {
+                role: "user".into(),
+                content: "hi".into(),
+                ..Default::default()
+            },
+            Message {
+                role: "assistant".into(),
+                content: "hello".into(),
+                reasoning: "I considered greeting.".into(),
+                reasoning_signature: "sig-abc".into(),
+                ..Default::default()
+            },
+            Message {
+                role: "user".into(),
+                content: "again".into(),
+                ..Default::default()
+            },
+        ];
+        let body =
+            marshal_bedrock_request(&msgs, &[], "us.anthropic.claude-opus-4-6-v1", "max", 32000)
+                .unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        let asst_blocks = messages[1]["content"].as_array().unwrap();
+        // text block first, then the signed reasoningContent block.
+        assert_eq!(asst_blocks.len(), 2);
+        assert_eq!(asst_blocks[0]["text"], "hello");
+        assert_eq!(
+            asst_blocks[1]["reasoningContent"]["reasoningText"]["text"],
+            "I considered greeting."
+        );
+        assert_eq!(
+            asst_blocks[1]["reasoningContent"]["reasoningText"]["signature"],
+            "sig-abc"
+        );
     }
 
     #[tokio::test]

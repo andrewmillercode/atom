@@ -494,6 +494,17 @@ impl SubagentHandle for DispatchBridge {
             ..Default::default()
         });
         self.state.store.update(&child.id, messages, "");
+        // Show the follow-up to every client viewing the child (and the
+        // parent's panel) immediately, not after the child's turn ends.
+        // The child's detached turn runs with skip_append, so this is the
+        // only place the user_message event can be emitted for it.
+        self.state.subs.broadcast(
+            &child.id,
+            &json!({"type": "user_message", "text": plan.prompt.clone()}),
+        );
+        self.state
+            .subs
+            .broadcast(&self.parent_id, &json!({"type": "children"}));
         self.state.turns.prepare_session_turn(&child.id);
         self.state
             .store

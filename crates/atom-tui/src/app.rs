@@ -34,9 +34,12 @@ pub const MINIDOT_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴"
 /// inputMaxHeight is the tallest the prompt field may grow, in rows.
 pub const INPUT_MAX_HEIGHT: usize = 8;
 
-/// workingStatusRows is the reserved chrome above the prompt's top border.
-pub const WORKING_STATUS_ROWS: usize = 1;
 pub const VIEWPORT_VPAD: usize = 1;
+/// Blank rows left at the bottom of the message viewport (between the
+/// last content row and the prompt) when no footer menu is open. The
+/// scrollbar and viewport rect still span the full region; only content
+/// is clipped short of this padding.
+pub const VIEWPORT_BOTTOM_PAD: usize = 1;
 pub const PROMPT_PAD: usize = 1;
 /// Rows below the status bar reserved for the card-dark cwd footer
 /// (the directory the agent was invoked from).
@@ -350,11 +353,7 @@ impl App {
         let status_rows = crate::statusbar::status_bar_rows(self);
         let max = (self.height as usize)
             .saturating_sub(
-                1 + status_rows
-                    + STATUS_FOOTER_ROWS
-                    + WORKING_STATUS_ROWS
-                    + 2 * PROMPT_PAD
-                    + self.preview_row_count(),
+                1 + status_rows + STATUS_FOOTER_ROWS + 2 * PROMPT_PAD + self.preview_row_count(),
             )
             .min(INPUT_MAX_HEIGHT)
             .max(1);
@@ -545,7 +544,7 @@ impl App {
         let max_scroll = self
             .content_lines
             .len()
-            .saturating_sub(self.viewport_height());
+            .saturating_sub(self.content_viewport_height());
         if self.following {
             self.scroll_y = max_scroll;
         } else {
@@ -596,18 +595,36 @@ impl App {
         let vp = (self.height as usize).saturating_sub(
             crate::statusbar::status_bar_rows(self)
                 + STATUS_FOOTER_ROWS
-                + WORKING_STATUS_ROWS
                 + 2 * PROMPT_PAD
                 + self.input_height()
                 + self.preview_row_count(),
         );
-        vp.saturating_sub(2 * VIEWPORT_VPAD).max(1)
+        // Reserve only the top viewport padding: the prompt card sits
+        // directly below the scrolling region (and below an open footer
+        // menu) with no empty row in between.
+        vp.saturating_sub(VIEWPORT_VPAD).max(1)
     }
 
     pub fn viewport_height(&self) -> usize {
         self.base_viewport_height()
             .saturating_sub(crate::overlays::footer_menu_height(self))
             .max(1)
+    }
+
+    /// Number of content rows actually drawn in the message viewport.
+    /// The scrollbar and viewport rect keep their full height
+    /// (`viewport_height()`); this reserves a small bottom padding row
+    /// of blank space between the last content row and the prompt when
+    /// no footer menu is open. A footer menu already separates content
+    /// from the prompt, so the padding is only applied without one.
+    pub fn content_viewport_height(&self) -> usize {
+        let vp = self.viewport_height();
+        let h = if crate::overlays::footer_menu_height(self) > 0 {
+            vp
+        } else {
+            vp.saturating_sub(VIEWPORT_BOTTOM_PAD)
+        };
+        h.max(1)
     }
 
     pub fn block_index_at_content_line(&self, line: usize) -> i32 {
@@ -636,7 +653,7 @@ impl App {
         let Some(y) = y.checked_sub(VIEWPORT_VPAD) else {
             return -1;
         };
-        if y >= self.viewport_height() {
+        if y >= self.content_viewport_height() {
             return -1;
         }
         self.block_index_at_content_line(self.scroll_y + y)
@@ -1833,6 +1850,19 @@ impl App {
         if ev.event_type == "subscribed" {
             return Vec::new();
         }
+        if ev.event_type == "user_message" {
+            // Another client sent a message on this session. Append it
+            // directly instead of reloading — a reload mid-turn would
+            // wipe the live streaming view. The sender is live and was
+            // skipped above, so this only reaches viewing clients.
+            self.blocks.push(Block {
+                kind: BlockKind::User,
+                text: ev.text.clone(),
+                ..Default::default()
+            });
+            self.refresh_viewport();
+            return Vec::new();
+        }
         match ev.event_type.as_str() {
             "round_start" | "tool_pending" | "content" | "reasoning" | "reasoning_end" | "tool"
             | "tool_result" | "tool_diff" | "compaction" | "compaction_end" | "usage" => {
@@ -2129,7 +2159,7 @@ impl App {
                     self.input.up();
                     return Vec::new();
                 }
-                let half = (self.viewport_height() / 2).max(1) as i64;
+                let half = (self.content_viewport_height() / 2).max(1) as i64;
                 self.scroll_viewport(-half);
             }
             KeyCode::Down => {
@@ -2137,14 +2167,14 @@ impl App {
                     self.input.down();
                     return Vec::new();
                 }
-                let half = (self.viewport_height() / 2).max(1) as i64;
+                let half = (self.content_viewport_height() / 2).max(1) as i64;
                 self.scroll_viewport(half);
             }
             KeyCode::PageUp => {
-                self.scroll_viewport(-(self.viewport_height() as i64));
+                self.scroll_viewport(-(self.content_viewport_height() as i64));
             }
             KeyCode::PageDown => {
-                self.scroll_viewport(self.viewport_height() as i64);
+                self.scroll_viewport(self.content_viewport_height() as i64);
             }
             KeyCode::Home => {
                 self.following = false;
@@ -2178,7 +2208,7 @@ impl App {
 
     pub fn scroll_viewport(&mut self, delta: i64) {
         let total = self.content_lines.len() as i64;
-        let vp = self.viewport_height() as i64;
+        let vp = self.content_viewport_height() as i64;
         let max = (total - vp).max(0);
         self.scroll_y = (self.scroll_y as i64 + delta).clamp(0, max.max(0)) as usize;
         self.following = self.scroll_y as i64 >= max.max(0);
@@ -2990,13 +3020,14 @@ impl App {
                 if self.scroll_y > 0 {
                     self.scroll_y -= 1;
                 }
-            } else if self.viewport_height() > 0 && y >= VIEWPORT_VPAD + self.viewport_height() - 1
+            } else if self.content_viewport_height() > 0
+                && y >= VIEWPORT_VPAD + self.content_viewport_height() - 1
             {
                 self.scroll_y += 1;
                 let max = self
                     .content_lines
                     .len()
-                    .saturating_sub(self.viewport_height());
+                    .saturating_sub(self.content_viewport_height());
                 self.following = self.scroll_y >= max;
             }
             if let Some(pos) = self.content_pos_at(x, y) {
@@ -3063,7 +3094,7 @@ impl App {
     }
 
     pub fn content_pos_at(&self, x: usize, y: usize) -> Option<(usize, usize)> {
-        let vp_h = self.viewport_height();
+        let vp_h = self.content_viewport_height();
         let y = y.checked_sub(VIEWPORT_VPAD)?;
         if y >= vp_h || self.content_lines.is_empty() {
             return None;
@@ -4190,6 +4221,41 @@ mod tests {
         assert!(app.streaming);
         assert!(!app.paused);
         assert!(fx.is_empty());
+    }
+
+    #[test]
+    fn user_message_from_other_client_appends_block() {
+        let mut app = App::new_test(90, 30);
+        app.session.id = "sess1".into();
+        // Not streaming: this client is only viewing the session.
+        app.streaming = false;
+
+        let fx = app.handle_msg(AppMsg::SubEvent(serde_json::json!({
+            "type": "user_message",
+            "text": "from another client",
+        })));
+
+        assert!(fx.is_empty());
+        let last = app.blocks.last().unwrap();
+        assert_eq!(last.kind, BlockKind::User);
+        assert_eq!(last.text, "from another client");
+    }
+
+    #[test]
+    fn user_message_while_live_is_skipped() {
+        let mut app = App::new_test(90, 30);
+        app.session.id = "sess1".into();
+        // This client is streaming its own turn, so the echo of the
+        // message it just sent must not append a duplicate block.
+        app.streaming = true;
+
+        let fx = app.handle_msg(AppMsg::SubEvent(serde_json::json!({
+            "type": "user_message",
+            "text": "our own message",
+        })));
+
+        assert!(fx.is_empty());
+        assert!(app.blocks.is_empty());
     }
 
     #[test]

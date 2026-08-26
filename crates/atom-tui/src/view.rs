@@ -1,7 +1,7 @@
 //! view.rs renders the whole frame into the ratatui buffer: the
 //! conversation viewport (windowed by scroll offset, with mouse-drag
 //! selection wash and footer-menu overlays), the animated splash, the
-//! bordered prompt with image previews, the working/status rows, the
+//! bordered prompt with image previews, the status row, the
 //! full-screen overlays, and the sandbox approval box.
 
 use ratatui::buffer::Buffer;
@@ -18,7 +18,6 @@ use crate::prompt::wrap_plain;
 /// Geometry of the fixed footer chrome, in screen rows (0-based tops).
 pub struct Layout {
     pub viewport_h: usize,
-    pub working_y: usize,
     pub prompt_top_y: usize,
     pub preview_y: usize,
     pub status_y: usize,
@@ -38,7 +37,6 @@ impl Layout {
         // returns (viewport_h, prompt_top)
         let reserved = status_rows
             + crate::app::STATUS_FOOTER_ROWS
-            + crate::app::WORKING_STATUS_ROWS
             + 2 * crate::app::PROMPT_PAD
             + input_h
             + preview_rows;
@@ -59,19 +57,19 @@ impl Layout {
         let preview_rows = preview::preview_row_count(app);
         let reserved = status_rows
             + crate::app::STATUS_FOOTER_ROWS
-            + crate::app::WORKING_STATUS_ROWS
             + 2 * crate::app::PROMPT_PAD
             + input_h
             + preview_rows;
         let viewport_h = (app.height as usize).saturating_sub(reserved).max(1);
-        let working_y = viewport_h;
-        let prompt_top_y = working_y + crate::app::WORKING_STATUS_ROWS;
+        // The prompt's top border sits directly below the viewport; the
+        // former working row now shares the status bar (see statusbar.rs),
+        // so no chrome is reserved above the prompt.
+        let prompt_top_y = viewport_h;
         let preview_y = prompt_top_y + crate::app::PROMPT_PAD + input_h;
         let status_y = preview_y + preview_rows + crate::app::PROMPT_PAD;
         let cwd_y = status_y + status_rows;
         Layout {
             viewport_h,
-            working_y,
             prompt_top_y,
             preview_y,
             status_y,
@@ -132,16 +130,6 @@ pub fn draw(app: &mut App, area: Rect, buf: &mut Buffer) -> Option<(u16, u16)> {
         app,
         Rect::new(area.right().saturating_sub(1), vp_rect.y, 1, vp_rect.height),
         buf,
-    );
-
-    // --- working row -------------------------------------------------------
-    let working = working_status_line(app);
-    write_line(
-        buf,
-        area.x + 1,
-        area.y + geo.working_y as u16,
-        inner_w,
-        &working,
     );
 
     // --- prompt input ------------------------------------------------------
@@ -301,12 +289,16 @@ fn write_line(buf: &mut Buffer, x: u16, y: u16, max_w: usize, line: &Line<'_>) {
 // ---------------------------------------------------------------------------
 
 fn draw_viewport(app: &mut App, rect: Rect, buf: &mut Buffer) {
-    let vp_h = rect.height as usize;
+    // The scrollbar and viewport rect span the full `rect.height`, but
+    // content is clipped to `content_viewport_height()` so a small blank
+    // padding row is left at the bottom (when no footer menu is open).
+    let vp_h = app.content_viewport_height().min(rect.height as usize);
     if app.blocks.is_empty() {
-        // Empty-conversation atom animation fills the viewport.
+        // Empty-conversation atom animation fills the content rows; the
+        // remaining bottom padding row(s) stay blank (base background).
         let art = atom_core::render::atom3d::render_atom3d(
             rect.width as i64,
-            rect.height as i64,
+            vp_h as i64,
             app.splash_t,
         );
         let lines = ansi::ansi_to_lines(&art);
@@ -352,25 +344,31 @@ fn draw_viewport(app: &mut App, rect: Rect, buf: &mut Buffer) {
 }
 
 fn draw_scrollbar(app: &App, rect: Rect, buf: &mut Buffer) {
-    let visible = rect.height.min(buf.area.bottom().saturating_sub(rect.y)) as usize;
+    let track = rect.height.min(buf.area.bottom().saturating_sub(rect.y)) as usize;
     let total = app.content_lines.len();
-    if visible == 0 || total <= visible || rect.x >= buf.area.right() {
+    if track == 0 || total <= track || rect.x >= buf.area.right() {
         return;
     }
 
-    let thumb_h = visible
-        .saturating_mul(visible)
+    // The track spans the full viewport height, but the thumb represents
+    // the visible *content* (which is padded short of the track when no
+    // footer menu is open), so its proportion reflects content_viewport.
+    let content_visible = app.content_viewport_height();
+    let thumb_h = (track.saturating_mul(content_visible))
         .div_ceil(total)
         .max(1)
-        .min(visible.saturating_sub(1).max(1));
-    let max_scroll = total - visible;
-    let thumb_top = app
-        .scroll_y
-        .min(max_scroll)
-        .saturating_mul(visible - thumb_h)
-        / max_scroll;
+        .min(track.saturating_sub(1).max(1));
+    let max_scroll = total.saturating_sub(content_visible);
+    let thumb_top = if max_scroll == 0 {
+        0
+    } else {
+        app.scroll_y
+            .min(max_scroll)
+            .saturating_mul(track - thumb_h)
+            / max_scroll
+    };
 
-    for row in 0..visible {
+    for row in 0..track {
         let thumb = row >= thumb_top && row < thumb_top + thumb_h;
         buf[(rect.x, rect.y + row as u16)]
             .set_symbol("█")
@@ -624,30 +622,11 @@ fn render_context_menu(app: &App) -> Vec<Line<'static>> {
 // Footer hint helpers.
 // ---------------------------------------------------------------------------
 
-/// Footer-menu and parent/child navigation hints above the prompt.
+/// Footer-menu and parent/child navigation hints. These now render inside
+/// the status bar (see [`crate::statusbar::nav_segments`]); this helper
+/// remains for direct unit tests of the hint text.
 pub fn working_status_line(app: &App) -> Line<'static> {
-    let mut segs: Vec<Vec<Span<'static>>> = Vec::new();
-
-    if app.manage_visible
-        || !matches!(app.picker_kind, PickerKind::None)
-        || app.context_visible
-        || app.reasoning_visible
-    {
-        segs.push(vec![Span::styled("esc to close", ansi::style_dim())]);
-    } else {
-        let n = app.manage_agents.len();
-        if n > 0 {
-            let label = if n == 1 {
-                "(1 subagent) Shift ↓".to_string()
-            } else {
-                format!("({n} subagents) Shift ↓")
-            };
-            segs.push(vec![Span::styled(label, ansi::style_dim())]);
-        }
-    }
-    if !app.session.parent_id.is_empty() {
-        segs.push(vec![Span::styled("Shift ↑ to return", ansi::style_dim())]);
-    }
+    let segs = crate::statusbar::nav_segments(app);
     if segs.is_empty() {
         return Line::from(" ");
     }
@@ -783,9 +762,9 @@ fn draw_approval_box(app: &App, req: ApprovalPrompt, area: Rect, buf: &mut Buffe
     let inner_w = app.inner_width().min(area.width.saturating_sub(4) as usize);
     let body = approval_body(&req, inner_w);
     let box_h = (body.len() + 2).min(area.height as usize) as u16;
-    // Float just above the working row.
-    let top = if geo.working_y >= box_h as usize {
-        area.y + (geo.working_y - box_h as usize) as u16
+    // Float just above the prompt's top border.
+    let top = if geo.prompt_top_y >= box_h as usize {
+        area.y + (geo.prompt_top_y - box_h as usize) as u16
     } else {
         area.y
     };
@@ -1770,13 +1749,14 @@ mod tests {
         app.refresh_viewport();
         let term = frame(&mut app, 100, 30);
 
-        // viewport_h=24 → working=24, card top=25, input=26,
-        // card bottom=27, status=28, cwd footer=29.
+        // viewport_h=25 → card top=25, input=26, card bottom=27,
+        // status=28, cwd footer=29. The former working row now shares
+        // the status bar, so the viewport grew into row 24.
         assert!(
             row_text(&term, 2).contains("hello world"),
             "user content follows viewport and card padding"
         );
-        assert_eq!(row_text(&term, 24).trim(), "", "working row idle");
+        assert_eq!(row_text(&term, 24).trim(), "", "last viewport row is empty");
         for y in 25..=27 {
             assert!(
                 row_text(&term, y).trim().is_empty(),
@@ -1872,7 +1852,7 @@ mod tests {
         term.backend_mut().resize(80, 24);
         draw_into(&mut app, &mut term);
 
-        // 80x24: vp_h=18 → working=18, card top=19, input=20,
+        // 80x24: vp_h=19 → card top=19, input=20,
         // card bottom=21, status=22, cwd footer=23.
         assert_eq!(term.backend().buffer().area.width, 80);
         assert_eq!(term.backend().buffer().area.height, 24);
@@ -1899,6 +1879,9 @@ mod tests {
         for y in 19..=21 {
             assert_eq!(cell(&term, 1, y).bg, ansi::c_card_light());
         }
-        assert!(row_text(&term, 18).trim().is_empty(), "working row 18");
+        assert!(
+            row_text(&term, 18).trim().is_empty(),
+            "last viewport row 18"
+        );
     }
 }

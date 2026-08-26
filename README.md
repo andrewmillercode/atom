@@ -9,7 +9,7 @@ It works the way opencode2's Ollama provider does: it POSTs to `/v1/chat/complet
 Atom has two parts: a **client** (the `atom` command you run) and a **session server** (a background process the client manages automatically).
 
 - When you run `atom`, it checks if a server is already running on its Unix socket (`~/.local/share/atom/atom.sock`). If so, it connects. If not, it starts one as a detached background process and waits for it to be ready.
-- The server holds sessions in memory and persists each one as a JSON file in `~/.local/share/atom/sessions/`. Sessions survive server restarts — the server loads them from disk on startup.
+- The server persists sessions in `~/.local/share/atom/sessions/sessions.sqlite3`. Startup loads only indexed metadata; conversation messages are queried when a session is opened.
 - Only one server runs at a time. If a second instance tries to start, it detects the existing one and exits cleanly.
 - The client is a ratatui TUI that handles terminal I/O, the conversation view, slash commands, and overlay selectors for models and sessions. The server handles model API calls, tool execution, and session persistence.
 - **Vector Search** (`vector_search`) runs [Semble](https://github.com/MinishLab/semble) `search` at a pinned version (`semble==0.5.5`) via `uvx`. It does not expose `find_related`. Requires [uv](https://docs.astral.sh/uv/).
@@ -224,4 +224,3 @@ sudo install atom /usr/local/bin
 ```
 
 or build from source: clone the repo and `cargo install --path crates/atom`.
-

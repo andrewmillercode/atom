@@ -143,6 +143,12 @@ pub struct ModelsDevModel {
     pub reasoning_options: Vec<ModelsDevReasoningOpt>,
     #[serde(default, deserialize_with = "crate::serde_null::null_as_default")]
     pub limit: ModelsDevLimit,
+    /// Supported input/output content types, e.g. `input: ["text",
+    /// "image"]`. Missing modalities deserialize to empty vectors. Used
+    /// to tell multimodal models apart from text-only ones so images are
+    /// stripped before a text-only model rejects them.
+    #[serde(default, deserialize_with = "crate::serde_null::null_as_default")]
+    pub modalities: ModelsDevModalities,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -170,6 +176,24 @@ pub struct ModelsDevLimit {
     pub context: i64,
 }
 
+/// ModelsDevModalities mirrors the models.dev `modalities` object: the
+/// content types a model accepts (`input`) and emits (`output`), e.g.
+/// `input: ["text", "image"]`. atom only acts on whether `input`
+/// includes "image"; the rest is preserved for completeness.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModelsDevModalities {
+    #[serde(
+        default,
+        deserialize_with = "crate::serde_null::null_elements_as_default"
+    )]
+    pub input: Vec<String>,
+    #[serde(
+        default,
+        deserialize_with = "crate::serde_null::null_elements_as_default"
+    )]
+    pub output: Vec<String>,
+}
+
 #[derive(Default)]
 struct CompactModels {
     entries: Box<[CompactModelEntry]>,
@@ -184,6 +208,10 @@ struct CompactModelEntry {
     level_len: u16,
     reasoning: bool,
     free: bool,
+    /// Whether the model accepts image input (`modalities.input` lists
+    /// "image"). False for text-only models so images can be stripped
+    /// before the request leaves atom.
+    image: bool,
 }
 
 #[derive(Default, Deserialize)]
@@ -200,6 +228,8 @@ struct CompactModelWire {
     reasoning_options: Vec<ModelsDevReasoningOpt>,
     #[serde(default, deserialize_with = "crate::serde_null::null_as_default")]
     limit: ModelsDevLimit,
+    #[serde(default, deserialize_with = "crate::serde_null::null_as_default")]
+    modalities: ModelsDevModalities,
 }
 
 fn push_compact_model(
@@ -214,7 +244,13 @@ fn push_compact_model(
         cost: wire.cost,
         reasoning_options: wire.reasoning_options,
         limit: wire.limit,
+        modalities: wire.modalities.clone(),
     };
+    let supports_image = wire
+        .modalities
+        .input
+        .iter()
+        .any(|m| m.eq_ignore_ascii_case("image"));
     let level_start = u32::try_from(level_ids.len()).map_err(|_| "models.dev catalog too large")?;
     if let Some(levels) = derive_reasoning_levels(&model) {
         for level in levels {
@@ -244,6 +280,7 @@ fn push_compact_model(
             .cost
             .as_ref()
             .is_some_and(|cost| cost.input == 0.0 && cost.output == 0.0),
+        image: supports_image,
     });
     Ok(())
 }
@@ -313,6 +350,7 @@ impl CompactModels {
                 cost: model.cost,
                 reasoning_options: model.reasoning_options,
                 limit: model.limit,
+                modalities: model.modalities,
             };
             push_compact_model(
                 &mut entries,
@@ -797,6 +835,17 @@ pub fn find_catalog_model(provider_name: &str, model_id: &str) -> Option<ModelsD
         limit: ModelsDevLimit {
             context: model.context,
         },
+        modalities: if model.image {
+            ModelsDevModalities {
+                input: vec!["text".into(), "image".into()],
+                output: vec!["text".into()],
+            }
+        } else {
+            ModelsDevModalities {
+                input: vec!["text".into()],
+                output: vec!["text".into()],
+            }
+        },
     })
 }
 
@@ -804,6 +853,19 @@ pub fn catalog_contains_model(model_id: &str) -> bool {
     current_models_dev_catalog()
         .and_then(|cat| find_compact_model(&cat, "", model_id).map(|_| ()))
         .is_some()
+}
+
+/// modelSupportsImageInput reports whether the model accepts image
+/// input, per the models.dev catalog's `modalities.input`. Returns
+/// `Some(true)` when the model is multimodal, `Some(false)` when the
+/// catalog explicitly lists it as text-only, and `None` for a model the
+/// catalog does not know (so callers keep current behavior instead of
+/// silently dropping images from a custom model that may in fact be
+/// multimodal). An empty provider name searches preferred hosts first.
+pub fn model_supports_image_input(provider: &str, model: &str) -> Option<bool> {
+    let cat = current_models_dev_catalog()?;
+    let (_, entry) = find_compact_model(&cat, provider, model)?;
+    Some(entry.image)
 }
 
 pub fn normalize_model_id(id: &str) -> String {
@@ -1469,6 +1531,59 @@ mod tests {
         assert_eq!(context_window_tokens("openai", "big"), 400000);
         assert_eq!(context_window_tokens("openai", "small"), 128000);
         assert_eq!(context_window_tokens("openai", "unknown"), 128000);
+    }
+
+    #[test]
+    fn model_supports_image_input_reads_modalities() {
+        let _g = lock();
+        let mut cat = ModelsDevCatalog::new();
+        cat.insert(
+            "openai".into(),
+            ModelsDevProvider {
+                models: HashMap::from([
+                    (
+                        "vision-model".to_string(),
+                        ModelsDevModel {
+                            modalities: ModelsDevModalities {
+                                input: vec!["text".into(), "image".into()],
+                                output: vec!["text".into()],
+                            },
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "text-only-model".to_string(),
+                        ModelsDevModel {
+                            modalities: ModelsDevModalities {
+                                input: vec!["text".into()],
+                                output: vec!["text".into()],
+                            },
+                            ..Default::default()
+                        },
+                    ),
+                    // No modalities at all → treated as text-only.
+                    ("no-modalities".to_string(), ModelsDevModel::default()),
+                ]),
+                ..Default::default()
+            },
+        );
+        set_models_dev_catalog_for_test(Some(cat));
+        assert_eq!(
+            model_supports_image_input("openai", "vision-model"),
+            Some(true)
+        );
+        assert_eq!(
+            model_supports_image_input("openai", "text-only-model"),
+            Some(false)
+        );
+        assert_eq!(
+            model_supports_image_input("openai", "no-modalities"),
+            Some(false)
+        );
+        // Unknown model / provider → None: callers keep current behavior
+        // instead of stripping images from a possibly-multimodal custom model.
+        assert_eq!(model_supports_image_input("openai", "unknown-model"), None);
+        assert_eq!(model_supports_image_input("nope", "vision-model"), None);
     }
 
     #[test]

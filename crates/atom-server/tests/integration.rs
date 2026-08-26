@@ -248,7 +248,7 @@ async fn collect_until_closed(mut rx: tokio::sync::mpsc::Receiver<Value>) -> (Ve
 // ---------------------------------------------------------------------------
 
 /// A plain content turn streams content deltas, a usage event, and done;
-/// the persisted session JSON carries the Go-compatible key set.
+/// the normalized store retains the complete assistant response.
 #[tokio::test(flavor = "multi_thread")]
 async fn send_streams_content_and_persists_session() {
     let env = TestEnv::new("send-content");
@@ -289,37 +289,74 @@ async fn send_streams_content_and_persists_session() {
     assert_eq!(events[4]["model"], "test-model");
     assert!(events[4]["duration_ms"].as_i64().is_some_and(|ms| ms > 0));
 
-    // Persisted session file: roles plus the Go-compatible key set.
-    let file = env
-        .path()
-        .join("sessions")
-        .join(format!("{}.json", sess.id));
-    let raw = std::fs::read_to_string(file).unwrap();
-    let v: Value = serde_json::from_str(&raw).unwrap();
-    for key in [
-        "id",
-        "title",
-        "messages",
-        "model",
-        "cwd",
-        "instructions",
-        "created_at",
-        "updated_at",
-    ] {
-        assert!(v.get(key).is_some(), "missing persisted key {key}");
-    }
-    let roles: Vec<&str> = v["messages"]
-        .as_array()
-        .unwrap()
+    let persisted = state.store.get(&sess.id).unwrap();
+    let roles: Vec<&str> = persisted
+        .messages
         .iter()
-        .map(|m| m["role"].as_str().unwrap())
+        .map(|message| message.role.as_str())
         .collect();
     assert_eq!(roles, vec!["user", "assistant"]);
-    assert_eq!(v["messages"][1]["content"], "Hello");
-    assert_eq!(v["messages"][1]["model"], "test-model");
-    assert!(v["messages"][1]["duration_ms"]
-        .as_i64()
-        .is_some_and(|ms| ms > 0));
+    assert_eq!(persisted.messages[1].content, "Hello");
+    assert_eq!(persisted.messages[1].model, "test-model");
+    assert!(persisted.messages[1].duration_ms > 0);
+}
+
+/// A second client subscribed to the same session sees the user's
+/// message (user_message broadcast) before the model finishes, not only
+/// after the turn's done event. The event carries the message text so
+/// viewers can append it without a full reload.
+#[tokio::test(flavor = "multi_thread")]
+async fn subscribed_client_sees_user_message_before_done() {
+    let env = TestEnv::new("sub-sees-user");
+    let base_url = spawn_mock_provider(vec![sse_response(concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\",\"reasoning\":null},\"finish_reason\":null}]}\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":null}]}\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n",
+        "data: [DONE]\n",
+    ))])
+    .await;
+    let state = spawn_server(&env, off_cfg()).await;
+
+    let sess = state.store.create("test-model", "/tmp", vec![]);
+    let mut sub = state.subs.subscribe(&sess.id);
+
+    let rx = client::stream_send(
+        &sess.id,
+        &json!({"message": "say hello", "base_url": base_url}),
+    )
+    .await
+    .unwrap();
+    let (_events, closed) = collect_until_closed(rx).await;
+    assert!(closed);
+
+    // The user message must be persisted immediately at turn start.
+    let got = state.store.get(&sess.id).unwrap();
+    assert_eq!(got.messages[0].role, "user");
+    assert_eq!(got.messages[0].content, "say hello");
+
+    // Subscriber receives the user_message event before the turn's done
+    // event, not only after the model finishes.
+    let mut sub_events = Vec::new();
+    while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(15), sub.rx.recv()).await {
+        let is_done = ev["type"] == "done";
+        sub_events.push(ev);
+        if is_done {
+            break;
+        }
+    }
+    let user_msg = sub_events
+        .iter()
+        .position(|e| e["type"] == "user_message")
+        .expect("subscriber got user_message event");
+    assert_eq!(sub_events[user_msg]["text"], "say hello");
+    let done_at = sub_events
+        .iter()
+        .position(|e| e["type"] == "done")
+        .expect("subscriber got done event");
+    assert!(
+        user_msg < done_at,
+        "user_message must precede done: {sub_events:?}"
+    );
 }
 
 /// A tool-call turn executes the tool (sandbox Off), feeds the result

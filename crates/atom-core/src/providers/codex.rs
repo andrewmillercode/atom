@@ -570,6 +570,7 @@ where
         result: StreamResult {
             content: reply,
             reasoning,
+            reasoning_signature: String::new(),
             reasoning_ms: em.reasoning_ms,
             tool_calls: calls,
             usage,

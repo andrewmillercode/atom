@@ -24,7 +24,12 @@ use serde_json::{json, Value};
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::{UnixListener, UnixStream};
+
+/// How long POST /pause waits for the paused turn to fully unwind before
+/// returning, so a follow-up /send can't race end_turn.
+const PAUSE_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 type Resp = Response<BoxBody<Bytes, Infallible>>;
 
@@ -389,6 +394,7 @@ async fn handle_pause(state: &Arc<AppState>, req: &mut Request<Incoming>, id: &s
     let body: PauseBody = decode(req).await.unwrap_or_default();
     state.turns.pause_session(id, &body.turn_id);
     state.subs.broadcast(id, &json!({"type": "paused"}));
+    state.turns.wait_idle(id, PAUSE_WAIT_TIMEOUT).await;
     no_content()
 }
 

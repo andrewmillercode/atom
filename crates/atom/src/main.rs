@@ -56,6 +56,14 @@ fn save_last_model_state(provider_name: &str, model: &str, thinking: &str) {
 const USAGE: &str = "usage: atom [-serve] [-model id] [-key key] [-url base] [-session id]
                      [-stats [-stats-days N]] [--output-test] [--hot] [-no-deps]";
 
+fn help_text() -> String {
+    format!(
+        "{USAGE}\n\nversion: {}\nbuild: {}",
+        env!("CARGO_PKG_VERSION"),
+        env!("ATOM_BUILD")
+    )
+}
+
 struct Args {
     serve: bool,
     model: String,
@@ -113,7 +121,7 @@ fn parse_args() -> Result<Args> {
             "hot-state" => a.hot_state = Some(next_val()?),
             "no-deps" => a.no_deps = true,
             "h" | "help" => {
-                println!("{USAGE}");
+                println!("{}", help_text());
                 std::process::exit(0);
             }
             other => return Err(anyhow!("unknown flag: -{other}\n{USAGE}")),
@@ -132,6 +140,10 @@ async fn main() {
 
 async fn run() -> Result<()> {
     let args = parse_args()?;
+
+    if args.serve {
+        set_server_process_name();
+    }
 
     // Ensure required tool dependencies (rg, uvx) exist before the
     // server spawns or the TUI takes over the terminal, while it is
@@ -299,6 +311,30 @@ async fn run() -> Result<()> {
     };
 
     launch_tui(providers, sel_provider, sel_model, args, Some(session)).await
+}
+
+fn set_server_process_name() {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        libc::pthread_setname_np(c"atoms".as_ptr());
+    }
+
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::prctl(libc::PR_SET_NAME, c"atoms".as_ptr(), 0, 0, 0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn help_identifies_version_and_build() {
+        let help = help_text();
+        assert!(help.contains(env!("CARGO_PKG_VERSION")));
+        assert!(help.contains(env!("ATOM_BUILD")));
+    }
 }
 
 async fn launch_tui(

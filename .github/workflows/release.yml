@@ -71,14 +71,14 @@ jobs:
               --target "$MERGE_SHA" \
               --title "atom v${VER}" \
               --notes-file "$NOTES_FILE" \
-              --generate-release-notes
+              --generate-notes
           else
             echo "::warning::${NOTES_FILE} not found at the merge commit — falling back to auto-generated release notes"
             gh release create "v${VER}" \
               --repo "$GITHUB_REPOSITORY" \
               --target "$MERGE_SHA" \
               --title "atom v${VER}" \
-              --generate-release-notes
+              --generate-notes
           fi
           echo "created=true" >> "$GITHUB_OUTPUT"
 

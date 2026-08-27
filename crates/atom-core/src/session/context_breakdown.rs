@@ -61,7 +61,7 @@ pub fn classify_instruction(content: &str) -> &'static str {
     if src == "skills" {
         return CONTEXT_CAT_REPO;
     }
-    // Bundled atom instructions (system-prompt.md, tools.md).
+    // Bundled atom instructions (instructions/...).
     if src.starts_with("instructions/") {
         return CONTEXT_CAT_ATOM;
     }
@@ -108,14 +108,11 @@ pub fn allocate_percents(parts: &[i64]) -> Vec<i64> {
 }
 
 /// contextBreakdown estimates live model-context occupancy by category.
-/// Tool definitions are the builtins; pass MCP tool defs via
-/// [`context_breakdown_with_tools`] once the server discovers them
-/// (Go's toolDefinitionsFor(cwd) = builtins + MCP tools for cwd).
-pub fn context_breakdown(sess: &Session) -> Vec<ContextRow> {
-    context_breakdown_with_tools(sess, &[])
-}
-
-pub fn context_breakdown_with_tools(sess: &Session, extra_tools: &[ToolDef]) -> Vec<ContextRow> {
+/// The caller passes the tool definitions to count: the builtins live in
+/// atom-tools (`atom_tools::tool_definitions`, plus MCP tools for cwd
+/// in Go's toolDefinitionsFor(cwd)), and atom-core cannot depend on
+/// atom-tools without a cycle.
+pub fn context_breakdown(sess: &Session, tools: &[ToolDef]) -> Vec<ContextRow> {
     let mut chars: std::collections::HashMap<&'static str, usize> =
         CONTEXT_CATEGORY_ORDER.iter().map(|&c| (c, 0)).collect();
 
@@ -123,8 +120,6 @@ pub fn context_breakdown_with_tools(sess: &Session, extra_tools: &[ToolDef]) -> 
         *chars.entry(classify_instruction(&m.content)).or_insert(0) += m.content.len();
     }
 
-    let mut tools = builtin_tool_definitions();
-    tools.extend_from_slice(extra_tools);
     if let Ok(raw) = serde_json::to_vec(&tools) {
         *chars.get_mut(CONTEXT_CAT_TOOLS).unwrap() += raw.len();
     }
@@ -163,76 +158,6 @@ pub fn context_row_meta(row: &ContextRow) -> String {
         crate::session::stats::format_tokens(row.tokens),
         row.pct
     )
-}
-
-/// builtinToolDefinitions is the built-in OpenAI tool list, including
-/// skill (main.go and friends). Only its serialized JSON length is used
-/// here today, but the definitions are byte-faithful ports so other
-/// crates can reuse them.
-pub fn builtin_tool_definitions() -> Vec<ToolDef> {
-    use serde_json::json;
-    macro_rules! def {
-        ($name:expr, $desc:expr, $params:expr) => {
-            ToolDef::new($name, $desc, $params)
-        };
-    }
-    vec![
-        def!(
-            "web_search",
-            "Search the web for current information. Returns search result titles, URLs, and snippets.",
-            json!({"type":"object","properties":{"query":{"type":"string","description":"The search query"}},"required":["query"]})
-        ),
-        def!(
-            "read_file",
-            "Read a file. Returns a window of lines (offset defaults to 0, limit defaults to 1000). After this, edit_file and write_file may be used on the path. If the file later changes on disk, those tools return a short diff of the change — do not re-read the whole file. Image files (png, jpg, gif, webp, bmp) are returned as images so vision-capable models can see them.",
-            json!({"type":"object","properties":{"path":{"type":"string","description":"Absolute or relative path to the file to read"},"offset":{"type":"integer","description":"0-based line offset to start reading from. Defaults to 0."},"limit":{"type":"integer","description":"Maximum number of lines to return. Defaults to 1000."}},"required":["path"]})
-        ),
-        def!(
-            "write_file",
-            "Create or overwrite a file with the given content. Existing files must be observed with read_file first. The file is re-checked automatically; if it changed since the last observation, the write is skipped and a short diff is returned. New files do not need a prior read. Do not use bash to write files.",
-            json!({"type":"object","properties":{"path":{"type":"string","description":"Absolute or relative path to the file to create or overwrite"},"content":{"type":"string","description":"The full content to write to the file"}},"required":["path","content"]})
-        ),
-        def!(
-            "edit_file",
-            "Edit a file by replacing unique exact text. Call read_file on the path once first (a window is enough). The file is re-checked automatically. If it changed since the last observation, the edit is skipped and a short diff is returned. After a successful edit, do not read_file again unless the next edit fails.",
-            json!({"type":"object","properties":{"path":{"type":"string","description":"Absolute or relative path to the file to edit"},"old_text":{"type":"string","description":"The exact text to find in the file"},"new_text":{"type":"string","description":"The replacement text"}},"required":["path","old_text","new_text"]})
-        ),
-        def!(
-            "vector_search",
-            "Search a local directory or git URL for relevant code by meaning or identifier. Returns matching snippets with file paths and line ranges. Prefer this over grep when looking for how something works. Does not search the web.",
-            json!({"type":"object","properties":{"query":{"type":"string","description":"Natural-language or identifier query"},"path":{"type":"string","description":"Local directory or https git URL. Defaults to the current directory."},"content":{"type":"string","enum":["code","docs","config","all"],"description":"What to search. Defaults to code."},"top_k":{"type":"integer","description":"Maximum number of snippets to return"},"max_snippet_lines":{"type":"integer","description":"Show only the first N lines of each snippet. 0 returns path and line range only."}},"required":["query"]})
-        ),
-        def!(
-            "grep",
-            "Fast regex text search with path, line number, and matching text. The pattern is a regular expression by default; set regex to false to match literal text. Use for identifiers, error strings, config keys, and structural patterns instead of running grep or rg in bash. The session workspace is searched by default and .gitignore is honored.",
-            json!({"type":"object","properties":{"pattern":{"type":"string","description":"Regular expression to find. Defaults to regex mode; set regex to false to match this string literally."},"path":{"type":"string","description":"Optional file or directory, relative to the session workspace. Omit to search the workspace."},"glob":{"type":"string","description":"Optional file filter such as *.rs or **/*.test.ts"},"regex":{"type":"boolean","description":"Set to false to disable regex matching and treat the pattern as a literal substring. Defaults to true."},"case_insensitive":{"type":"boolean","description":"Force case-insensitive matching. Otherwise smart-case is used."},"head_limit":{"type":"integer","description":"Maximum matches returned. Defaults to 100."}},"required":["pattern"]})
-        ),
-        def!(
-            "glob",
-            "Fast file discovery by pattern. Use instead of find, fd, or ls in bash. Searches the session workspace recursively by default and honors .gitignore.",
-            json!({"type":"object","properties":{"pattern":{"type":"string","description":"File glob such as **/*.rs, src/**/*.md, or Cargo.toml"},"path":{"type":"string","description":"Optional directory relative to the session workspace. Omit to search the workspace."},"head_limit":{"type":"integer","description":"Maximum paths returned. Defaults to 200."}},"required":["pattern"]})
-        ),
-        def!(
-            "visualize",
-            "Render a Mermaid diagram inline in the atom TUI as a high-density image; clicking anywhere on the rendered diagram opens a pan/zoom viewer in the browser. Every diagram follows the house style: muted, desaturated colors with color on borders/strokes only (classDef fill:none plus a colored stroke, never bright fills — diagrams render on a dark background), and a compact landscape layout (wide, not tall: prefer flowchart LR, short labels, side-by-side subgraphs) so the inline preview fills its block without dead vertical space. Use for conceptual thinking, architecture, data flow, function call graphs, sequence diagrams, state machines, ER models, etc. Prefer this over ASCII-art diagrams in replies. Provide standard Mermaid source (flowchart, sequenceDiagram, classDiagram, stateDiagram-v2, erDiagram, mindmap, gantt, pie, journey, gitGraph, and more). Include a short title — it names the browser artifact. If a render fails, the error names the offending line; fix the source and retry rather than giving up.",
-            json!({"type":"object","properties":{"code":{"type":"string","description":"The Mermaid diagram source, e.g. 'flowchart TD\\n  A[Start] --> B[Done]'"},"title":{"type":"string","description":"Short title for the diagram (used for the browser tab and artifact filename)"}},"required":["code"]})
-        ),
-        def!(
-            "bash",
-            "Run commands that require a shell, such as tests, builds, git, and package managers. File discovery and text search are faster and safer with glob and grep; file reads and changes belong in read_file, write_file, and edit_file.",
-            json!({"type":"object","properties":{"command":{"type":"string","description":"Command to execute from the session workspace"}},"required":["command"]})
-        ),
-        def!(
-            "dispatch",
-            "Manage subagents through one bulk interface. Use action=models to discover models; spawn creates one subagent per task string; inspect, send, and cancel target IDs, a batch, or all owned subagents.",
-            json!({"type":"object","properties":{"action":{"type":"string","enum":["models","spawn","inspect","send","cancel"]},"tasks":{"type":"array","minItems":1,"maxItems":100,"items":{"type":"string"}},"provider":{"type":"string"},"model":{"type":"string"},"thinking":{"type":"string"},"batch_id":{"type":"string"},"ids":{"type":"array","items":{"type":"string"}},"prompt":{"type":"string"},"messages":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"prompt":{"type":"string"}},"required":["id","prompt"]}},"wait":{"type":"string","enum":["none","any","all"]},"results":{"type":"boolean"},"statuses":{"type":"array","items":{"type":"string"}},"query":{"type":"string"}},"required":["action"]})
-        ),
-        def!(
-            "skill",
-            "Load a skill's full instructions by exact name from the skills catalog. Call this when the user's request matches a listed skill. Then follow those instructions.",
-            json!({"type":"object","properties":{"name":{"type":"string","description":"Exact skill name from the catalog"}},"required":["name"]})
-        ),
-    ]
 }
 
 #[cfg(test)]
@@ -280,6 +205,16 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// A stand-in tool list, since the defs live in atom-tools and this
+    /// crate cannot depend on it.
+    fn some_tools() -> Vec<ToolDef> {
+        vec![ToolDef::new(
+            "bash",
+            "Run commands that require a shell, such as tests, builds, git, and package managers.",
+            serde_json::json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}),
+        )]
+    }
+
     #[test]
     fn classify_instruction_categories() {
         const ATOM: &str = CONTEXT_CAT_ATOM;
@@ -290,7 +225,7 @@ mod tests {
                 ATOM,
             ),
             (
-                "Instructions from: instructions/tools.md\nbundled tools",
+                "Instructions from: instructions/notes.md\nbundled extra",
                 ATOM,
             ),
             ("Instructions from: skills\n- pack: Pack files", REPO),
@@ -319,7 +254,7 @@ mod tests {
         let mut sess = ctx_session();
         sess.instructions = vec![
             sys_msg(&format!(
-                "Instructions from: instructions/tools.md\n{}",
+                "Instructions from: instructions/notes.md\n{}",
                 "T".repeat(400)
             )),
             sys_msg(&format!("Instructions from: skills\n{}", "S".repeat(400))),
@@ -332,13 +267,13 @@ mod tests {
                 "G".repeat(400)
             )),
         ];
-        let rows = context_breakdown(&sess);
+        let rows = context_breakdown(&sess, &[]);
         assert_eq!(rows.len(), 5);
         let atom = row_by_name(&rows, CONTEXT_CAT_ATOM);
         let repo = row_by_name(&rows, CONTEXT_CAT_REPO);
         assert!(
             atom.tokens > 0,
-            "tools.md + config AGENTS.md should count as atom"
+            "instructions/notes.md + config AGENTS.md should count as atom"
         );
         assert!(
             repo.tokens > 0,
@@ -385,7 +320,7 @@ mod tests {
             },
             role_msg("nudge", "please continue"),
         ];
-        let rows = context_breakdown(&sess);
+        let rows = context_breakdown(&sess, &[]);
         let user = row_by_name(&rows, CONTEXT_CAT_USER);
         let agent = row_by_name(&rows, CONTEXT_CAT_AGENT);
         assert!(
@@ -422,7 +357,7 @@ mod tests {
 
     #[test]
     fn breakdown_tools_and_percents() {
-        let rows = context_breakdown(&ctx_session());
+        let rows = context_breakdown(&ctx_session(), &some_tools());
         assert_eq!(rows.len(), 5, "empty session rows");
         let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
         let sum: i64 = rows.iter().map(|r| r.pct).sum();
@@ -430,7 +365,7 @@ mod tests {
         let tools = row_by_name(&rows, CONTEXT_CAT_TOOLS);
         assert!(
             tools.tokens > 0,
-            "builtin tool definitions should be present"
+            "tool definitions passed by the caller should be counted"
         );
         assert_eq!(sum, 100);
     }
@@ -440,8 +375,12 @@ mod tests {
         let got = allocate_percents(&[0, 0, 0, 0, 0]);
         assert_eq!(got.len(), 5);
         assert!(got.iter().all(|p| *p == 0));
-        let rows = context_breakdown(&ctx_session());
+        let rows = context_breakdown(&ctx_session(), &[]);
         assert_eq!(rows.len(), 5);
+        let tools = row_by_name(&rows, CONTEXT_CAT_TOOLS);
+        // An empty slice still serializes as "[]" (2 chars -> 1 token);
+        // it must stay negligible compared with the builtin list.
+        assert!(tools.tokens <= 1);
     }
 
     #[test]
@@ -454,15 +393,15 @@ mod tests {
     #[test]
     fn instruction_source_extraction() {
         assert_eq!(
-            instruction_source("Instructions from: instructions/tools.md\nbody"),
-            "instructions/tools.md"
+            instruction_source("Instructions from: instructions/notes.md\nbody"),
+            "instructions/notes.md"
         );
         assert_eq!(instruction_source("no prefix"), "");
         assert_eq!(
             instruction_source("Instructions from:   /x/y AGENTS.md  \nnext"),
             "/x/y AGENTS.md"
         );
-        let rows = context_breakdown(&Session::default());
+        let rows = context_breakdown(&Session::default(), &[]);
         assert!(row_by_name(&rows, CONTEXT_CAT_USER).pct >= 0);
         let _ = compaction_prompt_text("x"); // touch import for parity helpers
     }

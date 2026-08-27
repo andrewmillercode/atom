@@ -1,14 +1,14 @@
 //! loadInstructionsFrom, ported from main.go: assembles the bundled
-//! atom instructions (system-prompt.md, then tools.md from the repo's
-//! instructions/ folder), then the skills catalog message, then AGENTS.md
-//! from the atom config directory and project AGENTS.md files (global
-//! then project, matching OpenCode's merge order). AGENTS.md files add
-//! context in place; they never replace the bundled system prompt. The
-//! server calls this when creating sessions and dispatch children.
+//! atom system prompt (system-prompt.md from the repo's instructions/
+//! folder; tool documentation travels in the tool definitions instead),
+//! then the skills catalog message, then AGENTS.md from the atom config
+//! directory and project AGENTS.md files (global then project, matching
+//! OpenCode's merge order). AGENTS.md files add context in place; they
+//! never replace the bundled system prompt. The server calls this when
+//! creating sessions and dispatch children.
 
 use atom_core::types::Message;
 use atom_tools::skills::{atom_config_dir, skills_catalog_message, walk_project_dirs_in};
-use atom_tools::vector_search::BUNDLED_TOOLS;
 
 /// Bundled instructions/system-prompt.md embedded like Go's //go:embed.
 pub const BUNDLED_SYSTEM_PROMPT: &str = include_str!("../../../instructions/system-prompt.md");
@@ -36,10 +36,7 @@ fn read_instruction_file(path: &std::path::Path) -> Option<String> {
 }
 
 pub fn load_instructions_from(cwd: &str) -> Vec<Message> {
-    let mut instructions = vec![
-        bundled_message("system-prompt.md", BUNDLED_SYSTEM_PROMPT),
-        bundled_message("tools.md", BUNDLED_TOOLS),
-    ];
+    let mut instructions = vec![bundled_message("system-prompt.md", BUNDLED_SYSTEM_PROMPT)];
     let catalog = skills_catalog_message(cwd);
     if !catalog.is_empty() {
         instructions.push(Message {
@@ -87,16 +84,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn starts_with_bundled_prompt_then_tools() {
+    fn starts_with_bundled_prompt() {
         let instr = load_instructions_from("/tmp");
-        assert!(instr.len() >= 2);
+        assert!(!instr.is_empty());
         assert_eq!(instr[0].role, "system");
         assert!(instr[0]
             .content
             .starts_with("Instructions from: instructions/system-prompt.md\n"));
-        assert!(instr[1]
-            .content
-            .starts_with("Instructions from: instructions/tools.md\n"));
+        assert!(
+            !instr
+                .iter()
+                .any(|m| m.content.contains("instructions/tools.md")),
+            "tools.md is gone; tool docs live in the tool defs"
+        );
+        // Behavioral primers that are not tool-specific stay in the
+        // bundled system prompt ("Finishing a turn").
+        assert!(BUNDLED_SYSTEM_PROMPT.contains("mid-implementation"));
     }
 
     #[test]

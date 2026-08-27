@@ -120,13 +120,18 @@ pub fn draw(app: &mut App, area: Rect, buf: &mut Buffer) -> Option<(u16, u16)> {
     );
     draw_viewport(app, vp_rect, buf);
 
-    // Footer menus take their own rows between the conversation and prompt,
-    // so opening one never paints over conversation content.
+    // Footer menus float over the last viewport rows, just above the
+    // prompt, so opening one never moves the conversation.
     let menu_h = overlays::footer_menu_height(app) as u16;
     if menu_h > 0 {
         draw_footer_menu(
             app,
-            Rect::new(vp_rect.x, vp_rect.bottom(), vp_rect.width, menu_h),
+            Rect::new(
+                vp_rect.x,
+                vp_rect.bottom().saturating_sub(menu_h),
+                vp_rect.width,
+                menu_h,
+            ),
             buf,
         );
     }
@@ -1088,28 +1093,7 @@ fn render_session_selector(app: &mut App) -> Vec<Line<'static>> {
         out.push(header_line("no matches"));
         return out;
     }
-    let counts: Vec<usize> = {
-        // Recompute per-row visual heights like the scroll math does.
-        rows.iter()
-            .enumerate()
-            .map(|(i, r)| {
-                if r.date {
-                    return 1;
-                }
-                let marker = if r
-                    .sess
-                    .as_ref()
-                    .map(|s| s.id == app.session.id)
-                    .unwrap_or(false)
-                {
-                    "→ "
-                } else {
-                    "  "
-                };
-                overlays::wrapped_label_line_count(&r.label, width, i == app.overlay_sel, marker)
-            })
-            .collect()
-    };
+    let counts: Vec<usize> = overlays::session_row_line_counts(app);
     let max_items = overlays::overlay_list_max_lines(app);
     let mut rendered = vec![false; rows.len()];
     overlays::overlay_for_each_visible(
@@ -1140,14 +1124,34 @@ fn render_session_selector(app: &mut App) -> Vec<Line<'static>> {
         } else {
             "  "
         };
-        if i == app.overlay_sel {
-            let label = format!("▸ {marker}{}", r.label);
-            for row in wrap_plain(&label, width) {
-                out.push(Line::from(Span::styled(row, ansi::style_selected())));
-            }
+        let is_sub = r.sess.as_ref().is_some_and(|s| !s.parent_id.is_empty());
+        let avail = if is_sub {
+            width.saturating_sub(overlays::SUBAGENT_TAG_WIDTH)
         } else {
-            for row in wrap_plain(&format!("{marker}{}", r.label), width) {
-                out.push(Line::from(Span::styled(row, ansi::style_inactive())));
+            width
+        };
+        let style = if i == app.overlay_sel {
+            ansi::style_selected()
+        } else {
+            ansi::style_inactive()
+        };
+        let label = if i == app.overlay_sel {
+            format!("▸ {marker}{}", r.label)
+        } else {
+            format!("{marker}{}", r.label)
+        };
+        for (li, row) in wrap_plain(&label, avail).into_iter().enumerate() {
+            if li == 0 && is_sub {
+                // Right-align the muted Subagent tag on the first line.
+                let used = ansi::line_width(&Line::from(row.as_str()));
+                let gap = avail.saturating_sub(used);
+                out.push(Line::from(vec![
+                    Span::styled(row, style),
+                    Span::raw(" ".repeat(gap + 2)),
+                    Span::styled(overlays::SUBAGENT_TAG.to_string(), ansi::style_dim()),
+                ]));
+            } else {
+                out.push(Line::from(Span::styled(row, style)));
             }
         }
     }
@@ -1804,6 +1808,39 @@ mod tests {
         let lines = render_manage_menu(&app);
         assert!(ansi::line_plain(&lines[1]).contains("| ⠙ Working"));
         assert!(ansi::line_plain(&lines[2]).contains("| Sandbox"));
+    }
+
+    #[test]
+    fn session_picker_tags_subagents_on_the_right() {
+        let mut app = App::new_test(80, 24);
+        let mut top = crate::app::empty_session_info();
+        top.id = "top1".into();
+        top.title = "main chat".into();
+        let mut sub = crate::app::empty_session_info();
+        sub.id = "sub1".into();
+        sub.title = "worker".into();
+        sub.parent_id = "top1".into();
+        app.overlay = Some(OverlayKind::Session);
+        app.overlay_sessions = vec![top, sub];
+
+        let lines = render_overlay(&mut app, OverlayKind::Session);
+        let plain: Vec<String> = lines.iter().map(ansi::line_plain).collect();
+        let top_row = plain.iter().find(|l| l.contains("main chat")).unwrap();
+        let sub_row = plain.iter().find(|l| l.contains("worker")).unwrap();
+        assert!(!top_row.contains("Subagent"), "plain session untagged");
+        assert!(
+            sub_row.ends_with("Subagent"),
+            "subagent row carries the tag: {sub_row:?}"
+        );
+        // The tag sits flush right at the picker width.
+        assert_eq!(sub_row.chars().count(), 80);
+        let tagged = lines
+            .iter()
+            .find(|l| ansi::line_plain(l).ends_with("Subagent"))
+            .unwrap();
+        let last = tagged.spans.last().unwrap();
+        assert_eq!(last.content, "Subagent");
+        assert_eq!(last.style.fg, ansi::style_dim().fg, "tag renders muted");
     }
 
     // -- Defect 1: palette colors must reach the buffer ----------------------

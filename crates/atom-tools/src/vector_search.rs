@@ -5,9 +5,6 @@ use crate::search::RunError;
 use std::path::Path;
 use std::time::Duration;
 
-/// Bundled instructions/tools.md embedded like Go's //go:embed.
-pub const BUNDLED_TOOLS: &str = include_str!("../../../instructions/tools.md");
-
 /// Pin Semble so atom always invokes the same CLI, not whatever is on PATH.
 pub const SEMBLE_VERSION: &str = "0.5.5";
 
@@ -236,17 +233,35 @@ mod tests {
     }
 
     #[test]
-    fn bundled_tools_mentions_primers() {
-        assert!(BUNDLED_TOOLS.contains("`grep`") && BUNDLED_TOOLS.contains("`glob`"));
-        assert!(BUNDLED_TOOLS.to_lowercase().contains("last resort"));
-        assert!(BUNDLED_TOOLS.contains("mid-implementation"));
-        assert!(
-            BUNDLED_TOOLS.contains("web_search")
-                && BUNDLED_TOOLS.contains("vector_search")
-                && BUNDLED_TOOLS.contains("dispatch")
-        );
-        let low = BUNDLED_TOOLS.to_lowercase();
-        assert!(!low.contains("find_related") && !low.contains("find-related"));
+    fn tool_defs_mention_primers() {
+        let defs = crate::defs::builtin_tool_definitions();
+        let get = |name: &str| {
+            defs.iter()
+                .find(|d| d.function.name == name)
+                .unwrap_or_else(|| panic!("{name} def missing"))
+                .function
+                .description
+                .clone()
+        };
+        let bash = get("bash");
+        assert!(bash.contains("Last resort"), "{bash}");
+        assert!(bash.contains("glob and grep"), "{bash}");
+        assert!(bash.contains("Never use bash to search"), "{bash}");
+        // The code-search workflow primer moved into the vector_search def.
+        let vs = get("vector_search");
+        assert!(vs.contains("Open returned file at given line"), "{vs}");
+        assert!(vs.contains("glob for files by name"), "{vs}");
+        // grep and glob defs exist and are referenced by the bash def.
+        assert!(!get("grep").is_empty() && !get("glob").is_empty());
+        for d in &defs {
+            let low = d.function.description.to_lowercase();
+            assert!(
+                !low.contains("find_related") && !low.contains("find-related"),
+                "{} mentions find-related: {}",
+                d.function.name,
+                low
+            );
+        }
     }
 
     #[test]

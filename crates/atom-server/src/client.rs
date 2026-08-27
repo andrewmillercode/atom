@@ -599,13 +599,13 @@ fn find_server_binary() -> Result<PathBuf> {
 
     // 1. Next to the running executable: the release install dir, the
     //    `atomsdev` install-dev symlink, or the target/debug alias.
-    let candidate = dir.join(&name);
+    let candidate = dir.join(name);
     if candidate.is_file() {
         return Ok(candidate);
     }
     // 2. Fallback: look on PATH (handles `cargo install` putting both
     //    binaries in ~/.cargo/bin which is already on PATH).
-    if let Some(found) = atom_core::deps::find_in_path(&name) {
+    if let Some(found) = atom_core::deps::find_in_path(name) {
         return Ok(found);
     }
     // 3. Dev builds: plain `cargo run` with no make symlinks — fall back

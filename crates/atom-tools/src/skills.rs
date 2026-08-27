@@ -312,7 +312,9 @@ mod tests {
     fn discovers_from_xdg_and_project_overrides_user() {
         let (_h, xdg, cwd, hb) = hermetic();
         write_skill_md(
-            &xdg.join(atom_core::build::dir_leaf()).join("skills").join("hello"),
+            &xdg.join(atom_core::build::dir_leaf())
+                .join("skills")
+                .join("hello"),
             "hello",
             "Say hi",
             "HELLO_BODY",
@@ -329,7 +331,9 @@ mod tests {
 
         // User catalog defines demo first; project .cursor/skills wins.
         write_skill_md(
-            &xdg.join(atom_core::build::dir_leaf()).join("skills").join("demo"),
+            &xdg.join(atom_core::build::dir_leaf())
+                .join("skills")
+                .join("demo"),
             "demo",
             "user desc",
             "USER_BODY",
@@ -354,7 +358,10 @@ mod tests {
     #[test]
     fn execute_skill_loads_body_with_footer() {
         let (_h, xdg, cwd, hb) = hermetic();
-        let dir = xdg.join(atom_core::build::dir_leaf()).join("skills").join("pack");
+        let dir = xdg
+            .join(atom_core::build::dir_leaf())
+            .join("skills")
+            .join("pack");
         write_skill_md(&dir, "pack", "Pack files", "PACK_INSTRUCTIONS");
         std::fs::write(dir.join("helper.sh"), "echo hi").unwrap();
 
@@ -385,7 +392,9 @@ mod tests {
         let (_h, xdg, cwd, hb) = hermetic();
         let long_body = format!("SECRET_SKILL_BODY {}", "x".repeat(200));
         write_skill_md(
-            &xdg.join(atom_core::build::dir_leaf()).join("skills").join("longone"),
+            &xdg.join(atom_core::build::dir_leaf())
+                .join("skills")
+                .join("longone"),
             "longone",
             "Use for long tasks",
             &long_body,

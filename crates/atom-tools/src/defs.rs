@@ -1,6 +1,12 @@
 //! Tool definitions, ported from main.go builtinToolDefinitions plus the
 //! def builders living in search.go / skills.go / mcp.go / vector_search.go
 //! / dispatch.go. Parameter schemas are Go's raw JSON strings verbatim.
+//!
+//! Descriptions are grug-style: short sentences, no filler, same rules.
+//! Serialized defs are charged to the model context every call, so tokens
+//! spent here buy rules, not prose. Budget is checked by length: serialized
+//! bytes / 4 (same heuristic as atom-core context_breakdown) should stay
+//! near 2.5k tokens for the builtin list.
 
 use atom_core::types::ToolDef;
 
@@ -14,23 +20,23 @@ pub fn builtin_tool_definitions() -> Vec<ToolDef> {
     vec![
         def(
             "web_search",
-            "Search the web for current information. Returns search result titles, URLs, and snippets.",
-            r#"{"type":"object","properties":{"query":{"type":"string","description":"The search query"}},"required":["query"]}"#,
+            "Search web for current info. Returns titles, URLs, snippets. Use when user asks about current events or info not in training data. Keep query concise, then answer from results.",
+            r#"{"type":"object","properties":{"query":{"type":"string","description":"Search query"}},"required":["query"]}"#,
         ),
         def(
             "read_file",
-            "Read a file. Returns a window of lines (offset defaults to 0, limit defaults to 1000). After this, edit_file and write_file may be used on the path. If the file later changes on disk, those tools return a short diff of the change — do not re-read the whole file. Image files (png, jpg, gif, webp, bmp) are returned as images so vision-capable models can see them.",
-            r#"{"type":"object","properties":{"path":{"type":"string","description":"Absolute or relative path to the file to read"},"offset":{"type":"integer","description":"0-based line offset to start reading from. Defaults to 0."},"limit":{"type":"integer","description":"Maximum number of lines to return. Defaults to 1000."}},"required":["path"]}"#,
+            "Read file, returns window of lines (offset default 0, limit default 1000). After this, edit_file and write_file may be used on path. If file changes on disk later, those tools return short diff — do not re-read whole file. Images (png, jpg, gif, webp, bmp) return as image for vision models.",
+            r#"{"type":"object","properties":{"path":{"type":"string","description":"File path, absolute or relative"},"offset":{"type":"integer","description":"0-based line offset, default 0"},"limit":{"type":"integer","description":"Max lines, default 1000"}},"required":["path"]}"#,
         ),
         def(
             "write_file",
-            "Create or overwrite a file with the given content. Existing files must be observed with read_file first. The file is re-checked automatically; if it changed since the last observation, the write is skipped and a short diff is returned. New files do not need a prior read. Do not use bash to write files.",
-            r#"{"type":"object","properties":{"path":{"type":"string","description":"Absolute or relative path to the file to create or overwrite"},"content":{"type":"string","description":"The full content to write to the file"}},"required":["path","content"]}"#,
+            "Create or overwrite file with content. Existing file must be observed with read_file first. Write re-checked automatically; if file changed since last read, write skipped, short diff returned. New file needs no prior read. Do not write files with bash.",
+            r#"{"type":"object","properties":{"path":{"type":"string","description":"File path to create or overwrite"},"content":{"type":"string","description":"Full content to write"}},"required":["path","content"]}"#,
         ),
         def(
             "edit_file",
-            "Edit a file by replacing unique exact text. Call read_file on the path once first (a window is enough). The file is re-checked automatically. If it changed since the last observation, the edit is skipped and a short diff is returned. After a successful edit, do not read_file again unless the next edit fails.",
-            r#"{"type":"object","properties":{"path":{"type":"string","description":"Absolute or relative path to the file to edit"},"old_text":{"type":"string","description":"The exact text to find in the file"},"new_text":{"type":"string","description":"The replacement text"}},"required":["path","old_text","new_text"]}"#,
+            "Edit file by replacing unique exact text. Call read_file on path once first (window enough). Re-checked automatically; if file changed since last read, edit skipped, short diff returned. After success, do not read_file again unless next edit fails.",
+            r#"{"type":"object","properties":{"path":{"type":"string","description":"File path to edit"},"old_text":{"type":"string","description":"Exact text to find in file"},"new_text":{"type":"string","description":"Replacement text"}},"required":["path","old_text","new_text"]}"#,
         ),
         vector_search_def(),
         grep_def(),
@@ -38,8 +44,8 @@ pub fn builtin_tool_definitions() -> Vec<ToolDef> {
         visualize_def(),
         def(
             "bash",
-            "Run commands that require a shell, such as tests, builds, git, and package managers. File discovery and text search are faster and safer with glob and grep; file reads and changes belong in read_file, write_file, and edit_file.",
-            r#"{"type":"object","properties":{"command":{"type":"string","description":"Command to execute from the session workspace"}},"required":["command"]}"#,
+            "Run commands needing shell: tests, builds, git, package managers. Last resort — only when no other builtin tool can do the job. Never use bash to search files or web: use glob and grep instead; file reads and changes belong in read_file, write_file, edit_file.",
+            r#"{"type":"object","properties":{"command":{"type":"string","description":"Command to run from session workspace"}},"required":["command"]}"#,
         ),
         dispatch_def(),
         skill_def(),
@@ -49,48 +55,58 @@ pub fn builtin_tool_definitions() -> Vec<ToolDef> {
 pub fn vector_search_def() -> ToolDef {
     def(
         "vector_search",
-        "Search a local directory or git URL for relevant code by meaning or identifier. Returns matching snippets with file paths and line ranges. Prefer this over grep when looking for how something works. Does not search the web.",
-        r#"{"type":"object","properties":{"query":{"type":"string","description":"Natural-language or identifier query"},"path":{"type":"string","description":"Local directory or https git URL. Defaults to the current directory."},"content":{"type":"string","enum":["code","docs","config","all"],"description":"What to search. Defaults to code."},"top_k":{"type":"integer","description":"Maximum number of snippets to return"},"max_snippet_lines":{"type":"integer","description":"Show only the first N lines of each snippet. 0 returns path and line range only."}},"required":["query"]}"#,
+        "Search local dir or git URL for code by meaning or identifier. Returns snippets with file paths and line ranges. Prefer over grep to learn how code works. Not web search. Index built on first run, cached, auto-invalidated on file change. Workflow: 1. vector_search first. 2. Open returned file at given line — no re-search or grep for same content. 3. grep only for every literal or regex occurrence (e.g. all callers of renamed fn). 4. glob for files by name or pattern. 5. No bash (find, fd, ls, grep, rg) for file search.",
+        r#"{"type":"object","properties":{"query":{"type":"string","description":"Natural-language or identifier query"},"path":{"type":"string","description":"Local dir or https git URL, default cwd"},"content":{"type":"string","enum":["code","docs","config","all"],"description":"What to search, default code"},"top_k":{"type":"integer","description":"Max snippets"},"max_snippet_lines":{"type":"integer","description":"Show only first N lines of snippet, 0 = path and line range only"}},"required":["query"]}"#,
     )
 }
 
 pub fn grep_def() -> ToolDef {
     def(
         "grep",
-        "Fast regex text search with path, line number, and matching text. The pattern is a regular expression by default; set regex to false to match literal text. Use for identifiers, error strings, config keys, and structural patterns instead of running grep or rg in bash. The session workspace is searched by default and .gitignore is honored.",
-        r#"{"type":"object","properties":{"pattern":{"type":"string","description":"Regular expression to find. Defaults to regex mode; set regex to false to match this string literally."},"path":{"type":"string","description":"Optional file or directory, relative to the session workspace or an absolute path. Omit to search the workspace."},"glob":{"type":"string","description":"Optional file filter such as *.rs or **/*.test.ts"},"regex":{"type":"boolean","description":"Set to false to disable regex matching and treat the pattern as a literal substring. Defaults to true."},"case_insensitive":{"type":"boolean","description":"Force case-insensitive matching. Otherwise smart-case is used."},"head_limit":{"type":"integer","description":"Maximum matches returned. Defaults to 100."}},"required":["pattern"]}"#,
+        "Fast regex text search: path, line number, matched text. Pattern regex by default; regex=false for literal. Use for identifiers, error strings, config keys, structural patterns instead of bash grep or rg. Searches session workspace by default, honors .gitignore.",
+        r#"{"type":"object","properties":{"pattern":{"type":"string","description":"Regex to find; regex=false for literal substring, default regex mode"},"path":{"type":"string","description":"Optional file or dir, relative to workspace or absolute; omit = workspace"},"glob":{"type":"string","description":"File filter like *.rs or **/*.test.ts"},"regex":{"type":"boolean","description":"false = literal substring, default true"},"case_insensitive":{"type":"boolean","description":"Force case-insensitive, else smart-case"},"head_limit":{"type":"integer","description":"Max matches, default 100"}},"required":["pattern"]}"#,
     )
 }
 
 pub fn glob_def() -> ToolDef {
     def(
         "glob",
-        "Fast file discovery by pattern. Use instead of find, fd, or ls in bash. Searches the session workspace recursively by default and honors .gitignore.",
-        r#"{"type":"object","properties":{"pattern":{"type":"string","description":"File glob such as **/*.rs, src/**/*.md, or Cargo.toml"},"path":{"type":"string","description":"Optional directory relative to the session workspace or an absolute path. Omit to search the workspace."},"head_limit":{"type":"integer","description":"Maximum paths returned. Defaults to 200."}},"required":["pattern"]}"#,
+        "Fast file discovery by pattern, instead of bash find, fd, ls. Searches session workspace recursively, honors .gitignore.",
+        r#"{"type":"object","properties":{"pattern":{"type":"string","description":"Glob like **/*.rs, src/**/*.md, Cargo.toml"},"path":{"type":"string","description":"Optional dir, relative to workspace or absolute; omit = workspace"},"head_limit":{"type":"integer","description":"Max paths, default 200"}},"required":["pattern"]}"#,
     )
 }
 
 pub fn visualize_def() -> ToolDef {
     def(
         "visualize",
-        "Render a Mermaid diagram inline in the atom TUI as a high-density image; clicking anywhere on the rendered diagram opens a pan/zoom viewer in the browser. Every diagram follows the house style: muted, desaturated colors with color on borders/strokes only (classDef fill:none plus a colored stroke, never bright fills — diagrams render on a dark background), and a compact landscape layout (wide, not tall: prefer flowchart LR, short labels, side-by-side subgraphs) so the inline preview fills its block without dead vertical space. Use for conceptual thinking, architecture, data flow, function call graphs, sequence diagrams, state machines, ER models, etc. Prefer this over ASCII-art diagrams in replies. Provide standard Mermaid source (flowchart, sequenceDiagram, classDiagram, stateDiagram-v2, erDiagram, mindmap, gantt, pie, journey, gitGraph, and more). Include a short title — it names the browser artifact. If a render fails, the error names the offending line; fix the source and retry rather than giving up.",
-        r#"{"type":"object","properties":{"code":{"type":"string","description":"The Mermaid diagram source, e.g. 'flowchart TD\\n  A[Start] --> B[Done]'"},"title":{"type":"string","description":"Short title for the diagram (used for the browser tab and artifact filename)"}},"required":["code"]}"#,
+        r#"Render Mermaid diagram inline in atom TUI, high-density image at full block width; click opens pan/zoom browser viewer. Use for concept thinking, architecture, data flow, call graphs, sequence, state machines, ER. Prefer over ASCII-art. Not for math unless user asks. House style: muted colors, color on borders only — classDef fill:none plus colored stroke, never bright fills (dark background); compact landscape layout, flowchart LR, short labels, side-by-side subgraphs. Source is raw Mermaid, no fences, complete diagram in one call, short title (names browser tab and artifact file). Render failure names offending line — fix and retry, no giving up. Inline image needs kitty graphics terminal; else open named HTML file in browser.
+
+Few-shot, most render failures are unquoted labels. BAD (colon breaks parser, bright style fill off-style, TD wastes space):
+A[Layer 1: static rules]
+GOOD:
+flowchart LR
+  A[Tool call] --> B{"Layer 1<br/>static rules"}
+  B -->|allow| C["run confined<br/>Seatbelt on"]
+  classDef plain fill:none,stroke:#8a919c
+  class A,B,C plain
+Rules: quote labels with punctuation, <br/> for line breaks, word-only labels may stay unquoted, one classDef per color role with fill:none + muted stroke, LR, short labels."#,
+        r#"{"type":"object","properties":{"code":{"type":"string","description":"Mermaid source, e.g. 'flowchart LR\\n  A[Start] --> B[Done]'"},"title":{"type":"string","description":"Short title, names browser tab and artifact file"}},"required":["code"]}"#,
     )
 }
 
 pub fn dispatch_def() -> ToolDef {
     def(
         "dispatch",
-        "Manage subagents through one bulk interface. Use action=models to discover exact providers and model IDs. action=spawn creates one subagent per string in tasks (maximum 100), all sharing provider/model/thinking; wait may be none, any, or all. action=inspect returns a status snapshot and optional results for ids, a batch_id, or all owned subagents. action=send continues selected subagents with prompt, or accepts messages for different prompts. action=cancel stops selected subagents. Every operation is bulk-capable; prefer batch_id over carrying many IDs. Nested dispatch is not allowed.",
-        r#"{"type":"object","properties":{"action":{"type":"string","enum":["models","spawn","inspect","send","cancel"],"description":"Operation to perform."},"tasks":{"type":"array","minItems":1,"maxItems":100,"items":{"type":"string"},"description":"Spawn only: one prompt string per new subagent."},"provider":{"type":"string","description":"Spawn only: exact provider from action=models. Omit to inherit."},"model":{"type":"string","description":"Spawn only: exact model ID from action=models. Omit to inherit."},"thinking":{"type":"string","description":"Spawn/send reasoning_effort, such as none, low, high, or max."},"batch_id":{"type":"string","description":"Target every subagent created by one spawn operation."},"ids":{"type":"array","items":{"type":"string"},"description":"Target selected subagent IDs. Omit ids and batch_id to target all owned subagents."},"prompt":{"type":"string","description":"Send only: follow-up prompt shared by all targets."},"messages":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"prompt":{"type":"string"}},"required":["id","prompt"]},"description":"Send only: distinct follow-up prompts by subagent ID."},"wait":{"type":"string","enum":["none","any","all"],"description":"Spawn/inspect: when to return. Defaults to none."},"results":{"type":"boolean","description":"Inspect: include each available result. Defaults to true."},"statuses":{"type":"array","items":{"type":"string","enum":["queued","working","sandbox","error","done","cancelled"]},"description":"Cancel only: restrict cancellation to these statuses."},"query":{"type":"string","description":"Models only: optional model ID filter."}},"required":["action"]}"#,
+        "Manage subagents through one bulk interface. action=models: discover exact providers and model IDs. action=spawn: one subagent per tasks string (max 100), all share provider/model/thinking; result has session id; send new prompt to continue, cancel to stop. action=inspect: status snapshot and optional results for ids, batch_id, or all owned subagents. action=send: continue selected subagents with prompt, or distinct messages per subagent. action=cancel: stop selected. Every operation bulk-capable; prefer batch_id over many IDs. User can open subagent by clicking tool block or shift+down. No nested dispatch, one level only.",
+        r#"{"type":"object","properties":{"action":{"type":"string","enum":["models","spawn","inspect","send","cancel"],"description":"Operation."},"tasks":{"type":"array","minItems":1,"maxItems":100,"items":{"type":"string"},"description":"Spawn only: one prompt per new subagent."},"provider":{"type":"string","description":"Spawn only: exact provider from action=models. Omit to inherit."},"model":{"type":"string","description":"Spawn only: exact model ID from action=models. Omit to inherit."},"thinking":{"type":"string","description":"Spawn/send reasoning_effort: none, low, high, or max."},"batch_id":{"type":"string","description":"Target every subagent from one spawn."},"ids":{"type":"array","items":{"type":"string"},"description":"Selected subagent IDs. Omit ids and batch_id to target all owned."},"prompt":{"type":"string","description":"Send only: follow-up prompt shared by all targets."},"messages":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"prompt":{"type":"string"}},"required":["id","prompt"]},"description":"Send only: distinct follow-up prompts by subagent ID."},"wait":{"type":"string","enum":["none","any","all"],"description":"Spawn/inspect: when to return, default none."},"results":{"type":"boolean","description":"Inspect: include available results, default true."},"statuses":{"type":"array","items":{"type":"string","enum":["queued","working","sandbox","error","done","cancelled"]},"description":"Cancel only: restrict cancellation to these statuses."},"query":{"type":"string","description":"Models only: optional model ID filter."}},"required":["action"]}"#,
     )
 }
 
 pub fn skill_def() -> ToolDef {
     def(
         "skill",
-        "Load a skill's full instructions by exact name from the skills catalog. Call this when the user's request matches a listed skill. Then follow those instructions.",
-        r#"{"type":"object","properties":{"name":{"type":"string","description":"Exact skill name from the catalog"}},"required":["name"]}"#,
+        "Load skill instructions by exact name from skills catalog (system prompt lists name + description only). Call when request matches listed skill, then follow instructions. Never load irrelevant skill.",
+        r#"{"type":"object","properties":{"name":{"type":"string","description":"Exact skill name from catalog"}},"required":["name"]}"#,
     )
 }
 

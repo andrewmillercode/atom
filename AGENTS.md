@@ -94,14 +94,15 @@ Both are built by `cargo build` and installed together by `make install-dev`
 
 ## Bundled instructions
 
-`instructions/system-prompt.md` and `instructions/tools.md` are the bundled
-instructions agents see when they run inside atom — the system prompt and
-the tools section respectively. AGENTS.md files (this one included) are
-merged separately as extra project context; they never replace the bundled
+`instructions/system-prompt.md` is the bundled system prompt agents see
+when they run inside atom. AGENTS.md files (this one included) are merged
+separately as extra project context; they never replace the bundled
 system prompt.
 
-When you add a tool, or change one in a substantial way (new parameters,
-changed semantics, new workflow guidance), update `instructions/tools.md`
-in the same change so the model-facing instructions stay accurate.
+There is no separate tools doc: tool documentation lives in the tool
+definitions themselves. When you add a tool, or change one in a
+substantial way (new parameters, changed semantics, new workflow
+guidance), update its definition in `crates/atom-tools/src/defs.rs` in
+the same change so the model-facing instructions stay accurate.
 Behavior guidance that is not tool-specific belongs in
 `instructions/system-prompt.md`.

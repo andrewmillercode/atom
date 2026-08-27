@@ -676,31 +676,27 @@ impl App {
                 + self.preview_row_count(),
         );
         // Reserve only the top viewport padding: the prompt card sits
-        // directly below the scrolling region (and below an open footer
-        // menu) with no empty row in between.
+        // directly below the scrolling region with no empty row in
+        // between. Footer menus float over the viewport's bottom rows.
         vp.saturating_sub(VIEWPORT_VPAD).max(1)
     }
 
     pub fn viewport_height(&self) -> usize {
+        // Footer menus overlay the viewport's last rows instead of
+        // taking dedicated rows, so the viewport never shrinks.
         self.base_viewport_height()
-            .saturating_sub(crate::overlays::footer_menu_height(self))
-            .max(1)
     }
 
     /// Number of content rows actually drawn in the message viewport.
     /// The scrollbar and viewport rect keep their full height
     /// (`viewport_height()`); this reserves a small bottom padding row
-    /// of blank space between the last content row and the prompt when
-    /// no footer menu is open. A footer menu already separates content
-    /// from the prompt, so the padding is only applied without one.
+    /// of blank space between the last content row and the prompt.
+    /// An open footer menu floats over the viewport's bottom rows and
+    /// does not change the scrollable content height.
     pub fn content_viewport_height(&self) -> usize {
-        let vp = self.viewport_height();
-        let h = if crate::overlays::footer_menu_height(self) > 0 {
-            vp
-        } else {
-            vp.saturating_sub(VIEWPORT_BOTTOM_PAD)
-        };
-        h.max(1)
+        self.viewport_height()
+            .saturating_sub(VIEWPORT_BOTTOM_PAD)
+            .max(1)
     }
 
     pub fn block_index_at_content_line(&self, line: usize) -> i32 {
@@ -2279,6 +2275,11 @@ impl App {
                     return vec![Effect::LoadSession {
                         id: self.session.parent_id.clone(),
                     }];
+                }
+                // On the parent, Shift+Up closes the subagent menu
+                // (the mirror of Shift+Down opening it).
+                if self.manage_visible {
+                    self.dismiss_manage_menu();
                 }
                 return Vec::new();
             }
@@ -3919,6 +3920,27 @@ mod tests {
         assert_eq!(app.input.value, "line\n\n");
         // Plain enter would send; ensure it did not run here.
         assert!(!app.streaming);
+    }
+
+    #[test]
+    fn shift_up_closes_subagent_menu_on_parent() {
+        let mut app = App::new_test(90, 30);
+        app.session.id = "parent".into();
+
+        // Opening the subagent menu on the parent, then Shift+Up closes it.
+        let fx = app.key(key(KeyCode::Down, KeyModifiers::SHIFT));
+        assert!(app.manage_visible);
+        assert!(fx.iter().any(|e| matches!(e, Effect::ListChildren { .. })));
+        let fx = app.key(key(KeyCode::Up, KeyModifiers::SHIFT));
+        assert!(!app.manage_visible);
+        assert!(fx.is_empty());
+
+        // Inside a subagent, Shift+Up still navigates to the parent.
+        app.session.parent_id = "parent".into();
+        let fx = app.key(key(KeyCode::Up, KeyModifiers::SHIFT));
+        assert!(fx
+            .iter()
+            .any(|e| matches!(e, Effect::LoadSession { id } if id == "parent")));
     }
 
     #[test]

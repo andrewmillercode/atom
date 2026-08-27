@@ -1091,7 +1091,11 @@ mod tests {
             r#"{"mcpServers":{"srv":{"command":"run","environment":{"KEY":"v"}}}}"#,
         )
         .unwrap();
-        let cfgs = load_mcp_configs_in("/", Some(&xdg.join(atom_core::build::dir_leaf())), Some(home.path()));
+        let cfgs = load_mcp_configs_in(
+            "/",
+            Some(&xdg.join(atom_core::build::dir_leaf())),
+            Some(home.path()),
+        );
         assert_eq!(cfgs["srv"].env["KEY"], "v");
     }
 

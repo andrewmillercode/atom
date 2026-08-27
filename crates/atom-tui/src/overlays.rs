@@ -218,14 +218,37 @@ pub fn discover_commands(cwd: &str) -> Vec<DynamicCommand> {
     out
 }
 
+/// Commands shown before the user types anything past "/". The rest of
+/// the catalog appears once a character narrows the query.
+const DEFAULT_COMMANDS: [&str; 7] = [
+    "/new",
+    "/sessions",
+    "/model",
+    "/providers",
+    "/subagents",
+    "/compact",
+    "/quit",
+];
+
 /// Resolves the visible slash rows from an in-memory discovery snapshot:
 /// built-ins first, then skills/MCP past "/", then /stats N at "/st".
+/// An un-narrowed "/" shows only DEFAULT_COMMANDS; a single typed
+/// character opens up the full catalog.
 pub fn match_commands(typed: &str, dynamic_commands: &[DynamicCommand]) -> Vec<DynamicCommand> {
-    let mut out = COMMANDS
-        .iter()
-        .filter(|c| c.name.starts_with(typed))
-        .map(DynamicCommand::builtin)
-        .collect::<Vec<_>>();
+    let builtins = if typed == "/" {
+        COMMANDS
+            .iter()
+            .filter(|c| DEFAULT_COMMANDS.contains(&c.name))
+            .map(DynamicCommand::builtin)
+            .collect::<Vec<_>>()
+    } else {
+        COMMANDS
+            .iter()
+            .filter(|c| c.name.starts_with(typed))
+            .map(DynamicCommand::builtin)
+            .collect::<Vec<_>>()
+    };
+    let mut out = builtins;
     out.extend(commands_after_min_prefix(typed, "/", dynamic_commands));
     let stats_30 = [DynamicCommand {
         name: "/stats 30".to_string(),
@@ -698,6 +721,22 @@ pub struct SessionRow {
     pub sess: Option<SessionInfo>,
 }
 
+/// Muted right-aligned tag marking subagent sessions in the picker.
+pub const SUBAGENT_TAG: &str = "Subagent";
+/// Columns the tag occupies: the tag plus the gap before it.
+pub const SUBAGENT_TAG_WIDTH: usize = SUBAGENT_TAG.len() + 2;
+
+/// Wrap width for a session row's label; subagent rows reserve space so
+/// the tag can sit flush right on the first visual line.
+fn session_label_width(width: usize, row: &SessionRow) -> usize {
+    let is_sub = row.sess.as_ref().is_some_and(|s| !s.parent_id.is_empty());
+    if is_sub {
+        width.saturating_sub(SUBAGENT_TAG_WIDTH)
+    } else {
+        width
+    }
+}
+
 /// dayLabel groups sessions under Today/Yesterday/date headers.
 pub fn day_label(t: chrono::DateTime<chrono::Utc>) -> String {
     use chrono::{Duration, Local, TimeZone};
@@ -786,7 +825,9 @@ pub fn move_session_sel(app: &mut App, dir: i32) {
     }
 }
 
-fn session_row_line_counts(app: &App) -> Vec<usize> {
+/// Per-row visual line counts for the session picker; shared by the
+/// scroll math and the renderer so wrapping stays in sync.
+pub fn session_row_line_counts(app: &App) -> Vec<usize> {
     let rows = session_rows(app);
     let width = app.width.max(1) as usize;
     rows.iter()
@@ -805,7 +846,12 @@ fn session_row_line_counts(app: &App) -> Vec<usize> {
             } else {
                 "  "
             };
-            wrapped_label_line_count(&r.label, width, i == app.overlay_sel, marker)
+            wrapped_label_line_count(
+                &r.label,
+                session_label_width(width, r),
+                i == app.overlay_sel,
+                marker,
+            )
         })
         .collect()
 }
@@ -837,20 +883,7 @@ fn footer_menu_rows(app: &App) -> usize {
     if app.menu_visible {
         let typed = app.menu_typed();
         let typed = typed.as_str();
-        let builtins = COMMANDS
-            .iter()
-            .filter(|c| c.name.starts_with(typed))
-            .count();
-        let dynamic = if typed.starts_with('/') && typed != "/" {
-            app.slash_commands
-                .iter()
-                .filter(|c| c.name.starts_with(typed))
-                .count()
-        } else {
-            0
-        };
-        let stats = usize::from(typed.starts_with("/st"));
-        return builtins + dynamic + stats;
+        return match_commands(typed, &app.slash_commands).len();
     }
     if app.manage_visible {
         return app.manage_agents.len() + 1;
@@ -961,9 +994,10 @@ pub fn footer_menu_row_at_y(app: &App, y: usize, n: usize) -> Option<usize> {
     if vis < 1 {
         return None;
     }
-    // y is relative to the viewport's top. The dedicated menu region starts
-    // immediately after the conversation, with one non-selectable divider.
-    let top = app.viewport_height().saturating_add(region_h - vis);
+    // y is relative to the viewport's top. The menu overlays the last
+    // region_h rows of the viewport: divider on top, items below, so the
+    // visible items end at the viewport's bottom edge.
+    let top = app.viewport_height().saturating_sub(vis);
     if y < top || y >= top + vis {
         return None;
     }
@@ -1289,18 +1323,28 @@ mod tests {
 
     #[test]
     fn slash_matching_builtin_and_stats30() {
+        // A bare "/" shows only the default shortlist.
         let base = match_commands("/", &[]);
         let names: Vec<&str> = base.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(
             names,
-            COMMANDS
-                .iter()
-                .map(|command| command.name)
-                .collect::<Vec<_>>()
+            vec![
+                "/new",
+                "/sessions",
+                "/model",
+                "/providers",
+                "/subagents",
+                "/compact",
+                "/quit"
+            ]
         );
+        // One typed character opens up the rest of the catalog.
         let st = match_commands("/st", &[]);
         let names: Vec<&str> = st.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["/stats", "/stats 30"]);
+        let se = match_commands("/se", &[]);
+        let names: Vec<&str> = se.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["/sessions", "/settings"]);
     }
 
     #[test]

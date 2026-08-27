@@ -67,7 +67,10 @@ mod tests {
             assert_eq!(client_name(), "atomdev");
             assert_eq!(server_name(), "atomsdev");
             assert_eq!(dir_leaf(), "atom-dev");
-            assert_eq!(version_label(), format!("{} (dev)", env!("CARGO_PKG_VERSION")));
+            assert_eq!(
+                version_label(),
+                format!("{} (dev)", env!("CARGO_PKG_VERSION"))
+            );
         } else {
             assert_eq!(client_name(), "atom");
             assert_eq!(server_name(), "atoms");

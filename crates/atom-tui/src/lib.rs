@@ -744,14 +744,17 @@ async fn run_effects(
                 let cwd = app.cwd.clone();
                 let tx = tx.clone();
                 tokio::spawn(async move {
+                    let tools = atom_tools::tool_definitions();
                     let rows = match api::get_session(&id).await {
-                        Ok(sess) => atom_core::session::context_breakdown::context_breakdown(&sess),
+                        Ok(sess) => {
+                            atom_core::session::context_breakdown::context_breakdown(&sess, &tools)
+                        }
                         Err(_) => {
                             let sess = atom_core::session::store::Session {
                                 cwd,
                                 ..Default::default()
                             };
-                            atom_core::session::context_breakdown::context_breakdown(&sess)
+                            atom_core::session::context_breakdown::context_breakdown(&sess, &tools)
                         }
                     };
                     let _ = tx.send(AppMsg::ContextLoaded(rows));

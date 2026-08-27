@@ -12,13 +12,19 @@
 #     install.sh and the auto-updater (crates/atom/src/update.rs) look for
 #
 # Labeling a PR that is already merged triggers the same flow, so both
-# label-then-merge and merge-then-label work.
+# label-then-merge and merge-then-label work. workflow_dispatch cuts a
+# release manually from the Actions tab, from the ref you dispatch on.
 
 name: release
 
 on:
   pull_request:
     types: [closed, labeled]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Commit or ref to release (default: what you dispatch on)"
+        required: false
 
 permissions:
   contents: write
@@ -31,25 +37,29 @@ jobs:
   release:
     runs-on: ubuntu-latest
     if: >-
-      github.event.pull_request.base.ref == 'main' &&
-      github.event.pull_request.merged == true &&
+      github.event_name == 'workflow_dispatch' ||
       (
-        github.event.action == 'closed' && contains(github.event.pull_request.labels.*.name, 'release') ||
-        github.event.action == 'labeled' && github.event.label.name == 'release'
+        github.event.pull_request.base.ref == 'main' &&
+        github.event.pull_request.merged == true &&
+        (
+          github.event.action == 'closed' && contains(github.event.pull_request.labels.*.name, 'release') ||
+          github.event.action == 'labeled' && github.event.label.name == 'release'
+        )
       )
     outputs:
       version: ${{ steps.ver.outputs.version }}
       created: ${{ steps.ver.outputs.created }}
+      sha: ${{ steps.ver.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          ref: ${{ github.event.pull_request.merge_commit_sha || inputs.ref || github.sha }}
 
       - name: Read version, create tag + release
         id: ver
         env:
           GH_TOKEN: ${{ github.token }}
-          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha || inputs.ref || github.sha }}
         run: |
           VER="$(awk '/^\[workspace\.package\]/{f=1;next} /^\[/{f=0} f && $1 == "version" {sub(/^version[[:space:]]*=[[:space:]]*"/, ""); sub(/".*$/, ""); print; exit}' Cargo.toml)"
           if [ -z "$VER" ]; then
@@ -57,6 +67,7 @@ jobs:
             exit 1
           fi
           echo "version=${VER}" >> "$GITHUB_OUTPUT"
+          echo "sha=${MERGE_SHA}" >> "$GITHUB_OUTPUT"
 
           if git ls-remote --exit-code --tags origin "refs/tags/v${VER}" >/dev/null 2>&1; then
             echo "tag v${VER} already exists — skipping release"
@@ -99,7 +110,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          ref: ${{ needs.release.outputs.sha }}
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2

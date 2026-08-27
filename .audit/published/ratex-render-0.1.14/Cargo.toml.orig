@@ -1,0 +1,35 @@
+[package]
+name = "ratex-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+description = "Raster and image rendering for RaTeX math typesetting"
+
+[dev-dependencies]
+ratex-svg = { workspace = true, features = ["standalone"] }
+ratex-pdf = { workspace = true }
+
+[dependencies]
+ratex-types = { workspace = true }
+ratex-font = { workspace = true }
+ratex-font-loader = { workspace = true }
+ratex-layout = { workspace = true }
+ratex-parser = { workspace = true }
+tiny-skia = "0.11"
+ab_glyph = "0.2"
+ttf-parser = "0.25"
+png = "0.17"
+serde_json = "1"
+ratex-katex-fonts = { workspace = true, optional = true }
+ratex-unicode-font = { workspace = true }
+
+[features]
+## Embed font source files in binary. No need for font directory with this feature.
+embed-fonts = ["dep:ratex-katex-fonts", "ratex-font-loader/embed-fonts"]
+
+[[bin]]
+name = "render"
+path = "src/main.rs"

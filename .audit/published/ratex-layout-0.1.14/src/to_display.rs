@@ -1,0 +1,1037 @@
+use std::collections::HashMap;
+
+use ratex_types::display_item::{DisplayItem, DisplayList};
+use ratex_types::path_command::PathCommand;
+
+use crate::layout_box::{BoxContent, LayoutBox, VBoxChildKind};
+use crate::surd::surd_font_for_inner_height;
+
+/// Unicode √ (U+221A), same glyph KaTeX uses for `\sqrt` surd.
+const SURD_CHAR: u32 = 0x221A;
+
+/// Convert a LayoutBox tree into a flat DisplayList with absolute coordinates.
+///
+/// The coordinate system:
+/// - x increases to the right
+/// - y increases downward (screen coordinates)
+/// - The origin (0, 0) is at the top-left of the bounding box
+/// - The baseline is at y = height
+pub fn to_display_list(root: &LayoutBox) -> DisplayList {
+    let mut items = Vec::new();
+    let baseline_y = root.height;
+    let mut font_str_cache: HashMap<ratex_font::FontId, String> = HashMap::new();
+    emit_box(root, 0.0, baseline_y, 1.0, &mut items, &mut font_str_cache);
+
+    if items.is_empty() {
+        return DisplayList {
+            items,
+            width: root.width,
+            height: root.height,
+            depth: root.depth,
+        };
+    }
+
+    // Compute visual bounding box from actual display items.
+    // This handles cases like \smash (zero height/depth) and \mathllap (zero width)
+    // where content extends beyond the nominal box dimensions.
+    // Horizontal: expand only genuinely zero-width roots. Nested zero-width
+    // constructs such as `\mathclap` intentionally keep their overflow outside
+    // the parent advance; the fixed output viewport clips that overflow exactly
+    // like KaTeX's measured element box.
+    let (min_x, max_x, min_y, max_y) = compute_visual_bounds(&items);
+
+    let mut width = root.width;
+    let mut height = root.height;
+    let mut depth = root.depth;
+    let total_h = root.height + root.depth;
+
+    // Expand vertical dimensions only when nominal total height is near-zero (e.g. \smash)
+    if total_h < 0.01 {
+        if min_y < -0.001 {
+            let extra = -min_y;
+            height += extra;
+            for item in &mut items {
+                shift_item_y(item, extra);
+            }
+        }
+        let nominal_bottom = height + depth;
+        let shifted_max_y = if min_y < -0.001 { max_y - min_y } else { max_y };
+        if shifted_max_y > nominal_bottom + 0.001 {
+            depth = shifted_max_y - height;
+        }
+    }
+
+    // Expand horizontal dimensions when the root itself has near-zero nominal
+    // width (e.g. a standalone \mathllap). For a non-zero parent, preserve
+    // negative child coordinates so nested lap ink is clipped by the viewport.
+    if root.width < 0.01 {
+        if min_x < -0.001 {
+            let extra = -min_x;
+            width += extra;
+            for item in &mut items {
+                shift_item_x(item, extra);
+            }
+        }
+        let shifted_max_x = if min_x < -0.001 { max_x - min_x } else { max_x };
+        if shifted_max_x > width + 0.001 {
+            width = shifted_max_x;
+        }
+    }
+
+    // Filled SVG paths (e.g. KaTeX `tallDelim` for `\vert`) can extend slightly above y=0 from
+    // curve overshoot; the pixmap uses nominal height/depth only and would clip. Shift down and
+    // grow depth when needed so all path ink fits. (Skip when `total_h < 0.01`: that case already
+    // adjusted vertical bounds using the same `min_y`.)
+    if total_h >= 0.01 && min_y < -0.001 {
+        let extra = -min_y;
+        height += extra;
+        for item in &mut items {
+            shift_item_y(item, extra);
+        }
+        let new_bottom = height + depth;
+        let adjusted_max_y = max_y + extra;
+        if adjusted_max_y > new_bottom + 0.001 {
+            depth = adjusted_max_y - height;
+        }
+    }
+
+    // Expand depth when content extends below the nominal bottom but nothing went above the top.
+    // This handles e.g. \smash[b] which zeroes the layout depth while content still renders below
+    // the baseline — the pixmap would otherwise be too short and clip the denominator.
+    if total_h >= 0.01 && min_y >= -0.001 && max_y > height + depth + 0.001 {
+        depth = max_y - height;
+    }
+
+    DisplayList {
+        items,
+        width,
+        height,
+        depth,
+    }
+}
+
+/// Iteratively emit DisplayItems for a LayoutBox at the given position.
+///
+/// `x`, `y` are the position of the box's baseline-left corner in absolute coordinates.
+/// `scale` is the cumulative size multiplier (1.0 at root, 0.7 in script, 0.5 in scriptscript).
+fn emit_box(
+    root: &LayoutBox,
+    root_x: f64,
+    root_y: f64,
+    root_scale: f64,
+    items: &mut Vec<DisplayItem>,
+    font_str_cache: &mut HashMap<ratex_font::FontId, String>,
+) {
+    enum EmitAction<'a> {
+        Box {
+            lbox: &'a LayoutBox,
+            x: f64,
+            y: f64,
+            scale: f64,
+        },
+        Item(DisplayItem),
+    }
+
+    let mut pending = vec![EmitAction::Box {
+        lbox: root,
+        x: root_x,
+        y: root_y,
+        scale: root_scale,
+    }];
+
+    while let Some(action) = pending.pop() {
+        let EmitAction::Box { lbox, x, y, scale } = action else {
+            if let EmitAction::Item(item) = action {
+                items.push(item);
+            }
+            continue;
+        };
+
+        match &lbox.content {
+            BoxContent::HBox(children) => {
+                let mut cur_x = x;
+                let mut child_actions = Vec::with_capacity(children.len());
+                for child in children {
+                    child_actions.push(EmitAction::Box {
+                        lbox: child,
+                        x: cur_x,
+                        y,
+                        scale,
+                    });
+                    cur_x += child.width * scale;
+                }
+                pending.extend(child_actions.into_iter().rev());
+            }
+
+            BoxContent::VBox(children) => {
+                let mut cur_y = y - lbox.height * scale;
+                let mut child_actions = Vec::new();
+                for child in children {
+                    match &child.kind {
+                        VBoxChildKind::Box(b) => {
+                            cur_y += b.height * scale;
+                            child_actions.push(EmitAction::Box {
+                                lbox: b,
+                                x: x + child.shift * scale,
+                                y: cur_y,
+                                scale,
+                            });
+                            cur_y += b.depth * scale;
+                        }
+                        VBoxChildKind::Kern(k) => {
+                            cur_y += k * scale;
+                        }
+                    }
+                }
+                pending.extend(child_actions.into_iter().rev());
+            }
+
+            BoxContent::Glyph { font_id, char_code } => {
+                let font_str = font_str_cache
+                    .entry(*font_id)
+                    .or_insert_with(|| font_id.as_str().to_string());
+                items.push(DisplayItem::GlyphPath {
+                    x,
+                    y,
+                    scale,
+                    font: font_str.clone(),
+                    char_code: *char_code,
+                    color: lbox.color,
+                });
+            }
+
+            BoxContent::GlyphRun { glyphs } => {
+                for glyph in glyphs {
+                    let font_str = font_str_cache
+                        .entry(glyph.font_id)
+                        .or_insert_with(|| glyph.font_id.as_str().to_string());
+                    items.push(DisplayItem::GlyphPath {
+                        x: x + glyph.x * scale,
+                        y,
+                        scale,
+                        font: font_str.clone(),
+                        char_code: glyph.char_code,
+                        color: lbox.color,
+                    });
+                }
+            }
+
+            BoxContent::Rule { thickness, raise } => {
+                // Baseline at `y` (downward screen coords); bottom of ink is `raise` em above baseline.
+                let cy = y - (raise + thickness / 2.0) * scale;
+                items.push(DisplayItem::Line {
+                    x,
+                    y: cy,
+                    width: lbox.width * scale,
+                    thickness: thickness * scale,
+                    color: lbox.color,
+                    dashed: false,
+                });
+            }
+
+            BoxContent::Fraction {
+                numer,
+                denom,
+                numer_shift,
+                denom_shift,
+                bar_thickness,
+                numer_scale: n_sc,
+                denom_scale: d_sc,
+            } => {
+                let child_numer_scale = scale * n_sc;
+                let child_denom_scale = scale * d_sc;
+
+                if *bar_thickness > 0.0 {
+                    let metrics = ratex_font::get_global_metrics(0);
+                    pending.push(EmitAction::Item(DisplayItem::Line {
+                        x,
+                        y: y - metrics.axis_height * scale,
+                        width: lbox.width * scale,
+                        thickness: bar_thickness * scale,
+                        color: lbox.color,
+                        dashed: false,
+                    }));
+                }
+                let denom_x = x + (lbox.width * scale - denom.width * child_denom_scale) / 2.0;
+                pending.push(EmitAction::Box {
+                    lbox: denom,
+                    x: denom_x,
+                    y: y + denom_shift * scale,
+                    scale: child_denom_scale,
+                });
+                let numer_x = x + (lbox.width * scale - numer.width * child_numer_scale) / 2.0;
+                pending.push(EmitAction::Box {
+                    lbox: numer,
+                    x: numer_x,
+                    y: y - numer_shift * scale,
+                    scale: child_numer_scale,
+                });
+            }
+
+            BoxContent::SupSub {
+                base,
+                sup,
+                sub,
+                sup_shift,
+                sub_shift,
+                sup_scale: ss,
+                sub_scale: bs,
+                center_scripts,
+                italic_correction,
+                sub_h_kern,
+            } => {
+                let base_x = if *center_scripts {
+                    x + (lbox.width - base.width) * scale / 2.0
+                } else {
+                    x
+                };
+                let mut child_actions = Vec::with_capacity(3);
+                child_actions.push(EmitAction::Box {
+                    lbox: base,
+                    x: base_x,
+                    y,
+                    scale,
+                });
+                if let Some(sup_box) = sup {
+                    let child_scale = scale * ss;
+                    let sup_x = if *center_scripts {
+                        x + (lbox.width * scale - sup_box.width * child_scale) / 2.0
+                    } else {
+                        base_x + (base.width + italic_correction) * scale
+                    };
+                    child_actions.push(EmitAction::Box {
+                        lbox: sup_box,
+                        x: sup_x,
+                        y: y - sup_shift * scale,
+                        scale: child_scale,
+                    });
+                }
+                if let Some(sub_box) = sub {
+                    let child_scale = scale * bs;
+                    let sub_x = if *center_scripts {
+                        x + (lbox.width * scale - sub_box.width * child_scale) / 2.0
+                    } else {
+                        base_x + base.width * scale + sub_h_kern * scale
+                    };
+                    child_actions.push(EmitAction::Box {
+                        lbox: sub_box,
+                        x: sub_x,
+                        y: y + sub_shift * scale,
+                        scale: child_scale,
+                    });
+                }
+                pending.extend(child_actions.into_iter().rev());
+            }
+
+            BoxContent::Radical {
+                body,
+                index,
+                index_offset,
+                index_scale,
+                rule_thickness,
+                inner_height,
+            } => {
+                let radical_width = lbox.width - index_offset - body.width;
+
+                let surd_x = x + index_offset * scale;
+
+                let index_action = if let Some(index_box) = index {
+                    // Root index (scriptscript): KaTeX `htmlBuilder` builds a vlist with
+                    // `positionType: "shift", positionData: -toShift` where
+                    // `toShift = 0.6 * (body.height - body.depth)` and `body` is the sqrt
+                    // inner+vlist (same height/depth as this radical box, excluding the index).
+                    // That aligns the root span with the sqrt body on the math baseline, then
+                    // shifts the glyph upward by `toShift` — not pinned to the top of the surd.
+                    //
+                    // Horizontal: KaTeX places the index at `\mkern 5mu` (5/18 em) from the LEFT
+                    // of the surd glyph, matching `.sqrt > .root { margin-left: 5/18em }`.
+                    // Using surd_x as the reference makes this scale correctly for all surd sizes
+                    // and for nested radicals where each level has a different index_offset.
+                    let to_shift = 0.6 * (lbox.height - lbox.depth);
+                    let index_baseline_y = y - to_shift * scale;
+                    let child_scale = scale * index_scale;
+                    Some(EmitAction::Box {
+                        lbox: index_box,
+                        x: surd_x + (5.0 / 18.0) * scale,
+                        y: index_baseline_y,
+                        scale: child_scale,
+                    })
+                } else {
+                    None
+                };
+                let surd_font = surd_font_for_inner_height(*inner_height);
+                let gh = ratex_font::get_char_metrics(surd_font, SURD_CHAR)
+                    .map(|m| m.height)
+                    .unwrap_or(lbox.height - rule_thickness);
+                let surd_font_str = font_str_cache
+                    .entry(surd_font)
+                    .or_insert_with(|| surd_font.as_str().to_string());
+                let surd_shift = lbox.height - rule_thickness - gh;
+                let surd_y = y - surd_shift * scale;
+                let surd_action = EmitAction::Item(DisplayItem::GlyphPath {
+                    x: surd_x,
+                    y: surd_y,
+                    scale,
+                    font: surd_font_str.clone(),
+                    char_code: SURD_CHAR,
+                    color: lbox.color,
+                });
+
+                // Vinculum: a horizontal rule extending the glyph's top bar over the body.
+                // Center it on the glyph's top bar position.
+                let line_center_y = surd_y - gh * scale + (rule_thickness * scale) / 2.0;
+                let line_action = EmitAction::Item(DisplayItem::Line {
+                    x: surd_x + radical_width * scale,
+                    y: line_center_y,
+                    width: body.width * scale,
+                    thickness: rule_thickness * scale,
+                    color: lbox.color,
+                    dashed: false,
+                });
+
+                pending.push(EmitAction::Box {
+                    lbox: body,
+                    x: surd_x + radical_width * scale,
+                    y,
+                    scale,
+                });
+                pending.push(line_action);
+                pending.push(surd_action);
+                if let Some(action) = index_action {
+                    pending.push(action);
+                }
+            }
+
+            BoxContent::OpLimits {
+                base,
+                sup,
+                sub,
+                base_shift,
+                sup_kern,
+                sub_kern,
+                slant,
+                sup_scale: ss,
+                sub_scale: bs,
+            } => {
+                let base_x = x + (lbox.width - base.width) * scale / 2.0;
+                let mut child_actions = Vec::with_capacity(3);
+                child_actions.push(EmitAction::Box {
+                    lbox: base,
+                    x: base_x,
+                    y: y + base_shift * scale,
+                    scale,
+                });
+                if let Some(sup_box) = sup {
+                    let child_scale = scale * ss;
+                    let sup_x = x
+                        + (lbox.width * scale - sup_box.width * child_scale) / 2.0
+                        + slant * scale / 2.0;
+                    let sup_y = y
+                        - (base.height - base_shift) * scale
+                        - sup_kern * scale
+                        - sup_box.depth * child_scale;
+                    child_actions.push(EmitAction::Box {
+                        lbox: sup_box,
+                        x: sup_x,
+                        y: sup_y,
+                        scale: child_scale,
+                    });
+                }
+                if let Some(sub_box) = sub {
+                    let child_scale = scale * bs;
+                    let sub_x = x + (lbox.width * scale - sub_box.width * child_scale) / 2.0
+                        - slant * scale / 2.0;
+                    let sub_y = y
+                        + (base.depth + base_shift) * scale
+                        + sub_kern * scale
+                        + sub_box.height * child_scale;
+                    child_actions.push(EmitAction::Box {
+                        lbox: sub_box,
+                        x: sub_x,
+                        y: sub_y,
+                        scale: child_scale,
+                    });
+                }
+                pending.extend(child_actions.into_iter().rev());
+            }
+
+            BoxContent::Accent {
+                base,
+                accent,
+                clearance,
+                skew,
+                is_below,
+                under_gap_em,
+            } => {
+                let accent_action = if *is_below {
+                    let accent_x = x + (base.width - accent.width) * scale / 2.0;
+                    let accent_y = y + (base.depth + under_gap_em) * scale + accent.height * scale;
+                    EmitAction::Box {
+                        lbox: accent,
+                        x: accent_x,
+                        y: accent_y,
+                        scale,
+                    }
+                } else {
+                    let accent_x = x + (base.width - accent.width) * scale / 2.0 + skew * scale;
+                    // Position accent so its TOP is at (clearance + effective_accent_height) above baseline.
+                    // For SVG accents (height=0, depth=h), position at clearance above baseline.
+                    // For glyph accents (height>0, depth=0), the visual mark is at the top of the glyph.
+                    // Place the glyph so its top aligns with clearance + small_mark_height above baseline.
+                    let is_svg_accent = accent.height <= 0.001;
+                    let accent_y = if is_svg_accent {
+                        y - clearance * scale - accent.depth * scale
+                    } else {
+                        // Glyph accent: position baseline so top of glyph = clearance above text baseline
+                        // accent_y - accent.height = y - (lbox.height) where lbox.height = clearance + eff_h
+                        // => accent_y = y - clearance - eff_h + accent.height
+                        // Simpler: shift glyph so top is at y - clearance - small_gap
+                        y - clearance * scale
+                            + (accent.height - 0.35_f64.min(accent.height)) * scale
+                    };
+                    EmitAction::Box {
+                        lbox: accent,
+                        x: accent_x,
+                        y: accent_y,
+                        scale,
+                    }
+                };
+                pending.push(accent_action);
+                pending.push(EmitAction::Box {
+                    lbox: base,
+                    x,
+                    y,
+                    scale,
+                });
+            }
+
+            BoxContent::LeftRight { left, right, inner } => {
+                let inner_x = x + left.width * scale;
+                let right_x = inner_x + inner.width * scale;
+                pending.push(EmitAction::Box {
+                    lbox: right,
+                    x: right_x,
+                    y,
+                    scale,
+                });
+                pending.push(EmitAction::Box {
+                    lbox: inner,
+                    x: inner_x,
+                    y,
+                    scale,
+                });
+                pending.push(EmitAction::Box {
+                    lbox: left,
+                    x,
+                    y,
+                    scale,
+                });
+            }
+
+            BoxContent::Array {
+                cells,
+                col_widths,
+                col_aligns,
+                row_heights,
+                row_depths,
+                col_gaps,
+                offset,
+                content_x_offset,
+                content_x_end_offset: _content_x_end_offset,
+                col_separators,
+                hlines_before_row,
+                rule_thickness,
+                double_rule_sep,
+                array_inner_width,
+                tag_gap_em,
+                tag_col_width,
+                row_tags,
+                tags_left: _tags_left,
+            } => {
+                let y_top = y - offset * scale;
+                let array_total_height = (lbox.height + lbox.depth) * scale;
+                let line_thickness = rule_thickness * scale;
+
+                // Compute y positions of row boundaries (0 = top of array, num_rows = bottom).
+                let mut boundary_ys: Vec<f64> = Vec::with_capacity(cells.len() + 1);
+                let mut cur_boundary = y_top;
+                boundary_ys.push(cur_boundary);
+                for r in 0..cells.len() {
+                    cur_boundary += (row_heights[r] + row_depths[r]) * scale;
+                    boundary_ys.push(cur_boundary);
+                }
+
+                // Draw horizontal lines (hlines) before/after each row.
+                // Each entry in hlines vec is one \hline (false) or \hdashline (true).
+                // Consecutive rules are separated by double_rule_sep (= \doublerulesep = 2pt).
+                //
+                // Extra space for n > 1 hlines was already added to the layout:
+                //   - r == 0: added to row_heights[0], so lines start at boundary_ys[0] going down.
+                //   - r >= 1: added to row_depths[r-1], so lines occupy the range
+                //             [boundary_ys[r] - (n-1)*rule_step, boundary_ys[r]], above row r.
+                let rule_step = line_thickness + double_rule_sep * scale;
+                for (r, hlines) in hlines_before_row.iter().enumerate() {
+                    if r < boundary_ys.len() {
+                        let n = hlines.len();
+                        let start_y = if r == 0 {
+                            boundary_ys[0]
+                        } else {
+                            boundary_ys[r] - (n.saturating_sub(1)) as f64 * rule_step
+                        };
+                        for (i, &is_dashed) in hlines.iter().enumerate() {
+                            items.push(DisplayItem::Line {
+                                x,
+                                y: start_y + i as f64 * rule_step,
+                                width: array_inner_width * scale,
+                                thickness: line_thickness,
+                                color: lbox.color,
+                                dashed: is_dashed,
+                            });
+                        }
+                    }
+                }
+
+                // Draw vertical column separator lines ('|' = solid, ':' = dashed).
+                // Put a separator at the midpoint of its column boundary gap.
+                for (i, sep) in col_separators.iter().enumerate() {
+                    if let Some(is_dashed) = sep {
+                        let prefix_w: f64 = col_widths[..i].iter().sum();
+                        let preceding_gaps: f64 = col_gaps[..i.saturating_sub(1)].iter().sum();
+                        let local_x = if i == 0 {
+                            0.0
+                        } else if i >= col_widths.len() {
+                            *array_inner_width
+                        } else {
+                            content_x_offset + prefix_w + preceding_gaps + col_gaps[i - 1] / 2.0
+                        };
+                        let abs_x = x + local_x * scale - line_thickness / 2.0;
+                        if *is_dashed {
+                            // Dashed vertical line: draw segments (dash=4t, gap=4t) top to bottom.
+                            let t = line_thickness;
+                            let dash = 4.0 * t;
+                            let period = 2.0 * dash;
+                            let mut cur_y = y_top;
+                            while cur_y < y_top + array_total_height {
+                                let seg_h = dash.min(y_top + array_total_height - cur_y);
+                                items.push(DisplayItem::Rect {
+                                    x: abs_x,
+                                    y: cur_y,
+                                    width: t,
+                                    height: seg_h,
+                                    color: lbox.color,
+                                });
+                                cur_y += period;
+                            }
+                        } else {
+                            items.push(DisplayItem::Rect {
+                                x: abs_x,
+                                y: y_top,
+                                width: line_thickness,
+                                height: array_total_height,
+                                color: lbox.color,
+                            });
+                        }
+                    }
+                }
+
+                // Render cells.
+                let mut cur_y = y_top;
+                let mut child_actions = Vec::new();
+                for (r, row) in cells.iter().enumerate() {
+                    let rh = row_heights[r];
+                    cur_y += rh * scale;
+                    let mut cur_x = x + content_x_offset * scale;
+                    for (c, cell) in row.iter().enumerate() {
+                        let cw = col_widths[c];
+                        let align = col_aligns.get(c).copied().unwrap_or(b'c');
+                        let cell_x = match align {
+                            b'l' => cur_x,
+                            b'r' => cur_x + (cw - cell.width) * scale,
+                            _ => cur_x + (cw - cell.width) * scale / 2.0,
+                        };
+                        child_actions.push(EmitAction::Box {
+                            lbox: cell,
+                            x: cell_x,
+                            y: cur_y,
+                            scale,
+                        });
+                        cur_x += cw * scale;
+                        if c + 1 < row.len() {
+                            cur_x += col_gaps.get(c).copied().unwrap_or(0.0) * scale;
+                        }
+                    }
+                    if *tag_col_width > 0.0 {
+                        if let Some(tb) = row_tags.get(r).and_then(|o| o.as_ref()) {
+                            let tag_start_em = array_inner_width + tag_gap_em;
+                            let tag_x =
+                                x + tag_start_em * scale + (tag_col_width - tb.width) * scale;
+                            child_actions.push(EmitAction::Box {
+                                lbox: tb,
+                                x: tag_x,
+                                y: cur_y,
+                                scale,
+                            });
+                        }
+                    }
+                    cur_y += row_depths[r] * scale;
+                }
+                pending.extend(child_actions.into_iter().rev());
+            }
+
+            BoxContent::SvgPath { commands, fill } => {
+                let scaled: Vec<PathCommand> = commands
+                    .iter()
+                    .map(|c| scale_path_command(c, scale))
+                    .collect();
+                items.push(DisplayItem::Path {
+                    x,
+                    y,
+                    commands: scaled,
+                    fill: *fill,
+                    color: lbox.color,
+                });
+            }
+
+            BoxContent::Framed {
+                body,
+                padding,
+                border_thickness,
+                has_border,
+                bg_color,
+                border_color,
+            } => {
+                let outer_w = lbox.width * scale;
+                let outer_h = lbox.height * scale;
+                let outer_d = lbox.depth * scale;
+                let top_y = y - outer_h;
+
+                // Background fill
+                if let Some(bg) = bg_color {
+                    items.push(DisplayItem::Rect {
+                        x,
+                        y: top_y,
+                        width: outer_w,
+                        height: outer_h + outer_d,
+                        color: *bg,
+                    });
+                }
+
+                // Border (4 sides as Rect strips)
+                if *has_border {
+                    let bt = border_thickness * scale;
+                    // Top
+                    items.push(DisplayItem::Rect {
+                        x,
+                        y: top_y,
+                        width: outer_w,
+                        height: bt,
+                        color: *border_color,
+                    });
+                    // Bottom
+                    items.push(DisplayItem::Rect {
+                        x,
+                        y: y + outer_d - bt,
+                        width: outer_w,
+                        height: bt,
+                        color: *border_color,
+                    });
+                    // Left
+                    items.push(DisplayItem::Rect {
+                        x,
+                        y: top_y,
+                        width: bt,
+                        height: outer_h + outer_d,
+                        color: *border_color,
+                    });
+                    // Right
+                    items.push(DisplayItem::Rect {
+                        x: x + outer_w - bt,
+                        y: top_y,
+                        width: bt,
+                        height: outer_h + outer_d,
+                        color: *border_color,
+                    });
+                }
+
+                // Body content (shifted by padding + border from left baseline)
+                let inner_offset = (padding + border_thickness) * scale;
+                pending.push(EmitAction::Box {
+                    lbox: body,
+                    x: x + inner_offset,
+                    y,
+                    scale,
+                });
+            }
+
+            BoxContent::RaiseBox { body, shift } => {
+                pending.push(EmitAction::Box {
+                    lbox: body,
+                    x,
+                    y: y - shift * scale,
+                    scale,
+                });
+            }
+
+            BoxContent::Scaled { body, child_scale } => {
+                pending.push(EmitAction::Box {
+                    lbox: body,
+                    x,
+                    y,
+                    scale: scale * child_scale,
+                });
+            }
+
+            BoxContent::Angl {
+                path_commands,
+                body,
+            } => {
+                let scaled: Vec<PathCommand> = path_commands
+                    .iter()
+                    .map(|c| scale_path_command(c, scale))
+                    .collect();
+                items.push(DisplayItem::Path {
+                    x,
+                    y,
+                    commands: scaled,
+                    fill: false,
+                    color: lbox.color,
+                });
+                pending.push(EmitAction::Box {
+                    lbox: body,
+                    x,
+                    y,
+                    scale,
+                });
+            }
+
+            BoxContent::Overline {
+                body,
+                rule_thickness,
+                offset,
+            } => {
+                let rule_center_y = y - (body.height + offset) * scale;
+                pending.push(EmitAction::Item(DisplayItem::Line {
+                    x,
+                    y: rule_center_y,
+                    width: lbox.width * scale,
+                    thickness: rule_thickness * scale,
+                    color: lbox.color,
+                    dashed: false,
+                }));
+                pending.push(EmitAction::Box {
+                    lbox: body,
+                    x,
+                    y,
+                    scale,
+                });
+            }
+
+            BoxContent::Underline {
+                body,
+                rule_thickness,
+                offset,
+            } => {
+                let rule_center_y = y + (body.depth + offset) * scale;
+                pending.push(EmitAction::Item(DisplayItem::Line {
+                    x,
+                    y: rule_center_y,
+                    width: lbox.width * scale,
+                    thickness: rule_thickness * scale,
+                    color: lbox.color,
+                    dashed: false,
+                }));
+                pending.push(EmitAction::Box {
+                    lbox: body,
+                    x,
+                    y,
+                    scale,
+                });
+            }
+
+            BoxContent::ProofTree { children, rules } => {
+                let top_y = y - lbox.height * scale;
+                for rule in rules.iter().rev() {
+                    pending.push(EmitAction::Item(DisplayItem::Line {
+                        x: x + rule.x * scale,
+                        y: top_y + rule.y * scale,
+                        width: rule.width * scale,
+                        thickness: rule.thickness * scale,
+                        color: lbox.color,
+                        dashed: rule.dashed,
+                    }));
+                }
+                for child in children.iter().rev() {
+                    pending.push(EmitAction::Box {
+                        lbox: &child.box_,
+                        x: x + child.x * scale,
+                        y: top_y + child.baseline_y * scale,
+                        scale,
+                    });
+                }
+            }
+
+            BoxContent::Kern | BoxContent::Empty => {}
+        }
+    }
+}
+
+fn scale_path_command(cmd: &PathCommand, scale: f64) -> PathCommand {
+    match *cmd {
+        PathCommand::MoveTo { x, y } => PathCommand::MoveTo {
+            x: x * scale,
+            y: y * scale,
+        },
+        PathCommand::LineTo { x, y } => PathCommand::LineTo {
+            x: x * scale,
+            y: y * scale,
+        },
+        PathCommand::CubicTo {
+            x1,
+            y1,
+            x2,
+            y2,
+            x,
+            y,
+        } => PathCommand::CubicTo {
+            x1: x1 * scale,
+            y1: y1 * scale,
+            x2: x2 * scale,
+            y2: y2 * scale,
+            x: x * scale,
+            y: y * scale,
+        },
+        PathCommand::QuadTo { x1, y1, x, y } => PathCommand::QuadTo {
+            x1: x1 * scale,
+            y1: y1 * scale,
+            x: x * scale,
+            y: y * scale,
+        },
+        PathCommand::Close => PathCommand::Close,
+    }
+}
+
+/// Compute the visual bounding box from line, rect, and path items (paths only when
+/// coordinates are within a sane em range — skips huge KaTeX `viewBox` artifacts).
+/// Returns (min_x, max_x, min_y, max_y) in em coordinates.
+fn compute_visual_bounds(items: &[DisplayItem]) -> (f64, f64, f64, f64) {
+    let mut min_x = f64::MAX;
+    let mut max_x = f64::MIN;
+    let mut min_y = f64::MAX;
+    let mut max_y = f64::MIN;
+
+    for item in items {
+        match item {
+            // Compute glyph extent from font metrics so edge cases like \smash
+            // (zero nominal height) and \mathllap (zero nominal width) are
+            // correctly sized: the pixmap is dimensioned from nominal bounds,
+            // but smashed/llap boxes have near-zero nominal dimensions.
+            DisplayItem::GlyphPath {
+                x,
+                y,
+                scale,
+                font,
+                char_code,
+                ..
+            } => {
+                let font_id =
+                    ratex_font::FontId::parse(font).unwrap_or(ratex_font::FontId::MainRegular);
+                let (w, h, d) = ratex_font::get_char_metrics(font_id, *char_code)
+                    .map(|m| (m.width, m.height, m.depth))
+                    .unwrap_or((0.0, 0.0, 0.0));
+                min_x = min_x.min(*x);
+                max_x = max_x.max(x + w * scale);
+                min_y = min_y.min(y - h * scale);
+                max_y = max_y.max(y + d * scale);
+            }
+            DisplayItem::Line {
+                x,
+                y,
+                width,
+                thickness,
+                ..
+            } => {
+                min_x = min_x.min(*x);
+                max_x = max_x.max(x + width);
+                min_y = min_y.min(y - thickness / 2.0);
+                max_y = max_y.max(y + thickness / 2.0);
+            }
+            DisplayItem::Rect {
+                x,
+                y,
+                width,
+                height,
+                ..
+            } => {
+                min_x = min_x.min(*x);
+                max_x = max_x.max(x + width);
+                min_y = min_y.min(*y);
+                max_y = max_y.max(y + height);
+            }
+            // Paths in document em space (delimiters, accents): include bbox so tall `tallDelim`
+            // curves are not clipped at the pixmap edge. Skip astronomical KaTeX coords (e.g. \phase).
+            DisplayItem::Path {
+                x: px,
+                y: py,
+                commands,
+                ..
+            } => {
+                const MAX_EM: f64 = 50.0;
+                for cmd in commands {
+                    let mut consider = |cx: f64, cy: f64| {
+                        if cx.abs() <= MAX_EM && cy.abs() <= MAX_EM {
+                            let abs_x = px + cx;
+                            let abs_y = py + cy;
+                            min_x = min_x.min(abs_x);
+                            max_x = max_x.max(abs_x);
+                            min_y = min_y.min(abs_y);
+                            max_y = max_y.max(abs_y);
+                        }
+                    };
+                    match cmd {
+                        PathCommand::MoveTo { x: cx, y: cy }
+                        | PathCommand::LineTo { x: cx, y: cy } => {
+                            consider(*cx, *cy);
+                        }
+                        PathCommand::CubicTo {
+                            x1,
+                            y1,
+                            x2,
+                            y2,
+                            x,
+                            y,
+                        } => {
+                            consider(*x1, *y1);
+                            consider(*x2, *y2);
+                            consider(*x, *y);
+                        }
+                        PathCommand::QuadTo { x1, y1, x, y } => {
+                            consider(*x1, *y1);
+                            consider(*x, *y);
+                        }
+                        PathCommand::Close => {}
+                    }
+                }
+            }
+        }
+    }
+
+    (min_x, max_x, min_y, max_y)
+}
+
+fn shift_item_y(item: &mut DisplayItem, dy: f64) {
+    match item {
+        DisplayItem::GlyphPath { y, .. } => *y += dy,
+        DisplayItem::Line { y, .. } => *y += dy,
+        DisplayItem::Rect { y, .. } => *y += dy,
+        DisplayItem::Path { y, .. } => *y += dy,
+    }
+}
+
+fn shift_item_x(item: &mut DisplayItem, dx: f64) {
+    match item {
+        DisplayItem::GlyphPath { x, .. } => *x += dx,
+        DisplayItem::Line { x, .. } => *x += dx,
+        DisplayItem::Rect { x, .. } => *x += dx,
+        DisplayItem::Path { x, .. } => *x += dx,
+    }
+}

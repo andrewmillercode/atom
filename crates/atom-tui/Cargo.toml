@@ -22,7 +22,9 @@ chrono = { workspace = true }
 libc = { workspace = true }
 regex = { workspace = true }
 notify = { workspace = true }
+resvg = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tempfile = { workspace = true }
+ttf-parser = "0.24.1"

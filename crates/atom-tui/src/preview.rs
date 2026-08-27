@@ -17,7 +17,7 @@ use atom_core::types::ImageData;
 use crate::app::App;
 use crate::events::Effect;
 
-/// Kitty protocol's maximum payload per chunk, before base64 encoding.
+/// Kitty protocol's maximum base64 payload per graphics command.
 const KITTY_MAX_CHUNK: usize = 4096;
 
 /// Preview geometry (preview.go): 6 cols × 3 rows is a visual square at
@@ -62,7 +62,24 @@ pub fn kitty_terminal() -> bool {
         || term.contains("kitty")
 }
 
+/// Every write to the terminal device — kitty graphics payloads
+/// (write_tty) and ratatui frame draws (event_loop) — must share this
+/// lock. Paint tasks run on the blocking pool while the event loop keeps
+/// drawing; without serialization their escape streams interleave and
+/// tear BOTH writers: garbled/missing text, and image tiles smeared over
+/// unrelated content. Resizing repaints the whole screen, which is why
+/// the damage used to "fix itself" on resize.
+static TTY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Acquires the terminal write lock. Callers that write escape sequences
+/// to the tty outside of preview.rs (the frame draw itself) must hold the
+/// same guard so the two writers never interleave.
+pub fn lock_tty() -> std::sync::MutexGuard<'static, ()> {
+    TTY_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn write_tty(s: &str) {
+    let _guard = lock_tty();
     let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") else {
         return;
     };
@@ -591,14 +608,44 @@ pub fn apply_image_chips(app: &App, input_view: String) -> String {
 /// The Kitty Unicode placeholder code point (U+10EEEE).
 const PLACEHOLDER: char = '\u{10EEEE}';
 
-/// Row/column diacritics from kitty's rowcolumn-diacritics.txt.
-const ROW_COL_DIACRITICS: [char; 16] = [
+/// Row/column diacritics from kitty's generated
+/// `rowcolumn-diacritics.txt` table. Keep enough entries for every grid
+/// coordinate atom can emit (`diagram_geometry` caps diagrams at 200
+/// columns and 60 rows).
+///
+/// This must never clamp or wrap an index. Reusing the last diacritic for
+/// wide diagrams makes many placeholder cells address the same image tile;
+/// some terminals then smear those tiles over later TUI content.
+const ROW_COL_DIACRITICS: [char; 200] = [
     '\u{0305}', '\u{030D}', '\u{030E}', '\u{0310}', '\u{0312}', '\u{033D}', '\u{033E}', '\u{033F}',
     '\u{0346}', '\u{034A}', '\u{034B}', '\u{034C}', '\u{0350}', '\u{0351}', '\u{0352}', '\u{0357}',
+    '\u{035B}', '\u{0363}', '\u{0364}', '\u{0365}', '\u{0366}', '\u{0367}', '\u{0368}', '\u{0369}',
+    '\u{036A}', '\u{036B}', '\u{036C}', '\u{036D}', '\u{036E}', '\u{036F}', '\u{0483}', '\u{0484}',
+    '\u{0485}', '\u{0486}', '\u{0487}', '\u{0592}', '\u{0593}', '\u{0594}', '\u{0595}', '\u{0597}',
+    '\u{0598}', '\u{0599}', '\u{059C}', '\u{059D}', '\u{059E}', '\u{059F}', '\u{05A0}', '\u{05A1}',
+    '\u{05A8}', '\u{05A9}', '\u{05AB}', '\u{05AC}', '\u{05AF}', '\u{05C4}', '\u{0610}', '\u{0611}',
+    '\u{0612}', '\u{0613}', '\u{0614}', '\u{0615}', '\u{0616}', '\u{0617}', '\u{0657}', '\u{0658}',
+    '\u{0659}', '\u{065A}', '\u{065B}', '\u{065D}', '\u{065E}', '\u{06D6}', '\u{06D7}', '\u{06D8}',
+    '\u{06D9}', '\u{06DA}', '\u{06DB}', '\u{06DC}', '\u{06DF}', '\u{06E0}', '\u{06E1}', '\u{06E2}',
+    '\u{06E4}', '\u{06E7}', '\u{06E8}', '\u{06EB}', '\u{06EC}', '\u{0730}', '\u{0732}', '\u{0733}',
+    '\u{0735}', '\u{0736}', '\u{073A}', '\u{073D}', '\u{073F}', '\u{0740}', '\u{0741}', '\u{0743}',
+    '\u{0745}', '\u{0747}', '\u{0749}', '\u{074A}', '\u{07EB}', '\u{07EC}', '\u{07ED}', '\u{07EE}',
+    '\u{07EF}', '\u{07F0}', '\u{07F1}', '\u{07F3}', '\u{0816}', '\u{0817}', '\u{0818}', '\u{0819}',
+    '\u{081B}', '\u{081C}', '\u{081D}', '\u{081E}', '\u{081F}', '\u{0820}', '\u{0821}', '\u{0822}',
+    '\u{0823}', '\u{0825}', '\u{0826}', '\u{0827}', '\u{0829}', '\u{082A}', '\u{082B}', '\u{082C}',
+    '\u{082D}', '\u{0951}', '\u{0953}', '\u{0954}', '\u{0F82}', '\u{0F83}', '\u{0F86}', '\u{0F87}',
+    '\u{135D}', '\u{135E}', '\u{135F}', '\u{17DD}', '\u{193A}', '\u{1A17}', '\u{1A75}', '\u{1A76}',
+    '\u{1A77}', '\u{1A78}', '\u{1A79}', '\u{1A7A}', '\u{1A7B}', '\u{1A7C}', '\u{1B6B}', '\u{1B6D}',
+    '\u{1B6E}', '\u{1B6F}', '\u{1B70}', '\u{1B71}', '\u{1B72}', '\u{1B73}', '\u{1CD0}', '\u{1CD1}',
+    '\u{1CD2}', '\u{1CDA}', '\u{1CDB}', '\u{1CE0}', '\u{1DC0}', '\u{1DC1}', '\u{1DC3}', '\u{1DC4}',
+    '\u{1DC5}', '\u{1DC6}', '\u{1DC7}', '\u{1DC8}', '\u{1DC9}', '\u{1DCB}', '\u{1DCC}', '\u{1DD1}',
+    '\u{1DD2}', '\u{1DD3}', '\u{1DD4}', '\u{1DD5}', '\u{1DD6}', '\u{1DD7}', '\u{1DD8}', '\u{1DD9}',
+    '\u{1DDA}', '\u{1DDB}', '\u{1DDC}', '\u{1DDD}', '\u{1DDE}', '\u{1DDF}', '\u{1DE0}', '\u{1DE1}',
+    '\u{1DE2}', '\u{1DE3}', '\u{1DE4}', '\u{1DE5}', '\u{1DE6}', '\u{1DFE}', '\u{20D0}', '\u{20D1}',
 ];
 
 fn row_col_diacritic(n: usize) -> char {
-    ROW_COL_DIACRITICS[n.min(ROW_COL_DIACRITICS.len() - 1)]
+    ROW_COL_DIACRITICS[n]
 }
 
 /// placeholderGrid builds rows of U+10EEEE cells with fg = id plus row
@@ -630,18 +677,22 @@ fn kitty_delete_virtual(id: usize) -> String {
 pub(crate) fn kitty_transmit(id: usize, png_data: &[u8]) -> String {
     let b64 = base64::engine::general_purpose::STANDARD.encode(png_data);
     let mut sb = String::new();
-    let opts = format!("a=t,f=100,i={id},q=2");
-    let bytes = b64.as_bytes();
-    let mut off = 0usize;
-    while bytes.len() - off > KITTY_MAX_CHUNK {
+    let chunks: Vec<&[u8]> = b64.as_bytes().chunks(KITTY_MAX_CHUNK).collect();
+    for (index, bytes) in chunks.iter().enumerate() {
+        let more = usize::from(index + 1 < chunks.len());
+        // Kitty continuation chunks inherit the first command's action,
+        // format and image id. Repeating those fields is non-conformant and
+        // can make stricter terminals treat each chunk as a new upload.
+        let control = if index == 0 {
+            format!("a=t,f=100,i={id},q=2,m={more}")
+        } else {
+            format!("q=2,m={more}")
+        };
         sb.push_str(&format!(
-            "\x1b_G{},m=1;{}\x1b\\",
-            opts,
-            &b64[off..off + KITTY_MAX_CHUNK]
+            "\x1b_G{control};{}\x1b\\",
+            std::str::from_utf8(bytes).expect("base64 is ASCII")
         ));
-        off += KITTY_MAX_CHUNK;
     }
-    sb.push_str(&format!("\x1b_G{};{}\x1b\\", opts, &b64[off..]));
     sb
 }
 
@@ -668,24 +719,254 @@ pub fn paint_kitty_previews(entries: &[(usize, Vec<u8>)]) {
     write_tty(&sb);
 }
 
-/// paint_kitty_diagrams transmits rendered diagram PNGs as virtual
-/// placements sized `cols` x `rows`, and deletes every stale diagram id
-/// the caller reports (ids the previous paint used but the current block
-/// list no longer references). Diagrams own the 17..=255 id range;
-/// 1..=16 stays reserved for image previews above. Each entry's PNG is
-/// read from its artifact path inside this blocking task. Best-effort:
-/// unreadable files are skipped silently.
-pub fn paint_kitty_diagrams(specs: &[(usize, String, usize, usize)], stale_ids: &[usize]) {
+/// A diagram spec passed to the paint function.
+pub struct DiagramSpec {
+    pub id: usize,
+    pub svg: String,
+    pub png: String,
+    pub cols: usize,
+    pub rows: usize,
+}
+
+/// Rasterize an SVG at the given pixel dimensions with a solid card
+/// background using resvg. Returns PNG bytes, or None on failure.
+/// Card background color is sourced from the atom palette (CardDark).
+fn rasterize_svg(svg_data: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
+    use resvg::tiny_skia;
+    use resvg::usvg;
+
+    let mut opt = usvg::Options::default();
+    opt.fontdb_mut().load_system_fonts();
+
+    // Color emoji (🚀, 🔥, 📊, …) rasterize as missing-glyph tofu boxes unless
+    // we steer usvg's text fallback toward a real color-emoji font. usvg's
+    // default fallback returns the *first* face that claims to cover the
+    // codepoint, which on macOS is the hidden `.LastResort` font that draws a
+    // .notdef box for every codepoint. Prefer a dedicated emoji font first,
+    // then chain to the default behaviour for everything else.
+    let mut resolver = usvg::FontResolver::default();
+    let default_fallback =
+        std::mem::replace(&mut resolver.select_fallback, Box::new(|_, _, _| None));
+    resolver.select_fallback = Box::new(move |c, exclude_fonts, fontdb| {
+        if is_emoji_char(c) {
+            if let Some(id) = color_emoji_face(c, exclude_fonts, fontdb) {
+                return Some(id);
+            }
+        }
+        default_fallback(c, exclude_fonts, fontdb)
+    });
+    opt.font_resolver = resolver;
+
+    let tree = usvg::Tree::from_data(svg_data, &opt).ok()?;
+
+    let mut pixmap = tiny_skia::Pixmap::new(width, height)?;
+
+    // Source card bg from atom's palette.
+    let bg_hex =
+        atom_core::render::colors::theme_color(atom_core::render::colors::ThemeColor::CardDark);
+    let bg =
+        parse_hex_to_skia(&bg_hex).unwrap_or(tiny_skia::Color::from_rgba8(0x15, 0x15, 0x16, 255));
+    pixmap.fill(bg);
+
+    // Scale the SVG to fit with padding.
+    let svg_size = tree.size();
+    let pad = 16.0_f32;
+    let avail_w = (width as f32 - pad * 2.0).max(1.0);
+    let avail_h = (height as f32 - pad * 2.0).max(1.0);
+    let scale = (avail_w / svg_size.width()).min(avail_h / svg_size.height());
+    let tx = (width as f32 - svg_size.width() * scale) / 2.0;
+    let ty = (height as f32 - svg_size.height() * scale) / 2.0;
+
+    let transform = tiny_skia::Transform::from_translate(tx, ty).post_scale(scale, scale);
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+    pixmap.encode_png().ok()
+}
+
+/// True if `c` is an emoji codepoint. Used to steer usvg's font fallback toward
+/// a color-emoji font only for characters that actually need one, so normal
+/// text keeps its existing matching behaviour.
+fn is_emoji_char(c: char) -> bool {
+    let cp = c as u32;
+    // High-plane pictographs/emoticons + supplemental symbols.
+    (0x1F300..=0x1FAFF).contains(&cp)
+        // Miscellaneous Symbols & Pictographs, Dingbats, Misc Symbols & Arrows.
+        || (0x2600..=0x27BF).contains(&cp)
+        || (0x2B00..=0x2BFF).contains(&cp)
+        // A few text-presentation emoji outside those blocks.
+        || matches!(cp,
+            0x00A9 | 0x00AE | 0x203C | 0x2049 | 0x2122 | 0x2139
+            | 0x2194..=0x2199 | 0x21A9 | 0x21AA | 0x231A | 0x231B
+            | 0x2328 | 0x23CF | 0x23E9..=0x23F3 | 0x23F8..=0x23FA
+            | 0x24C2 | 0x25AA | 0x25AB | 0x25B6 | 0x25C0
+            | 0x25FB..=0x25FE | 0x2934 | 0x2935
+            | 0x3030 | 0x303D | 0x3297 | 0x3299)
+}
+
+/// Returns the ID of a dedicated color-emoji font face, preferring a normal
+/// (non-hidden) face over hidden/system-UI ones such as `.LastResort`. The
+/// default usvg fallback would otherwise pick `.LastResort`, which covers every
+/// codepoint with a tofu box, so it never reaches the emoji font.
+fn color_emoji_face(
+    _c: char,
+    exclude_fonts: &[resvg::usvg::fontdb::ID],
+    fontdb: &resvg::usvg::fontdb::Database,
+) -> Option<resvg::usvg::fontdb::ID> {
+    let mut hidden_candidate = None;
+    for face in fontdb.faces() {
+        if exclude_fonts.contains(&face.id) {
+            continue;
+        }
+        let looks_emoji = face
+            .families
+            .iter()
+            .any(|(name, _)| name.to_lowercase().contains("emoji"))
+            || face.post_script_name.to_lowercase().contains("emoji");
+        if !looks_emoji {
+            continue;
+        }
+        let primary = face.families.first().map(|f| f.0.as_str()).unwrap_or("");
+        if !primary.starts_with('.') {
+            return Some(face.id);
+        }
+        if hidden_candidate.is_none() {
+            hidden_candidate = Some(face.id);
+        }
+    }
+    hidden_candidate
+}
+
+fn parse_hex_to_skia(hex: &str) -> Option<resvg::tiny_skia::Color> {
+    let hex = hex.trim_start_matches('#');
+    if hex.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some(resvg::tiny_skia::Color::from_rgba8(r, g, b, 255))
+}
+
+/// paint_kitty_diagrams renders diagram SVGs as virtual placements sized
+/// `cols` x `rows`, and deletes every stale diagram id the caller reports.
+/// Diagrams own the 17..=255 id range. Best-effort: unreadable files are
+/// skipped silently.
+pub fn paint_kitty_diagrams(specs: &[DiagramSpec], stale_ids: &[usize]) {
     let mut sb = String::new();
     for id in stale_ids {
         sb.push_str(&kitty_delete_virtual(*id));
     }
-    for (id, path, cols, rows) in specs {
-        let Ok(png) = std::fs::read(path) else {
-            continue;
+    for spec in specs {
+        let target_w = (spec.cols as u32) * PREVIEW_CELL_W;
+        let target_h = (spec.rows as u32) * PREVIEW_CELL_H;
+
+        let png = if !spec.svg.is_empty() {
+            // Rasterize SVG on-demand at exact terminal dimensions.
+            std::fs::read(&spec.svg)
+                .ok()
+                .and_then(|data| rasterize_svg(&data, target_w, target_h))
+        } else if !spec.png.is_empty() {
+            // Legacy: read pre-rendered PNG from disk.
+            std::fs::read(&spec.png).ok()
+        } else {
+            None
         };
-        sb.push_str(&kitty_transmit(*id, &png));
-        sb.push_str(&format!("\x1b_Ga=p,U=1,i={id},c={cols},r={rows},q=2\x1b\\"));
+
+        let Some(png) = png else { continue };
+        sb.push_str(&kitty_transmit(spec.id, &png));
+        sb.push_str(&format!(
+            "\x1b_Ga=p,U=1,i={},c={},r={},q=2\x1b\\",
+            spec.id, spec.cols, spec.rows
+        ));
     }
     write_tty(&sb);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Decode rasterized PNG bytes into RGBA pixels.
+    fn decode_rgba(png: &[u8]) -> image::RgbaImage {
+        image::load_from_memory(png).expect("decode PNG").to_rgba8()
+    }
+
+    /// Count distinct RGBA colours across the whole image. A real colour emoji
+    /// produces hundreds of colours; a tofu (.notdef) box is mostly a single
+    /// outline colour, so this cleanly separates the two.
+    fn distinct_colors(img: &image::RgbaImage) -> usize {
+        let mut colors = std::collections::HashSet::new();
+        for p in img.pixels() {
+            colors.insert(*p);
+        }
+        colors.len()
+    }
+
+    /// Count pixels that differ from the card background (CardDark).
+    fn non_bg_pixels(img: &image::RgbaImage, bg: (u8, u8, u8)) -> usize {
+        img.pixels()
+            .filter(|p| (p.0[0], p.0[1], p.0[2]) != bg)
+            .count()
+    }
+
+    /// The card background RGBA used by `rasterize_svg`, parsed from the theme.
+    fn card_bg_rgba() -> (u8, u8, u8) {
+        let hex =
+            atom_core::render::colors::theme_color(atom_core::render::colors::ThemeColor::CardDark);
+        let hex = hex.trim_start_matches('#');
+        (
+            u8::from_str_radix(&hex[0..2], 16).unwrap(),
+            u8::from_str_radix(&hex[2..4], 16).unwrap(),
+            u8::from_str_radix(&hex[4..6], 16).unwrap(),
+        )
+    }
+
+    /// An SVG with a full-bleed card background + one text line, matching the
+    /// mermaid output shape that `rasterize_svg` is fed.
+    fn svg_with_text(text: &str) -> String {
+        let bg = card_bg_rgba();
+        format!(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="400" height="200">
+  <rect width="400" height="200" fill="#{:02x}{:02x}{:02x}"/>
+  <text x="20" y="100" font-size="48" fill="#ccc" font-family="sans-serif">{}</text>
+</svg>"##,
+            bg.0, bg.1, bg.2, text
+        )
+    }
+
+    #[test]
+    fn emoji_renders_as_colored_glyphs_not_tofu() {
+        let svg = svg_with_text("🚀🔥📊");
+        let png = rasterize_svg(svg.as_bytes(), 400, 200).expect("rasterize emoji SVG");
+        let img = decode_rgba(&png);
+        let colors = distinct_colors(&img);
+        // A real colour emoji has hundreds/thousands of distinct colours; tofu
+        // boxes have only a handful (background + one outline colour).
+        assert!(
+            colors > 100,
+            "emoji should rasterize to many colours (real glyphs), got {colors}"
+        );
+    }
+
+    #[test]
+    fn plain_text_still_renders() {
+        let svg = svg_with_text("OK TEXT");
+        let png = rasterize_svg(svg.as_bytes(), 400, 200).expect("rasterize plain SVG");
+        let img = decode_rgba(&png);
+        let bg = card_bg_rgba();
+        let non_bg = non_bg_pixels(&img, bg);
+        assert!(
+            non_bg > 500,
+            "plain text should still rasterize as glyphs, got {non_bg} non-background pixels"
+        );
+    }
+
+    #[test]
+    fn is_emoji_char_recognizes_common_emoji() {
+        for c in ['🚀', '🔥', '📊', '😀', '❤', '⚡', '☀'] {
+            assert!(is_emoji_char(c), "{c:?} (U+{:X}) should be emoji", c as u32);
+        }
+        for c in ['A', 'z', '1', ' ', 'é'] {
+            assert!(!is_emoji_char(c), "{c:?} should not be emoji");
+        }
+    }
 }

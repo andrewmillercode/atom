@@ -852,6 +852,11 @@ impl App {
                 self.viewport_dirty = true;
                 if blocks::assign_block_diagram_ids(&mut self.blocks) {
                     self.preview_dirty = true;
+                    // Tool results arrive after the visualize card was
+                    // rendered. Assigning an id only marks the preview as
+                    // dirty; explicitly schedule the kitty transmission so
+                    // the reserved placeholder grid is not left blank.
+                    effects.push(Effect::PaintPreviews);
                 }
                 if !self.session.id.is_empty()
                     && !atom_tools::parse_dispatch_session_id(&ev.text).is_empty()
@@ -1986,7 +1991,12 @@ impl App {
         fx.push(Effect::Subscribe {
             id: self.session.id.clone(),
         });
-        fx.push(Effect::PaintPreviews);
+        // Don't push PaintPreviews here; preview_dirty is already set and
+        // the post-draw check in the event loop will fire it AFTER the
+        // first frame renders placeholder cells at the correct terminal
+        // width. Pushing it here causes a race: the blocking paint task
+        // transmits kitty data before the draw, potentially with stale
+        // geometry (default 80-col width before the real size is known).
         if !self.session.id.is_empty() {
             fx.push(Effect::ListChildren {
                 id: self.session.id.clone(),
@@ -2123,12 +2133,23 @@ impl App {
         self.height = h;
         if w != prev_w {
             self.refresh_viewport();
+            if self.blocks.iter().any(|block| block.diagram.is_some()) {
+                self.preview_dirty = true;
+            }
         }
     }
 
     fn resize(&mut self, w: u16, h: u16) -> Vec<Effect> {
+        let width_changed = w != self.width;
         self.apply_resize(w, h);
-        Vec::new()
+        if width_changed && self.blocks.iter().any(|block| block.diagram.is_some()) {
+            // refresh_viewport recomputes each diagram's placeholder grid;
+            // transmit a matching virtual placement for the new geometry.
+            self.preview_dirty = true;
+            vec![Effect::PaintPreviews]
+        } else {
+            Vec::new()
+        }
     }
 
     fn paste(&mut self, content: String) -> Vec<Effect> {
@@ -3328,6 +3349,21 @@ impl App {
                 self.clear_selection();
             }
             self.prompt_selecting = true;
+            // A click on an actual editable text row repositions the cursor
+            // at the clicked (wrapped, scrolled) display position. Padding /
+            // border rows and the image-preview rows are left untouched.
+            let geo = crate::view::Layout::compute(self);
+            let text_top = geo.prompt_top_y + PROMPT_PAD;
+            let text_bottom = text_top + self.input_height();
+            if y >= text_top && y < text_bottom {
+                self.input.clear_selection();
+                let col = x.saturating_sub(TUI_HPAD + PROMPT_PAD);
+                let wrapped_row = (y - text_top) + self.input.scroll_y;
+                let offset = self
+                    .input
+                    .offset_at_display(self.input_width(), wrapped_row, col);
+                self.input.cursor = offset;
+            }
             return Vec::new();
         }
         self.input.clear_selection();
@@ -4327,6 +4363,73 @@ mod tests {
     }
 
     #[test]
+    fn click_on_prompt_text_repositions_cursor() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = App::new_test(80, 40);
+        app.input.set_value("hello world");
+
+        let geo = crate::view::Layout::compute(&app);
+        let text_row = geo.prompt_top_y + PROMPT_PAD;
+        let click = |col: u16, row: u16| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::empty(),
+        };
+
+        // Click on the 'w' (cell 6) of the first editable row.
+        let x = (TUI_HPAD + PROMPT_PAD + 6) as u16;
+        let _ = app.mouse(click(x, text_row as u16));
+        assert_eq!(app.input.cursor, 6, "click on 'w' placed the cursor there");
+
+        // A click in the top padding row must NOT reposition the cursor.
+        let _ = app.mouse(click(x, geo.prompt_top_y as u16));
+        assert_eq!(app.input.cursor, 6, "top padding row keeps the cursor put");
+
+        // A click in the bottom padding row (inside the box, below the text)
+        // must also NOT reposition the cursor.
+        let bottom_pad = (geo.prompt_top_y + PROMPT_PAD + app.input_height()) as u16;
+        let _ = app.mouse(click(x, bottom_pad));
+        assert_eq!(
+            app.input.cursor, 6,
+            "bottom padding row keeps the cursor put"
+        );
+    }
+
+    #[test]
+    fn click_on_prompt_wrapped_row_respects_scroll() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = App::new_test(50, 20);
+        let long = (0..20)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.input.set_value(&long);
+
+        // Simulate an internal scroll so the last logical line is at the top
+        // of the field (as `view()` would after pinning the cursor there).
+        app.input.scroll_y = app.input.content_lines(app.input_width()) - 1;
+
+        let geo = crate::view::Layout::compute(&app);
+        let text_row = geo.prompt_top_y + PROMPT_PAD;
+        // Click column 0 on the first visible (scrolled) text row.
+        let x = (TUI_HPAD + PROMPT_PAD) as u16;
+        let y = text_row as u16;
+        let ev = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::empty(),
+        };
+        let _ = app.mouse(ev);
+        let expected = long.find("line19").unwrap();
+        assert_eq!(
+            app.input.cursor, expected,
+            "scrolled click lands on the start of line19"
+        );
+    }
+
+    #[test]
     fn usage_event_updates_session_status_data() {
         let mut app = App::new_test(90, 30);
         let v: serde_json::Value = serde_json::from_str(
@@ -4488,6 +4591,60 @@ mod tests {
                 .iter()
                 .any(|span| span.content.contains("new result"))
         }));
+    }
+
+    #[test]
+    fn visualize_tool_result_schedules_inline_preview_paint() {
+        let mut app = App::new_test(80, 20);
+        app.blocks.push(Block {
+            kind: BlockKind::Tool,
+            title: "Visualize".into(),
+            tool_name: "visualize".into(),
+            text: "Architecture".into(),
+            ..Default::default()
+        });
+
+        let fx = app.handle_stream_event(&StreamEvent {
+            event_type: "tool_result".into(),
+            text: "rendered diagram\n[atom-diagram] png=/a.png png-dark=/a-dark.png html=/a.html width=400 height=200".into(),
+            ..Default::default()
+        });
+
+        let diagram = app.blocks[0].diagram.as_ref().expect("diagram attached");
+        assert!(diagram.id >= crate::blocks::MIN_KITTY_DIAGRAM_ID);
+        assert!(app.preview_dirty);
+        assert!(fx
+            .iter()
+            .any(|effect| matches!(effect, Effect::PaintPreviews)));
+    }
+
+    #[test]
+    fn resizing_a_diagram_schedules_a_matching_kitty_placement() {
+        let mut app = App::new_test(80, 20);
+        app.blocks.push(Block {
+            kind: BlockKind::Tool,
+            title: "Visualize".into(),
+            tool_name: "visualize".into(),
+            tool_done: true,
+            diagram: Some(crate::blocks::DiagramRef {
+                png: "/a.png".into(),
+                png_dark: "/a-dark.png".into(),
+                html: "/a.html".into(),
+                w: 400,
+                h: 200,
+                id: crate::blocks::MIN_KITTY_DIAGRAM_ID,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        app.preview_dirty = false;
+
+        let fx = app.handle_msg(AppMsg::Resize(120, 20));
+
+        assert!(app.preview_dirty);
+        assert!(fx
+            .iter()
+            .any(|effect| matches!(effect, Effect::PaintPreviews)));
     }
 
     #[test]

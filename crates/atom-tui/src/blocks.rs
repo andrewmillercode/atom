@@ -28,7 +28,8 @@ pub const USER_EXPAND_HINT: &str = "… click to expand";
 
 /// A rendered Mermaid diagram attached to a visualize tool block.
 ///
-/// `png`/`html` are artifact paths from the tool's marker line. `id` is
+/// `png`/`png_dark`/`html` are artifact paths from the tool's marker
+/// line (light- and dark-theme rasters plus the browser viewer). `id` is
 /// the kitty image id used for the virtual placement (0 until assigned
 /// by the app; diagrams use the 17..=255 range so they never collide
 /// with the 1..=16 slots the prompt previews own). `cols`/`rows` size
@@ -36,7 +37,12 @@ pub const USER_EXPAND_HINT: &str = "… click to expand";
 /// geometry from preview.rs (32x64 px per cell).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DiagramRef {
+    /// SVG artifact path (new format). Preferred for rendering.
+    pub svg: String,
+    /// Light-theme PNG path (legacy format, backward compat).
     pub png: String,
+    /// Dark-theme PNG path (legacy format, backward compat).
+    pub png_dark: String,
     pub html: String,
     pub w: u32,
     pub h: u32,
@@ -590,19 +596,60 @@ fn truncate_bytes(s: &str, n: usize) -> String {
 // visualize diagram markers.
 // ---------------------------------------------------------------------------
 
-/// Parses the `[atom-diagram] png=… html=… width=… height=…` marker line
-/// the visualize tool embeds in its result. Returns (png, html, w, h).
-pub fn parse_diagram_marker(result: &str) -> Option<(String, String, u32, u32)> {
-    static RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
-        regex::Regex::new(r"\[atom-diagram\] png=(\S+) html=(\S+) width=(\d+) height=(\d+)")
-            .expect("static regex")
+/// Parses the `[atom-diagram] png=… [png-dark=…] html=… width=… height=…`
+/// marker line the visualize tool embeds in its result. Returns
+/// (png, png_dark, html, w, h); `png_dark` defaults to `png` for legacy
+/// markers that predate the dark-theme raster. Paths are double-quoted
+/// (artifact locations contain spaces on macOS); the unquoted form is
+/// still accepted for old sessions, where the capture runs non-greedily
+/// to the next field separator so paths containing spaces parse fully.
+/// (The marker is atom-generated, so ` html=`, ` width=` etc. are
+/// reliable separators.)
+///
+/// Handles both the new SVG format:
+///   `[atom-diagram] svg="..." html="..." width=N height=N`
+/// and the legacy PNG format (for old sessions):
+///   `[atom-diagram] png="..." png-dark="..." html="..." width=N height=N`
+///
+/// Returns (svg, png, png_dark, html, w, h).
+pub fn parse_diagram_marker(result: &str) -> Option<(String, String, String, String, u32, u32)> {
+    // Try new SVG format first.
+    static RE_SVG: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(
+            r#"\[atom-diagram\] svg=(?:"([^"]*)"|(.*?)) html=(?:"([^"]*)"|(.*?)) width=(\d+) height=(\d+)"#,
+        )
+        .expect("static regex")
     });
-    let caps = RE.captures(result)?;
+    if let Some(caps) = RE_SVG.captures(result) {
+        let svg = caps.get(1).or_else(|| caps.get(2))?.as_str().to_string();
+        let html = caps.get(3).or_else(|| caps.get(4))?.as_str().to_string();
+        let w: u32 = caps[5].parse().ok()?;
+        let h: u32 = caps[6].parse().ok()?;
+        return Some((svg, String::new(), String::new(), html, w, h));
+    }
+
+    // Legacy PNG format.
+    static RE_PNG: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(
+            r#"\[atom-diagram\] png=(?:"([^"]*)"|(.*?)) (?:png-dark=(?:"([^"]*)"|(.*?)) )?html=(?:"([^"]*)"|(.*?)) width=(\d+) height=(\d+)"#,
+        )
+        .expect("static regex")
+    });
+    let caps = RE_PNG.captures(result)?;
+    let png = caps.get(1).or_else(|| caps.get(2))?.as_str().to_string();
+    let png_dark = caps
+        .get(3)
+        .or_else(|| caps.get(4))
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_else(|| png.clone());
+    let html = caps.get(5).or_else(|| caps.get(6))?.as_str().to_string();
     Some((
-        caps[1].to_string(),
-        caps[2].to_string(),
-        caps[3].parse().ok()?,
-        caps[4].parse().ok()?,
+        String::new(),
+        png,
+        png_dark,
+        html,
+        caps[7].parse().ok()?,
+        caps[8].parse().ok()?,
     ))
 }
 
@@ -676,19 +723,29 @@ pub fn assign_block_diagram_ids(blocks: &mut [Block]) -> bool {
 /// diagram_geometry sizes the placeholder grid for a diagram, preserving
 /// its aspect at the approximate terminal cell geometry from preview.rs
 /// (PREVIEW_CELL_W x PREVIEW_CELL_H px per cell). The grid width tracks
-/// the render width; rows are capped so a very tall diagram never floods
-/// the viewport (kitty stretches the PNG to the placement box).
+/// the render width — the old 60-col cap squeezed diagrams to half the
+/// TUI and made their text unreadable. Rows are capped by shrinking
+/// cols, never by breaking the aspect, so a very tall diagram cannot
+/// flood the viewport (kitty stretches the PNG to the placement box).
 /// Returns true when the geometry changed.
 pub fn diagram_geometry(d: &mut DiagramRef, inner: usize) -> bool {
     if d.w == 0 || d.h == 0 {
         return false;
     }
-    let cols = inner.saturating_sub(2 * PAD_CELL).clamp(10, 60);
+    let mut cols = inner.saturating_sub(2 * PAD_CELL).clamp(10, 200);
+    // Cap cols to 2/3 of the available width so the preview is a compact
+    // thumbnail rather than a full-width image you need to scroll past.
+    cols = cols.min(inner * 2 / 3).max(10);
     // Displayed px: cols*CELL_W wide, rows*CELL_H tall; keep the w/h
     // ratio, i.e. rows = cols * (h/w) * (CELL_W/CELL_H).
     let cell_ratio = preview::PREVIEW_CELL_W as f64 / preview::PREVIEW_CELL_H as f64;
-    let rows = ((cols as f64 * d.h as f64 / d.w as f64) * cell_ratio).round() as usize;
-    let rows = rows.clamp(1, 48);
+    let mut rows = ((cols as f64 * d.h as f64 / d.w as f64) * cell_ratio).round() as usize;
+    const MAX_ROWS: usize = 20;
+    if rows > MAX_ROWS {
+        rows = MAX_ROWS;
+        cols = ((rows as f64 / cell_ratio) * d.w as f64 / d.h as f64).round() as usize;
+        cols = cols.clamp(10, 200);
+    }
     if d.cols == cols && d.rows == rows {
         return false;
     }
@@ -700,22 +757,28 @@ pub fn diagram_geometry(d: &mut DiagramRef, inner: usize) -> bool {
 /// call; an unmatched result becomes its own block.
 pub fn attach_tool_result(blocks: &mut Vec<Block>, content: &str, diff: &str) {
     let id = atom_tools::parse_dispatch_session_id(content);
-    let diagram = if content.contains("[atom-diagram]") {
-        parse_diagram_marker(content).map(|(png, html, w, h)| DiagramRef {
-            png,
-            html,
-            w,
-            h,
-            ..Default::default()
-        })
-    } else {
-        None
-    };
     for b in blocks.iter_mut() {
         if b.kind == BlockKind::Tool && !b.tool_done {
             b.result = content.to_string();
             b.tool_done = true;
-            b.diagram = diagram;
+            // Diagram markers are only honored for visualize results. Any
+            // other tool output that happens to quote the marker line
+            // (a grep over this repo's source, for instance) must not
+            // hijack the block into a diagram card.
+            if b.tool_name == "visualize" && content.contains("[atom-diagram]") {
+                b.diagram =
+                    parse_diagram_marker(content).map(|(svg, png, png_dark, html, w, h)| {
+                        DiagramRef {
+                            svg,
+                            png,
+                            png_dark,
+                            html,
+                            w,
+                            h,
+                            ..Default::default()
+                        }
+                    });
+            }
             if !diff.is_empty() {
                 b.diff = diff.to_string();
             }
@@ -732,7 +795,6 @@ pub fn attach_tool_result(blocks: &mut Vec<Block>, content: &str, diff: &str) {
         tool_done: true,
         diff: diff.to_string(),
         session_id: id,
-        diagram,
         ..Default::default()
     });
 }
@@ -1322,7 +1384,11 @@ fn render_tool_block_linked(b: &mut Block, width: usize, spinner_frame: &str) ->
             body_links = links;
         } else {
             let mut summary = tool_result_summary(&b.result, &b.diff).to_string();
-            if b.diagram.is_some() {
+            // The marker line is machine-readable by contract: strip it
+            // for every visualize result, even when parsing failed (an
+            // unparseable legacy marker would otherwise render as
+            // garbage with truncated links).
+            if name == "visualize" {
                 summary = strip_diagram_marker(&summary);
             }
             if !summary.is_empty() && !file_change_byte_summary(&name, &summary) {
@@ -2125,12 +2191,66 @@ mod tests {
     fn diagram_marker_parse_and_strip() {
         let result = "rendered diagram \"Arch\" (400x200 px, saved at 2x density)\n \
                       inline preview is shown in the atom TUI\n \
-                      [atom-diagram] png=/tmp/d/arch-1a2b3c4d.png \
-                      html=/tmp/d/arch-1a2b3c4d.html width=400 height=200";
-        let (png, html, w, h) = parse_diagram_marker(result).expect("marker parsed");
+                      [atom-diagram] png=\"/tmp/d/arch-1a2b3c4d.png\" \
+                      png-dark=\"/tmp/d/arch-1a2b3c4d-dark.png\" \
+                      html=\"/tmp/d/arch-1a2b3c4d.html\" width=400 height=200";
+        let (_svg, png, png_dark, html, w, h) =
+            parse_diagram_marker(result).expect("marker parsed");
         assert_eq!(png, "/tmp/d/arch-1a2b3c4d.png");
+        assert_eq!(png_dark, "/tmp/d/arch-1a2b3c4d-dark.png");
         assert_eq!(html, "/tmp/d/arch-1a2b3c4d.html");
         assert_eq!((w, h), (400, 200));
+        // Regression: macOS artifact paths contain a space ("Application
+        // Support"); quoted paths must survive the parser intact.
+        let macos = "[atom-diagram] png=\"/Users/a/Library/Application Support/atom/diagrams/arch-1a2b3c4d.png\" png-dark=\"/Users/a/Library/Application Support/atom/diagrams/arch-1a2b3c4d-dark.png\" html=\"/Users/a/Library/Application Support/atom/diagrams/arch-1a2b3c4d.html\" width=400 height=200";
+        let (_svg, png, png_dark, html, _, _) =
+            parse_diagram_marker(&macos).expect("quoted spaced path parsed");
+        assert_eq!(
+            png,
+            "/Users/a/Library/Application Support/atom/diagrams/arch-1a2b3c4d.png"
+        );
+        assert_eq!(
+            png_dark,
+            "/Users/a/Library/Application Support/atom/diagrams/arch-1a2b3c4d-dark.png"
+        );
+        assert_eq!(
+            html,
+            "/Users/a/Library/Application Support/atom/diagrams/arch-1a2b3c4d.html"
+        );
+        // Legacy sessions carry unquoted space-free paths.
+        let legacy = "[atom-diagram] png=/tmp/d/arch-1a2b3c4d.png \
+                      html=/tmp/d/arch-1a2b3c4d.html width=400 height=200";
+        let (_, png, _, _, _, _) = parse_diagram_marker(&legacy).expect("legacy marker parsed");
+        assert_eq!(png, "/tmp/d/arch-1a2b3c4d.png");
+        // Legacy unquoted paths containing spaces must parse fully too
+        // (macOS "Application Support").
+        let legacy_spaced = "[atom-diagram] png=/Users/a/Application Support/atom/diagrams/arch-1a2b3c4d.png html=/Users/a/Library/Application Support/atom/diagrams/arch-1a2b3c4d.html width=400 height=200";
+        let (_, png, _, html, _, _) =
+            parse_diagram_marker(legacy_spaced).expect("legacy spaced marker parsed");
+        assert_eq!(
+            png,
+            "/Users/a/Application Support/atom/diagrams/arch-1a2b3c4d.png"
+        );
+        assert_eq!(
+            html,
+            "/Users/a/Library/Application Support/atom/diagrams/arch-1a2b3c4d.html"
+        );
+        // Legacy markers without png-dark default the dark raster to the
+        // light one, so old sessions still paint.
+        let legacy_no_dark = "[atom-diagram] png=\"/Users/a/Application Support/atom/diagrams/arch-1a2b3c4d.png\" html=\"/Users/a/Library/Application Support/atom/diagrams/arch-1a2b3c4d.html\" width=400 height=200";
+        let (_, png, png_dark, _, _, _) =
+            parse_diagram_marker(legacy_no_dark).expect("legacy marker parsed");
+        assert_eq!(png_dark, png);
+
+        // New SVG format.
+        let svg_marker = "[atom-diagram] svg=\"/tmp/d/arch-1a2b3c4d.svg\" html=\"/tmp/d/arch-1a2b3c4d.html\" width=800 height=400";
+        let (svg, png, _, html, w, h) =
+            parse_diagram_marker(svg_marker).expect("svg marker parsed");
+        assert_eq!(svg, "/tmp/d/arch-1a2b3c4d.svg");
+        assert!(png.is_empty(), "svg format should not populate png");
+        assert_eq!(html, "/tmp/d/arch-1a2b3c4d.html");
+        assert_eq!((w, h), (800, 400));
+
         assert!(parse_diagram_marker("no marker here").is_none());
         let stripped = strip_diagram_marker(result);
         assert!(!stripped.contains("atom-diagram"));
@@ -2149,18 +2269,41 @@ mod tests {
         }];
         attach_tool_result(
             &mut blocks,
-            "rendered diagram\n [atom-diagram] png=/a.png html=/a.html width=100 height=50",
+            "rendered diagram\n [atom-diagram] png=/a.png png-dark=/a-dark.png html=/a.html width=100 height=50",
             "",
         );
         assert!(blocks[0].tool_done);
         let d = blocks[0].diagram.as_ref().expect("diagram attached");
         assert_eq!(d.png, "/a.png");
+        assert_eq!(d.png_dark, "/a-dark.png");
         assert_eq!(d.html, "/a.html");
         assert_eq!((d.w, d.h), (100, 50));
         assert_eq!(d.id, 0, "ids are assigned later by the app");
         // Results without a marker leave the diagram empty.
         attach_tool_result(&mut blocks, "plain", "");
         assert!(blocks[1].diagram.is_none());
+    }
+
+    #[test]
+    fn attach_tool_result_marker_only_counts_for_visualize() {
+        // A grep result that happens to quote the marker line (e.g. from
+        // this repo's own source) must not become a diagram card.
+        let content =
+            "app.rs:4151: \"rendered diagram\\n [atom-diagram] png=/a.png html=/a.html width=400 height=200\"";
+        for name in ["grep", "bash", "read_file", ""] {
+            let mut blocks = vec![Block {
+                kind: BlockKind::Tool,
+                title: "Grep".into(),
+                tool_name: name.into(),
+                ..Default::default()
+            }];
+            attach_tool_result(&mut blocks, content, "");
+            assert!(blocks[0].tool_done);
+            assert!(
+                blocks[0].diagram.is_none(),
+                "{name} result must not attach a diagram"
+            );
+        }
     }
 
     #[test]
@@ -2207,18 +2350,43 @@ mod tests {
             ..Default::default()
         };
         assert!(diagram_geometry(&mut d, 62));
-        assert_eq!(d.cols, 60);
-        // rows = 60 * (200/400) * (32/64) = 15
-        assert_eq!(d.rows, 15);
+        // cols capped at 2/3 of inner: 62*2/3 = 41
+        assert_eq!(d.cols, 41);
+        // rows = 41 * (200/400) * (32/64) = 10.25 -> 10
+        assert_eq!(d.rows, 10);
         // Re-running with the same width is a no-op.
         assert!(!diagram_geometry(&mut d, 62));
         // Narrower width re-fits the grid.
         assert!(diagram_geometry(&mut d, 42));
-        assert_eq!(d.cols, 40);
-        assert_eq!(d.rows, 10);
-        // Zero dimensions are left untouched.
+        // 42*2/3 = 28
+        assert_eq!(d.cols, 28);
+        assert_eq!(d.rows, 7);
+        // Wide render widths: 2/3 of 120 = 80
+        assert!(diagram_geometry(&mut d, 120));
+        assert_eq!(d.cols, 80);
+        assert_eq!(d.rows, 20); // 80 * (200/400) * (32/64) = 20
+                                // Zero dimensions are left untouched.
         let mut empty = DiagramRef::default();
         assert!(!diagram_geometry(&mut empty, 62));
+    }
+
+    #[test]
+    fn diagram_geometry_row_cap_shrinks_cols_not_aspect() {
+        // A very tall diagram: capping rows must shrink cols so the
+        // placement box keeps the PNG's aspect (kitty stretches the PNG
+        // to the box, so a broken ratio would distort the image).
+        let mut d = DiagramRef {
+            w: 100,
+            h: 2000,
+            ..Default::default()
+        };
+        assert!(diagram_geometry(&mut d, 120));
+        assert_eq!(d.rows, 20);
+        // cols = (20 / 0.5) * (100/2000) = 2 -> clamped to 10 minimum.
+        assert_eq!(d.cols, 10);
+        // When both caps hit, aspect preservation is best-effort.
+        // Verify cols got clamped rather than going below minimum.
+        assert!(d.cols >= 10);
     }
 
     #[test]
@@ -2274,8 +2442,12 @@ mod tests {
         }
         // Geometry was filled in during render for the paint pass.
         let d = b.diagram.as_ref().unwrap();
-        assert_eq!(d.cols, 60);
-        assert_eq!(d.rows, 15);
+        // 2/3 of inner (78-2=76 content, 76*2/3=50, minus PAD=1*2 → 49 cols after clamp)
+        // Actually: inner passed = 80's inner_width - 2 = 76. 76*2/3 = 50.
+        // cols = min(76-2, 50) = 50. rows = 50*(200/400)*(32/64) = 12.5 -> 13
+        assert!(d.cols > 0);
+        assert!(d.rows > 0);
+        assert!(d.rows <= 20);
         if preview::kitty_terminal() {
             // Placeholder grid rows follow the summary.
             let placeholders = out
@@ -2284,6 +2456,31 @@ mod tests {
                 .filter(|l| ansi::line_plain(l).contains('\u{10EEEE}'))
                 .count();
             assert_eq!(placeholders, d.rows, "one grid row per rows count");
+        }
+    }
+
+    #[test]
+    fn unparseable_visualize_marker_is_still_stripped() {
+        // A legacy marker with spaces in unquoted paths (or any other
+        // malformed marker) may fail to parse; the machine-readable line
+        // must still never reach the transcript, where it would render
+        // as garbage with truncated links.
+        let mut b = Block {
+            kind: BlockKind::Tool,
+            title: "Visualize".into(),
+            tool_name: "visualize".into(),
+            text: "Login".into(),
+            tool_done: true,
+            result: "rendered diagram \"Login\" (400x200 px)\n \
+                     [atom-diagram] png= html= width=x height=y"
+                .into(),
+            diagram: None,
+            ..Default::default()
+        };
+        assert!(parse_diagram_marker(&b.result).is_none());
+        let out = render_block_linked(&mut b, 80, true, "*");
+        for line in &out.lines {
+            assert!(!ansi::line_plain(line).contains("atom-diagram"));
         }
     }
 

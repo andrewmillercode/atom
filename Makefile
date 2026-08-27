@@ -34,10 +34,10 @@ CARGO_BUILD_FLAGS ?=
 all: build
 
 build:
-	$(CARGO) build $(CARGO_BUILD_FLAGS) --bin atom
+	$(CARGO) build $(CARGO_BUILD_FLAGS) --bin atom --bin atoms
 
 build-release:
-	$(CARGO) build --release --bin atom
+	$(CARGO) build --release --bin atom --bin atoms
 
 install-dev: build
 	install -d $(BIN_DIR)

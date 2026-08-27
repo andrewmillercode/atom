@@ -133,6 +133,9 @@ fn restore_terminal(terminal: &mut Term) {
     use crossterm::event::{DisableBracketedPaste, DisableFocusChange, DisableMouseCapture};
     use crossterm::execute;
     use crossterm::terminal::*;
+    // A blocking paint task may still be mid-payload when we tear down;
+    // serialize with it so the exit sequence cannot interleave.
+    let _tty = preview::lock_tty();
     let _ = execute!(
         terminal.backend_mut(),
         DisableBracketedPaste,
@@ -224,10 +227,17 @@ async fn event_loop(
         let title = window_title(app);
         if title != st.last_title {
             st.last_title = title.clone();
+            // Locked: SetTitle bytes must not interleave with a concurrent
+            // kitty paint payload (same tty, different writers).
+            let _guard = preview::lock_tty();
             let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle(title));
         }
 
         let mut cursor_pos: Option<(u16, u16)> = None;
+        // Hold the tty write lock across the whole frame — draw, flush and
+        // cursor update are one escape sequence burst; a concurrent kitty
+        // paint interleaving here is what garbled the TUI until resize.
+        let tty_guard = preview::lock_tty();
         terminal.draw(|f| {
             cursor_pos = view::draw(app, f.area(), f.buffer_mut());
         })?;
@@ -239,6 +249,15 @@ async fn event_loop(
             None => {
                 let _ = terminal.hide_cursor();
             }
+        }
+        drop(tty_guard);
+        // A first frame can discover the real terminal width before a
+        // crossterm Resize event arrives. If that changes diagram geometry,
+        // paint the matching kitty placement after the placeholder grid is
+        // on screen instead of leaving a stale/blank reserved area.
+        if app.preview_dirty && preview::kitty_terminal() {
+            effects.push(Effect::PaintPreviews);
+            run_effects(app, &tx, &mut st, &mut effects).await;
         }
         if app.quitting {
             return Ok(());
@@ -409,6 +428,7 @@ fn dispatch_msg(
                 app.copied_msg = format!("theme reloaded in {} ms", elapsed.as_millis());
                 app.copied_at = Some(std::time::Instant::now());
                 effects.push(Effect::PaintPreviews);
+                let _guard = preview::lock_tty();
                 terminal.clear()?;
             }
             Err(error) => {
@@ -885,17 +905,33 @@ async fn run_effects(
                 }
                 // Diagram ids and geometry are (re)derived here so freshly
                 // attached diagrams still paint even if a render pass has
-                // not filled them in yet.
+                // not filled them in yet. When either changes, the
+                // placeholder grid on screen (cached block lines) is stale:
+                // invalidate it and defer the kitty paint to the post-draw
+                // check, which fires after the frame shows the new grid.
+                // Painting immediately would transmit placements whose
+                // c/r dims match nothing on screen — tiles then stretch
+                // over unrelated content until a resize.
                 let inner = app.inner_width().saturating_sub(2).max(1);
-                if crate::blocks::assign_block_diagram_ids(&mut app.blocks) {
-                    app.preview_dirty = true;
-                }
+                let mut changed = crate::blocks::assign_block_diagram_ids(&mut app.blocks);
                 for block in app.blocks.iter_mut() {
                     if let Some(d) = block.diagram.as_mut() {
                         if crate::blocks::diagram_geometry(d, inner) {
-                            app.preview_dirty = true;
+                            changed = true;
                         }
                     }
+                }
+                if changed {
+                    for block in app.blocks.iter_mut() {
+                        if block.diagram.is_some() {
+                            block.lines = None;
+                        }
+                    }
+                    app.viewport_dirty = true;
+                    // The post-draw check only fires when this flag is set;
+                    // make the deferred repaint unconditional.
+                    app.preview_dirty = true;
+                    continue;
                 }
                 if !app.preview_dirty {
                     continue;
@@ -925,13 +961,19 @@ async fn run_effects(
                 }
                 // Diagrams: current placements plus every diagram id no
                 // longer referenced, which gets deleted on the tty.
-                let mut diagram_specs: Vec<(usize, String, usize, usize)> = Vec::new();
+                let mut diagram_specs: Vec<preview::DiagramSpec> = Vec::new();
                 let mut diagram_ids: Vec<usize> = Vec::new();
                 for block in app.blocks.iter() {
                     if let Some(d) = &block.diagram {
                         if d.id > 0 && d.cols > 0 && d.rows > 0 {
                             diagram_ids.push(d.id);
-                            diagram_specs.push((d.id, d.png.clone(), d.cols, d.rows));
+                            diagram_specs.push(preview::DiagramSpec {
+                                id: d.id,
+                                svg: d.svg.clone(),
+                                png: d.png.clone(),
+                                cols: d.cols,
+                                rows: d.rows,
+                            });
                         }
                     }
                 }

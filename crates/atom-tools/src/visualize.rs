@@ -1,22 +1,28 @@
-//! visualize tool: renders Mermaid diagrams to a high-density PNG for
-//! inline kitty-graphics display in the TUI plus a self-contained,
-//! pan/zoom HTML viewer for the browser.
+//! visualize tool: renders Mermaid diagrams to SVG for inline display
+//! in the TUI (rasterized on-demand via resvg at the exact terminal
+//! dimensions) plus a self-contained, pan/zoom HTML viewer for the
+//! browser.
 //!
 //! Rendering shells out to a browserless Mermaid CLI — `merman-cli`
-//! (native Rust, preferred) or the official `mmdc` (Node) — using the
-//! shared `mmdc` dialect both accept: `-i <in> -o <out> -s <scale>
-//! -b <bg>`. Both write Mermaid-parity SVG, which is what the HTML
-//! viewer embeds, so browser zoom stays vector-crisp.
+//! (native Rust, preferred) or the official `mmdc` (Node) — producing
+//! a single SVG. The TUI rasterizes this SVG at paint time (in the
+//! kitty graphics paint pass) using resvg with a proper card background
+//! matched to the terminal theme. The browser viewer re-renders with the
+//! real Mermaid.js from a CDN (theme-aware) and falls back to the SVG
+//! when offline.
 //!
 //! Artifacts are content-addressed under the app data dir
-//! (`<data>/atom/diagrams/<slug>-<hash8>.{png,html}`): identical
+//! (`<data>/atom/diagrams/<slug>-<hash8>.{svg,html}`): identical
 //! Mermaid sources reuse the same files across calls and sessions.
 //!
 //! The tool result embeds a single machine-readable marker line
-//! (`[atom-diagram] png=… html=… width=… height=…`) that the TUI parses
-//! to paint the inline image; it is stripped from the rendered summary.
+//! (`[atom-diagram] svg="…" html="…" width=… height=…`)
+//! that the TUI parses to paint the inline image; it is stripped from
+//! the rendered summary. Paths are quoted because the artifacts dir
+//! contains a space on macOS.
 
 use crate::{ToolCtx, ToolOutcome};
+use atom_core::render::colors::COLOR_BORDER;
 use std::path::PathBuf;
 
 /// Which renderer binary is available ("merman-cli" or "mmdc").
@@ -56,48 +62,51 @@ fn slugify(title: &str) -> String {
     }
 }
 
-/// Renders Mermaid `code` to (svg_bytes, png_bytes) via the external CLI.
-/// Uses a tempdir workspace because both CLIs want file inputs/outputs.
-async fn render_mermaid(code: &str, bin: &std::path::Path) -> Result<(Vec<u8>, Vec<u8>), String> {
+/// Builds the mermaid CLI `config.json`. Forces native SVG `<text>`
+/// labels (htmlLabels:false — resvg can't render `<foreignObject>`) and
+/// overrides the dark theme's default muted subgraph fill so clusters
+/// render as transparent boxes with a border. `themeVariables` only
+/// change the default cluster fill; explicit user-supplied
+/// `style ... fill:` directives are left untouched.
+fn mermaid_config() -> String {
+    format!(
+        r#"{{"flowchart":{{"htmlLabels":false}},"sequence":{{"htmlLabels":false}},"htmlLabels":false,"themeVariables":{{"clusterBkg":"transparent","clusterBorder":"{COLOR_BORDER}"}}}}"#
+    )
+}
+
+/// Renders Mermaid `code` to SVG via the external CLI.
+/// Uses the dark theme so diagrams look native in atom's dark TUI.
+/// Forces native SVG text (htmlLabels:false) so resvg can render labels.
+async fn render_mermaid(code: &str, bin: &std::path::Path) -> Result<Vec<u8>, String> {
     let dir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
     let src = dir.path().join("diagram.mmd");
     std::fs::write(&src, code).map_err(|e| format!("write source: {e}"))?;
     let svg_path = dir.path().join("diagram.svg");
-    let png_path = dir.path().join("diagram.png");
 
-    // SVG (mermaid-parity, for the browser viewer) then PNG (2x density,
-    // transparent background so kitty composites onto the terminal bg).
-    let run = |out: &std::path::Path, extra: &[String]| -> Vec<String> {
-        let mut args = vec![
-            "-i".to_string(),
-            src.display().to_string(),
-            "-o".to_string(),
-            out.display().to_string(),
-        ];
-        args.extend(extra.iter().cloned());
-        args
-    };
-    renderer_run(bin, &run(&svg_path, &[])).await?;
-    renderer_run(
-        bin,
-        &run(
-            &png_path,
-            &[
-                "-s".to_string(),
-                "2".to_string(),
-                "-b".into(),
-                "transparent".into(),
-            ],
-        ),
-    )
-    .await?;
+    // Config that forces SVG <text> instead of <foreignObject> (which
+    // resvg can't render). htmlLabels:false is the key setting.
+    let cfg_path = dir.path().join("config.json");
+    std::fs::write(&cfg_path, mermaid_config()).map_err(|e| format!("write config: {e}"))?;
+
+    let args: Vec<String> = vec![
+        "-i".to_string(),
+        src.display().to_string(),
+        "-o".to_string(),
+        svg_path.display().to_string(),
+        "-t".to_string(),
+        "dark".to_string(),
+        "-b".to_string(),
+        "transparent".to_string(),
+        "-c".to_string(),
+        cfg_path.display().to_string(),
+    ];
+    renderer_run(bin, &args).await?;
 
     let svg = std::fs::read(&svg_path).map_err(|e| format!("read svg: {e}"))?;
-    let png = std::fs::read(&png_path).map_err(|e| format!("read png: {e}"))?;
-    if svg.is_empty() || png.is_empty() {
+    if svg.is_empty() {
         return Err("renderer produced empty output".to_string());
     }
-    Ok((svg, png))
+    Ok(svg)
 }
 
 async fn renderer_run(bin: &std::path::Path, args: &[String]) -> Result<(), String> {
@@ -125,13 +134,40 @@ async fn renderer_run(bin: &std::path::Path, args: &[String]) -> Result<(), Stri
     Ok(())
 }
 
-/// PNG pixel dimensions without a full decode.
-fn png_size(data: &[u8]) -> Option<(u32, u32)> {
-    image::ImageReader::new(std::io::Cursor::new(data))
-        .with_guessed_format()
-        .ok()?
-        .into_dimensions()
-        .ok()
+/// Extract SVG dimensions from the viewBox or width/height attributes.
+/// Returns (width, height) in logical pixels.
+fn svg_size(data: &[u8]) -> Option<(u32, u32)> {
+    let s = std::str::from_utf8(data).ok()?;
+    // Try viewBox first: viewBox="0 0 W H"
+    if let Some(vb_start) = s.find("viewBox=\"") {
+        let rest = &s[vb_start + 9..];
+        if let Some(end) = rest.find('"') {
+            let parts: Vec<&str> = rest[..end].split_whitespace().collect();
+            if parts.len() == 4 {
+                let w: f64 = parts[2].parse().ok()?;
+                let h: f64 = parts[3].parse().ok()?;
+                if w > 0.0 && h > 0.0 {
+                    return Some((w.ceil() as u32, h.ceil() as u32));
+                }
+            }
+        }
+    }
+    // Fallback: width="N" height="N" attributes
+    let parse_attr = |attr: &str| -> Option<u32> {
+        let needle = format!("{attr}=\"");
+        let start = s.find(&needle)? + needle.len();
+        let rest = &s[start..];
+        let end = rest.find('"')?;
+        let val: f64 = rest[..end].trim_end_matches("px").parse().ok()?;
+        Some(val.ceil() as u32)
+    };
+    let w = parse_attr("width")?;
+    let h = parse_attr("height")?;
+    if w > 0 && h > 0 {
+        Some((w, h))
+    } else {
+        None
+    }
 }
 
 /// escape_html escapes the handful of characters that matter in HTML text.
@@ -141,11 +177,28 @@ fn escape_html(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
-/// viewer_html builds the self-contained browser viewer: inlined SVG,
-/// drag-to-pan, wheel/pinch zoom, keyboard navigation, fit/reset, and
-/// the mermaid source in a collapsible section. No external assets —
-/// works offline from file://.
-fn viewer_html(title: &str, svg: &str, code: &str) -> String {
+/// js_string JSON-encodes a value for embedding inside a <script> block,
+/// escaping "</" so the sequence can never close the script tag early
+/// (mermaid labels may legitimately contain "</script>").
+fn js_string(s: &str) -> String {
+    serde_json::to_string(s)
+        .unwrap_or_else(|_| "\"\"".into())
+        .replace("</", "<\\/")
+}
+
+/// viewer_html builds the self-contained browser viewer. Dark theme with
+/// dot grid background, pan/zoom via pointer drag and wheel.
+/// Colors sourced from atom's palette (colors.rs constants).
+fn viewer_html(title: &str, slug: &str, svg: &str, code: &str) -> String {
+    // Pull colors from the palette at build time.
+    use atom_core::render::colors::*;
+    let bg = COLOR_BACKGROUND; // #111112
+    let card = COLOR_CARD_DARK; // #151516
+    let border = COLOR_BORDER; // #272b33
+    let muted_extra = COLOR_MUTED_EXTRA; // #3d3d3d
+    let muted = COLOR_MUTED; // #666666
+    let fg = COLOR_FOREGROUND; // #dee3e8
+
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -154,28 +207,30 @@ fn viewer_html(title: &str, svg: &str, code: &str) -> String {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title}</title>
 <style>
-  :root {{ color-scheme: light dark; }}
-  html, body {{ margin: 0; height: 100%; overflow: hidden;
-    background: light-dark(#fafafa, #14161a); }}
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  html, body {{ height: 100%; overflow: hidden; background: {bg}; color: {fg}; }}
+  body {{ display: flex; flex-direction: column; font: 13px/1.4 -apple-system, "Segoe UI", sans-serif; }}
   header {{ display: flex; align-items: center; gap: 12px; padding: 8px 14px;
-    font: 13px -apple-system, "Segoe UI", sans-serif;
-    color: light-dark(#333, #ccc); border-bottom: 1px solid light-dark(#e2e2e2, #2a2a2a);
-    user-select: none; }}
+    border-bottom: 1px solid {border}; user-select: none; z-index: 10; }}
   header .title {{ font-weight: 600; flex: 1; overflow: hidden;
     text-overflow: ellipsis; white-space: nowrap; }}
-  header button {{ font: inherit; border: 1px solid light-dark(#ccc, #3a3a3a);
-    background: transparent; color: inherit; border-radius: 6px;
-    padding: 2px 10px; cursor: pointer; }}
-  header button:hover {{ background: light-dark(#ececec, #24262b); }}
-  #stage {{ width: 100%; height: calc(100% - 37px); cursor: grab; touch-action: none; }}
-  #stage {{ transform-origin: 0 0; display: inline-block; }}
+  header button {{ font: inherit; border: 1px solid {border};
+    background: {card}; color: {fg}; border-radius: 6px;
+    padding: 3px 10px; cursor: pointer; }}
+  header button:hover {{ background: {border}; }}
+  #viewport {{ flex: 1; position: relative; overflow: hidden; cursor: grab;
+    touch-action: none; user-select: none;
+    background-color: {bg};
+    background-image: radial-gradient(circle, {muted_extra} 1px, transparent 1px);
+    background-size: 24px 24px; }}
+  #stage {{ position: absolute; left: 0; top: 0; transform-origin: 0 0; }}
   #stage svg {{ display: block; max-width: none; }}
   details {{ position: fixed; right: 12px; bottom: 12px; max-width: min(640px, 80vw);
-    background: light-dark(#ffffff, #1b1d22); border: 1px solid light-dark(#ddd, #2c2e33);
+    background: {card}; border: 1px solid {border};
     border-radius: 8px; padding: 8px 12px; font: 12px ui-monospace, monospace;
-    box-shadow: 0 4px 16px rgba(0,0,0,.15); }}
-  details pre {{ max-height: 40vh; overflow: auto; white-space: pre-wrap; }}
-  summary {{ cursor: pointer; font: 13px -apple-system, "Segoe UI", sans-serif; }}
+    box-shadow: 0 4px 16px rgba(0,0,0,.4); z-index: 10; }}
+  details pre {{ max-height: 40vh; overflow: auto; white-space: pre-wrap; color: {muted}; }}
+  summary {{ cursor: pointer; color: {muted}; }}
 </style>
 </head>
 <body>
@@ -185,87 +240,108 @@ fn viewer_html(title: &str, svg: &str, code: &str) -> String {
   <button onclick="zoomBy(1.25)">+</button>
   <button onclick="zoomBy(0.8)">&minus;</button>
   <button onclick="reset()">100%</button>
-  <span id="pct"></span>
+  <button onclick="downloadSvg()">SVG</button>
+  <span id="pct" style="min-width:3em;text-align:right;color:{muted}"></span>
 </header>
-<div id="stage-container" style="display:none"></div>
-<div id="stage"></div>
-<details><summary>Mermaid source</summary><pre>{code_html}</pre></details>
+<div id="viewport"><div id="stage"></div></div>
+<details><summary>&#9654; Mermaid source</summary><pre>{code_html}</pre></details>
 <script>
 "use strict";
+const viewport = document.getElementById("viewport");
 const stage = document.getElementById("stage");
-const stageContainer = document.getElementById("stage-container");
-const FIT_PAD = 32;
-let scale = 1, tx = 0, ty = 0;
+let scale = 1, tx = 0, ty = 0, natW = 800, natH = 600;
 
-stage.innerHTML = {svg_js};
-// Mermaid SVGs carry fixed width/height; swap to a viewBox so CSS
-// scaling stays crisp, then hide the raw svg and drive the transform
-// from the container.
-const svgEl = stage.querySelector("svg");
-let natW = 800, natH = 600;
-if (svgEl) {{
-  const vb = svgEl.viewBox.baseVal;
-  if (vb && vb.width && vb.height) {{ natW = vb.width; natH = vb.height; }}
-  else if (svgEl.width.baseVal.value && svgEl.height.baseVal.value) {{
-    natW = svgEl.width.baseVal.value; natH = svgEl.height.baseVal.value;
+function setSvg(svg) {{
+  stage.innerHTML = svg;
+  const el = stage.querySelector("svg");
+  if (!el) return;
+  const vb = el.viewBox && el.viewBox.baseVal;
+  if (vb && vb.width > 0 && vb.height > 0) {{ natW = vb.width; natH = vb.height; }}
+  else {{
+    const w = el.width && el.width.baseVal.value;
+    const h = el.height && el.height.baseVal.value;
+    if (w > 0 && h > 0) {{ natW = w; natH = h; }}
   }}
-  svgEl.removeAttribute("width"); svgEl.removeAttribute("height");
-  svgEl.style.width = natW + "px"; svgEl.style.height = natH + "px";
+  el.removeAttribute("width"); el.removeAttribute("height");
+  el.style.width = natW + "px"; el.style.height = natH + "px";
+  stage.style.width = natW + "px"; stage.style.height = natH + "px";
+  fit();
 }}
-stage.style.width = natW + "px"; stage.style.height = natH + "px";
+
+setSvg({svg_js});
+
+const MERMAID_CDN = "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js";
+function renderWithMermaid() {{
+  if (typeof mermaid === "undefined") return;
+  mermaid.initialize({{ startOnLoad: false, theme: "dark", securityLevel: "loose", themeVariables: {{ clusterBkg: "transparent", clusterBorder: "{border}" }} }});
+  mermaid.render("mmd-" + Date.now(), {code_js})
+    .then(({{ svg }}) => setSvg(svg))
+    .catch(() => {{}});
+}}
+const s = document.createElement("script");
+s.src = MERMAID_CDN; s.onload = renderWithMermaid;
+document.head.appendChild(s);
+
+new ResizeObserver(() => fit()).observe(viewport);
 
 function apply() {{
-  stage.style.transform = `translate(${{tx}}px, ${{ty}}px) scale(${{scale}})`;
+  stage.style.transform = `translate(${{tx}}px,${{ty}}px) scale(${{scale}})`;
   document.getElementById("pct").textContent = Math.round(scale * 100) + "%";
 }}
 function zoomBy(f, cx, cy) {{
-  const r = stageContainer.getBoundingClientRect();
+  const r = viewport.getBoundingClientRect();
   cx = cx === undefined ? r.width / 2 : cx - r.left;
   cy = cy === undefined ? r.height / 2 : cy - r.top;
   const ns = Math.min(20, Math.max(0.02, scale * f));
   const k = ns / scale;
-  tx = cx - (cx - tx) * k; ty = cy - (cy - ty) * k; scale = ns; apply();
+  tx = cx - (cx - tx) * k; ty = cy - (cy - ty) * k; scale = ns;
+  apply();
 }}
 function fit() {{
-  const r = stageContainer.getBoundingClientRect();
-  scale = Math.min((r.width - FIT_PAD) / natW, (r.height - FIT_PAD) / natH);
-  scale = Math.min(4, Math.max(0.02, scale));
-  tx = (r.width - natW * scale) / 2; ty = (r.height - natH * scale) / 2; apply();
+  const r = viewport.getBoundingClientRect();
+  if (r.width < 1 || r.height < 1 || natW < 1 || natH < 1) return;
+  scale = Math.min((r.width - 64) / natW, (r.height - 64) / natH, 4);
+  scale = Math.max(0.02, scale);
+  tx = (r.width - natW * scale) / 2;
+  ty = (r.height - natH * scale) / 2;
+  apply();
 }}
-function reset() {{ scale = 1; tx = 0; ty = 0; apply(); }}
-let px = 0, py = 0, down = false;
-stageContainer.addEventListener("pointerdown", e => {{
+function reset() {{
+  const r = viewport.getBoundingClientRect();
+  scale = 1;
+  tx = (r.width - natW) / 2; ty = (r.height - natH) / 2;
+  apply();
+}}
+function downloadSvg() {{
+  const el = stage.querySelector("svg");
+  if (!el) return;
+  const blob = new Blob([new XMLSerializer().serializeToString(el)], {{type:"image/svg+xml"}});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob); a.download = "{slug}.svg"; a.click();
+}}
+let px=0, py=0, down=false;
+viewport.addEventListener("pointerdown", e => {{
+  if (e.button !== 0) return;
   down = true; px = e.clientX; py = e.clientY;
-  stageContainer.style.cursor = "grabbing"; stageContainer.setPointerCapture(e.pointerId);
+  viewport.style.cursor = "grabbing"; viewport.setPointerCapture(e.pointerId);
 }});
-stageContainer.addEventListener("pointermove", e => {{
-  if (!down) return; tx += e.clientX - px; ty += e.clientY - py;
+viewport.addEventListener("pointermove", e => {{
+  if (!down) return;
+  tx += e.clientX - px; ty += e.clientY - py;
   px = e.clientX; py = e.clientY; apply();
 }});
-window.addEventListener("pointerup", () => {{
-  down = false; stageContainer.style.cursor = "grab";
-}});
-stageContainer.addEventListener("wheel", e => {{
+window.addEventListener("pointerup", () => {{ down = false; viewport.style.cursor = "grab"; }});
+viewport.addEventListener("wheel", e => {{
   e.preventDefault();
-  zoomBy(e.deltaY < 0 ? 1.1 : 0.9, e.clientX, e.clientY);
-}}, {{ passive: false }});
-stageContainer.addEventListener("dblclick", fit);
+  zoomBy(e.deltaY < 0 ? 1.15 : 0.87, e.clientX, e.clientY);
+}}, {{passive:false}});
+viewport.addEventListener("dblclick", fit);
 window.addEventListener("keydown", e => {{
   if (e.key === "+" || e.key === "=") zoomBy(1.25);
   else if (e.key === "-") zoomBy(0.8);
   else if (e.key === "0") reset();
   else if (e.key === "f") fit();
-  else if (e.key.startsWith("Arrow")) {{
-    const d = 40 * (e.shiftKey ? 3 : 1);
-    if (e.key === "ArrowLeft") tx += d;
-    if (e.key === "ArrowRight") tx -= d;
-    if (e.key === "ArrowUp") ty += d;
-    if (e.key === "ArrowDown") ty -= d;
-    apply(); e.preventDefault();
-  }}
 }});
-window.addEventListener("resize", fit);
-fit();
 </script>
 </body>
 </html>
@@ -273,7 +349,9 @@ fit();
         title = escape_html(title),
         title_html = escape_html(title),
         code_html = escape_html(code),
-        svg_js = serde_json::to_string(svg).unwrap_or_else(|_| "\"\"".into()),
+        code_js = js_string(code),
+        svg_js = js_string(svg),
+        slug = slug,
     )
 }
 
@@ -314,41 +392,42 @@ pub async fn execute_visualize(args_json: &str, _ctx: &ToolCtx<'_>) -> ToolOutco
         }
     };
 
-    let (svg, png) = match render_mermaid(&code, &bin).await {
+    let svg = match render_mermaid(&code, &bin).await {
         Ok(v) => v,
         Err(e) => return ToolOutcome::from_text(format!("error: {e}")),
     };
-    let Some((w, h)) = png_size(&png) else {
-        return ToolOutcome::from_text("error: rendered PNG has no dimensions".into());
+    let Some((w, h)) = svg_size(&svg) else {
+        return ToolOutcome::from_text("error: rendered SVG has no dimensions".into());
     };
 
     // Content-addressed artifacts: identical sources reuse the same files.
     let hash = atom_core::util::sha256_hash(code.as_bytes());
     let hash8: String = hash.chars().take(8).collect();
-    let stem = format!("{}-{}", slugify(title), hash8);
+    let slug = slugify(title);
+    let stem = format!("{slug}-{hash8}");
     let dir = diagram_dir();
     if let Err(e) = std::fs::create_dir_all(&dir) {
         return ToolOutcome::from_text(format!("error: create {}: {e}", dir.display()));
     }
-    let png_path = dir.join(format!("{stem}.png"));
+    let svg_path = dir.join(format!("{stem}.svg"));
     let html_path = dir.join(format!("{stem}.html"));
-    if let Err(e) = std::fs::write(&png_path, &png) {
-        return ToolOutcome::from_text(format!("error: write png: {e}"));
+    if let Err(e) = std::fs::write(&svg_path, &svg) {
+        return ToolOutcome::from_text(format!("error: write svg: {e}"));
     }
     let svg_str = match std::str::from_utf8(&svg) {
         Ok(s) => s,
         Err(_) => return ToolOutcome::from_text("error: svg is not valid utf-8".into()),
     };
-    if let Err(e) = std::fs::write(&html_path, viewer_html(title, svg_str, &code)) {
+    if let Err(e) = std::fs::write(&html_path, viewer_html(title, &slug, svg_str, &code)) {
         return ToolOutcome::from_text(format!("error: write viewer: {e}"));
     }
 
     ToolOutcome::from_text(format!(
-        "rendered diagram \"{title}\" ({w}x{h} px, saved at 2x density)\n\
+        "rendered diagram \"{title}\" ({w}x{h} px)\n\
          inline preview is shown in the atom TUI; expand it for a pan/zoom view in the browser\n\
          {}",
         diagram_marker(
-            &png_path.display().to_string(),
+            &svg_path.display().to_string(),
             &html_path.display().to_string(),
             w,
             h
@@ -361,8 +440,12 @@ pub async fn execute_visualize(args_json: &str, _ctx: &ToolCtx<'_>) -> ToolOutco
 // ---------------------------------------------------------------------------
 
 /// The exact machine-readable marker line embedded in visualize results.
-pub fn diagram_marker(png: &str, html: &str, w: u32, h: u32) -> String {
-    format!("[atom-diagram] png={png} html={html} width={w} height={h}")
+/// Paths are double-quoted: the artifacts dir contains a space on macOS
+/// (`~/Library/Application Support/atom/diagrams/`), and unquoted paths
+/// would break the TUI's marker parser as well as terminal link
+/// detection.
+pub fn diagram_marker(svg: &str, html: &str, w: u32, h: u32) -> String {
+    format!("[atom-diagram] svg=\"{svg}\" html=\"{html}\" width={w} height={h}")
 }
 
 #[cfg(test)]
@@ -380,7 +463,104 @@ mod tests {
     }
 
     #[test]
+    fn diagram_marker_quotes_paths() {
+        let marker = diagram_marker(
+            "/Users/a/Library/Application Support/atom/diagrams/arch-1a2b3c4d.svg",
+            "/Users/a/Library/Application Support/atom/diagrams/arch-1a2b3c4d.html",
+            400,
+            200,
+        );
+        assert_eq!(
+            marker,
+            "[atom-diagram] svg=\"/Users/a/Library/Application Support/atom/diagrams/arch-1a2b3c4d.svg\" \
+             html=\"/Users/a/Library/Application Support/atom/diagrams/arch-1a2b3c4d.html\" \
+             width=400 height=200"
+        );
+    }
+
+    #[test]
+    fn svg_size_from_viewbox() {
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800.5 400.2"></svg>"#;
+        assert_eq!(svg_size(svg), Some((801, 401)));
+    }
+
+    #[test]
+    fn svg_size_from_attributes() {
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="600" height="300"></svg>"#;
+        assert_eq!(svg_size(svg), Some((600, 300)));
+    }
+
+    #[test]
+    fn svg_size_from_px_attributes() {
+        let svg = br#"<svg width="600px" height="300px"></svg>"#;
+        assert_eq!(svg_size(svg), Some((600, 300)));
+    }
+
+    #[test]
     fn escape_html_escapes_text_nodes() {
         assert_eq!(escape_html("a<b>&c"), "a&lt;b&gt;&amp;c");
+    }
+
+    #[test]
+    fn js_string_escapes_script_closers() {
+        assert_eq!(js_string("a</script>b"), "\"a<\\/script>b\"");
+        assert_eq!(
+            js_string("flowchart TD\nA --> B"),
+            "\"flowchart TD\\nA --> B\""
+        );
+    }
+
+    #[test]
+    fn viewer_html_embeds_source_and_fallback() {
+        let html = viewer_html(
+            "Arch",
+            "arch",
+            "<svg id=\"x\"></svg>",
+            "flowchart TD\nA --> B",
+        );
+        assert!(html.contains("<title>Arch</title>"));
+        assert!(html.contains(">Arch</div>"));
+        assert!(html.contains("flowchart TD\\nA --> B"));
+        assert!(html.contains("flowchart TD\nA --&gt; B"));
+        assert!(html.contains("svg id=\\\"x\\\""));
+        assert!(html.contains("<\\/svg>"));
+        assert!(html.contains("id=\"viewport\""));
+        assert!(!html.contains("stage-container"));
+        assert!(html.contains("mermaid@11"));
+        assert!(html.contains("a.download = \"arch.svg\""));
+        // ResizeObserver replaces old scheduleFit/setTimeout approach
+        assert!(html.contains("ResizeObserver"));
+        assert!(!html.contains("scheduleFit"));
+    }
+
+    #[test]
+    fn mermaid_config_renders_clusters_transparent_with_border() {
+        // Subgraph/group clusters should render as a bordered, empty
+        // (transparent) box rather than the dark theme's muted fill.
+        let cfg = mermaid_config();
+        assert!(cfg.contains("\"clusterBkg\":\"transparent\""), "cfg: {cfg}");
+        assert!(cfg.contains("\"clusterBorder\":\"#272b33\""), "cfg: {cfg}");
+        // Keep the native-SVG-text forcing resvg relies on.
+        assert!(cfg.contains("\"htmlLabels\":false"), "cfg: {cfg}");
+        assert!(cfg.contains("\"flowchart\""), "cfg: {cfg}");
+        assert!(cfg.contains("\"sequence\""), "cfg: {cfg}");
+    }
+
+    #[test]
+    fn viewer_html_sets_cluster_theme_variables_for_mermaid_render() {
+        // The onload Mermaid.js re-render in the browser viewer must
+        // match the offline SVG: transparent cluster fill + border.
+        let html = viewer_html(
+            "Arch",
+            "arch",
+            "<svg id=\"x\"></svg>",
+            "flowchart TD\nsubgraph bins\nA\nend",
+        );
+        assert!(
+            html.contains(
+                "themeVariables: { clusterBkg: \"transparent\", clusterBorder: \"#272b33\" }"
+            ),
+            "html: {html}"
+        );
     }
 }

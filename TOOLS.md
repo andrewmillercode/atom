@@ -33,7 +33,7 @@ The index is built on first run (and cached for subsequent runs) and invalidated
 
 ## Visualize
 
-Use `visualize` to render a Mermaid diagram inline in the atom TUI as a high-density image, with an expand button (top-right of the rendered diagram) that opens a pan/zoom viewer in the browser. Prefer it over ASCII-art diagrams for conceptual thinking, architecture, data flow, function call graphs, sequence diagrams, state machines, ER models, and similar.
+Use `visualize` to render a Mermaid diagram inline in the atom TUI as a high-density image sized to the full block width, with an expand button (top-right of the rendered diagram) that opens the browser viewer. The inline image is theme-aware (a dark-theme raster is composited on dark terminals), and the viewer re-renders with the real Mermaid.js — theme-aware, with Fit/zoom/pan, an SVG download, and the source in a collapsible panel. Prefer `visualize` over ASCII-art diagrams for conceptual thinking, architecture, data flow, function call graphs, sequence diagrams, state machines, ER models, and similar.
 
 - `code` (required): standard Mermaid source — flowchart, sequenceDiagram, classDiagram, stateDiagram-v2, erDiagram, mindmap, gantt, pie, journey, gitGraph, and more. Provide the complete diagram in one call.
 - `title` (optional): a short title; it names the browser tab and the artifact file.

@@ -1838,6 +1838,42 @@ mod tests {
     }
 
     #[test]
+    fn wide_kitty_placeholder_uses_distinct_column_diacritics() {
+        // Regression: the old 16-entry table clamped every later column
+        // to the same diacritic, so wide image tiles aliased and kitty
+        // smeared the diagram over subsequent terminal content.
+        let lines = ansi::ansi_to_lines(&preview::placeholder_grid(17, 200, 1));
+        let mut buf = Buffer::empty(Rect::new(0, 0, 200, 1));
+        write_line(&mut buf, 0, 0, 200, &lines[0]);
+        let symbols: std::collections::HashSet<&str> =
+            (0..200).map(|x| buf[(x, 0)].symbol()).collect();
+        assert_eq!(symbols.len(), 200);
+        assert_eq!(buf[(15, 0)].symbol(), "\u{10EEEE}\u{0305}\u{0357}");
+        assert_eq!(buf[(16, 0)].symbol(), "\u{10EEEE}\u{0305}\u{035B}");
+
+        let rows = ansi::ansi_to_lines(&preview::placeholder_grid(17, 1, 60));
+        let row_symbols: std::collections::HashSet<&str> = rows
+            .iter()
+            .map(|row| row.spans[0].content.as_ref())
+            .collect();
+        assert_eq!(row_symbols.len(), 60, "row diacritics must not alias");
+    }
+
+    #[test]
+    fn kitty_transmit_uses_protocol_continuation_chunks() {
+        let encoded = preview::kitty_transmit(17, &[7; 5_000]);
+        let commands: Vec<&str> = encoded
+            .split("\x1b_G")
+            .filter(|command| !command.is_empty())
+            .collect();
+        assert_eq!(commands.len(), 2);
+        assert!(commands[0].starts_with("a=t,f=100,i=17,q=2,m=1;"));
+        assert!(commands[1].starts_with("q=2,m=0;"));
+        assert!(!commands[1].contains("a=t"));
+        assert!(!commands[1].contains("i=17"));
+    }
+
+    #[test]
     fn write_line_expands_tabs_and_ignores_controls() {
         let mut buf = Buffer::empty(Rect::new(0, 0, 10, 1));
         write_line(&mut buf, 0, 0, 10, &Line::from("a\tb\rc\u{0007}d\u{007f}e"));

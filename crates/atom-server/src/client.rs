@@ -645,7 +645,7 @@ pub async fn ensure_server() -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         let _ = std::process::Command::new("caffeinate")
-            .args(["-i", "-w", &child.id().to_string()])
+            .args(["-i", "-d", "-w", &child.id().to_string()])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

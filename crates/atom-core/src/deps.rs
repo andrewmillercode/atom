@@ -220,8 +220,9 @@ impl Installer for RealInstaller {
 ///   (headless `-serve`, piped stdin), only install when
 ///   `ATOM_DEPS_AUTOINSTALL=1` is set and otherwise just warn.
 /// - `ATOM_SKIP_DEPS=1` bypasses the check entirely.
+///
 /// Never blocks startup fatally: failures degrade to the existing
-/// "install rg" tool errors.
+/// "install X" tool errors.
 pub async fn ensure_on_startup(interactive: bool, installer: &dyn Installer) {
     if std::env::var_os("ATOM_SKIP_DEPS").is_some() {
         return;

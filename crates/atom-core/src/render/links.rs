@@ -12,10 +12,13 @@ use super::colors::{ansi_bg, ansi_fg, COLOR_SECONDARY};
 
 /// linkRe matches http(s) and file URLs, home-relative paths, and
 /// absolute Unix paths with at least two segments (so /thinking and
-/// other slash-commands stay plain text).
+/// other slash-commands stay plain text). A backticked or double-quoted
+/// span that starts with a path prefix links in full, so paths
+/// containing spaces (`~/Library/Application Support/...` or
+/// "/Users/me/My Docs/...") aren't truncated at the space.
 static LINK_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-    r#"(?i)\bhttps?://[^\s<>\[\]"'`]+|file://[^\s<>\[\]"'`]+|~/(?:[A-Za-z0-9._+-]+/)*[A-Za-z0-9._+-]+|/(?:[A-Za-z0-9._+-]+/){1,}[A-Za-z0-9._+-]+"#,
+    r#"(?i)`(?:~/|/)[^`\n]+`|"(?:~/|/)[^"\n]+"|\bhttps?://[^\s<>\[\]"'`]+|file://[^\s<>\[\]"'`]+|~/(?:[A-Za-z0-9._+-]+/)*[A-Za-z0-9._+-]+|/(?:[A-Za-z0-9._+-]+/){1,}[A-Za-z0-9._+-]+"#,
 ).unwrap()
 });
 
@@ -49,7 +52,29 @@ pub fn linkify(text: &str, restore_fg: &str, restore_bg: &str) -> String {
     let mut sb = String::with_capacity(text.len() + 64);
     let mut last = 0usize;
     for m in LINK_RE.find_iter(text) {
-        let display = trim_link(m.as_str());
+        let raw = m.as_str();
+        // Backticked or double-quoted paths: the delimiter characters
+        // stay as plain text and the path inside — spaces included —
+        // becomes the hyperlink.
+        if let Some(inner) = raw
+            .strip_prefix('`')
+            .and_then(|s| s.strip_suffix('`'))
+            .or_else(|| raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
+        {
+            let delim = raw.chars().next().expect("delimited match is non-empty");
+            sb.push_str(&text[last..m.start()]);
+            sb.push(delim);
+            sb.push_str(&render_link(
+                inner,
+                &link_uri(inner),
+                restore_fg,
+                restore_bg,
+            ));
+            sb.push(delim);
+            last = m.end();
+            continue;
+        }
+        let display = trim_link(raw);
         if display.is_empty() {
             continue;
         }
@@ -441,6 +466,40 @@ mod tests {
             home
         )))));
         assert!(out.contains("~/.config/atom/AGENTS.md"));
+    }
+
+    #[test]
+    fn linkify_backticked_path_with_space() {
+        let in_text = "`~/Library/Application Support/atom/diagrams/`";
+        let home = dirs::home_dir().unwrap().display().to_string();
+        let out = linkify(in_text, "", "");
+        // The full path — space included — becomes the URI, escaped.
+        assert!(out.contains(&osc8_open(&file_uri(&format!(
+            "{home}/Library/Application Support/atom/diagrams/"
+        )))));
+        // Backticks remain visible and no text is lost.
+        assert_eq!(visible_width(&out), visible_width(in_text));
+        // Absolute backticked paths behave the same.
+        let out = linkify("`/Users/a/My Docs/x.md`", "", "");
+        assert!(out.contains(&osc8_open(&file_uri("/Users/a/My Docs/x.md"))));
+    }
+
+    #[test]
+    fn linkify_double_quoted_path_with_space() {
+        // The visualize tool marker quotes artifact paths; a
+        // space-containing path must not truncate at the space.
+        let in_text = "png=\"/Users/a/My Docs/x.png\" html=\"/Users/a/My Docs/x.html\"";
+        let out = linkify(in_text, "", "");
+        assert!(out.contains(&osc8_open(&file_uri("/Users/a/My Docs/x.png"))));
+        assert!(out.contains(&osc8_open(&file_uri("/Users/a/My Docs/x.html"))));
+        // The full display text survives (no truncation at the space).
+        assert!(out.contains("/Users/a/My Docs/x.png"));
+        assert!(out.contains("/Users/a/My Docs/x.html"));
+        // The double quotes stay visible as plain text.
+        assert!(out.contains("png=\""));
+        assert!(out.contains("\" html=\""));
+        assert!(out.ends_with('"'));
+        assert_eq!(visible_width(&out), visible_width(in_text));
     }
 
     #[test]

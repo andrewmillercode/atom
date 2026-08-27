@@ -21,3 +21,4 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 libc = { workspace = true }
+reqwest = { workspace = true }

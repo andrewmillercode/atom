@@ -685,37 +685,6 @@ fn pause_dispatch_session(state: &AppState, id: &str) {
     state.turns.pause_session(id, &format!("dispatch-{id}"));
 }
 
-/// cancelActiveChildren stops every active child session of a parent. The
-/// parent turn being interrupted (Esc/pause) only fires the parent's cancel
-/// token; the child turns are detached, so without this they would keep
-/// running in the background. Mirrors `DispatchBridge::cancel` for each
-/// active child: pause the live turn, mark it cancelled, and drop it from
-/// the parent's children listing.
-async fn cancel_active_children(state: &Arc<AppState>, parent_id: &str) {
-    let children: Vec<String> = state
-        .store
-        .children_info(parent_id)
-        .into_iter()
-        .filter(|child| child.status.is_active())
-        .map(|child| child.id)
-        .collect();
-    for sid in children {
-        pause_dispatch_session(state, &sid);
-        let sid_owned = sid.clone();
-        state
-            .store_call(move |store| {
-                store.set_cancelled(&sid_owned, true);
-                store.update_delegate_status(&sid_owned, DelegateStatus::Cancelled);
-            })
-            .await;
-    }
-    if !parent_id.is_empty() {
-        state
-            .subs
-            .broadcast(parent_id, &json!({"type": "children"}));
-    }
-}
-
 /// kickoffDispatchTurn runs the child turn detached from any HTTP
 /// request: other viewers may subscribe normally, but the detached task
 /// itself does not create an undrained subscriber queue. It writes nothing

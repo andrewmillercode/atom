@@ -262,6 +262,7 @@ pub fn assistant_message(
 /// before the server split. When either cancellation token fires (the
 /// turn was paused), it stops reading and returns the partial reply so
 /// far.
+#[allow(clippy::too_many_arguments)]
 pub async fn stream_model_to_client<S>(
     state: &AppState,
     out: &EventOut,

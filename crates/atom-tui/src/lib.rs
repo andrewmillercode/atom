@@ -643,10 +643,11 @@ async fn run_effects(
                 tokio::spawn(async move {
                     let mut resp = api::stream_send_healed(&req).await;
                     // The server may have shut down; restart and retry once.
-                    if resp.is_err() && !api::is_running().await {
-                        if api::ensure_server().await.is_ok() {
-                            resp = atom_server::client::stream_send(&session_id, &body).await;
-                        }
+                    if resp.is_err()
+                        && !api::is_running().await
+                        && api::ensure_server().await.is_ok()
+                    {
+                        resp = atom_server::client::stream_send(&session_id, &body).await;
                     }
                     match resp {
                         Ok(rx) => {
@@ -699,7 +700,7 @@ async fn run_effects(
                 tokio::spawn(async move {
                     match api::list_sessions().await {
                         Ok(mut sessions) => {
-                            sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+                            sessions.sort_by_key(|a| std::cmp::Reverse(a.updated_at));
                             let _ = tx.send(AppMsg::SessionsLoaded(sessions));
                         }
                         Err(e) => {
@@ -835,10 +836,11 @@ async fn run_effects(
                     // would instead of surfacing a 409.
                     let mut resp = api::stream_send_healed(&req).await;
                     // The server may have shut down; restart and retry once.
-                    if resp.is_err() && !api::is_running().await {
-                        if api::ensure_server().await.is_ok() {
-                            resp = atom_server::client::stream_send(&id, &body).await;
-                        }
+                    if resp.is_err()
+                        && !api::is_running().await
+                        && api::ensure_server().await.is_ok()
+                    {
+                        resp = atom_server::client::stream_send(&id, &body).await;
                     }
                     match resp {
                         Ok(rx) => {

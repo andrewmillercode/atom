@@ -191,11 +191,10 @@ fn should_escape_path(ch: char) -> bool {
     if ch.is_ascii_alphanumeric() {
         return false;
     }
-    match ch {
-        '-' | '_' | '.' | '~' => false,
-        '$' | '&' | '+' | ',' | '/' | ':' | ';' | '=' | '@' => false,
-        _ => true,
-    }
+    !matches!(
+        ch,
+        '-' | '_' | '.' | '~' | '$' | '&' | '+' | ',' | '/' | ':' | ';' | '=' | '@'
+    )
 }
 
 /// lexical_abs stands in for Go's filepath.Abs: pure lexical join with
@@ -430,9 +429,7 @@ fn flush_word(st: &mut WrapState<'_>, _limit: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::render::colors::{
-        ansi_bg, ansi_fg, COLOR_CARD_DARK, COLOR_FOREGROUND, COLOR_SECONDARY,
-    };
+    use crate::render::colors::{ansi_fg, COLOR_CARD_DARK, COLOR_FOREGROUND, COLOR_SECONDARY};
 
     #[test]
     fn slash_commands_stay_plain() {
@@ -566,7 +563,7 @@ mod tests {
         let got = wrap_linked(&format!("prefix {url} suffix"), 20, COLOR_FOREGROUND, "");
         let want = "prefix \x1b]8;;https://ness-health.com/a/very/long/path/that/will/wrap\x07\
 \x1b[38;2;180;145;176m\x1b[4mhttps://ness-\nhealth.com/a/very/lo\nng/path/that/will/wr\nap\
-\x1b[24m\x1b[38;2;222;227;232m\x1b]8;;\x07 suffix";
+\x1b[24m\x1b[38;2;206;213;217m\x1b]8;;\x07 suffix";
         assert_eq!(got, want, "\ngot:  {:?}\nwant: {:?}", got, want);
     }
 

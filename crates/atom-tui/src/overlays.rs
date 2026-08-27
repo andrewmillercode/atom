@@ -35,17 +35,12 @@ pub enum ModelPickerPurpose {
     Compaction,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum PickerKind {
+    #[default]
     None,
     Mcp,
     Skills,
-}
-
-impl Default for PickerKind {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 /// pickerItem is one row in the /mcps or /skills footer menu.
@@ -928,8 +923,7 @@ pub fn footer_menu_window(
         let item_count = n - title_rows;
         let item_sel = sel
             .saturating_sub(title_rows)
-            .min(item_count.saturating_sub(1))
-            .max(if item_count == 0 { 0 } else { 0 });
+            .min(item_count.saturating_sub(1));
         let mut start_item = item_sel.saturating_sub(vis_items / 2);
         if vis_items > 0 && start_item + vis_items > item_count {
             start_item = item_count.saturating_sub(vis_items);

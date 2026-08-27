@@ -99,6 +99,7 @@ dependencies = [
  "atom-tui",
  "chrono",
  "libc",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

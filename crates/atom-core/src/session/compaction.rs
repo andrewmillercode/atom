@@ -521,7 +521,8 @@ pub(crate) async fn post_chat_completion(
         [670, 1200, 1400, 2000, 2400, 2600, 3000, 5000, 10000, 15000];
     const MAX_BODY: usize = 1 << 20;
 
-    for attempt in 0usize.. {
+    let mut attempt = 0usize;
+    loop {
         let mut resp = client
             .post(format!("{base_url}/chat/completions"))
             .header("Content-Type", "application/json")
@@ -550,6 +551,7 @@ pub(crate) async fn post_chat_completion(
         let text = String::from_utf8_lossy(&snippet).trim().to_string();
         if is_retryable_provider_error(status.as_u16(), &text) && attempt < RETRY_DELAYS_MS.len() {
             tokio::time::sleep(Duration::from_millis(RETRY_DELAYS_MS[attempt])).await;
+            attempt += 1;
             continue;
         }
         let reason = status.canonical_reason().unwrap_or("");
@@ -557,7 +559,6 @@ pub(crate) async fn post_chat_completion(
             .trim_end()
             .to_string()));
     }
-    unreachable!()
 }
 
 fn is_retryable_provider_error(status: u16, body: &str) -> bool {

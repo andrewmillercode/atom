@@ -665,11 +665,18 @@ mod tests {
         // last tool def and the system block (sent as a one-block array
         // because the string form cannot carry cache_control). Messages
         // change every round, so they carry no marker.
-        let msgs = vec![Message {
-            role: "user".into(),
-            content: "hi".into(),
-            ..Default::default()
-        }];
+        let msgs = vec![
+            Message {
+                role: "system".into(),
+                content: "be helpful".into(),
+                ..Default::default()
+            },
+            Message {
+                role: "user".into(),
+                content: "hi".into(),
+                ..Default::default()
+            },
+        ];
         let tools = vec![
             ToolDef::new("get_weather", "weather lookup", json!({"type": "object"})),
             ToolDef::new("get_time", "clock", serde_json::Value::Null),

@@ -51,7 +51,8 @@ tar -xzf "$TMP/${ASSET}" -C "$TMP"
 INSTALL_DIR="${ATOM_INSTALL_DIR:-$HOME/.local/bin}"
 mkdir -p "$INSTALL_DIR"
 install -m 755 "$TMP/atom" "$INSTALL_DIR/atom"
-echo "==> installed $INSTALL_DIR/atom"
+install -m 755 "$TMP/atoms" "$INSTALL_DIR/atoms"
+echo "==> installed $INSTALL_DIR/atom and $INSTALL_DIR/atoms"
 
 # --- PATH -------------------------------------------------------------------
 if ! printf '%s' ":$PATH:" | grep -qF ":$INSTALL_DIR:"; then
@@ -88,6 +89,15 @@ if [ -z "${ATOM_NO_DEPS:-}" ]; then
       echo "    (rerun with ATOM_NO_DEPS=1 to skip this check)"
     fi
   fi
+fi
+
+# atoms refuses to run without its launch token, so only verify it exists
+# and is executable.
+if [ -x "$INSTALL_DIR/atoms" ]; then
+  echo "==> atoms server binary present and executable"
+else
+  echo "warning: atoms server binary missing or not executable" >&2
+  exit 1
 fi
 
 # --- smoke test ---------------------------------------------------------------

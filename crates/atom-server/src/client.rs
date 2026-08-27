@@ -529,8 +529,10 @@ pub async fn respond_approval(session_id: &str, approval_id: &str, decision: &st
 // ---------------------------------------------------------------------------
 
 /// serverSupportsClient reports whether the live server exposes every API
-/// this client needs. Older servers 404 on /api/capabilities or omit
-/// newer flags (dispatch).
+/// this client needs and was built from the same release. Older servers
+/// 404 on /api/capabilities or omit newer flags (dispatch); a server from
+/// a different version is recycled so a stale binary can't serve a newer
+/// client.
 pub async fn server_supports_client() -> bool {
     #[derive(serde::Deserialize)]
     struct Caps {
@@ -544,6 +546,8 @@ pub async fn server_supports_client() -> bool {
         skills: bool,
         #[serde(default)]
         keepalive: bool,
+        #[serde(default)]
+        version: Option<String>,
     }
     let caps: Caps = match get("/api/capabilities").await {
         Ok(v) => match serde_json::from_value(v) {
@@ -552,7 +556,12 @@ pub async fn server_supports_client() -> bool {
         },
         Err(_) => return false,
     };
-    caps.compact && caps.dispatch && caps.mcp && caps.skills && caps.keepalive
+    caps.compact
+        && caps.dispatch
+        && caps.mcp
+        && caps.skills
+        && caps.keepalive
+        && caps.version.as_deref() == Some(env!("CARGO_PKG_VERSION"))
 }
 
 /// stopBackgroundServer SIGTERMs the pid from server.pid and waits for

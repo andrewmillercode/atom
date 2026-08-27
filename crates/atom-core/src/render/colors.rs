@@ -19,7 +19,7 @@ pub const COLOR_PRIMARY: &str = "#8cadd1";
 pub const COLOR_PRIMARY_DARK: &str = "#545e69";
 pub const COLOR_SELECT: &str = "#354455";
 pub const COLOR_BACKGROUND: &str = "#111112";
-pub const COLOR_FOREGROUND: &str = "#dee3e8";
+pub const COLOR_FOREGROUND: &str = "#ced5d9";
 pub const COLOR_MUTED: &str = "#666666";
 pub const COLOR_MUTED_EXTRA: &str = "#3d3d3d";
 pub const COLOR_DIFF_ADD: &str = "#032615";
@@ -254,7 +254,7 @@ mod tests {
     fn fg_sequences_match_embedded_theme() {
         assert_eq!(ansi_fg(COLOR_PRIMARY), "\x1b[38;2;140;173;209m");
         assert_eq!(ansi_fg(COLOR_MUTED), "\x1b[38;2;102;102;102m");
-        assert_eq!(ansi_fg(COLOR_FOREGROUND), "\x1b[38;2;222;227;232m");
+        assert_eq!(ansi_fg(COLOR_FOREGROUND), "\x1b[38;2;206;213;217m");
         assert_eq!(ansi_fg(COLOR_SECONDARY), "\x1b[38;2;180;145;176m");
         assert_eq!(ansi_fg(COLOR_SYNTAX_TYPE), "\x1b[38;2;232;160;122m");
         assert_eq!(ansi_fg(COLOR_SYNTAX_STRING), "\x1b[38;2;216;201;176m");

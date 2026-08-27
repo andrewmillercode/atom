@@ -6,6 +6,8 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+mod update;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct LastModel {
     #[serde(default)]
@@ -121,6 +123,10 @@ fn parse_args() -> Result<Args> {
                 println!("{}", help_text());
                 std::process::exit(0);
             }
+            "v" | "version" => {
+                println!("{}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
             other => return Err(anyhow!("unknown flag: -{other}\n{USAGE}")),
         }
     }
@@ -137,6 +143,12 @@ async fn main() {
 
 async fn run() -> Result<()> {
     let args = parse_args()?;
+
+    // Auto-update first, before the deps check and TUI. Skipped in
+    // stats/output-test/hot modes.
+    if !args.stats && !args.output_test && !args.hot {
+        update::run().await;
+    }
 
     // Ensure required tool dependencies (rg, uvx, merman-cli) exist
     // before the server spawns or the TUI takes over the terminal, while

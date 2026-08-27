@@ -1,0 +1,1506 @@
+warning: match can be simplified with `.unwrap_or_default()`
+  --> crates/atom-core/src/providers/auth.rs:59:5
+   |
+59 | /     match serde_json::from_slice::<HashMap<String, AuthEntry>>(&b) {
+60 | |         Ok(store) => store,
+61 | |         Err(_) => HashMap::new(),
+62 | |     }
+   | |_____^ help: replace it with: `serde_json::from_slice::<HashMap<String, AuthEntry>>(&b).unwrap_or_default()`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#manual_unwrap_or_default
+   = note: `#[warn(clippy::manual_unwrap_or_default)]` on by default
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+   --> crates/atom-core/src/providers/bedrock.rs:519:31
+    |
+519 | fn parse_frame(buf: &[u8]) -> Option<(usize, Vec<(String, HeaderValue)>, Bytes)> {
+    |                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#type_complexity
+    = note: `#[warn(clippy::type_complexity)]` on by default
+
+warning: manual `!RangeInclusive::contains` implementation
+   --> crates/atom-core/src/providers/bedrock.rs:521:8
+    |
+521 |     if total < 16 || total > 8_000_000 || buf.len() < total {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `!(16..=8_000_000).contains(&total)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#manual_range_contains
+    = note: `#[warn(clippy::manual_range_contains)]` on by default
+
+warning: module has the same name as its containing module
+  --> crates/atom-core/src/providers/mod.rs:12:1
+   |
+12 | pub mod providers;
+   | ^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#module_inception
+   = note: `#[warn(clippy::module_inception)]` on by default
+
+warning: using `contains()` instead of `iter().any()` is more efficient
+  --> crates/atom-core/src/providers/providers.rs:76:25
+   |
+76 |             let found = models.iter().any(|m| *m == model);
+   |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `models.contains(&model)`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#manual_contains
+   = note: `#[warn(clippy::manual_contains)]` on by default
+
+warning: unneeded `return` statement
+   --> crates/atom-core/src/providers/providers.rs:289:13
+    |
+289 |             return Ok(ids);
+    |             ^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#needless_return
+    = note: `#[warn(clippy::needless_return)]` on by default
+help: remove `return`
+    |
+289 -             return Ok(ids);
+289 +             Ok(ids)
+    |
+
+warning: stripping a prefix manually
+   --> crates/atom-core/src/render/diff.rs:344:21
+    |
+344 |                     &line[1..]
+    |                     ^^^^^^^^^^
+    |
+note: the prefix was tested here
+   --> crates/atom-core/src/render/diff.rs:343:28
+    |
+343 |                 let code = if line.starts_with(' ') {
+    |                            ^^^^^^^^^^^^^^^^^^^^^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#manual_strip
+    = note: `#[warn(clippy::manual_strip)]` on by default
+help: try using the `strip_prefix` method
+    |
+343 ~                 let code = if let Some(<stripped>) = line.strip_prefix(' ') {
+344 ~                     <stripped>
+    |
+
+warning: match expression looks like `matches!` macro
+   --> crates/atom-core/src/render/links.rs:194:5
+    |
+194 | /     match ch {
+195 | |         '-' | '_' | '.' | '~' => false,
+196 | |         '$' | '&' | '+' | ',' | '/' | ':' | ';' | '=' | '@' => false,
+197 | |         _ => true,
+198 | |     }
+    | |_____^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#match_like_matches_macro
+    = note: `#[warn(clippy::match_like_matches_macro)]` on by default
+help: use `matches!` directly
+    |
+194 -     match ch {
+195 -         '-' | '_' | '.' | '~' => false,
+196 -         '$' | '&' | '+' | ',' | '/' | ':' | ';' | '=' | '@' => false,
+197 -         _ => true,
+198 -     }
+194 +     !matches!(ch, '-' | '_' | '.' | '~' | '$' | '&' | '+' | ',' | '/' | ':' | ';' | '=' | '@')
+    |
+
+warning: the loop variable `attempt` is used to index `RETRY_DELAYS_MS`
+   --> crates/atom-core/src/session/compaction.rs:524:20
+    |
+524 |     for attempt in 0usize.. {
+    |                    ^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#needless_range_loop
+    = note: `#[warn(clippy::needless_range_loop)]` on by default
+help: consider using an iterator and enumerate()
+    |
+524 -     for attempt in 0usize.. {
+524 +     for (attempt, <item>) in RETRY_DELAYS_MS.iter().enumerate() {
+    |
+
+warning: manually reimplementing `div_ceil`
+  --> crates/atom-core/src/session/context_breakdown.rs:32:5
+   |
+32 |     ((n + 3) / 4) as i64
+   |     ^^^^^^^^^^^^^ help: consider using `.div_ceil()`: `n.div_ceil(4)`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#manual_div_ceil
+   = note: `#[warn(clippy::manual_div_ceil)]` on by default
+
+warning: this `map_or` can be simplified
+   --> crates/atom-core/src/session/stats.rs:129:12
+    |
+129 |         if earliest.map_or(true, |e| sess.created_at < e) {
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#unnecessary_map_or
+    = note: `#[warn(clippy::unnecessary_map_or)]` on by default
+help: use `is_none_or` instead
+    |
+129 -         if earliest.map_or(true, |e| sess.created_at < e) {
+129 +         if earliest.is_none_or(|e| sess.created_at < e) {
+    |
+
+warning: this `map_or` can be simplified
+   --> crates/atom-core/src/session/stats.rs:132:12
+    |
+132 |         if latest.map_or(true, |l| sess.updated_at > l) {
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#unnecessary_map_or
+help: use `is_none_or` instead
+    |
+132 -         if latest.map_or(true, |l| sess.updated_at > l) {
+132 +         if latest.is_none_or(|l| sess.updated_at > l) {
+    |
+
+warning: manual implementation of `.is_multiple_of()`
+   --> crates/atom-core/src/session/stats.rs:205:47
+    |
+205 |         report.median_tokens_per_session = if session_totals.len() % 2 == 0 {
+    |                                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: replace with: `session_totals.len().is_multiple_of(2)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#manual_is_multiple_of
+    = note: `#[warn(clippy::manual_is_multiple_of)]` on by default
+
+warning: clamp-like pattern without using clamp function
+   --> crates/atom-core/src/session/stats.rs:292:5
+    |
+292 | /     if width < 34 {
+293 | |         width = 34;
+294 | |     }
+295 | |     if width > 64 {
+296 | |         width = 64;
+297 | |     }
+    | |_____^ help: replace with clamp: `width = width.clamp(34, 64);`
+    |
+    = note: clamp will panic if max < min
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#manual_clamp
+    = note: `#[warn(clippy::manual_clamp)]` on by default
+
+warning: calls to `push` immediately after creation
+   --> crates/atom-core/src/session/stats.rs:342:5
+    |
+342 | /     let mut lines: Vec<String> = Vec::new();
+343 | |
+344 | |     // Overview: session and message counts plus the span in days.
+345 | |     lines.push(box_line("┌"));
+...   |
+351 | |     lines.push(box_line("└"));
+352 | |     lines.push(String::new());
+    | |______________________________^ help: consider using the `vec![]` macro: `let mut lines: Vec<String> = vec![..];`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#vec_init_then_push
+    = note: `#[warn(clippy::vec_init_then_push)]` on by default
+
+warning: consider using `sort_by_key`
+   --> crates/atom-core/src/session/store.rs:476:9
+    |
+476 |         infos.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#unnecessary_sort_by
+    = note: `#[warn(clippy::unnecessary_sort_by)]` on by default
+help: try
+    |
+476 -         infos.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+476 +         infos.sort_by_key(|a| std::cmp::Reverse(a.updated_at));
+    |
+
+warning: consider using `sort_by_key`
+   --> crates/atom-core/src/session/store.rs:487:9
+    |
+487 |         list.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#unnecessary_sort_by
+help: try
+    |
+487 -         list.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+487 +         list.sort_by_key(|a| std::cmp::Reverse(a.updated_at));
+    |
+
+warning: `atom-core` (lib) generated 17 warnings (run `cargo clippy --fix --lib -p atom-core -- ` to apply 8 suggestions)
+warning: needlessly taken reference of left operand
+  --> crates/atom-sandbox/src/exec.rs:62:41
+   |
+62 |         .find(|id| RULES.iter().any(|r| &r.id == *id))
+   |                                         -----^^^^^^^
+   |                                         |
+   |                                         help: use the left value directly: `r.id`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#op_ref
+   = note: `#[warn(clippy::op_ref)]` on by default
+
+warning: this function has too many arguments (8/7)
+   --> crates/atom-sandbox/src/exec.rs:412:1
+    |
+412 | / fn audit(
+413 | |     data_dir_path: &Path,
+414 | |     session_id: &str,
+415 | |     cmd: &str,
+...   |
+420 | |     note: Option<&str>,
+421 | | ) {
+    | |_^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#too_many_arguments
+    = note: `#[warn(clippy::too_many_arguments)]` on by default
+
+warning: this `impl` can be derived
+  --> crates/atom-sandbox/src/rules.rs:35:1
+   |
+35 | / impl Default for Verdict {
+36 | |     fn default() -> Self {
+37 | |         Verdict::Allow
+38 | |     }
+39 | | }
+   | |_^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#derivable_impls
+   = note: `#[warn(clippy::derivable_impls)]` on by default
+help: replace the manual implementation with a derive attribute and mark the default variant
+   |
+16 + #[derive(Default)]
+17 | pub enum Verdict {
+18 |     #[serde(rename = "allow")]
+19 ~     #[default]
+20 ~     Allow,
+   |
+
+warning: `atom-sandbox` (lib) generated 3 warnings (run `cargo clippy --fix --lib -p atom-sandbox -- ` to apply 2 suggestions)
+warning: this `match` expression can be replaced with `?`
+   --> crates/atom-tools/src/clipboard.rs:264:9
+    |
+264 | /         match read_local_image(&unescape_paste_path(line)) {
+265 | |             Some(f) => files.push(f),
+266 | |             None => return None,
+267 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#question_mark
+    = note: `#[warn(clippy::question_mark)]` on by default
+help: try instead
+    |
+264 ~         {
+265 +             let f = read_local_image(&unescape_paste_path(line))?;
+266 +             files.push(f)
+267 +         }
+    |
+
+warning: file opened with `create`, but `truncate` behavior not defined
+   --> crates/atom-tools/src/file_edit.rs:411:10
+    |
+411 |         .create(true)
+    |          ^^^^^^^^^^^^- help: add: `.truncate(true)`
+    |
+    = help: if you intend to overwrite an existing file entirely, call `.truncate(true)`
+    = help: if you instead know that you may want to keep some parts of the old file, call `.truncate(false)`
+    = help: alternatively, use `.append(true)` to append to the file instead of overwriting it
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#suspicious_open_options
+    = note: `#[warn(clippy::suspicious_open_options)]` on by default
+
+warning: large size difference between variants
+   --> crates/atom-tools/src/mcp.rs:258:1
+    |
+258 | / pub(crate) enum Transport {
+259 | |     Stdio(StdioSession),
+    | |     ------------------- the largest variant contains at least 320 bytes
+260 | |     Http(HttpSession),
+    | |     ----------------- the second-largest variant contains at least 88 bytes
+261 | | }
+    | |_^ the entire enum is at least 320 bytes
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#large_enum_variant
+    = note: `#[warn(clippy::large_enum_variant)]` on by default
+help: consider boxing the large fields or introducing indirection in some other way to reduce the total size of the enum
+    |
+259 -     Stdio(StdioSession),
+259 +     Stdio(Box<StdioSession>),
+    |
+
+warning: useless use of `format!`
+   --> crates/atom-tools/src/mcp.rs:365:28
+    |
+365 |                   return Err(format!(
+    |  ____________________________^
+366 | |                     "{}",
+367 | |                     err.get("message")
+368 | |                         .and_then(|m| m.as_str())
+369 | |                         .unwrap_or("tool error")
+370 | |                 ));
+    | |_________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#useless_format
+    = note: `#[warn(clippy::useless_format)]` on by default
+help: consider using `.to_string()`
+    |
+365 ~                 return Err(err.get("message")
+366 +                         .and_then(|m| m.as_str())
+367 ~                         .unwrap_or("tool error").to_string());
+    |
+
+warning: useless use of `format!`
+   --> crates/atom-tools/src/mcp.rs:548:24
+    |
+548 |               return Err(format!(
+    |  ________________________^
+549 | |                 "{}",
+550 | |                 err.get("message")
+551 | |                     .and_then(|m| m.as_str())
+552 | |                     .unwrap_or("request failed")
+553 | |             ));
+    | |_____________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#useless_format
+help: consider using `.to_string()`
+    |
+548 ~             return Err(err.get("message")
+549 +                     .and_then(|m| m.as_str())
+550 ~                     .unwrap_or("request failed").to_string());
+    |
+
+warning: manually reimplementing `div_ceil`
+  --> crates/atom-tools/src/read_file.rs:89:5
+   |
+89 |     ((n + 2) / 3) * 4
+   |     ^^^^^^^^^^^^^ help: consider using `.div_ceil()`: `n.div_ceil(3)`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#manual_div_ceil
+   = note: `#[warn(clippy::manual_div_ceil)]` on by default
+
+warning: `atom-tools` (lib) generated 6 warnings (run `cargo clippy --fix --lib -p atom-tools -- ` to apply 4 suggestions)
+warning: function `cancel_active_children` is never used
+   --> crates/atom-server/src/dispatch.rs:694:10
+    |
+694 | async fn cancel_active_children(state: &Arc<AppState>, parent_id: &str) {
+    |          ^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: this function has too many arguments (8/7)
+   --> crates/atom-server/src/turn.rs:265:1
+    |
+265 | / pub async fn stream_model_to_client<S>(
+266 | |     state: &AppState,
+267 | |     out: &EventOut,
+268 | |     session_id: &str,
+...   |
+275 | | where
+276 | |     S: Stream<Item = anyhow::Result<atom_core::types::StreamChunk>>,
+    | |____________________________________________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#too_many_arguments
+    = note: `#[warn(clippy::too_many_arguments)]` on by default
+
+warning: `atom-server` (lib) generated 2 warnings
+warning: unused variable: `handle`
+   --> crates/atom-server/src/state.rs:718:13
+    |
+718 |         let handle = tt.start_turn("w", "t");
+    |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_handle`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+   --> crates/atom-tools/src/file_edit.rs:798:24
+    |
+798 |         let out = edit(&&env.ctx(), &path, "package greet", "package hello").await;
+    |                        ^^^^^^^^^^^ help: change this to: `&env.ctx()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#needless_borrow
+    = note: `#[warn(clippy::needless_borrow)]` on by default
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+   --> crates/atom-tools/src/file_edit.rs:818:24
+    |
+818 |         assert_read_ok(&&env.ctx(), &path).await;
+    |                        ^^^^^^^^^^^ help: change this to: `&env.ctx()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#needless_borrow
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+   --> crates/atom-tools/src/file_edit.rs:820:24
+    |
+820 |         let out = edit(&&env.ctx(), &path, "return \"hi\"", "return \"hello\"").await;
+    |                        ^^^^^^^^^^^ help: change this to: `&env.ctx()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#needless_borrow
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+   --> crates/atom-tools/src/file_edit.rs:823:24
+    |
+823 |         let out = edit(&&env.ctx(), &path, "return \"bye\"", "return \"goodbye\"").await;
+    |                        ^^^^^^^^^^^ help: change this to: `&env.ctx()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#needless_borrow
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+   --> crates/atom-tools/src/file_edit.rs:839:24
+    |
+839 |         assert_read_ok(&&env.ctx(), &path).await;
+    |                        ^^^^^^^^^^^ help: change this to: `&env.ctx()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#needless_borrow
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+   --> crates/atom-tools/src/file_edit.rs:847:24
+    |
+847 |         let out = edit(&&env.ctx(), &path, "return \"hi\"", "return \"hello\"").await;
+    |                        ^^^^^^^^^^^ help: change this to: `&env.ctx()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#needless_borrow
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+   --> crates/atom-tools/src/file_edit.rs:863:24
+    |
+863 |         let out = edit(&&env.ctx(), &path, "return \"hi\"", "return \"hello\"").await;
+    |                        ^^^^^^^^^^^ help: change this to: `&env.ctx()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#needless_borrow
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+   --> crates/atom-tools/src/file_edit.rs:872:24
+    |
+872 |         assert_read_ok(&&env.ctx(), &path).await;
+    |                        ^^^^^^^^^^^ help: change this to: `&env.ctx()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#needless_borrow
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+   --> crates/atom-tools/src/file_edit.rs:874:24
+    |
+874 |         let out = edit(&&env.ctx(), &path, "return \"hi\"", "return \"hey\"").await;
+    |                        ^^^^^^^^^^^ help: change this to: `&env.ctx()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#needless_borrow
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+   --> crates/atom-tools/src/file_edit.rs:892:24
+    |
+892 |         assert_read_ok(&&env.ctx(), &path).await;
+    |                        ^^^^^^^^^^^ help: change this to: `&env.ctx()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#needless_borrow
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+   --> crates/atom-tools/src/file_edit.rs:894:24
+    |
+894 |         let out = edit(&&env.ctx(), &path, "return \"hello\"", "return \"hi\"").await;
+    |                        ^^^^^^^^^^^ help: change this to: `&env.ctx()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#needless_borrow
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+   --> crates/atom-tools/src/file_edit.rs:916:13
+    |
+916 |             &&env.ctx(),
+    |             ^^^^^^^^^^^ help: change this to: `&env.ctx()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#needless_borrow
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+   --> crates/atom-tools/src/file_edit.rs:926:24
+    |
+926 |         assert_read_ok(&&env.ctx(), &path).await;
+    |                        ^^^^^^^^^^^ help: change this to: `&env.ctx()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#needless_borrow
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+   --> crates/atom-tools/src/file_edit.rs:932:13
+    |
+932 |             &&env.ctx(),
+    |             ^^^^^^^^^^^ help: change this to: `&env.ctx()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#needless_borrow
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+   --> crates/atom-tools/src/file_edit.rs:944:24
+    |
+944 |         assert_read_ok(&&env.ctx(), &path).await;
+    |                        ^^^^^^^^^^^ help: change this to: `&env.ctx()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#needless_borrow
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+   --> crates/atom-tools/src/file_edit.rs:948:13
+    |
+948 |             &&env.ctx(),
+    |             ^^^^^^^^^^^ help: change this to: `&env.ctx()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#needless_borrow
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+   --> crates/atom-tools/src/file_edit.rs:966:13
+    |
+966 |             &&env.ctx(),
+    |             ^^^^^^^^^^^ help: change this to: `&env.ctx()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#needless_borrow
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+   --> crates/atom-tools/src/file_edit.rs:977:24
+    |
+977 |         assert_read_ok(&&env.ctx(), &path).await;
+    |                        ^^^^^^^^^^^ help: change this to: `&env.ctx()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#needless_borrow
+
+warning: file opened with `create`, but `truncate` behavior not defined
+   --> crates/atom-tools/src/file_edit.rs:982:14
+    |
+982 |             .create(true)
+    |              ^^^^^^^^^^^^- help: add: `.truncate(true)`
+    |
+    = help: if you intend to overwrite an existing file entirely, call `.truncate(true)`
+    = help: if you instead know that you may want to keep some parts of the old file, call `.truncate(false)`
+    = help: alternatively, use `.append(true)` to append to the file instead of overwriting it
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#suspicious_open_options
+
+warning: useless conversion to the same type: `image::ImageBuffer<image::Rgba<u8>, std::vec::Vec<u8>>`
+   --> crates/atom-tools/src/read_file.rs:261:41
+    |
+261 |         image::DynamicImage::ImageRgba8(img.into())
+    |                                         ^^^^^^^^^^ help: consider removing `.into()`: `img`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#useless_conversion
+    = note: `#[warn(clippy::useless_conversion)]` on by default
+
+warning: useless use of `format!`
+   --> crates/atom-sandbox/src/approvals.rs:303:13
+    |
+303 |             format!("curl\u{1f}/ws")
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `.to_string()`: `"curl\u{1f}/ws".to_string()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#useless_format
+    = note: `#[warn(clippy::useless_format)]` on by default
+
+warning: used `assert_eq!` with a literal bool
+   --> crates/atom-sandbox/src/exec.rs:562:9
+    |
+562 |         assert_eq!(out.approved, false);
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#bool_assert_comparison
+    = note: `#[warn(clippy::bool_assert_comparison)]` on by default
+help: replace it with `assert!(..)`
+    |
+562 -         assert_eq!(out.approved, false);
+562 +         assert!(!out.approved);
+    |
+
+warning: used `assert_eq!` with a literal bool
+   --> crates/atom-sandbox/src/exec.rs:640:9
+    |
+640 |         assert_eq!(out.approved, false);
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#bool_assert_comparison
+help: replace it with `assert!(..)`
+    |
+640 -         assert_eq!(out.approved, false);
+640 +         assert!(!out.approved);
+    |
+
+warning: used `assert_eq!` with a literal bool
+   --> crates/atom-sandbox/src/exec.rs:667:9
+    |
+667 |         assert_eq!(first.approved, true);
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#bool_assert_comparison
+help: replace it with `assert!(..)`
+    |
+667 -         assert_eq!(first.approved, true);
+667 +         assert!(first.approved);
+    |
+
+warning: unused imports: `CatalogGuard`, `DataDirGuard`, `EnvVarGuard`, `clear_builtin_provider_env`, `inject_models_dev`, and `set_env`
+  --> crates/atom-core/src/providers/mod.rs:51:5
+   |
+51 |     clear_builtin_provider_env, inject_models_dev, isolate_data_dir, set_env, test_lock,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^                    ^^^^^^^
+52 |     CatalogGuard, DataDirGuard, EnvVarGuard, StubServer,
+   |     ^^^^^^^^^^^^  ^^^^^^^^^^^^  ^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `ansi_bg`
+   --> crates/atom-core/src/render/links.rs:434:9
+    |
+434 |         ansi_bg, ansi_fg, COLOR_CARD_DARK, COLOR_FOREGROUND, COLOR_SECONDARY,
+    |         ^^^^^^^
+
+warning: method `path` is never used
+   --> crates/atom-core/src/providers/providers.rs:662:16
+    |
+661 |     impl DataDirGuard {
+    |     ----------------- method in this implementation
+662 |         pub fn path(&self) -> &PathBuf {
+    |                ^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field assignment outside of initializer for an instance created with Default::default()
+   --> crates/atom-core/src/config.rs:265:9
+    |
+265 | /         config.compaction = Some(CompactionConfig {
+266 | |             provider: "openai".into(),
+267 | |             model: "gpt-5".into(),
+268 | |         });
+    | |___________^
+    |
+note: consider initializing the variable with `config::AtomConfig { compaction: Some(CompactionConfig {
+                  provider: "openai".into(),
+                  model: "gpt-5".into(),
+              }), web_search: Some(WebSearchConfig {
+                  server: "exa".into(),
+                  tool: "web_search_exa".into(),
+              }), ..Default::default() }` and removing relevant reassignments
+   --> crates/atom-core/src/config.rs:264:9
+    |
+264 |         let mut config = AtomConfig::default();
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#field_reassign_with_default
+    = note: `#[warn(clippy::field_reassign_with_default)]` on by default
+
+warning: this `MutexGuard` is held across an await point
+   --> crates/atom-core/src/providers/auth.rs:227:13
+    |
+227 |         let _g = crate::providers::test_lock();
+    |             ^^
+    |
+    = help: consider using an async-aware `Mutex` type or ensuring the `MutexGuard` is dropped before calling `await`
+note: these are all the await points this lock is held through
+   --> crates/atom-core/src/providers/auth.rs:242:52
+    |
+242 |         assert_eq!(load_provider_key("openrouter").await, "auth-key");
+    |                                                    ^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#await_holding_lock
+    = note: `#[warn(clippy::await_holding_lock)]` on by default
+
+warning: this `MutexGuard` is held across an await point
+   --> crates/atom-core/src/providers/auth.rs:247:13
+    |
+247 |         let _g = crate::providers::test_lock();
+    |             ^^
+    |
+    = help: consider using an async-aware `Mutex` type or ensuring the `MutexGuard` is dropped before calling `await`
+note: these are all the await points this lock is held through
+   --> crates/atom-core/src/providers/auth.rs:253:52
+    |
+253 |         assert_eq!(load_provider_key("openrouter").await, "legacy-key");
+    |                                                    ^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#await_holding_lock
+
+warning: this `MutexGuard` is held across an await point
+   --> crates/atom-core/src/providers/auth.rs:258:13
+    |
+258 |         let _g = crate::providers::test_lock();
+    |             ^^
+    |
+    = help: consider using an async-aware `Mutex` type or ensuring the `MutexGuard` is dropped before calling `await`
+note: these are all the await points this lock is held through
+   --> crates/atom-core/src/providers/auth.rs:270:48
+    |
+270 |         assert_eq!(load_provider_key("ollama").await, "ollama-sk");
+    |                                                ^^^^^
+271 |         assert_eq!(load_provider_key("ollama-cloud").await, "ollama-sk");
+    |                                                      ^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#await_holding_lock
+
+warning: this `MutexGuard` is held across an await point
+   --> crates/atom-core/src/providers/auth.rs:276:13
+    |
+276 |         let _g = crate::providers::test_lock();
+    |             ^^
+    |
+    = help: consider using an async-aware `Mutex` type or ensuring the `MutexGuard` is dropped before calling `await`
+note: these are all the await points this lock is held through
+   --> crates/atom-core/src/providers/auth.rs:290:52
+    |
+290 |         assert_eq!(load_provider_key("openrouter").await, "");
+    |                                                    ^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#await_holding_lock
+
+warning: this `MutexGuard` is held across an await point
+   --> crates/atom-core/src/providers/auth.rs:339:13
+    |
+339 |         let _g = crate::providers::test_lock();
+    |             ^^
+    |
+    = help: consider using an async-aware `Mutex` type or ensuring the `MutexGuard` is dropped before calling `await`
+note: these are all the await points this lock is held through
+   --> crates/atom-core/src/providers/auth.rs:351:56
+    |
+351 |         assert_eq!(load_provider_key("github-copilot").await, "refresh-only");
+    |                                                        ^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#await_holding_lock
+
+warning: manual `Range::contains` implementation
+    --> crates/atom-core/src/providers/bedrock.rs:1298:17
+     |
+1298 |         assert!(budget >= 1024 && budget < 32000, "budget {budget} must fit");
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `(1024..32000).contains(&budget)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#manual_range_contains
+
+warning: calls to `push` immediately after creation
+    --> crates/atom-core/src/providers/bedrock.rs:1446:9
+     |
+1446 | /         let mut wire: Vec<Bytes> = Vec::new();
+1447 | |         wire.push(mk("messageStart", r#"{"role":"assistant"}"#.into()));
+1448 | |         wire.push(mk(
+1449 | |             "contentBlockDelta",
+...    |
+1468 | |         ));
+1469 | |         wire.push(mk("messageStop", r#"{"stopReason":"tool_use"}"#.into()));
+     | |____________________________________________________________________________^ help: consider using the `vec![]` macro: `let wire: Vec<Bytes> = vec![..];`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#vec_init_then_push
+     = note: `#[warn(clippy::vec_init_then_push)]` on by default
+
+warning: this `MutexGuard` is held across an await point
+   --> crates/atom-core/src/providers/oauth.rs:661:13
+    |
+661 |         let _g = crate::providers::test_lock();
+    |             ^^
+    |
+    = help: consider using an async-aware `Mutex` type or ensuring the `MutexGuard` is dropped before calling `await`
+note: these are all the await points this lock is held through
+   --> crates/atom-core/src/providers/oauth.rs:712:57
+    |
+712 |         let e = exchange_openai_code("the-code", "ver").await.unwrap();
+    |                                                         ^^^^^
+...
+724 |         let e2 = refresh_openai_token("refresh-1").await.unwrap();
+    |                                                    ^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#await_holding_lock
+
+warning: `format!` in `format!` args
+   --> crates/atom-core/src/providers/oauth.rs:688:21
+    |
+688 | / ...   format!(
+689 | | ...       "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+690 | | ...       format!("{{\"access_token\":\"access-1\",\"refresh_token\":\"refresh-1\",\"expires_in\":3600,\"id_token\":\"{}\"}}", id...
+691 | | ...       format!("{{\"access_token\":\"access-1\",\"refresh_token\":\"refresh-1\",\"expires_in\":3600,\"id_token\":\"{}\"}}", id2)
+692 | | ...   )
+    | |_______^
+    |
+    = help: combine the `format!(..)` arguments with the outer `format!(..)` call
+    = help: or consider changing `format!` to `format_args!`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#format_in_format_args
+    = note: `#[warn(clippy::format_in_format_args)]` on by default
+
+warning: this `MutexGuard` is held across an await point
+   --> crates/atom-core/src/providers/oauth.rs:744:13
+    |
+744 |         let _g = crate::providers::test_lock();
+    |             ^^
+    |
+    = help: consider using an async-aware `Mutex` type or ensuring the `MutexGuard` is dropped before calling `await`
+note: these are all the await points this lock is held through
+   --> crates/atom-core/src/providers/oauth.rs:768:38
+    |
+768 |         let e = ensure_openai_auth().await.unwrap();
+    |                                      ^^^^^
+...
+771 |             crate::providers::auth::load_provider_key("openai").await,
+    |                                                                 ^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#await_holding_lock
+
+warning: this `MutexGuard` is held across an await point
+   --> crates/atom-core/src/providers/oauth.rs:778:13
+    |
+778 |         let _g = crate::providers::test_lock();
+    |             ^^
+    |
+    = help: consider using an async-aware `Mutex` type or ensuring the `MutexGuard` is dropped before calling `await`
+note: these are all the await points this lock is held through
+   --> crates/atom-core/src/providers/oauth.rs:789:38
+    |
+789 |         assert!(ensure_openai_auth().await.is_err());
+    |                                      ^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#await_holding_lock
+
+warning: this `MutexGuard` is held across an await point
+   --> crates/atom-core/src/providers/oauth.rs:833:13
+    |
+833 |         let _g = crate::providers::test_lock();
+    |             ^^
+    |
+    = help: consider using an async-aware `Mutex` type or ensuring the `MutexGuard` is dropped before calling `await`
+note: these are all the await points this lock is held through
+   --> crates/atom-core/src/providers/oauth.rs:845:91
+    |
+845 |             tokio::time::timeout(Duration::from_millis(50), run_openai_oauth_flow(&flow)).await;
+    |                                                                                           ^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#await_holding_lock
+
+warning: this `MutexGuard` is held across an await point
+   --> crates/atom-core/src/providers/providers.rs:966:13
+    |
+966 |         let _g = test_lock();
+    |             ^^
+    |
+    = help: consider using an async-aware `Mutex` type or ensuring the `MutexGuard` is dropped before calling `await`
+note: these are all the await points this lock is held through
+   --> crates/atom-core/src/providers/providers.rs:986:36
+    |
+986 |         let ps = build_providers().await;
+    |                                    ^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#await_holding_lock
+
+warning: this `MutexGuard` is held across an await point
+    --> crates/atom-core/src/providers/providers.rs:996:13
+     |
+ 996 |         let _g = test_lock();
+     |             ^^
+     |
+     = help: consider using an async-aware `Mutex` type or ensuring the `MutexGuard` is dropped before calling `await`
+note: these are all the await points this lock is held through
+    --> crates/atom-core/src/providers/providers.rs:1016:36
+     |
+1016 |         let ps = build_providers().await;
+     |                                    ^^^^^
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#await_holding_lock
+
+warning: this `MutexGuard` is held across an await point
+    --> crates/atom-core/src/providers/providers.rs:1023:13
+     |
+1023 |         let _g = test_lock();
+     |             ^^
+     |
+     = help: consider using an async-aware `Mutex` type or ensuring the `MutexGuard` is dropped before calling `await`
+note: these are all the await points this lock is held through
+    --> crates/atom-core/src/providers/providers.rs:1034:36
+     |
+1034 |         let ps = build_providers().await;
+     |                                    ^^^^^
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#await_holding_lock
+
+warning: this `MutexGuard` is held across an await point
+    --> crates/atom-core/src/providers/providers.rs:1042:13
+     |
+1042 |         let _g = test_lock();
+     |             ^^
+     |
+     = help: consider using an async-aware `Mutex` type or ensuring the `MutexGuard` is dropped before calling `await`
+note: these are all the await points this lock is held through
+    --> crates/atom-core/src/providers/providers.rs:1053:36
+     |
+1053 |         let ps = build_providers().await;
+     |                                    ^^^^^
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#await_holding_lock
+
+warning: this `MutexGuard` is held across an await point
+    --> crates/atom-core/src/providers/providers.rs:1063:13
+     |
+1063 |         let _g = test_lock();
+     |             ^^
+     |
+     = help: consider using an async-aware `Mutex` type or ensuring the `MutexGuard` is dropped before calling `await`
+note: these are all the await points this lock is held through
+    --> crates/atom-core/src/providers/providers.rs:1067:36
+     |
+1067 |         let ps = build_providers().await;
+     |                                    ^^^^^
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#await_holding_lock
+
+warning: this `MutexGuard` is held across an await point
+    --> crates/atom-core/src/providers/providers.rs:1081:13
+     |
+1081 |         let _g = test_lock();
+     |             ^^
+     |
+     = help: consider using an async-aware `Mutex` type or ensuring the `MutexGuard` is dropped before calling `await`
+note: these are all the await points this lock is held through
+    --> crates/atom-core/src/providers/providers.rs:1101:36
+     |
+1101 |         let ps = build_providers().await;
+     |                                    ^^^^^
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#await_holding_lock
+
+warning: this `MutexGuard` is held across an await point
+    --> crates/atom-core/src/providers/providers.rs:1109:13
+     |
+1109 |         let _g = test_lock();
+     |             ^^
+     |
+     = help: consider using an async-aware `Mutex` type or ensuring the `MutexGuard` is dropped before calling `await`
+note: these are all the await points this lock is held through
+    --> crates/atom-core/src/providers/providers.rs:1121:36
+     |
+1121 |         let ids = fetch_models(&p).await.unwrap();
+     |                                    ^^^^^
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#await_holding_lock
+
+warning: this `MutexGuard` is held across an await point
+    --> crates/atom-core/src/providers/providers.rs:1127:13
+     |
+1127 |         let _g = test_lock();
+     |             ^^
+     |
+     = help: consider using an async-aware `Mutex` type or ensuring the `MutexGuard` is dropped before calling `await`
+note: these are all the await points this lock is held through
+    --> crates/atom-core/src/providers/providers.rs:1146:36
+     |
+1146 |         let ids = fetch_models(&p).await.unwrap();
+     |                                    ^^^^^
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#await_holding_lock
+
+warning: this `MutexGuard` is held across an await point
+    --> crates/atom-core/src/providers/providers.rs:1152:13
+     |
+1152 |         let _g = test_lock();
+     |             ^^
+     |
+     = help: consider using an async-aware `Mutex` type or ensuring the `MutexGuard` is dropped before calling `await`
+note: these are all the await points this lock is held through
+    --> crates/atom-core/src/providers/providers.rs:1172:36
+     |
+1172 |         let ids = fetch_models(&p).await.unwrap();
+     |                                    ^^^^^
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#await_holding_lock
+
+warning: this `MutexGuard` is held across an await point
+    --> crates/atom-core/src/providers/providers.rs:1180:13
+     |
+1180 |         let _g = test_lock();
+     |             ^^
+     |
+     = help: consider using an async-aware `Mutex` type or ensuring the `MutexGuard` is dropped before calling `await`
+note: these are all the await points this lock is held through
+    --> crates/atom-core/src/providers/providers.rs:1227:37
+     |
+1227 |         assert_eq!(fetch_models(&p).await.unwrap(), vec!["free-model"]);
+     |                                     ^^^^^
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#await_holding_lock
+
+warning: this `MutexGuard` is held across an await point
+    --> crates/atom-core/src/providers/providers.rs:1238:13
+     |
+1238 |         let _g = test_lock();
+     |             ^^
+     |
+     = help: consider using an async-aware `Mutex` type or ensuring the `MutexGuard` is dropped before calling `await`
+note: these are all the await points this lock is held through
+    --> crates/atom-core/src/providers/providers.rs:1265:36
+     |
+1265 |         let ids = fetch_models(&p).await.unwrap();
+     |                                    ^^^^^
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#await_holding_lock
+
+warning: this `MutexGuard` is held across an await point
+    --> crates/atom-core/src/providers/providers.rs:1272:13
+     |
+1272 |         let _g = test_lock();
+     |             ^^
+     |
+     = help: consider using an async-aware `Mutex` type or ensuring the `MutexGuard` is dropped before calling `await`
+note: these are all the await points this lock is held through
+    --> crates/atom-core/src/providers/providers.rs:1297:14
+     |
+1297 |             .await
+     |              ^^^^^
+...
+1301 |             .await
+     |              ^^^^^
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#await_holding_lock
+
+warning: this `MutexGuard` is held across an await point
+    --> crates/atom-core/src/providers/providers.rs:1414:13
+     |
+1414 |         let _g = test_lock();
+     |             ^^
+     |
+     = help: consider using an async-aware `Mutex` type or ensuring the `MutexGuard` is dropped before calling `await`
+note: these are all the await points this lock is held through
+    --> crates/atom-core/src/providers/providers.rs:1431:84
+     |
+1431 |         let chunks = collect_chunks(&format!("http://{}/v1", srv.addr), "sk-live").await;
+     |                                                                                    ^^^^^
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#await_holding_lock
+
+warning: this `MutexGuard` is held across an await point
+    --> crates/atom-core/src/providers/providers.rs:1469:13
+     |
+1469 |         let _g = test_lock();
+     |             ^^
+     |
+     = help: consider using an async-aware `Mutex` type or ensuring the `MutexGuard` is dropped before calling `await`
+note: these are all the await points this lock is held through
+    --> crates/atom-core/src/providers/providers.rs:1484:77
+     |
+1484 |         let chunks = collect_chunks(&format!("http://{}/v1", srv.addr), "").await;
+     |                                                                             ^^^^^
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#await_holding_lock
+
+warning: this `MutexGuard` is held across an await point
+    --> crates/atom-core/src/providers/providers.rs:1508:13
+     |
+1508 |         let _g = test_lock();
+     |             ^^
+     |
+     = help: consider using an async-aware `Mutex` type or ensuring the `MutexGuard` is dropped before calling `await`
+note: these are all the await points this lock is held through
+    --> crates/atom-core/src/providers/providers.rs:1514:89
+     |
+1514 |         let res = stream_chat(&format!("http://{}/v1", srv.addr), "", req, "reasoning").await;
+     |                                                                                         ^^^^^
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#await_holding_lock
+
+warning: this `MutexGuard` is held across an await point
+   --> crates/atom-core/src/providers/retry.rs:318:13
+    |
+318 |         let _g = test_lock();
+    |             ^^
+    |
+    = help: consider using an async-aware `Mutex` type or ensuring the `MutexGuard` is dropped before calling `await`
+note: these are all the await points this lock is held through
+   --> crates/atom-core/src/providers/retry.rs:338:10
+    |
+338 |         .await
+    |          ^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#await_holding_lock
+
+warning: this `MutexGuard` is held across an await point
+   --> crates/atom-core/src/providers/retry.rs:346:13
+    |
+346 |         let _g = test_lock();
+    |             ^^
+    |
+    = help: consider using an async-aware `Mutex` type or ensuring the `MutexGuard` is dropped before calling `await`
+note: these are all the await points this lock is held through
+   --> crates/atom-core/src/providers/retry.rs:358:10
+    |
+358 |         .await
+    |          ^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#await_holding_lock
+
+warning: this `MutexGuard` is held across an await point
+   --> crates/atom-core/src/providers/retry.rs:370:13
+    |
+370 |         let _g = test_lock();
+    |             ^^
+    |
+    = help: consider using an async-aware `Mutex` type or ensuring the `MutexGuard` is dropped before calling `await`
+note: these are all the await points this lock is held through
+   --> crates/atom-core/src/providers/retry.rs:385:76
+    |
+385 |         let res = tokio::time::timeout(Duration::from_millis(900), future).await;
+    |                                                                            ^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#await_holding_lock
+
+warning: calls to `push` immediately after creation
+   --> crates/atom-core/src/session/stats.rs:342:5
+    |
+342 | /     let mut lines: Vec<String> = Vec::new();
+343 | |
+344 | |     // Overview: session and message counts plus the span in days.
+345 | |     lines.push(box_line("┌"));
+...   |
+351 | |     lines.push(box_line("└"));
+352 | |     lines.push(String::new());
+    | |______________________________^ help: consider using the `vec![]` macro: `let mut lines: Vec<String> = vec![..];`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#vec_init_then_push
+
+warning: `atom-server` (lib test) generated 3 warnings (2 duplicates) (run `cargo clippy --fix --lib -p atom-server --tests -- ` to apply 1 suggestion)
+warning: `atom-tools` (lib test) generated 26 warnings (6 duplicates) (run `cargo clippy --fix --lib -p atom-tools --tests -- ` to apply 19 suggestions)
+warning: `atom-sandbox` (lib test) generated 7 warnings (3 duplicates) (run `cargo clippy --fix --lib -p atom-sandbox --tests -- ` to apply 4 suggestions)
+warning: `atom-core` (lib test) generated 51 warnings (16 duplicates) (run `cargo clippy --fix --lib -p atom-core --tests -- ` to apply 3 suggestions)
+warning: this `impl` can be derived
+   --> crates/atom-tui/src/ansi.rs:137:1
+    |
+137 | / impl Default for Attrs {
+138 | |     fn default() -> Self {
+139 | |         Attrs {
+140 | |             fg: None,
+...   |
+149 | | }
+    | |_^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#derivable_impls
+    = note: `#[warn(clippy::derivable_impls)]` on by default
+help: replace the manual implementation with a derive attribute
+    |
+127 + #[derive(Default)]
+128 | struct Attrs {
+    |
+
+warning: clamp-like pattern without using clamp function
+   --> crates/atom-tui/src/app.rs:386:19
+    |
+386 |           let max = (self.height as usize)
+    |  ___________________^
+387 | |             .saturating_sub(
+388 | |                 1 + status_rows + STATUS_FOOTER_ROWS + 2 * PROMPT_PAD + self.preview_row_count(),
+...   |
+391 | |             .max(1);
+    | |___________________^
+    |
+    = note: clamp will panic if max < min
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#manual_clamp
+    = note: `#[warn(clippy::manual_clamp)]` on by default
+help: replace with clamp
+    |
+386 ~         let max = (self.height as usize)
+387 +             .saturating_sub(
+388 +                 1 + status_rows + STATUS_FOOTER_ROWS + 2 * PROMPT_PAD + self.preview_row_count(),
+389 ~             ).clamp(1, INPUT_MAX_HEIGHT);
+    |
+
+warning: this `if` can be collapsed into the outer `match`
+   --> crates/atom-tui/src/app.rs:538:21
+    |
+538 | /                     if !b.tool_done {
+539 | |                         b.lines = None;
+540 | |                         self.viewport_dirty = true;
+541 | |                     }
+    | |_____________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_match
+    = note: `#[warn(clippy::collapsible_match)]` on by default
+help: collapse nested if block
+    |
+537 ~                 BlockKind::Tool
+538 ~                     if !b.tool_done => {
+539 |                         b.lines = None;
+540 |                         self.viewport_dirty = true;
+541 ~                     }
+    |
+
+warning: this `map_or` can be simplified
+   --> crates/atom-tui/src/app.rs:628:20
+    |
+628 |                   && self
+    |  ____________________^
+629 | |                     .content_lines
+630 | |                     .get(raw.wrapping_sub(1))
+631 | |                     .map_or(false, |l| l.spans.is_empty())
+    | |__________________________________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#unnecessary_map_or
+    = note: `#[warn(clippy::unnecessary_map_or)]` on by default
+help: use `is_some_and` instead
+    |
+631 -                     .map_or(false, |l| l.spans.is_empty())
+631 +                     .is_some_and(|l| l.spans.is_empty())
+    |
+
+warning: unneeded `return` statement
+    --> crates/atom-tui/src/app.rs:2820:9
+     |
+2820 |         return vec![Effect::ReloadProviders];
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#needless_return
+     = note: `#[warn(clippy::needless_return)]` on by default
+help: remove `return`
+     |
+2820 -         return vec![Effect::ReloadProviders];
+2820 +         vec![Effect::ReloadProviders]
+     |
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+   --> crates/atom-tui/src/blocks.rs:223:28
+    |
+223 |         wrapped_line_count(&tool_result_summary(&self.result, &self.diff), result_inner)
+    |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: change this to: `tool_result_summary(&self.result, &self.diff)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#needless_borrow
+    = note: `#[warn(clippy::needless_borrow)]` on by default
+
+warning: matching on `Some` with `ok()` is redundant
+   --> crates/atom-tui/src/blocks.rs:569:13
+    |
+569 |             if let Some(v) = args.ok() {
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#match_result_ok
+    = note: `#[warn(clippy::match_result_ok)]` on by default
+help: consider matching on `Ok(v)` and removing the call to `ok` instead
+    |
+569 -             if let Some(v) = args.ok() {
+569 +             if let Ok(v) = args {
+    |
+
+warning: unnecessary use of `to_string`
+   --> crates/atom-tui/src/math.rs:169:33
+    |
+169 | ...                   &math.full_source().to_string(),
+    |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `math.full_source()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#unnecessary_to_owned
+    = note: `#[warn(clippy::unnecessary_to_owned)]` on by default
+
+warning: this `repeat().take()` can be written more concisely
+   --> crates/atom-tui/src/math.rs:175:42
+    |
+175 | ...                   links.extend(std::iter::repeat(Vec::new()).take(rows.len()));
+    |                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `repeat_n()` instead: `std::iter::repeat_n(Vec::new(), rows.len())`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#manual_repeat_n
+    = note: `#[warn(clippy::manual_repeat_n)]` on by default
+
+warning: unnecessary use of `to_string`
+   --> crates/atom-tui/src/math.rs:189:29
+    |
+189 | ...                   &math.full_source().to_string(),
+    |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `math.full_source()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#unnecessary_to_owned
+
+warning: this `impl` can be derived
+  --> crates/atom-tui/src/overlays.rs:45:1
+   |
+45 | / impl Default for PickerKind {
+46 | |     fn default() -> Self {
+47 | |         Self::None
+48 | |     }
+49 | | }
+   | |_^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#derivable_impls
+help: replace the manual implementation with a derive attribute and mark the default variant
+   |
+39 + #[derive(Default)]
+40 | pub enum PickerKind {
+41 ~     #[default]
+42 ~     None,
+   |
+
+warning: this `if` has identical blocks
+   --> crates/atom-tui/src/overlays.rs:932:37
+    |
+932 |             .max(if item_count == 0 { 0 } else { 0 });
+    |                                     ^^^^^
+    |
+note: same as this
+   --> crates/atom-tui/src/overlays.rs:932:48
+    |
+932 |             .max(if item_count == 0 { 0 } else { 0 });
+    |                                                ^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#if_same_then_else
+    = note: `#[warn(clippy::if_same_then_else)]` on by default
+
+warning: this `if` has identical blocks
+   --> crates/atom-tui/src/preview.rs:530:36
+    |
+530 |       if image_size(&norm).is_some() {
+    |  ____________________________________^
+531 | |         p.cols = PREVIEW_COLS;
+532 | |         p.rows = PREVIEW_ROWS;
+533 | |     } else if kitty_terminal() {
+    | |_____^
+    |
+note: same as this
+   --> crates/atom-tui/src/preview.rs:533:32
+    |
+533 |       } else if kitty_terminal() {
+    |  ________________________________^
+534 | |         p.cols = PREVIEW_COLS;
+535 | |         p.rows = PREVIEW_ROWS;
+536 | |     }
+    | |_____^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#if_same_then_else
+
+warning: the loop variable `i` is used to index `out`
+  --> crates/atom-tui/src/spinner.rs:56:14
+   |
+56 |     for i in 0..TRAIL_LEN {
+   |              ^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#needless_range_loop
+   = note: `#[warn(clippy::needless_range_loop)]` on by default
+help: consider using an iterator and enumerate()
+   |
+56 -     for i in 0..TRAIL_LEN {
+56 +     for (i, <item>) in out.iter_mut().enumerate().take(TRAIL_LEN) {
+   |
+
+warning: manual checked division
+   --> crates/atom-tui/src/view.rs:374:24
+    |
+374 |     let thumb_top = if max_scroll == 0 {
+    |                        ^^^^^^^^^^^^^^^ check performed here
+...
+377 |         app.scroll_y.min(max_scroll).saturating_mul(track - thumb_h) / max_scroll
+    |         ------------------------------------------------------------------------- division performed here
+    |
+    = help: consider using `checked_div`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#manual_checked_ops
+    = note: `#[warn(clippy::manual_checked_ops)]` on by default
+
+warning: the loop variable `i` is used to index `filtered`
+    --> crates/atom-tui/src/view.rs:1249:14
+     |
+1249 |     for i in scroll..end {
+     |              ^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+     |
+1249 -     for i in scroll..end {
+1249 +     for (i, <item>) in filtered.iter().enumerate().take(end).skip(scroll) {
+     |
+
+warning: this `if` statement can be collapsed
+   --> crates/atom-tui/src/lib.rs:646:21
+    |
+646 | /                     if resp.is_err() && !api::is_running().await {
+647 | |                         if api::ensure_server().await.is_ok() {
+648 | |                             resp = atom_server::client::stream_send(&session_id, &body).await;
+649 | |                         }
+650 | |                     }
+    | |_____________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+    = note: `#[warn(clippy::collapsible_if)]` on by default
+help: collapse nested if block
+    |
+646 ~                     if resp.is_err() && !api::is_running().await
+647 ~                         && api::ensure_server().await.is_ok() {
+648 |                             resp = atom_server::client::stream_send(&session_id, &body).await;
+649 ~                         }
+    |
+
+warning: consider using `sort_by_key`
+   --> crates/atom-tui/src/lib.rs:702:29
+    |
+702 | ...                   sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#unnecessary_sort_by
+    = note: `#[warn(clippy::unnecessary_sort_by)]` on by default
+help: try
+    |
+702 -                             sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+702 +                             sessions.sort_by_key(|a| std::cmp::Reverse(a.updated_at));
+    |
+
+warning: this `if` statement can be collapsed
+   --> crates/atom-tui/src/lib.rs:838:21
+    |
+838 | /                     if resp.is_err() && !api::is_running().await {
+839 | |                         if api::ensure_server().await.is_ok() {
+840 | |                             resp = atom_server::client::stream_send(&id, &body).await;
+841 | |                         }
+842 | |                     }
+    | |_____________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+838 ~                     if resp.is_err() && !api::is_running().await
+839 ~                         && api::ensure_server().await.is_ok() {
+840 |                             resp = atom_server::client::stream_send(&id, &body).await;
+841 ~                         }
+    |
+
+warning: manual implementation of `str::repeat` using iterators
+    --> crates/atom-tui/src/app.rs:4193:28
+     |
+4193 |         let long: String = std::iter::repeat("row line\n").take(20).collect();
+     |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `"row line\n".repeat(20)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#manual_str_repeat
+     = note: `#[warn(clippy::manual_str_repeat)]` on by default
+
+warning: this `repeat().take()` can be written more concisely
+    --> crates/atom-tui/src/app.rs:4193:28
+     |
+4193 |         let long: String = std::iter::repeat("row line\n").take(20).collect();
+     |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `repeat_n()` instead: `std::iter::repeat_n("row line\n", 20)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#manual_repeat_n
+     = note: `#[warn(clippy::manual_repeat_n)]` on by default
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+    --> crates/atom-tui/src/blocks.rs:2229:34
+     |
+2229 |             parse_diagram_marker(&macos).expect("quoted spaced path parsed");
+     |                                  ^^^^^^ help: change this to: `macos`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#needless_borrow
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+    --> crates/atom-tui/src/blocks.rs:2245:57
+     |
+2245 |         let (_, png, _, _, _, _) = parse_diagram_marker(&legacy).expect("legacy marker parsed");
+     |                                                         ^^^^^^^ help: change this to: `legacy`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#needless_borrow
+
+warning: manual implementation of `str::repeat` using iterators
+    --> crates/atom-tui/src/blocks.rs:2608:28
+     |
+2608 |         let long: String = std::iter::repeat("output row\n").take(30).collect();
+     |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `"output row\n".repeat(30)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#manual_str_repeat
+
+warning: this `repeat().take()` can be written more concisely
+    --> crates/atom-tui/src/blocks.rs:2608:28
+     |
+2608 |         let long: String = std::iter::repeat("output row\n").take(30).collect();
+     |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `repeat_n()` instead: `std::iter::repeat_n("output row\n", 30)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#manual_repeat_n
+
+warning: this `repeat().take()` can be written more concisely
+   --> crates/atom-tui/src/math.rs:175:42
+    |
+175 | ...                   links.extend(std::iter::repeat(Vec::new()).take(rows.len()));
+    |                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `repeat_n()` instead: `std::iter::repeat_n(Vec::new(), rows.len())`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#manual_repeat_n
+
+warning: called `filter(..).next_back()` on an `DoubleEndedIterator`
+   --> crates/atom-tui/src/outputtest.rs:207:25
+    |
+207 |           let reasoning = app
+    |  _________________________^
+208 | |             .blocks
+209 | |             .iter()
+210 | |             .filter(|b| b.kind == BlockKind::Reasoning)
+211 | |             .next_back()
+    | |________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#filter_next
+    = note: `#[warn(clippy::filter_next)]` on by default
+help: use `.rfind(..)` instead
+    |
+207 ~         let reasoning = app
+208 +             .blocks
+209 +             .iter().rfind(|b| b.kind == BlockKind::Reasoning)
+    |
+
+warning: `atom-tui` (lib) generated 19 warnings (run `cargo clippy --fix --lib -p atom-tui -- ` to apply 12 suggestions)
+warning: `atom-tui` (lib test) generated 26 warnings (18 duplicates) (run `cargo clippy --fix --lib -p atom-tui --tests -- ` to apply 8 suggestions)
+warning: items after a test module
+   --> crates/atom/src/main.rs:305:1
+    |
+305 |   mod tests {
+    |   ^^^^^^^^^
+...
+316 | / async fn launch_tui(
+317 | |     providers: Vec<atom_core::providers::providers::Provider>,
+318 | |     sel_provider: atom_core::providers::providers::Provider,
+319 | |     sel_model: String,
+320 | |     args: Args,
+321 | |     session: Option<atom_core::session::store::SessionInfo>,
+322 | | ) -> Result<()> {
+    | |_______________^
+...
+334 |   fn zero_session() -> atom_core::session::store::SessionInfo {
+    |   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+354 |   fn is_terminal() -> bool {
+    |   ^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#items_after_test_module
+    = note: `#[warn(clippy::items_after_test_module)]` on by default
+    = help: move the items to before the test module was defined
+
+warning: `atom` (bin "atom" test) generated 1 warning (run `cargo clippy --fix --bin "atom" -p atom --tests -- ` to apply 1 suggestion)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.27s

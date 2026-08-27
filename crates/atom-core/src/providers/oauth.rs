@@ -150,7 +150,7 @@ pub(crate) fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn parse_query(query: &str) -> Vec<(String, String)> {
+pub(crate) fn parse_query(query: &str) -> Vec<(String, String)> {
     query
         .split('&')
         .filter(|p| !p.is_empty())
@@ -685,10 +685,11 @@ mod tests {
                         extract_form_value(req, "code_verifier").as_deref(),
                         Some("ver")
                     );
+                    let body = format!("{{\"access_token\":\"access-1\",\"refresh_token\":\"refresh-1\",\"expires_in\":3600,\"id_token\":\"{}\"}}", id2);
                     format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        format!("{{\"access_token\":\"access-1\",\"refresh_token\":\"refresh-1\",\"expires_in\":3600,\"id_token\":\"{}\"}}", id2).len(),
-                        format!("{{\"access_token\":\"access-1\",\"refresh_token\":\"refresh-1\",\"expires_in\":3600,\"id_token\":\"{}\"}}", id2)
+                        body.len(),
+                        body
                     )
                 }
                 "refresh_token" => {

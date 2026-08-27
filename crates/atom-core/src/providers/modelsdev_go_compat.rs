@@ -2,7 +2,7 @@
 mod repro_real_cache {
     use crate::providers::modelsdev::*;
 
-    fn lock() -> std::sync::MutexGuard<'static, ()> {
+    fn lock() -> crate::providers::testutil::TestLockGuard {
         crate::providers::test_lock()
     }
 

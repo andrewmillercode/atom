@@ -53,7 +53,7 @@ fn derive_trail_colors(base: (u8, u8, u8)) -> [Rgba; TRAIL_LEN] {
     }; TRAIL_LEN];
 
     // Can't derive Copy for Rgba with f32 in const, just do it manually:
-    for i in 0..TRAIL_LEN {
+    for (i, slot) in out.iter_mut().enumerate() {
         let (alpha, bf): (f32, f32) = if i == 0 {
             (1.0, 1.0) // lead: full brightness
         } else if i == 1 {
@@ -61,7 +61,7 @@ fn derive_trail_colors(base: (u8, u8, u8)) -> [Rgba; TRAIL_LEN] {
         } else {
             (0.65_f32.powi(i as i32 - 1), 1.0) // exponential decay
         };
-        out[i] = Rgba {
+        *slot = Rgba {
             r: (br * bf).min(1.0),
             g: (bg * bf).min(1.0),
             b: (bb * bf).min(1.0),

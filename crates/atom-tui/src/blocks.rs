@@ -220,7 +220,7 @@ impl Block {
     }
 
     fn tool_output_exceeds_preview(&self, result_inner: usize, diff_width: usize) -> bool {
-        wrapped_line_count(&tool_result_summary(&self.result, &self.diff), result_inner)
+        wrapped_line_count(tool_result_summary(&self.result, &self.diff), result_inner)
             > TOOL_RESULT_PREVIEW_LINES
             || wrapped_line_count(&self.diff, diff_width) > TOOL_RESULT_PREVIEW_LINES
     }
@@ -566,7 +566,7 @@ pub fn tool_action(name: &str, arguments: &str) -> String {
             }
         }
         _ => {
-            if let Some(v) = args.ok() {
+            if let Ok(v) = args {
                 if name.starts_with("mcp_") {
                     for key in ["query", "name", "url", "path"] {
                         if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
@@ -2226,7 +2226,7 @@ mod tests {
         // Support"); quoted paths must survive the parser intact.
         let macos = "[atom-diagram] png=\"/Users/a/Library/Application Support/atom/diagrams/arch-1a2b3c4d.png\" png-dark=\"/Users/a/Library/Application Support/atom/diagrams/arch-1a2b3c4d-dark.png\" html=\"/Users/a/Library/Application Support/atom/diagrams/arch-1a2b3c4d.html\" width=400 height=200";
         let (_svg, png, png_dark, html, _, _) =
-            parse_diagram_marker(&macos).expect("quoted spaced path parsed");
+            parse_diagram_marker(macos).expect("quoted spaced path parsed");
         assert_eq!(
             png,
             "/Users/a/Library/Application Support/atom/diagrams/arch-1a2b3c4d.png"
@@ -2242,7 +2242,7 @@ mod tests {
         // Legacy sessions carry unquoted space-free paths.
         let legacy = "[atom-diagram] png=/tmp/d/arch-1a2b3c4d.png \
                       html=/tmp/d/arch-1a2b3c4d.html width=400 height=200";
-        let (_, png, _, _, _, _) = parse_diagram_marker(&legacy).expect("legacy marker parsed");
+        let (_, png, _, _, _, _) = parse_diagram_marker(legacy).expect("legacy marker parsed");
         assert_eq!(png, "/tmp/d/arch-1a2b3c4d.png");
         // Legacy unquoted paths containing spaces must parse fully too
         // (macOS "Application Support").
@@ -2605,7 +2605,7 @@ mod render_tests {
 
     #[test]
     fn expand_toggle_grows_rendered_output() {
-        let long: String = std::iter::repeat("output row\n").take(30).collect();
+        let long: String = "output row\n".repeat(30);
         let mut b = Block {
             kind: BlockKind::Tool,
             title: "Web Search".into(),

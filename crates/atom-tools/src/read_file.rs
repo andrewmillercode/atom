@@ -86,7 +86,7 @@ pub fn execute_read_file(arguments: &str, ctx: &ToolCtx<'_>) -> ToolOutcome {
 // ---------------------------------------------------------------------------
 
 fn b64_len(n: usize) -> usize {
-    ((n + 2) / 3) * 4
+    n.div_ceil(3) * 4
 }
 
 pub(crate) fn normalize_image(data: &[u8]) -> Result<(Vec<u8>, String), String> {
@@ -258,7 +258,7 @@ mod tests {
         // instead just verify a moderately sized image round-trips.
         let img = image::RgbaImage::from_pixel(3000, 2000, [255u8; 4].into());
         let mut buf = Vec::new();
-        image::DynamicImage::ImageRgba8(img.into())
+        image::DynamicImage::ImageRgba8(img)
             .write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)
             .unwrap();
         let (out, mime) = normalize_image(&buf).unwrap();

@@ -473,7 +473,7 @@ impl SessionStore {
     /// are not retained by the store.
     pub fn list(&self) -> Vec<Session> {
         let mut infos: Vec<SessionInfo> = self.index.read().unwrap().values().cloned().collect();
-        infos.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        infos.sort_by_key(|a| std::cmp::Reverse(a.updated_at));
         infos
             .into_iter()
             .filter_map(|info| self.load(&info.id))
@@ -484,7 +484,7 @@ impl SessionStore {
     /// transcripts, sorted by UpdatedAt descending.
     pub fn list_info(&self) -> Vec<SessionInfo> {
         let mut list: Vec<SessionInfo> = self.index.read().unwrap().values().cloned().collect();
-        list.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        list.sort_by_key(|a| std::cmp::Reverse(a.updated_at));
         list
     }
 

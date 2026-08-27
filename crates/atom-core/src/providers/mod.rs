@@ -9,6 +9,9 @@ pub mod modelsdev;
 #[cfg(test)]
 pub mod modelsdev_go_compat;
 pub mod oauth;
+// `providers::providers` mirrors the Go package layout (providers/
+// providers.go); renaming it would ripple through every caller.
+#[allow(clippy::module_inception)]
 pub mod providers;
 pub mod retry;
 
@@ -47,7 +50,4 @@ pub use retry::{
 #[cfg(test)]
 pub(crate) use self::providers::testutil;
 #[cfg(test)]
-pub(crate) use self::providers::testutil::{
-    clear_builtin_provider_env, inject_models_dev, isolate_data_dir, set_env, test_lock,
-    CatalogGuard, DataDirGuard, EnvVarGuard, StubServer,
-};
+pub(crate) use self::providers::testutil::{isolate_data_dir, test_lock, StubServer};

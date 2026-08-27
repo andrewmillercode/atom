@@ -197,7 +197,7 @@ fn viewer_html(title: &str, slug: &str, svg: &str, code: &str) -> String {
     let border = COLOR_BORDER; // #272b33
     let muted_extra = COLOR_MUTED_EXTRA; // #3d3d3d
     let muted = COLOR_MUTED; // #666666
-    let fg = COLOR_FOREGROUND; // #dee3e8
+    let fg = COLOR_FOREGROUND; // #ced5d9
 
     format!(
         r#"<!DOCTYPE html>

@@ -411,6 +411,7 @@ pub(crate) fn with_file_lock_timeout<R>(
         .create(true)
         .read(true)
         .write(true)
+        .truncate(false)
         .open(&path)
         .map_err(|e| format!("error locking file: {e}"))?;
     let deadline = Instant::now() + timeout;
@@ -795,7 +796,7 @@ mod tests {
         let path = env.ws.path().join("greet.go");
         std::fs::write(&path, "package greet\n").unwrap();
 
-        let out = edit(&&env.ctx(), &path, "package greet", "package hello").await;
+        let out = edit(&env.ctx(), &path, "package greet", "package hello").await;
         assert!(
             out.text
                 .starts_with("error: file has not been read in this session."),
@@ -815,12 +816,12 @@ mod tests {
             "func Hello() { return \"hi\" }\nfunc Bye() { return \"bye\" }\n",
         )
         .unwrap();
-        assert_read_ok(&&env.ctx(), &path).await;
+        assert_read_ok(&env.ctx(), &path).await;
 
-        let out = edit(&&env.ctx(), &path, "return \"hi\"", "return \"hello\"").await;
+        let out = edit(&env.ctx(), &path, "return \"hi\"", "return \"hello\"").await;
         assert!(out.text.starts_with("edited"), "{}", out.text);
 
-        let out = edit(&&env.ctx(), &path, "return \"bye\"", "return \"goodbye\"").await;
+        let out = edit(&env.ctx(), &path, "return \"bye\"", "return \"goodbye\"").await;
         assert!(out.text.starts_with("edited"), "{}", out.text);
 
         let got = std::fs::read_to_string(&path).unwrap();
@@ -836,7 +837,7 @@ mod tests {
             "func Hello() { return \"hi\" }\nfunc Bye() { return \"bye\" }\n",
         )
         .unwrap();
-        assert_read_ok(&&env.ctx(), &path).await;
+        assert_read_ok(&env.ctx(), &path).await;
 
         std::fs::write(
             &path,
@@ -844,7 +845,7 @@ mod tests {
         )
         .unwrap();
 
-        let out = edit(&&env.ctx(), &path, "return \"hi\"", "return \"hello\"").await;
+        let out = edit(&env.ctx(), &path, "return \"hi\"", "return \"hello\"").await;
         assert!(
             out.text
                 .starts_with("error: file changed since last observation."),
@@ -860,7 +861,7 @@ mod tests {
         );
         assert!(!out.text.contains("package "), "{}", out.text);
 
-        let out = edit(&&env.ctx(), &path, "return \"hi\"", "return \"hello\"").await;
+        let out = edit(&env.ctx(), &path, "return \"hi\"", "return \"hello\"").await;
         assert!(out.text.starts_with("edited"), "{}", out.text);
     }
 
@@ -869,9 +870,9 @@ mod tests {
         let env = FileEnv::new();
         let path = env.ws.path().join("greet.go");
         std::fs::write(&path, "func Hello() string {\n\treturn \"hello\"\n}\n").unwrap();
-        assert_read_ok(&&env.ctx(), &path).await;
+        assert_read_ok(&env.ctx(), &path).await;
 
-        let out = edit(&&env.ctx(), &path, "return \"hi\"", "return \"hey\"").await;
+        let out = edit(&env.ctx(), &path, "return \"hi\"", "return \"hey\"").await;
         assert!(
             out.text.starts_with("error: old_text not found."),
             "{}",
@@ -889,9 +890,9 @@ mod tests {
             "func Hello() { return \"hello\" }\nfunc HelloAgain() { return \"hello\" }\n",
         )
         .unwrap();
-        assert_read_ok(&&env.ctx(), &path).await;
+        assert_read_ok(&env.ctx(), &path).await;
 
-        let out = edit(&&env.ctx(), &path, "return \"hello\"", "return \"hi\"").await;
+        let out = edit(&env.ctx(), &path, "return \"hello\"", "return \"hi\"").await;
         assert!(
             out.text.starts_with("error: old_text found 2 times."),
             "{}",
@@ -913,7 +914,7 @@ mod tests {
         let out = execute_write_file(
             &serde_json::json!({"path": path.display().to_string(), "content": "new\n"})
                 .to_string(),
-            &&env.ctx(),
+            &env.ctx(),
         )
         .await;
         assert!(
@@ -923,13 +924,13 @@ mod tests {
             out.text
         );
 
-        assert_read_ok(&&env.ctx(), &path).await;
+        assert_read_ok(&env.ctx(), &path).await;
         std::fs::write(&path, "changed\n").unwrap();
 
         let out = execute_write_file(
             &serde_json::json!({"path": path.display().to_string(), "content": "new\n"})
                 .to_string(),
-            &&env.ctx(),
+            &env.ctx(),
         )
         .await;
         assert!(
@@ -941,11 +942,11 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "changed\n");
 
         // After refreshing observation the write applies and returns a diff.
-        assert_read_ok(&&env.ctx(), &path).await;
+        assert_read_ok(&env.ctx(), &path).await;
         let out = execute_write_file(
             &serde_json::json!({"path": path.display().to_string(), "content": "new\n"})
                 .to_string(),
-            &&env.ctx(),
+            &env.ctx(),
         )
         .await;
         assert!(out.text.starts_with("wrote 4 bytes to "), "{}", out.text);
@@ -963,7 +964,7 @@ mod tests {
         let path = env.ws.path().join("fresh.txt");
         let out = execute_write_file(
             &serde_json::json!({"path": path.display().to_string(), "content": "abc"}).to_string(),
-            &&env.ctx(),
+            &env.ctx(),
         )
         .await;
         assert!(out.text.starts_with("wrote 3 bytes to "), "{}", out.text);
@@ -974,7 +975,7 @@ mod tests {
         let env = FileEnv::new();
         let path = env.ws.path().join("a.txt");
         std::fs::write(&path, "hello\n").unwrap();
-        assert_read_ok(&&env.ctx(), &path).await;
+        assert_read_ok(&env.ctx(), &path).await;
 
         // Hold the same lock another "process" would take.
         let lock = lock_file_path(&path.display().to_string());
@@ -982,6 +983,7 @@ mod tests {
             .create(true)
             .read(true)
             .write(true)
+            .truncate(false)
             .open(&lock)
             .unwrap();
         let fd = std::os::unix::io::AsRawFd::as_raw_fd(&held);

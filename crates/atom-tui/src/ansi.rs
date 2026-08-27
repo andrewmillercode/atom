@@ -123,7 +123,7 @@ pub fn frame_style() -> Style {
 // ANSI parsing.
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Default)]
 struct Attrs {
     fg: Option<Color>,
     bg: Option<Color>,
@@ -132,20 +132,6 @@ struct Attrs {
     underline: bool,
     crossed_out: bool,
     dim: bool,
-}
-
-impl Default for Attrs {
-    fn default() -> Self {
-        Attrs {
-            fg: None,
-            bg: None,
-            bold: false,
-            italic: false,
-            underline: false,
-            crossed_out: false,
-            dim: false,
-        }
-    }
 }
 
 impl Attrs {

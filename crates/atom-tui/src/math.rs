@@ -165,14 +165,9 @@ fn render_assistant_markdown_with(
                     FormulaState::Ready(formula) => {
                         let rows = formula_to_lines(&formula);
                         if rows.is_empty() {
-                            render_math_fallback(
-                                &math.full_source().to_string(),
-                                width,
-                                &mut lines,
-                                &mut links,
-                            );
+                            render_math_fallback(math.full_source(), width, &mut lines, &mut links);
                         } else {
-                            links.extend(std::iter::repeat(Vec::new()).take(rows.len()));
+                            links.extend(std::iter::repeat_n(Vec::new(), rows.len()));
                             lines.extend(rows);
                         }
                     }
@@ -185,12 +180,7 @@ fn render_assistant_markdown_with(
                     // Pending: the worker owns it and a MathWake will follow.
                     // Failed: deterministic (parse/limit) — keep the LaTeX.
                     FormulaState::Pending | FormulaState::Failed(_) | FormulaState::Unsupported => {
-                        render_math_fallback(
-                            &math.full_source().to_string(),
-                            width,
-                            &mut lines,
-                            &mut links,
-                        );
+                        render_math_fallback(math.full_source(), width, &mut lines, &mut links);
                     }
                 }
                 // Paragraph break between the formula and following prose.

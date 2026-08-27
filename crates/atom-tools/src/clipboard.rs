@@ -261,10 +261,7 @@ pub fn local_images_from_paste(content: &str) -> Option<Vec<LocalImageFile>> {
         if line.is_empty() {
             continue;
         }
-        match read_local_image(&unescape_paste_path(line)) {
-            Some(f) => files.push(f),
-            None => return None,
-        }
+        files.push(read_local_image(&unescape_paste_path(line))?);
     }
     Some(files)
 }

@@ -59,7 +59,7 @@ impl Default for ExecOutcome {
 fn primary_rule_id(a: &Analysis) -> String {
     a.matched_rules
         .iter()
-        .find(|id| RULES.iter().any(|r| &r.id == *id))
+        .find(|id| RULES.iter().any(|r| r.id == *id))
         .cloned()
         .unwrap_or_default()
 }
@@ -409,6 +409,7 @@ async fn run_child(mut command: Command) -> ExecOutcome {
 
 /// Append one JSONL audit record to dataDir()/sandbox-audit.log.
 /// Best-effort: audit failures never fail the command result.
+#[allow(clippy::too_many_arguments)]
 fn audit(
     data_dir_path: &Path,
     session_id: &str,
@@ -559,7 +560,7 @@ mod tests {
         .await;
         let elapsed = started.elapsed();
         assert!(out.verdict.uses_network);
-        assert_eq!(out.approved, false);
+        assert!(!out.approved);
         assert_ne!(out.exit_code, 0, "unapproved curl must not run");
         assert!(
             out.stderr.contains("not approved"),
@@ -637,7 +638,7 @@ mod tests {
         assert_eq!(out.exit_code, -1);
         assert!(out.stdout.is_empty());
         assert!(out.stderr.contains("blocked by sandbox policy"));
-        assert_eq!(out.approved, false);
+        assert!(!out.approved);
         assert_eq!(out.confined, ConfineKind::None);
 
         let log = std::fs::read_to_string(e._data.path().join("sandbox-audit.log")).unwrap();
@@ -664,7 +665,7 @@ mod tests {
             &approver,
         )
         .await;
-        assert_eq!(first.approved, true);
+        assert!(first.approved);
 
         // The grant recorded by call one lives in the process-global store.
         let rule_id = primary_rule_id(&first.verdict);

@@ -256,7 +256,7 @@ pub struct McpCallResult {
 }
 
 pub(crate) enum Transport {
-    Stdio(StdioSession),
+    Stdio(Box<StdioSession>),
     Http(HttpSession),
 }
 
@@ -362,12 +362,11 @@ impl StdioSession {
                 continue; // notifications / other responses
             }
             if let Some(err) = v.get("error") {
-                return Err(format!(
-                    "{}",
-                    err.get("message")
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("tool error")
-                ));
+                return Err(err
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("tool error")
+                    .to_string());
             }
             return Ok(v.get("result").cloned().unwrap_or(serde_json::Value::Null));
         }
@@ -545,12 +544,11 @@ impl HttpSession {
             return Err("response id mismatch".to_string());
         }
         if let Some(err) = v.get("error") {
-            return Err(format!(
-                "{}",
-                err.get("message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("request failed")
-            ));
+            return Err(err
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("request failed")
+                .to_string());
         }
         Ok(v.get("result").cloned().unwrap_or(serde_json::Value::Null))
     }
@@ -693,7 +691,7 @@ async fn connect_transport(
                 stdout: tokio::io::BufReader::new(stdout).lines(),
                 next_id: 0,
             };
-            Ok(Transport::Stdio(sess))
+            Ok(Transport::Stdio(Box::new(sess)))
         }
         other => Err(format!("unsupported type \"{other}\"")),
     }

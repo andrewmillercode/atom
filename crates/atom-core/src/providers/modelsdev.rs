@@ -1072,7 +1072,7 @@ mod tests {
     }
 
     // Serializes catalog injection across tests (the catalog is global).
-    fn lock() -> std::sync::MutexGuard<'static, ()> {
+    fn lock() -> crate::providers::testutil::TestLockGuard {
         crate::providers::test_lock()
     }
 

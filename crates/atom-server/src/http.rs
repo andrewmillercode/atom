@@ -214,10 +214,12 @@ async fn route(
             }
             drop(guard);
             // Feature flags so a newer client can detect a stale
-            // background server and restart it.
+            // background server and restart it. `version` lets a client
+            // also reject a server built from a different release.
             return full_body(json!({
                 "compact": true, "dispatch": true, "mcp": true,
                 "skills": true, "keepalive": true,
+                "version": env!("CARGO_PKG_VERSION"),
             }));
         }
         _ => {}

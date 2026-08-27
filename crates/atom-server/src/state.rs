@@ -715,7 +715,7 @@ mod tests {
     fn force_end_session_turns_unwedges_a_dead_turn() {
         let tt = TurnTable::default();
         // A registered turn whose task died mid-flight.
-        let handle = tt.start_turn("w", "t");
+        let _handle = tt.start_turn("w", "t");
         // A reservation leaked before the turn task ever started.
         assert!(tt.try_prepare_session_turn("r"));
         assert!(tt.session_has_active_turn("w"));

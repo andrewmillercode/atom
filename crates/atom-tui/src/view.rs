@@ -371,11 +371,12 @@ fn draw_scrollbar(app: &App, rect: Rect, buf: &mut Buffer) {
         .max(1)
         .min(track.saturating_sub(1).max(1));
     let max_scroll = total.saturating_sub(content_visible);
-    let thumb_top = if max_scroll == 0 {
-        0
-    } else {
-        app.scroll_y.min(max_scroll).saturating_mul(track - thumb_h) / max_scroll
-    };
+    let thumb_top = app
+        .scroll_y
+        .min(max_scroll)
+        .saturating_mul(track - thumb_h)
+        .checked_div(max_scroll)
+        .unwrap_or(0);
 
     for row in 0..track {
         let thumb = row >= thumb_top && row < thumb_top + thumb_h;
@@ -1246,8 +1247,7 @@ fn render_providers_overlay(app: &App) -> Vec<Line<'static>> {
     let max_items = overlays::overlay_list_max_lines(app);
     let scroll = overlays::overlay_list_scroll(app.overlay_sel, max_items, filtered.len());
     let end = (scroll + max_items).min(filtered.len());
-    for i in scroll..end {
-        let e = &filtered[i];
+    for (i, e) in filtered.iter().enumerate().take(end).skip(scroll) {
         let label = if e.status.is_empty() {
             e.label.clone()
         } else {

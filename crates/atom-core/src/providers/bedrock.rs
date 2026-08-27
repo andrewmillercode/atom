@@ -516,9 +516,14 @@ fn read_u32(buf: &[u8], off: usize) -> Option<u32> {
 /// Parses one complete eventstream frame from the front of `buf`.
 /// Returns None when more bytes are needed. On success returns the
 /// consumed length plus the ":event-type"-ish header map and payload.
-fn parse_frame(buf: &[u8]) -> Option<(usize, Vec<(String, HeaderValue)>, Bytes)> {
+type FrameHeaders = Vec<(String, HeaderValue)>;
+
+/// (consumed bytes, headers, payload)
+type ParsedFrame = (usize, FrameHeaders, Bytes);
+
+fn parse_frame(buf: &[u8]) -> Option<ParsedFrame> {
     let total = read_u32(buf, 0)? as usize;
-    if total < 16 || total > 8_000_000 || buf.len() < total {
+    if !(16..=8_000_000).contains(&total) || buf.len() < total {
         return None;
     }
     let headers_len = read_u32(buf, 4)? as usize;
@@ -1295,7 +1300,7 @@ mod tests {
             .expect("sonnet 4.5 high is extended");
         assert_eq!(t.additional["thinking"]["type"], "enabled");
         let budget = t.additional["thinking"]["budget_tokens"].as_i64().unwrap();
-        assert!(budget >= 1024 && budget < 32000, "budget {budget} must fit");
+        assert!((1024..32000).contains(&budget), "budget {budget} must fit");
         assert_eq!(t.inference["maxTokens"], 32000);
         assert_eq!(t.inference["temperature"], 1.0);
     }
@@ -1443,30 +1448,31 @@ mod tests {
                 payload.as_bytes(),
             )
         };
-        let mut wire: Vec<Bytes> = Vec::new();
-        wire.push(mk("messageStart", r#"{"role":"assistant"}"#.into()));
-        wire.push(mk(
-            "contentBlockDelta",
-            r#"{"contentBlockIndex":0,"delta":{"text":"Hello"}}"#.into(),
-        ));
-        wire.push(mk(
-            "contentBlockDelta",
-            r#"{"contentBlockIndex":1,"delta":{"reasoningContent":{"text":"hmm"}}}"#.into(),
-        ));
-        wire.push(mk(
-            "contentBlockStart",
-            r#"{"contentBlockIndex":2,"start":{"toolUse":{"toolUseId":"t1","name":"calc"}}}"#
-                .into(),
-        ));
-        wire.push(mk(
-            "contentBlockDelta",
-            r#"{"contentBlockIndex":2,"delta":{"toolUse":{"input":"{\"x\":1}"}}}"#.into(),
-        ));
-        wire.push(mk(
-            "metadata",
-            r#"{"usage":{"inputTokens":11,"outputTokens":7,"totalTokens":18}}"#.into(),
-        ));
-        wire.push(mk("messageStop", r#"{"stopReason":"tool_use"}"#.into()));
+        let wire: Vec<Bytes> = vec![
+            mk("messageStart", r#"{"role":"assistant"}"#.into()),
+            mk(
+                "contentBlockDelta",
+                r#"{"contentBlockIndex":0,"delta":{"text":"Hello"}}"#.into(),
+            ),
+            mk(
+                "contentBlockDelta",
+                r#"{"contentBlockIndex":1,"delta":{"reasoningContent":{"text":"hmm"}}}"#.into(),
+            ),
+            mk(
+                "contentBlockStart",
+                r#"{"contentBlockIndex":2,"start":{"toolUse":{"toolUseId":"t1","name":"calc"}}}"#
+                    .into(),
+            ),
+            mk(
+                "contentBlockDelta",
+                r#"{"contentBlockIndex":2,"delta":{"toolUse":{"input":"{\"x\":1}"}}}"#.into(),
+            ),
+            mk(
+                "metadata",
+                r#"{"usage":{"inputTokens":11,"outputTokens":7,"totalTokens":18}}"#.into(),
+            ),
+            mk("messageStop", r#"{"stopReason":"tool_use"}"#.into()),
+        ];
 
         let stream = futures::stream::iter(wire.into_iter().map(Ok::<_, reqwest::Error>));
         let st = BedrockStreamState {

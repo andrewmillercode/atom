@@ -73,7 +73,7 @@ pub async fn find_provider_for_model(providers: &[Provider], model: &str) -> Opt
         let model = model.to_string();
         async move {
             let models = fetch_models(&p).await.unwrap_or_default();
-            let found = models.iter().any(|m| *m == model);
+            let found = models.contains(&model);
             (p, found)
         }
         .boxed()
@@ -284,9 +284,10 @@ pub async fn fetch_models(p: &Provider) -> anyhow::Result<Vec<String>> {
                     .unwrap_or_default()
                     .into_iter()
                     .collect::<HashSet<_>>();
-                return Ok(ids.into_iter().filter(|id| free.contains(id)).collect());
+                Ok(ids.into_iter().filter(|id| free.contains(id)).collect())
+            } else {
+                Ok(ids)
             }
-            return Ok(ids);
         }
         other => {
             if p.name == "ollama-local" {
@@ -643,11 +644,19 @@ pub(crate) mod testutil {
     use std::sync::{Mutex, MutexGuard};
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
-    pub fn test_lock() -> MutexGuard<'static, ()> {
-        match TEST_LOCK.lock() {
+    /// Opaque guard for [`test_lock`]. A newtype over the std guard:
+    /// the lock is deliberately held across `.await`s (it serializes
+    /// tests that mutate process-global state), which the std guard
+    /// would flag as `clippy::await_holding_lock` — here that is the
+    /// intended semantics, not a hazard.
+    pub struct TestLockGuard(#[allow(dead_code)] MutexGuard<'static, ()>);
+
+    pub fn test_lock() -> TestLockGuard {
+        let g = match TEST_LOCK.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
-        }
+        };
+        TestLockGuard(g)
     }
 
     /// Sets XDG_DATA_HOME to a fresh temp directory for the duration of
@@ -656,12 +665,6 @@ pub(crate) mod testutil {
         prev: Option<std::ffi::OsString>,
         #[allow(dead_code)]
         path: PathBuf,
-    }
-
-    impl DataDirGuard {
-        pub fn path(&self) -> &PathBuf {
-            &self.path
-        }
     }
 
     impl Drop for DataDirGuard {

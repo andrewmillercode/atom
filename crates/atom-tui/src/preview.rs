@@ -527,10 +527,7 @@ pub fn add_image(app: &mut App, name: &str, data: &[u8]) -> anyhow::Result<()> {
         rows: 0,
         num: next_image_num_excluding(&app.pending, &reserved),
     };
-    if image_size(&norm).is_some() {
-        p.cols = PREVIEW_COLS;
-        p.rows = PREVIEW_ROWS;
-    } else if kitty_terminal() {
+    if image_size(&norm).is_some() || kitty_terminal() {
         p.cols = PREVIEW_COLS;
         p.rows = PREVIEW_ROWS;
     }

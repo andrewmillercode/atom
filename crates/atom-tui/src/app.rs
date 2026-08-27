@@ -387,8 +387,7 @@ impl App {
             .saturating_sub(
                 1 + status_rows + STATUS_FOOTER_ROWS + 2 * PROMPT_PAD + self.preview_row_count(),
             )
-            .min(INPUT_MAX_HEIGHT)
-            .max(1);
+            .clamp(1, INPUT_MAX_HEIGHT);
         lines.min(max).max(1)
     }
 
@@ -534,11 +533,9 @@ impl App {
                         self.viewport_dirty = true;
                     }
                 }
-                BlockKind::Tool => {
-                    if !b.tool_done {
-                        b.lines = None;
-                        self.viewport_dirty = true;
-                    }
+                BlockKind::Tool if !b.tool_done => {
+                    b.lines = None;
+                    self.viewport_dirty = true;
                 }
                 _ => {}
             }
@@ -628,7 +625,7 @@ impl App {
                 && self
                     .content_lines
                     .get(raw.wrapping_sub(1))
-                    .map_or(false, |l| l.spans.is_empty())
+                    .is_some_and(|l| l.spans.is_empty())
             {
                 raw - 1
             } else {
@@ -2817,7 +2814,7 @@ impl App {
         }
         let _ = auth::remove_auth(&e.id);
         auth::remove_legacy_provider_key(&e.id);
-        return vec![Effect::ReloadProviders];
+        vec![Effect::ReloadProviders]
     }
 
     fn delete_selected_session(&mut self) -> Vec<Effect> {
@@ -4190,7 +4187,7 @@ mod tests {
             text: "hi".into(),
             ..Default::default()
         });
-        let long: String = std::iter::repeat("row line\n").take(20).collect();
+        let long: String = "row line\n".repeat(20);
         app.blocks.push(Block {
             kind: BlockKind::Tool,
             title: "Bash".into(),

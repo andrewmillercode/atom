@@ -29,7 +29,7 @@ pub const CONTEXT_CATEGORY_ORDER: [&str; 5] = [
 
 /// estimateTokens is the char/4 heuristic used for session usage.
 pub fn estimate_tokens(n: usize) -> i64 {
-    ((n + 3) / 4) as i64
+    n.div_ceil(4) as i64
 }
 
 pub fn estimate_message_chars(m: &Message) -> i64 {

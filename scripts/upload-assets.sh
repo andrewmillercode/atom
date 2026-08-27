@@ -9,13 +9,24 @@
 # a binary in it.
 #
 # Usage:
-#   scripts/upload-assets.sh <vX.Y.Z>   # e.g. v0.1.1
+#   scripts/upload-assets.sh [vX.Y.Z]   # e.g. v0.1.1
+#
+# The tag is optional: it defaults to the version in [workspace.package]
+# (Cargo.toml) — the same source the release workflow uses. Pass it only
+# to override.
 #
 # Requires: cargo, gh (authenticated: gh auth login). Run on macOS —
 # assets are macOS-only; there is no Linux build.
 set -euo pipefail
 
-TAG="${1:?usage: scripts/upload-assets.sh <vX.Y.Z>  (e.g. v0.1.1)}"
+if [ $# -ge 1 ]; then
+  TAG="$1"
+else
+  VER="$(awk '/^\[workspace\.package\]/{f=1;next} /^\[/{f=0} f && $1 == "version" {sub(/^version[[:space:]]*=[[:space:]]*"/, ""); sub(/".*$/, ""); print; exit}' Cargo.toml)"
+  [ -n "$VER" ] || { echo "error: could not read [workspace.package] version from Cargo.toml; pass a tag explicitly" >&2; exit 1; }
+  TAG="v${VER}"
+  echo "==> version ${TAG} (from Cargo.toml)"
+fi
 
 OS="$(uname -s)"
 ARCH="$(uname -m)"

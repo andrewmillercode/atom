@@ -25,10 +25,11 @@ use atom_core::types::{
 };
 use atom_tools::defs::without_tool;
 use chrono::Local;
-use futures::{Stream, StreamExt};
+use futures::{FutureExt, Stream, StreamExt};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -600,6 +601,30 @@ fn done_event(duration_ms: i64, model: &str) -> Value {
         "duration_ms": duration_ms,
         "model": model,
     })
+}
+
+/// runSessionTurnGuarded wraps run_session_turn so a turn task that dies
+/// mid-flight (a panic, most commonly) can never wedge the session: its
+/// turn-table registration — or the pre-start reservation — would
+/// otherwise stay behind, and every later /send would be rejected with
+/// 409 "session already has an active turn" until the server restarted.
+/// On the healthy path end_turn already deregistered the turn and
+/// force_end_session_turns is a no-op.
+pub async fn run_session_turn_guarded(
+    state: &Arc<AppState>,
+    sess: &mut Session,
+    id: &str,
+    opts: TurnOpts,
+    out: EventOut,
+    parent: CancelToken,
+) {
+    let res = AssertUnwindSafe(run_session_turn(state, sess, id, opts, out, parent))
+        .catch_unwind()
+        .await;
+    if res.is_err() {
+        eprintln!("atoms: turn task for session {id} panicked; clearing active-turn state");
+    }
+    state.turns.force_end_session_turns(id);
 }
 
 /// runSessionTurn processes one chat turn: it appends the user's

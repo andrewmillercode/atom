@@ -687,7 +687,7 @@ async fn handle_send(
     tokio::spawn(async move {
         let _guard = guard;
         let out = EventOut::Response(tx);
-        turn::run_session_turn(&state, &mut sess, &id, opts, out, disconnect).await;
+        turn::run_session_turn_guarded(&state, &mut sess, &id, opts, out, disconnect).await;
         let _ = done_tx.send(());
     });
     resp

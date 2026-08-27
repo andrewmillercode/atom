@@ -434,16 +434,14 @@ pub async fn execute_visualize(args_json: &str, _ctx: &ToolCtx<'_>) -> ToolOutco
         return ToolOutcome::from_text(format!("error: write viewer: {e}"));
     }
 
-    ToolOutcome::from_text(format!(
-        "rendered diagram \"{title}\" ({w}x{h} px)\n\
-         inline preview is shown in the atom TUI; expand it for a pan/zoom view in the browser\n\
-         {}",
-        diagram_marker(
-            &svg_path.display().to_string(),
-            &html_path.display().to_string(),
-            w,
-            h
-        ),
+    // The result is the bare machine-readable marker line: the block
+    // header already shows the title and the diagram itself is rendered
+    // inline, so no human-readable prose is added around it.
+    ToolOutcome::from_text(diagram_marker(
+        &svg_path.display().to_string(),
+        &html_path.display().to_string(),
+        w,
+        h,
     ))
 }
 

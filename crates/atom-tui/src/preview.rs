@@ -89,6 +89,19 @@ fn write_tty(s: &str) {
     let _ = tty.flush();
 }
 
+/// Writes raw bytes to the tty WITHOUT acquiring the lock. Only for
+/// callers that already hold [`lock_tty`] — the event loop's frame
+/// section, which must flush pending math-engine Kitty commands before
+/// drawing the frame that displays them (calling the locking variant
+/// there would deadlock).
+pub fn write_tty_locked_bytes(bytes: &[u8]) {
+    let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") else {
+        return;
+    };
+    let _ = tty.write_all(bytes);
+    let _ = tty.flush();
+}
+
 // ---------------------------------------------------------------------------
 // Paste parsing.
 // ---------------------------------------------------------------------------

@@ -1818,6 +1818,7 @@ impl App {
             | AppMsg::HotRebuilt(_)
             | AppMsg::ThemeReloaded(_)
             | AppMsg::Redraw
+            | AppMsg::MathWake
             | AppMsg::Heartbeat
             | AppMsg::SendReady { .. }
             | AppMsg::SubReady { .. } => Vec::new(),
@@ -3198,10 +3199,11 @@ impl App {
         }
     }
 
-    /// Check if a click at viewport (x, y) lands on the right-aligned
-    /// "⤢ open" hint in a visualize block's header row. The header sits
-    /// one row below the block start (offset 0 is the top pad row); the
-    /// hint is the last `right_w` columns of the boxed header text.
+    /// Check if a click at viewport (x, y) lands anywhere on a visualize
+    /// block. The entire card is the click target — header, summary rows,
+    /// and the inline image alike — and opens the browser pan/zoom viewer.
+    /// The block spans `block_start` (content row of its top pad row)
+    /// through `block_start + lines.len() - 1`.
     fn diagram_open_hit(&self, bi: usize, x: usize, y: usize) -> Option<String> {
         let d = self.blocks.get(bi)?.diagram.as_ref()?;
         if d.html.is_empty() {
@@ -3209,17 +3211,16 @@ impl App {
         }
         let block_start = *self.block_start.get(bi)?;
         let content_row = y.checked_sub(VIEWPORT_VPAD)? + self.scroll_y;
-        if content_row != block_start + 1 {
+        let lines = self.blocks[bi].lines.as_ref()?;
+        let last_row = block_start + lines.len().saturating_sub(1);
+        if content_row < block_start || content_row > last_row {
             return None;
         }
+        // Column: anywhere across the card (the boxed text starts one pad
+        // column in and spans the full inner width).
         let inner = self.inner_width().saturating_sub(2).max(1);
-        let right_w = unicode_width::UnicodeWidthStr::width(blocks::DIAGRAM_OPEN_HINT);
         let col = x.checked_sub(TUI_HPAD)?;
-        // The boxed header starts one pad column in, so the hint occupies
-        // roughly [inner - right_w + 1, inner + 1]; stay a column generous
-        // on each side.
-        let hit_start = inner.saturating_sub(right_w);
-        if col >= hit_start && col <= inner + 1 {
+        if col <= inner + 1 {
             Some(d.html.clone())
         } else {
             None
@@ -4223,7 +4224,7 @@ mod tests {
     }
 
     #[test]
-    fn click_on_open_hint_launches_diagram_viewer() {
+    fn click_anywhere_on_diagram_block_opens_viewer() {
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
         let mut app = App::new_test(80, 40);
         app.blocks.push(Block {
@@ -4245,8 +4246,8 @@ mod tests {
         });
         app.refresh_viewport();
 
-        // Header row: block start + 1 (offset 0 is the top pad row). The
-        // hint is right-aligned; its x sits at the end of the boxed text.
+        // The whole card is the click target. Header row: block start + 1
+        // (offset 0 is the top pad row).
         let y = (VIEWPORT_VPAD + app.block_start[0] + 1 - app.scroll_y) as u16;
         let inner = app.inner_width().saturating_sub(2).max(1);
         let x_hint = (TUI_HPAD + inner) as u16; // last text column
@@ -4263,7 +4264,7 @@ mod tests {
             "hint click must open the viewer: {fx:?}"
         );
 
-        // A click on the left side of the same header row is a no-op.
+        // A click on the left side of the same header row also opens.
         let ev = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 4,
@@ -4271,12 +4272,34 @@ mod tests {
             modifiers: KeyModifiers::empty(),
         };
         let fx = app.mouse(ev);
-        assert!(!fx.iter().any(|e| matches!(e, Effect::OpenLink { .. })));
-        // And a click one row above (the pad row) does nothing either.
+        assert!(
+            fx.iter()
+                .any(|e| matches!(e, Effect::OpenLink { uri } if uri == "file:///a.html")),
+            "header click outside the hint must also open: {fx:?}"
+        );
+
+        // A click on a body row (the inline image grid) opens too.
+        let lines = app.blocks[0].lines.as_ref().expect("block rendered");
+        let y_body = (VIEWPORT_VPAD + app.block_start[0] + lines.len().saturating_sub(1)
+            - app.scroll_y) as u16;
         let ev = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: x_hint,
-            row: y.saturating_sub(1),
+            row: y_body,
+            modifiers: KeyModifiers::empty(),
+        };
+        let fx = app.mouse(ev);
+        assert!(
+            fx.iter()
+                .any(|e| matches!(e, Effect::OpenLink { uri } if uri == "file:///a.html")),
+            "body click must open the viewer: {fx:?}"
+        );
+
+        // A click strictly above the card does nothing.
+        let ev = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x_hint,
+            row: y.saturating_sub(2),
             modifiers: KeyModifiers::empty(),
         };
         let fx = app.mouse(ev);

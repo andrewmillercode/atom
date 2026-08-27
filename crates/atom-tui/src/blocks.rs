@@ -145,6 +145,11 @@ pub struct Block {
     pub line_width: usize,
     pub line_show_r: bool,
     pub line_expanded: bool,
+    /// Math-engine generation this block's lines were rendered under:
+    /// 0 = rendered without math; otherwise a mismatch with
+    /// `math::generation()` means a formula finished rendering and the
+    /// cached lines are stale.
+    pub line_formula_gen: u64,
 }
 
 impl Default for Block {
@@ -172,6 +177,7 @@ impl Default for Block {
             line_width: 0,
             line_show_r: true,
             line_expanded: false,
+            line_formula_gen: 0,
         }
     }
 }
@@ -189,6 +195,11 @@ impl Block {
             return false;
         };
         if self.line_width != width {
+            return false;
+        }
+        // A block whose math was rendered under an older engine generation
+        // (a formula finished rendering since) must re-render.
+        if self.line_formula_gen != 0 && self.line_formula_gen != crate::math::generation() {
             return false;
         }
         if matches!(
@@ -994,10 +1005,21 @@ pub fn render_block_linked(
             if b.text.is_empty() {
                 return out;
             }
-            let md = atom_core::render::markdown::render_markdown(&b.text, width.max(1));
-            let parsed = ansi::ansi_to_lines_linked(&md);
-            out.lines.extend(parsed.lines);
-            out.links.extend(parsed.links);
+            // `$$…$$` display math goes through the math engine when one
+            // is running: ready formulas become Kitty placeholder rows and
+            // still-rendering/failed ones keep their LaTeX. `None` (no
+            // engine, no closed math) renders via the regular path.
+            if let Some(math) = crate::math::render_assistant_markdown(&b.text, width.max(1)) {
+                b.line_formula_gen = crate::math::generation();
+                out.lines.extend(math.lines);
+                out.links.extend(math.links);
+            } else {
+                b.line_formula_gen = 0;
+                let md = atom_core::render::markdown::render_markdown(&b.text, width.max(1));
+                let parsed = ansi::ansi_to_lines_linked(&md);
+                out.lines.extend(parsed.lines);
+                out.links.extend(parsed.links);
+            }
             if !b.model.is_empty() {
                 let footer = match b.turn_duration {
                     Some(duration) => {
@@ -2254,7 +2276,16 @@ mod tests {
         assert!(parse_diagram_marker("no marker here").is_none());
         let stripped = strip_diagram_marker(result);
         assert!(!stripped.contains("atom-diagram"));
-        assert!(stripped.starts_with("rendered diagram"));
+        // Prose around the marker (legacy stored results) survives the
+        // strip untouched...
+        assert!(stripped.contains("rendered diagram"));
+        // ...while a current marker-only result strips to nothing.
+        assert_eq!(
+            strip_diagram_marker(
+                "[atom-diagram] png=\"/a.png\" html=\"/a.html\" width=400 height=200"
+            ),
+            ""
+        );
         // Non-marker results pass through unchanged.
         assert_eq!(strip_diagram_marker("plain output"), "plain output");
     }
@@ -2412,10 +2443,9 @@ mod tests {
             tool_name: "visualize".into(),
             text: "Login".into(),
             tool_done: true,
-            result: "rendered diagram \"Login\" (400x200 px, saved at 2x density)\n \
-                     inline preview is shown in the atom TUI\n \
-                     [atom-diagram] png=/a.png html=/a.html width=400 height=200"
-                .into(),
+            // Current visualize results are the bare marker line; the
+            // block header + inline image carry all the information.
+            result: "[atom-diagram] png=/a.png html=/a.html width=400 height=200".into(),
             diagram: Some(DiagramRef {
                 png: "/a.png".into(),
                 html: "/a.html".into(),
@@ -2444,14 +2474,16 @@ mod tests {
             header.trim_end().ends_with("⤢ open"),
             "hint is right-aligned: {header:?}"
         );
-        // The machine marker never reaches the transcript.
+        // The machine marker never reaches the transcript, and a
+        // marker-only result leaves no summary prose behind.
         for line in &out.lines {
             assert!(!ansi::line_plain(line).contains("atom-diagram"));
+            assert!(
+                !ansi::line_plain(line).contains("rendered diagram"),
+                "no result prose: {:?}",
+                ansi::line_plain(line)
+            );
         }
-        assert!(out
-            .lines
-            .iter()
-            .any(|l| ansi::line_plain(l).contains("rendered diagram")));
         for line in &out.lines {
             assert_eq!(ansi::line_width(line), 80, "{:?}", ansi::line_plain(line));
         }

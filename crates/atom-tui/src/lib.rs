@@ -14,6 +14,7 @@ pub mod app;
 pub mod blocks;
 pub mod events;
 pub mod hot;
+pub mod math;
 pub mod outputtest;
 pub mod overlays;
 pub mod preview;
@@ -173,6 +174,11 @@ async fn event_loop(
         last_title: String::new(),
     };
 
+    // Display math (`$$…$$` in assistant messages): one engine per
+    // process, only when the terminal speaks the Kitty graphics
+    // protocol. Completion callbacks arrive here as AppMsg::MathWake.
+    math::init(tx.clone());
+
     // Terminal input lives in its own task so the EventStream is only ever
     // polled by one persistent future with a real waker.  Polling it via
     // now_or_never() (no-op waker) or dropping it mid-poll from select!
@@ -238,6 +244,10 @@ async fn event_loop(
         // cursor update are one escape sequence burst; a concurrent kitty
         // paint interleaving here is what garbled the TUI until resize.
         let tty_guard = preview::lock_tty();
+        // Flush newly rendered formula uploads/placements before the frame
+        // that displays their placeholder cells (same guard: these bytes
+        // must not interleave with the frame).
+        math::flush_terminal_commands();
         terminal.draw(|f| {
             cursor_pos = view::draw(app, f.area(), f.buffer_mut());
         })?;
@@ -390,6 +400,14 @@ fn dispatch_msg(
     if matches!(msg, AppMsg::Redraw) {
         terminal.clear()?;
         return Ok(true);
+    }
+    if matches!(msg, AppMsg::MathWake) {
+        // A display formula finished rendering in the background. Mark the
+        // viewport dirty so stale LaTeX fallbacks re-render into placeholder
+        // rows on the next frame; no full-screen clear needed (ratatui diffs
+        // the changed rows).
+        app.viewport_dirty = true;
+        return Ok(false);
     }
 
     // --hot rebuild finished: save state + exec the new binary.
@@ -623,7 +641,7 @@ async fn run_effects(
                 // Dial off the event loop so input/render/Esc stay live while
                 // the server warms up the stream (provider TTFB can be seconds).
                 tokio::spawn(async move {
-                    let mut resp = api::stream_send(&req).await;
+                    let mut resp = api::stream_send_healed(&req).await;
                     // The server may have shut down; restart and retry once.
                     if resp.is_err() && !api::is_running().await {
                         if api::ensure_server().await.is_ok() {
@@ -811,7 +829,11 @@ async fn run_effects(
                     if let Err(e) = api::pause_turn(&id, &pause_turn_id).await {
                         let _ = tx.send(AppMsg::Errored(e.to_string()));
                     }
-                    let mut resp = api::stream_send(&req).await;
+                    // The pause targeted the turn that was streaming, but the
+                    // server may have another registration behind it (raced
+                    // pause, stale entry): heal the same way a plain send
+                    // would instead of surfacing a 409.
+                    let mut resp = api::stream_send_healed(&req).await;
                     // The server may have shut down; restart and retry once.
                     if resp.is_err() && !api::is_running().await {
                         if api::ensure_server().await.is_ok() {

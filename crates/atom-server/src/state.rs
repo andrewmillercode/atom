@@ -433,6 +433,21 @@ impl TurnTable {
         maps.reserved.remove(id);
     }
 
+    /// Backstop for turn tasks that die mid-flight (a panic, most
+    /// commonly): removes every registered turn and releases the
+    /// reservation. A healthy turn already deregistered itself via
+    /// end_turn, so this is a no-op then. Without it, a dead turn task
+    /// would wedge the session — every later /send would be rejected
+    /// with 409 "session already has an active turn" until restart.
+    pub fn force_end_session_turns(&self, id: &str) {
+        let mut maps = self.0.lock().unwrap();
+        maps.reserved.remove(id);
+        if maps.turns.remove(id).is_some() {
+            maps.completed.insert(id.to_string());
+        }
+        maps.notify.notify_one();
+    }
+
     pub fn clear_pending_pauses(&self, id: &str) {
         self.0.lock().unwrap().pending_pauses.remove(id);
     }
@@ -694,6 +709,26 @@ mod tests {
 
         tt.end_turn("s", &handle);
         assert!(tt.try_prepare_session_turn("s"));
+    }
+
+    #[test]
+    fn force_end_session_turns_unwedges_a_dead_turn() {
+        let tt = TurnTable::default();
+        // A registered turn whose task died mid-flight.
+        let handle = tt.start_turn("w", "t");
+        // A reservation leaked before the turn task ever started.
+        assert!(tt.try_prepare_session_turn("r"));
+        assert!(tt.session_has_active_turn("w"));
+        assert!(tt.session_has_active_turn("r"));
+
+        tt.force_end_session_turns("w");
+        tt.force_end_session_turns("r");
+        assert!(!tt.session_has_active_turn("w"));
+        assert!(!tt.session_has_active_turn("r"));
+
+        // The session must accept new turns again after the backstop.
+        assert!(tt.try_prepare_session_turn("w"));
+        assert!(tt.try_prepare_session_turn("r"));
     }
 
     #[tokio::test]

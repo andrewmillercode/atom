@@ -1,6 +1,9 @@
 # Rust
 target/
 
+# Vendored crates (never commit; deps are pinned via Cargo.lock)
+vendor/
+
 # macOS
 .DS_Store
 

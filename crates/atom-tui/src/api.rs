@@ -68,11 +68,41 @@ pub async fn delete_session(id: &str) -> Result<Value> {
     atom_server::client::delete(&format!("/api/sessions/{id}")).await
 }
 
-/// pauseTurn asks the server to stop an active stream.
+/// pauseTurn asks the server to stop an active stream. An empty turn_id
+/// pauses every active turn of the session.
 pub async fn pause_turn(id: &str, turn_id: &str) -> Result<()> {
     let body = json!({ "turn_id": turn_id });
     atom_server::client::post(&format!("/api/sessions/{id}/pause"), &body).await?;
     Ok(())
+}
+
+/// isActiveTurnConflict reports whether a failed /send dial was rejected
+/// with 409 "session already has an active turn": the TUI believed the
+/// session idle, but the server still has a turn registered (a raced
+/// pause, a hung tool round, or a stale entry). Callers must never
+/// surface this; the recovery is exactly what the message asks for —
+/// pause the turn, then dial again.
+pub fn is_active_turn_conflict(err: &anyhow::Error) -> bool {
+    err.to_string().contains("already has an active turn")
+}
+
+/// streamSendHealed dials /send and recovers from the 409
+/// active-turn conflict instead of surfacing it: pause every active
+/// turn of the session, then retry once. The pause waits server-side
+/// until the turn has fully unwound, so the retry starts from a clean
+/// idle state. Any other error (or a second 409, meaning the turn
+/// would not stop) is returned untouched.
+pub async fn stream_send_healed(
+    req: &crate::events::SendRequest,
+) -> Result<tokio::sync::mpsc::Receiver<Value>> {
+    match stream_send(req).await {
+        Ok(rx) => Ok(rx),
+        Err(e) if is_active_turn_conflict(&e) => {
+            let _ = pause_turn(&req.session_id, "").await;
+            stream_send(req).await
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// compact folds history on an in-flight turn.

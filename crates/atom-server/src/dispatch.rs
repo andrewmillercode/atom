@@ -754,7 +754,7 @@ pub fn kickoff_dispatch_turn(
             Some(s) => s,
             None => return,
         };
-        crate::turn::run_session_turn(
+        crate::turn::run_session_turn_guarded(
             &state,
             &mut sess,
             &id,
@@ -881,7 +881,7 @@ async fn maybe_auto_continue_parent(
         compact_instructions: String::new(),
         skip_append: false,
     };
-    crate::turn::run_session_turn(
+    crate::turn::run_session_turn_guarded(
         state,
         &mut parent_sess,
         &parent_id_owned,

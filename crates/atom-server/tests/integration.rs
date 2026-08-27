@@ -755,3 +755,58 @@ async fn events_stream_and_last_viewer_cancels_turns() {
     }
     assert!(cancelled, "last subscriber leaving must cancel the turn");
 }
+
+/// A stale server-side turn must never brick a session: /send answers
+/// 409 while the turn is registered, the pause endpoint clears it (and
+/// waits for the turn to unwind), and the retried /send is accepted.
+/// This is the contract the TUI relies on to self-heal a desync between
+/// its "idle" composer state and the server's active-turn table, instead
+/// of surfacing "session already has an active turn" to the user.
+#[tokio::test(flavor = "multi_thread")]
+async fn send_conflict_clears_after_pause_and_retry() {
+    let env = TestEnv::new("send-conflict");
+    let state = spawn_server(&env, off_cfg()).await;
+    let sess = state.store.create("m", "/tmp", vec![]);
+    let sid = sess.id.clone();
+
+    // A live turn the client no longer knows about: it stops (end_turn)
+    // as soon as it is paused, the way run_session_turn unwinds.
+    let handle = state.turns.start_turn(&sid, "stale");
+    {
+        let handle = handle.clone();
+        let state = state.clone();
+        let sid = sid.clone();
+        tokio::spawn(async move {
+            handle.cancel_token().cancelled().await;
+            state.turns.end_turn(&sid, &handle);
+        });
+    }
+
+    // The send is rejected with the conflict the TUI must never surface.
+    let err = client::stream_send(&sid, &json!({"message": "hello", "turn_id": "t2"}))
+        .await
+        .expect_err("send must conflict while a turn is active");
+    assert!(err.to_string().starts_with("409: "), "got: {err}");
+    assert!(err.to_string().contains("already has an active turn"));
+
+    // Pause every active turn of the session (the TUI's heal path);
+    // the server waits for the turn to unwind before answering.
+    client::post(
+        &format!("/api/sessions/{sid}/pause"),
+        &json!({"turn_id": ""}),
+    )
+    .await
+    .expect("pause must succeed");
+    assert!(handle.is_cancelled());
+    assert!(!state.turns.session_has_active_turn(&sid));
+
+    // The retried send is accepted and streams events.
+    let mut rx = client::stream_send(&sid, &json!({"message": "hello", "turn_id": "t2"}))
+        .await
+        .expect("send must be accepted after the pause");
+    let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .expect("stream open");
+    assert_eq!(first["type"], "round_start");
+}

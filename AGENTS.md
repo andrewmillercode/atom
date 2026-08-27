@@ -33,6 +33,23 @@ This symlinks `target/debug/atom` and `target/debug/atoms` into
 `~/.local/bin`. Make sure `~/.local/bin` is on your `PATH`. The client
 starts the `atoms` server automatically if it isn't already running.
 
+## Dependencies
+
+Registry dependencies come from crates.io, pinned by the committed
+`Cargo.lock`. Published crate versions are immutable on crates.io and
+tarballs are checksum-verified against the lockfile at download, so the
+lockfile alone gives reproducible builds. `vendor/` is not used and is
+gitignored — do not commit it.
+
+- To add or bump a dependency use `cargo add` / `cargo update` normally,
+  then commit the updated `Cargo.lock`.
+- `ratatex` (LaTeX/Kitty math rendering in `atom-tui`) is pinned with
+  `=0.1.0` and `default-features = false`; the `ratex-*` engine crates sit
+  at `0.1.14` in `Cargo.lock`. Those exact versions passed the 2026-08
+  supply-chain audit — do not bump them casually.
+- If an offline/self-contained build artifact is ever needed, run
+  `cargo vendor` into a scratch directory and do not commit the result.
+
 ## Tests
 
 Run the test suite after any change:

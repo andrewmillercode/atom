@@ -33,7 +33,7 @@ The index is built on first run (and cached for subsequent runs) and invalidated
 
 ## Visualize
 
-Use `visualize` to render a Mermaid diagram inline in the atom TUI as a high-density image sized to the full block width; clicking anywhere on the rendered diagram opens the browser viewer (pan/zoom, Fit, SVG download, source panel). The inline image is theme-aware (a dark-theme raster is composited on dark terminals), and the viewer re-renders with the real Mermaid.js. Prefer `visualize` over ASCII-art diagrams for conceptual thinking, architecture, data flow, function call graphs, sequence diagrams, state machines, ER models, and similar.
+Use `visualize` to render a Mermaid diagram inline in the atom TUI as a high-density image sized to the full block width; clicking anywhere on the rendered diagram opens the browser viewer (pan/zoom, Fit, SVG download, source panel). The inline image is theme-aware (a dark-theme raster is composited on dark terminals), and the viewer re-renders with the real Mermaid.js. Prefer `visualize` over ASCII-art diagrams for conceptual thinking, architecture, data flow, function call graphs, sequence diagrams, state machines, ER models, and similar. Do not use for math unless explicitly requested for by user.
 
 **House style — every diagram follows it:**
 

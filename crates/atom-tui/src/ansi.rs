@@ -566,7 +566,11 @@ pub fn style_line_range(line: &Line<'static>, c0: usize, c1: usize, style: Style
             out.push(Span::raw(piece(hi, w)));
         }
     }
-    Line::from(out)
+    // Keep the line-level style: math placeholder rows carry the Kitty
+    // image id there, and a selection wipe would blank the formula.
+    let mut selected = Line::from(out);
+    selected.style = line.style;
+    selected
 }
 
 /// Cuts a line's visible cells to [c0, c1).
@@ -774,5 +778,18 @@ mod tests {
         assert_eq!(styled.spans.len(), 3);
         assert_eq!(styled.spans[1].content.as_ref(), "llo w");
         assert_eq!(styled.spans[1].style.bg, Some(Color::Red));
+    }
+
+    #[test]
+    fn range_styling_keeps_the_line_level_style() {
+        // Math placeholder rows carry the Kitty image id as the Line-level
+        // fg; selecting text over them must not strip it (blank formula).
+        let line = Line::styled(
+            "\u{10EEEE}\u{0305}\u{030D}",
+            Style::new().fg(Color::Rgb(9, 8, 7)),
+        );
+        let styled = style_line_range(&line, 0, 1, Style::new().bg(Color::Red));
+        assert_eq!(styled.style.fg, Some(Color::Rgb(9, 8, 7)));
+        assert_eq!(styled.spans[0].style.bg, Some(Color::Red));
     }
 }

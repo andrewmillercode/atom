@@ -52,29 +52,36 @@ pub fn init(wake: UnboundedSender<AppMsg>) {
     if !crate::preview::kitty_terminal() || ENGINE.get().is_some() {
         return;
     }
-    // Cell geometry matches the preview/diagram paint passes
-    // (preview.rs), which is what the transcript already assumes when it
-    // sizes placeholder grids. tmux passthrough is not used anywhere in
-    // atom; formulas are no different.
+    // Formula geometry is its own knob, deliberately not preview.rs's
+    // thumbnail constants: ratatex slices the rasterized formula into
+    // "cells" of this assumed size and kitty then scales the PNG across
+    // that many real terminal cells, so a smaller assumed cell renders
+    // the same glyphs larger — and sharper, because kitty downscales a
+    // denser PNG instead of upscaling a sparse one. 20×40 keeps the 1:2
+    // aspect of typical terminal cells (no distortion), and with dpi 240
+    // a display formula lands around two to two-and-a-half text lines
+    // tall instead of being squeezed into one. tmux passthrough is not
+    // used anywhere in atom; formulas are no different.
+    const MATH_CELL_W: u16 = 20;
+    const MATH_CELL_H: u16 = 40;
+    const MATH_DPI: u16 = 240;
     let engine = Ratatex::builder(TerminalProfile::kitty(
-            PixelSize::new(
-                crate::preview::PREVIEW_CELL_W as u16,
-                crate::preview::PREVIEW_CELL_H as u16,
-            ),
-            false,
-        ))
-        .colors(ColorScheme {
-            foreground: theme_foreground(),
-            // Transparent background + grayscale antialiasing composites
-            // onto whatever the terminal shows, so theme switches and
-            // selection highlights never leave formula halos.
-            background: None,
-        })
-        .on_update(move || {
-            // Best-effort: a send error means the TUI is shutting down.
-            let _ = wake.send(AppMsg::MathWake);
-        })
-        .build();
+        PixelSize::new(MATH_CELL_W, MATH_CELL_H),
+        false,
+    ))
+    .dpi(MATH_DPI)
+    .colors(ColorScheme {
+        foreground: theme_foreground(),
+        // Transparent background + grayscale antialiasing composites
+        // onto whatever the terminal shows, so theme switches and
+        // selection highlights never leave formula halos.
+        background: None,
+    })
+    .on_update(move || {
+        // Best-effort: a send error means the TUI is shutting down.
+        let _ = wake.send(AppMsg::MathWake);
+    })
+    .build();
     if let Ok(engine) = engine {
         let _ = ENGINE.set(engine);
     }
@@ -142,9 +149,9 @@ fn render_assistant_markdown_with(
     while let Some(segment) = iter.next() {
         match segment {
             MarkdownSegment::Text(prose) => {
-                let parsed = ansi::ansi_to_lines_linked(&atom_core::render::markdown::render_markdown(
-                    prose, width,
-                ));
+                let parsed = ansi::ansi_to_lines_linked(
+                    &atom_core::render::markdown::render_markdown(prose, width),
+                );
                 lines.extend(parsed.lines);
                 links.extend(parsed.links);
             }
@@ -158,7 +165,12 @@ fn render_assistant_markdown_with(
                     FormulaState::Ready(formula) => {
                         let rows = formula_to_lines(&formula);
                         if rows.is_empty() {
-                            render_math_fallback(&math.full_source().to_string(), width, &mut lines, &mut links);
+                            render_math_fallback(
+                                &math.full_source().to_string(),
+                                width,
+                                &mut lines,
+                                &mut links,
+                            );
                         } else {
                             links.extend(std::iter::repeat(Vec::new()).take(rows.len()));
                             lines.extend(rows);
@@ -173,7 +185,12 @@ fn render_assistant_markdown_with(
                     // Pending: the worker owns it and a MathWake will follow.
                     // Failed: deterministic (parse/limit) — keep the LaTeX.
                     FormulaState::Pending | FormulaState::Failed(_) | FormulaState::Unsupported => {
-                        render_math_fallback(&math.full_source().to_string(), width, &mut lines, &mut links);
+                        render_math_fallback(
+                            &math.full_source().to_string(),
+                            width,
+                            &mut lines,
+                            &mut links,
+                        );
                     }
                 }
                 // Paragraph break between the formula and following prose.
@@ -195,9 +212,8 @@ fn render_math_fallback(
     lines: &mut Vec<Line<'static>>,
     links: &mut Vec<Vec<ansi::LinkRegion>>,
 ) {
-    let parsed = ansi::ansi_to_lines_linked(&atom_core::render::markdown::render_markdown(
-        source, width,
-    ));
+    let parsed =
+        ansi::ansi_to_lines_linked(&atom_core::render::markdown::render_markdown(source, width));
     lines.extend(parsed.lines);
     links.extend(parsed.links);
 }
@@ -317,7 +333,11 @@ mod tests {
         let placeholder_rows: Vec<usize> = (2..ready.lines.len() - 2)
             .filter(|i| plain(&ready.lines[*i]).starts_with('\u{10EEEE}'))
             .collect();
-        assert!(!placeholder_rows.is_empty(), "no placeholder rows among {}", ready.lines.len());
+        assert!(
+            !placeholder_rows.is_empty(),
+            "no placeholder rows among {}",
+            ready.lines.len()
+        );
         for row in &placeholder_rows {
             let line = &ready.lines[*row];
             assert_eq!(line.spans.len(), 1);

@@ -250,12 +250,17 @@ fn write_line(buf: &mut Buffer, x: u16, y: u16, max_w: usize, line: &Line<'_>) {
     if y < buf.area.top() || y >= buf.area.bottom() || x >= buf.area.right() || max_w == 0 {
         return;
     }
+    // Line-level style sits under every span style (ratatui's draw model);
+    // math placeholder rows carry the Kitty image id there, so dropping it
+    // would leave the formula's reserved cells unresolvable (blank).
+    let base = ansi::frame_style().patch(line.style);
     let mut col = x;
     let mut last_col = None;
     let end = x
         .saturating_add(max_w.min(u16::MAX as usize) as u16)
         .min(buf.area.right());
     for span in &line.spans {
+        let span_style = base.patch(span.style);
         for ch in span.content.chars() {
             use unicode_width::UnicodeWidthChar;
             if ch == '\t' {
@@ -263,9 +268,7 @@ fn write_line(buf: &mut Buffer, x: u16, y: u16, max_w: usize, line: &Line<'_>) {
                     if col >= end {
                         return;
                     }
-                    buf[(col, y)]
-                        .set_char(' ')
-                        .set_style(ansi::frame_style().patch(span.style));
+                    buf[(col, y)].set_char(' ').set_style(span_style);
                     last_col = Some(col);
                     col += 1;
                 }
@@ -285,9 +288,7 @@ fn write_line(buf: &mut Buffer, x: u16, y: u16, max_w: usize, line: &Line<'_>) {
             if col.saturating_add(w as u16) > end {
                 return;
             }
-            buf[(col, y)]
-                .set_char(ch)
-                .set_style(ansi::frame_style().patch(span.style));
+            buf[(col, y)].set_char(ch).set_style(span_style);
             last_col = Some(col);
             col += w.max(1) as u16;
         }
@@ -1889,6 +1890,42 @@ mod tests {
 
         assert_eq!(buf[(0, 0)].symbol(), "e\u{0301}");
         assert_eq!(buf[(1, 0)].symbol(), "x");
+    }
+
+    #[test]
+    fn write_line_applies_line_level_styles() {
+        // Math placeholder rows carry the Kitty image id as the Line-level
+        // fg; the drawer must honor it or kitty cannot resolve the image.
+        let placeholder = "\u{10EEEE}\u{0305}\u{030D}\u{10EEEE}\u{0305}\u{030E}";
+        let mut buf = Buffer::empty(Rect::new(0, 0, 2, 1));
+        write_line(
+            &mut buf,
+            0,
+            0,
+            2,
+            &Line::styled(placeholder, Style::new().fg(Color::Rgb(9, 8, 7))),
+        );
+        assert_eq!(buf[(0, 0)].fg, Color::Rgb(9, 8, 7));
+        assert_eq!(buf[(1, 0)].fg, Color::Rgb(9, 8, 7));
+        // The frame background still applies underneath.
+        assert_eq!(buf[(0, 0)].bg, ansi::c_background());
+        assert_eq!(buf[(0, 0)].symbol(), "\u{10EEEE}\u{0305}\u{030D}");
+
+        // A span-level style still wins over the line-level style.
+        let mut buf = Buffer::empty(Rect::new(0, 0, 2, 1));
+        write_line(
+            &mut buf,
+            0,
+            0,
+            2,
+            &Line {
+                style: Style::new().fg(Color::Rgb(9, 8, 7)),
+                spans: vec![Span::styled("ab", Style::new().fg(Color::Rgb(1, 2, 3)))],
+                ..Default::default()
+            },
+        );
+        assert_eq!(buf[(0, 0)].fg, Color::Rgb(1, 2, 3));
+        assert_eq!(buf[(1, 0)].fg, Color::Rgb(1, 2, 3));
     }
 
     #[test]

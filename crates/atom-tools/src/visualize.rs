@@ -34,7 +34,7 @@ fn renderer() -> Option<PathBuf> {
 pub fn diagram_dir() -> PathBuf {
     dirs::data_dir()
         .unwrap_or_else(std::env::temp_dir)
-        .join("atom")
+        .join(atom_core::build::dir_leaf())
         .join("diagrams")
 }
 

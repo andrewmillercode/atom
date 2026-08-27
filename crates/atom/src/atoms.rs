@@ -3,7 +3,8 @@
 //! This is a thin entry point that runs the background HTTP server
 //! (the same code that `atom --serve` used to invoke). Shipping it as
 //! a separate binary means macOS Activity Monitor / `ps` display the
-//! process as "atoms" without any symlink or hard-link tricks.
+//! process as "atoms" (atomsdev for dev builds) without any symlink or
+//! hard-link tricks.
 //!
 //! The binary refuses to start unless the `_ATOM_LAUNCH` env var is set
 //! to the expected token — this prevents users from running it directly.

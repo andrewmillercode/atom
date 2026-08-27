@@ -25,13 +25,14 @@ struct SkillFrontmatter {
     description: String,
 }
 
-/// atomConfigDir is $XDG_CONFIG_HOME/atom, defaulting to ~/.config/atom.
+/// atomConfigDir is $XDG_CONFIG_HOME/atom, defaulting to ~/.config/atom
+/// (atom-dev for dev builds — see atom_core::build).
 pub fn atom_config_dir() -> Option<PathBuf> {
     let config_dir = match std::env::var("XDG_CONFIG_HOME") {
         Ok(v) if !v.is_empty() => PathBuf::from(v),
         _ => dirs::home_dir()?.join(".config"),
     };
-    Some(config_dir.join("atom"))
+    Some(config_dir.join(atom_core::build::dir_leaf()))
 }
 
 /// walkProjectDirs lists cwd then each parent up to home (closest first).
@@ -311,7 +312,7 @@ mod tests {
     fn discovers_from_xdg_and_project_overrides_user() {
         let (_h, xdg, cwd, hb) = hermetic();
         write_skill_md(
-            &xdg.join("atom").join("skills").join("hello"),
+            &xdg.join(atom_core::build::dir_leaf()).join("skills").join("hello"),
             "hello",
             "Say hi",
             "HELLO_BODY",
@@ -319,7 +320,7 @@ mod tests {
 
         let skills = discover_skills_in(
             &cwd.display().to_string(),
-            Some(&xdg.join("atom")),
+            Some(&xdg.join(atom_core::build::dir_leaf())),
             Some(&hb),
         );
         let s = skills.get("hello").expect("missing hello");
@@ -328,7 +329,7 @@ mod tests {
 
         // User catalog defines demo first; project .cursor/skills wins.
         write_skill_md(
-            &xdg.join("atom").join("skills").join("demo"),
+            &xdg.join(atom_core::build::dir_leaf()).join("skills").join("demo"),
             "demo",
             "user desc",
             "USER_BODY",
@@ -342,7 +343,7 @@ mod tests {
 
         let skills = discover_skills_in(
             &cwd.display().to_string(),
-            Some(&xdg.join("atom")),
+            Some(&xdg.join(atom_core::build::dir_leaf())),
             Some(&hb),
         );
         let s = skills.get("demo").expect("missing demo");
@@ -353,14 +354,14 @@ mod tests {
     #[test]
     fn execute_skill_loads_body_with_footer() {
         let (_h, xdg, cwd, hb) = hermetic();
-        let dir = xdg.join("atom").join("skills").join("pack");
+        let dir = xdg.join(atom_core::build::dir_leaf()).join("skills").join("pack");
         write_skill_md(&dir, "pack", "Pack files", "PACK_INSTRUCTIONS");
         std::fs::write(dir.join("helper.sh"), "echo hi").unwrap();
 
         let out = execute_skill_in(
             r#"{"name":"pack"}"#,
             &cwd.display().to_string(),
-            Some(&xdg.join("atom")),
+            Some(&xdg.join(atom_core::build::dir_leaf())),
             Some(&hb),
         );
         assert!(out.contains("PACK_INSTRUCTIONS"), "{out}");
@@ -372,7 +373,7 @@ mod tests {
         let out = execute_skill_in(
             r#"{"name":"nope"}"#,
             &cwd.display().to_string(),
-            Some(&xdg.join("atom")),
+            Some(&xdg.join(atom_core::build::dir_leaf())),
             Some(&hb),
         );
         assert!(out.contains("error: unknown skill \"nope\""), "{out}");
@@ -384,14 +385,14 @@ mod tests {
         let (_h, xdg, cwd, hb) = hermetic();
         let long_body = format!("SECRET_SKILL_BODY {}", "x".repeat(200));
         write_skill_md(
-            &xdg.join("atom").join("skills").join("longone"),
+            &xdg.join(atom_core::build::dir_leaf()).join("skills").join("longone"),
             "longone",
             "Use for long tasks",
             &long_body,
         );
         let msg = skills_catalog_message_roots(
             &cwd.display().to_string(),
-            Some(&xdg.join("atom")),
+            Some(&xdg.join(atom_core::build::dir_leaf())),
             Some(&hb),
         );
         assert!(msg.contains("Instructions from: skills"), "{msg}");

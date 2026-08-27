@@ -206,7 +206,9 @@ pub struct SessionInfo {
     pub updated_at: DateTime<Utc>,
 }
 
-/// atom data directory, honouring XDG_DATA_HOME (~/.local/share/atom).
+/// atom data directory, honouring XDG_DATA_HOME
+/// (~/.local/share/atom, or atom-dev for dev builds — see
+/// atom_core::build).
 pub fn data_dir() -> PathBuf {
     let base = std::env::var("XDG_DATA_HOME")
         .ok()
@@ -214,7 +216,7 @@ pub fn data_dir() -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|h| h.join(".local/share")))
         .unwrap_or_else(|| std::env::temp_dir().join("atom"));
-    let d = base.join("atom");
+    let d = base.join(crate::build::dir_leaf());
     let _ = std::fs::create_dir_all(&d);
     d
 }

@@ -29,9 +29,14 @@ To make `atom` available on your PATH during development:
 make install-dev
 ```
 
-This symlinks `target/debug/atom` and `target/debug/atoms` into
-`~/.local/bin`. Make sure `~/.local/bin` is on your `PATH`. The client
-starts the `atoms` server automatically if it isn't already running.
+This symlinks the debug build into `~/.local/bin` as `atomdev` and
+`atomsdev` (release installs keep the `atom`/`atoms` names). Make sure
+`~/.local/bin` is on your `PATH`. The client starts the `atomsdev`
+server automatically if it isn't already running.
+
+Dev and release never mix: dev binaries and the auto-updater are
+gated on the debug build, and dev state lives in `atom-dev` data/
+config dirs (see `crates/atom-core/src/build.rs`).
 
 ## Dependencies
 
@@ -85,7 +90,7 @@ There are two binaries in `crates/atom/Cargo.toml`:
   it requires a launch token set by `atom` (`_ATOM_LAUNCH=managed`).
 
 Both are built by `cargo build` and installed together by `make install-dev`
-or `make install`.
+(as `atomdev`/`atomsdev`) or `make install` (as `atom`/`atoms`).
 
 ## Bundled instructions
 

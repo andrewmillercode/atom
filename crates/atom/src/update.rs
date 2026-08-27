@@ -82,7 +82,13 @@ pub async fn run() {
     };
 
     match decide(current, &latest, &state.attempted, state.failures) {
-        Decision::Run | Decision::Blacklisted => return,
+        Decision::Run => return,
+        Decision::Blacklisted => {
+            eprintln!(
+                "[atom] update to v{latest} unavailable — earlier attempts failed, staying on v{current}"
+            );
+            return;
+        }
         Decision::Attempt => {}
     }
 
@@ -95,15 +101,21 @@ pub async fn run() {
         Err(e) => {
             state.failures = state.failures.saturating_add(1);
             let _ = save_state(&state);
-            eprintln!("atom: auto-update failed: {e:#}");
+            eprintln!("[atom] upgrade failed, falling back to v{current}");
+            eprintln!("  {e:#}");
         }
     }
 }
 
 /// Gates that skip the updater entirely (silently, no network).
 fn gates_pass() -> bool {
-    // Dev build: canonicalized path under target/debug or target/release.
-    // Also protects `make install-dev` symlinks into ~/.local/bin.
+    // Dev builds never self-update: they run from target/ or the
+    // atomdev symlink and are refreshed by `make install-dev`.
+    if cfg!(debug_assertions) {
+        return false;
+    }
+    // Release build run straight out of target/ (or symlinked into it):
+    // the Makefile owns that tree, so leave it alone.
     if let Ok(exe) = std::env::current_exe() {
         if let Ok(canon) = exe.canonicalize() {
             let s = canon.to_string_lossy();
@@ -169,9 +181,9 @@ async fn attempt_update(
         Lock::Acquired => {}
     }
 
-    // c. Print + download the tarball into the stage dir.
+    // c. Announce + download the tarball into the stage dir.
     let current = env!("CARGO_PKG_VERSION");
-    eprintln!("atom: updating v{current} → v{latest}…");
+    eprintln!("[atom] new version found: v{latest} — upgrading from v{current}…");
     std::fs::create_dir_all(&stage_dir)?;
     let url = download_url(release, latest);
     let archive = stage_dir.join(format!(
@@ -213,7 +225,7 @@ async fn attempt_update(
     // g. Mark success and let the caller relaunch.
     state.failures = 0;
     save_state(state)?;
-    eprintln!("atom: updated to v{latest}, restarting…");
+    eprintln!("[atom] success! restarting…");
     Ok(true)
 }
 

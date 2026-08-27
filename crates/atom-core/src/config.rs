@@ -164,12 +164,12 @@ pub fn bundled_web_search_profile(id: &str) -> Option<WebSearchProfile> {
 
 pub fn config_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME").filter(|dir| !dir.is_empty()) {
-        return PathBuf::from(dir).join("atom");
+        return PathBuf::from(dir).join(crate::build::dir_leaf());
     }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".config")
-        .join("atom")
+        .join(crate::build::dir_leaf())
 }
 
 pub fn config_path() -> PathBuf {

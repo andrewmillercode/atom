@@ -1047,11 +1047,11 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let xdg = home.path().join("xdg");
         let cwd = home.path().join("proj");
-        std::fs::create_dir_all(xdg.join("atom")).unwrap();
+        std::fs::create_dir_all(xdg.join(atom_core::build::dir_leaf())).unwrap();
         std::fs::create_dir_all(cwd.join(".cursor")).unwrap();
 
         std::fs::write(
-            xdg.join("atom").join("mcp.json"),
+            xdg.join(atom_core::build::dir_leaf()).join("mcp.json"),
             r#"{"mcpServers":{
                 "github":{"command":"npx","args":["-y","@modelcontextprotocol/server-github"]},
                 "gone":{"command":"echo","disabled":true},
@@ -1070,7 +1070,7 @@ mod tests {
 
         let cfgs = load_mcp_configs_in(
             &cwd.display().to_string(),
-            Some(&xdg.join("atom")),
+            Some(&xdg.join(atom_core::build::dir_leaf())),
             Some(home.path()),
         );
         assert!(
@@ -1085,13 +1085,13 @@ mod tests {
     fn environment_aliases_env_when_env_missing() {
         let home = tempfile::tempdir().unwrap();
         let xdg = home.path().join("xdg");
-        std::fs::create_dir_all(xdg.join("atom")).unwrap();
+        std::fs::create_dir_all(xdg.join(atom_core::build::dir_leaf())).unwrap();
         std::fs::write(
-            xdg.join("atom").join("mcp.json"),
+            xdg.join(atom_core::build::dir_leaf()).join("mcp.json"),
             r#"{"mcpServers":{"srv":{"command":"run","environment":{"KEY":"v"}}}}"#,
         )
         .unwrap();
-        let cfgs = load_mcp_configs_in("/", Some(&xdg.join("atom")), Some(home.path()));
+        let cfgs = load_mcp_configs_in("/", Some(&xdg.join(atom_core::build::dir_leaf())), Some(home.path()));
         assert_eq!(cfgs["srv"].env["KEY"], "v");
     }
 

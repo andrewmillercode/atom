@@ -588,23 +588,50 @@ fn data_dir_pid_path() -> PathBuf {
     atom_core::session::store::data_dir().join("server.pid")
 }
 
-/// Locate the `atoms` server binary. It lives next to the running `atom`
+/// Locate the `atoms` server binary (named `atomsdev` in dev builds —
+/// see atom_core::build). It lives next to the running `atom`
 /// executable (same directory), which works for both dev-symlink and
 /// release installs.
 fn find_server_binary() -> Result<PathBuf> {
     let exe = std::env::current_exe().context("find own executable")?;
     let dir = exe.parent().context("executable has no parent dir")?;
-    let candidate = dir.join("atoms");
+    let name = atom_core::build::server_name();
+
+    // 1. Next to the running executable: the release install dir, the
+    //    `atomsdev` install-dev symlink, or the target/debug alias.
+    let candidate = dir.join(&name);
     if candidate.is_file() {
         return Ok(candidate);
     }
-    // Fallback: look on PATH (handles `cargo install` putting both
-    // binaries in ~/.cargo/bin which is already on PATH).
-    if let Some(found) = atom_core::deps::find_in_path("atoms") {
+    // 2. Fallback: look on PATH (handles `cargo install` putting both
+    //    binaries in ~/.cargo/bin which is already on PATH).
+    if let Some(found) = atom_core::deps::find_in_path(&name) {
         return Ok(found);
     }
+    // 3. Dev builds: plain `cargo run` with no make symlinks — fall back
+    //    to the `atoms` artifact beside the canonicalized executable.
+    //    Canonicalizing matters on macOS, where current_exe keeps the
+    //    atomdev symlink path: resolving it lands in target/debug, whose
+    //    sibling `atoms` is the matching dev server. The unresolved dir
+    //    is deliberately not searched: it can hold a release `atoms`
+    //    that serves the release socket, which a dev client can't use.
+    if atom_core::build::is_dev() {
+        if let Ok(canon) = exe.canonicalize() {
+            if let Some(parent) = canon.parent() {
+                let sibling = parent.join("atoms");
+                if sibling.is_file() {
+                    return Ok(sibling);
+                }
+            }
+        }
+    }
+    let hint = if atom_core::build::is_dev() {
+        " — dev builds expect the atomdev/atomsdev symlinks; run `make install-dev`"
+    } else {
+        ""
+    };
     Err(anyhow!(
-        "cannot find `atoms` server binary (looked in {} and PATH)",
+        "cannot find `{name}` server binary (looked in {} and PATH){hint}",
         dir.display()
     ))
 }

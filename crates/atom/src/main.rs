@@ -61,7 +61,7 @@ const USAGE: &str = "usage: atom [-model id] [-key key] [-url base] [-session id
 fn help_text() -> String {
     format!(
         "{USAGE}\n\nversion: {}\nbuild: {}",
-        env!("CARGO_PKG_VERSION"),
+        atom_core::build::version_label(),
         env!("ATOM_BUILD")
     )
 }
@@ -124,7 +124,7 @@ fn parse_args() -> Result<Args> {
                 std::process::exit(0);
             }
             "v" | "version" => {
-                println!("{}", env!("CARGO_PKG_VERSION"));
+                println!("{}", atom_core::build::version_label());
                 std::process::exit(0);
             }
             other => return Err(anyhow!("unknown flag: -{other}\n{USAGE}")),
@@ -144,9 +144,15 @@ async fn main() {
 async fn run() -> Result<()> {
     let args = parse_args()?;
 
-    // Auto-update first, before the deps check and TUI. Skipped in
-    // stats/output-test/hot modes.
+    // Interactive launch (everything but stats/output-test/hot): print a
+    // startup line, then auto-update before the deps check and TUI, so
+    // the upgrade flow is visible on the clean terminal:
+    //
+    //   [atom] initializing…
+    //   [atom] new version found: v0.1.1 — upgrading from v0.1.0…
+    //   [atom] success! restarting…        (or: upgrade failed, falling back)
     if !args.stats && !args.output_test && !args.hot {
+        eprintln!("[atom] initializing…");
         update::run().await;
     }
 

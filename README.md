@@ -8,7 +8,7 @@ You can use it with your OpenAI, Opencode Go, Ollama Cloud subscriptions, with o
 
 ## Why make a harness?
 
-Most harnesses that I've tried personally use too much memory/cpu, look ugly, or don't have enough features. I've made Atom to be resource efficient, capable, while looking polished at the same time. I think the harness can substantially improve model performance, so a personal harness was worthwhile working on.
+Most harnesses that I've tried personally use too much memory/cpu, look ugly, or don't have enough features. I've made Atom to be resource efficient, capable, while looking polished at the same time. Harnesses can substantially improve model performance, so a personal harness tuned to my preferences was worthwhile working on.
 
 ## What can Atom do?
 

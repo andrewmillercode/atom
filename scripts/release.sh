@@ -1,52 +1,44 @@
 #!/usr/bin/env bash
 #
-# Build the atom and atoms binaries and attach them to a GitHub release.
+# Manual release: tag, cut a DRAFT GitHub release, then build + publish
+# locally via scripts/upload-assets.sh.
 #
-# Merging a PR labeled `release` into main does this automatically via
+# Merging a PR labeled `release` into main (or a manual workflow_dispatch)
+# does the tag + draft-release part automatically via
 # .github/workflows/release.yml; use this script only for manual releases.
 #
 # Usage:
 #   scripts/release.sh <vX.Y.Z>
 #
-#   <vX.Y.Z>  the version tag, e.g. v0.1.0
-#
-# Steps:
-#   1. cargo build --release --bin atom --bin atoms
-#   2. package both binaries as atom-<version>-<os>-<arch>.tar.gz
-#   3. tag + push
-#   4. create the GitHub release and attach the archive
-#
 # Requires: cargo, git, gh (authenticated: gh auth login).
 # Commit your work first — the tag points at whatever is committed.
 set -euo pipefail
 
-VERSION="${1:?usage: scripts/release.sh <vX.Y.Z>  (e.g. v0.1.0)}"
+TAG="${1:?usage: scripts/release.sh <vX.Y.Z>  (e.g. v0.1.1)}"
 
 if ! git diff --quiet; then
   echo "error: working tree has uncommitted changes; commit first" >&2
   exit 1
 fi
 
-echo "==> building"
-cargo build --release --bin atom --bin atoms
+if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1 \
+  || gh release view "$TAG" >/dev/null 2>&1; then
+  echo "error: ${TAG} already exists (tag or release); to finish it: scripts/upload-assets.sh ${TAG}" >&2
+  exit 1
+fi
 
-# Normalize arch so names match what install.sh requests (aarch64 -> arm64).
-ARCH="$(uname -m)"
-case "$ARCH" in
-  arm64|aarch64) ARCH="arm64" ;;
-  x86_64|amd64)  ARCH="x86_64" ;;
-esac
-ASSET="atom-${VERSION}-$(uname -s)-${ARCH}.tar.gz"
-echo "==> packaging ${ASSET}"
-tar -czf "$ASSET" -C target/release atom atoms
+echo "==> tagging ${TAG}"
+git tag "$TAG"
+git push origin "$TAG"
 
-echo "==> tagging ${VERSION}"
-git tag "$VERSION"
-git push origin "$VERSION"
+NOTES_FILE="releases/${TAG}.md"
+echo "==> creating draft release ${TAG}"
+if [ -f "$NOTES_FILE" ]; then
+  gh release create "$TAG" --draft --verify-tag --title "atom ${TAG}" \
+    --notes-file "$NOTES_FILE" --generate-notes
+else
+  echo "==> warning: ${NOTES_FILE} not found — falling back to auto-generated notes" >&2
+  gh release create "$TAG" --draft --verify-tag --title "atom ${TAG}" --generate-notes
+fi
 
-echo "==> creating release + attaching binary"
-gh release create "$VERSION" "$ASSET" \
-  --title "atom $VERSION" \
-  --notes "Prebuilt binary for $(uname -s) $(uname -m)."
-
-echo "done: https://github.com/andrewmillercode/atom/releases/tag/${VERSION}"
+exec scripts/upload-assets.sh "$TAG"

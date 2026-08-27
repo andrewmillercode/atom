@@ -1,4 +1,4 @@
-# Automated releases.
+# Automated releases. macOS arm64 only — nothing is built in CI.
 #
 # Merging a PR labeled `release` into main cuts a release:
 #   - the merge commit on main becomes the tag + release target
@@ -7,9 +7,12 @@
 #   - the release body comes from releases/v<version>.md at that commit;
 #     if the file is missing, notes fall back to GitHub's auto-generated
 #     PR list (warns in the run log)
-#   - binaries are built for macOS arm64 and Linux x86_64 and attached as
-#     atom-v<version>-<Darwin|Linux>-<arm64|x86_64>.tar.gz — the exact names
-#     install.sh and the auto-updater (crates/atom/src/update.rs) look for
+#   - the release is created as a DRAFT: invisible to install.sh and the
+#     auto-updater until a locally-built binary is attached and it is
+#     published (the publish guard refuses to go live without an asset)
+#
+# Finishing the release happens locally on a mac:
+#   scripts/upload-assets.sh v<version>    # build, package, upload, publish
 #
 # Labeling a PR that is already merged triggers the same flow, so both
 # label-then-merge and merge-then-label work. workflow_dispatch cuts a
@@ -49,13 +52,12 @@ jobs:
     outputs:
       version: ${{ steps.ver.outputs.version }}
       created: ${{ steps.ver.outputs.created }}
-      sha: ${{ steps.ver.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.merge_commit_sha || inputs.ref || github.sha }}
 
-      - name: Read version, create tag + release
+      - name: Read version, tag, create draft release
         id: ver
         env:
           GH_TOKEN: ${{ github.token }}
@@ -67,10 +69,10 @@ jobs:
             exit 1
           fi
           echo "version=${VER}" >> "$GITHUB_OUTPUT"
-          echo "sha=${MERGE_SHA}" >> "$GITHUB_OUTPUT"
 
-          if git ls-remote --exit-code --tags origin "refs/tags/v${VER}" >/dev/null 2>&1; then
-            echo "tag v${VER} already exists — skipping release"
+          if git ls-remote --exit-code --tags origin "refs/tags/v${VER}" >/dev/null 2>&1 \
+            || gh release view "v${VER}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release v${VER} already exists (tag or draft) — skipping"
             echo "created=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -82,49 +84,16 @@ jobs:
               --target "$MERGE_SHA" \
               --title "atom v${VER}" \
               --notes-file "$NOTES_FILE" \
-              --generate-notes
+              --generate-notes \
+              --draft
           else
             echo "::warning::${NOTES_FILE} not found at the merge commit — falling back to auto-generated release notes"
             gh release create "v${VER}" \
               --repo "$GITHUB_REPOSITORY" \
               --target "$MERGE_SHA" \
               --title "atom v${VER}" \
-              --generate-notes
+              --generate-notes \
+              --draft
           fi
           echo "created=true" >> "$GITHUB_OUTPUT"
-
-  assets:
-    needs: release
-    if: needs.release.outputs.created == 'true'
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-latest
-            os_name: Darwin
-            arch: arm64
-          - os: ubuntu-latest
-            os_name: Linux
-            arch: x86_64
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.release.outputs.sha }}
-
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build
-        run: cargo build --release --locked --bin atom --bin atoms
-
-      - name: Package
-        run: |
-          ASSET="atom-v${{ needs.release.outputs.version }}-${{ matrix.os_name }}-${{ matrix.arch }}.tar.gz"
-          tar -czf "$ASSET" -C target/release atom atoms
-          echo "ASSET=$ASSET" >> "$GITHUB_ENV"
-
-      - name: Upload to release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release upload "v${{ needs.release.outputs.version }}" "$ASSET" --clobber --repo "$GITHUB_REPOSITORY"
+          echo "next: build + publish locally with scripts/upload-assets.sh v${VER}"

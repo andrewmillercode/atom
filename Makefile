@@ -34,9 +34,12 @@ BIN_DIR_SED = $(subst /,\/,$(BIN_DIR))
 CARGO ?= cargo
 CARGO_BUILD_FLAGS ?=
 
-.PHONY: all build build-release install-dev install uninstall clean
+.PHONY: all dev build build-release install-dev install uninstall clean release
 
 all: build
+
+# Dev build (debug profile; also emits the atomdev/atomsdev dev aliases).
+dev: build
 
 build:
 	$(CARGO) build $(CARGO_BUILD_FLAGS) --bin atom --bin atoms --bin atomdev --bin atomsdev
@@ -80,8 +83,8 @@ uninstall:
 clean:
 	$(CARGO) clean
 
-# Tag, build, and attach the binary to a GitHub release (requires gh authed).
-#   make release VERSION=v0.1.0
+# Interactive release: confirm version, build, pick notes, tag a commit,
+# publish the GitHub release with the binary attached (requires gh authed).
+#   make release
 release:
-	@test -n "$(VERSION)" || (echo "usage: make release VERSION=v0.1.0" && exit 1)
-	./scripts/release.sh "$(VERSION)"
+	@./scripts/release.sh

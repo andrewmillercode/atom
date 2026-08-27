@@ -2,6 +2,9 @@
 #
 # Build the atom and atoms binaries and attach them to a GitHub release.
 #
+# Merging a PR labeled `release` into main does this automatically via
+# .github/workflows/release.yml; use this script only for manual releases.
+#
 # Usage:
 #   scripts/release.sh <vX.Y.Z>
 #

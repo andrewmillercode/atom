@@ -13,3 +13,4 @@ vendor/
 
 # Local scratch
 *.log
+.clippywork/

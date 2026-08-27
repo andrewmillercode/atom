@@ -207,8 +207,7 @@ mod tests {
         let reasoning = app
             .blocks
             .iter()
-            .filter(|b| b.kind == BlockKind::Reasoning)
-            .next_back()
+            .rfind(|b| b.kind == BlockKind::Reasoning)
             .expect("reasoning block");
         assert!(
             reasoning.active,

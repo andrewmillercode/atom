@@ -8,7 +8,7 @@ use atom_core::types::ToolDef;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -57,6 +57,10 @@ pub struct McpTool {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn cache_key(name: &str, cwd: &str) -> String {
+    let cwd = std::fs::canonicalize(cwd)
+        .unwrap_or_else(|_| PathBuf::from(cwd))
+        .to_string_lossy()
+        .into_owned();
     format!("{name}\x00{cwd}")
 }
 
@@ -252,7 +256,7 @@ pub struct McpCallResult {
 }
 
 pub(crate) enum Transport {
-    Stdio(StdioSession),
+    Stdio(Box<StdioSession>),
     Http(HttpSession),
 }
 
@@ -358,12 +362,11 @@ impl StdioSession {
                 continue; // notifications / other responses
             }
             if let Some(err) = v.get("error") {
-                return Err(format!(
-                    "{}",
-                    err.get("message")
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("tool error")
-                ));
+                return Err(err
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("tool error")
+                    .to_string());
             }
             return Ok(v.get("result").cloned().unwrap_or(serde_json::Value::Null));
         }
@@ -541,12 +544,11 @@ impl HttpSession {
             return Err("response id mismatch".to_string());
         }
         if let Some(err) = v.get("error") {
-            return Err(format!(
-                "{}",
-                err.get("message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("request failed")
-            ));
+            return Err(err
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("request failed")
+                .to_string());
         }
         Ok(v.get("result").cloned().unwrap_or(serde_json::Value::Null))
     }
@@ -665,14 +667,14 @@ async fn connect_transport(
             if cfg.command.is_empty() {
                 return Err("missing command".to_string());
             }
+            let cwd = Path::new(cwd);
+            if !cwd.is_absolute() {
+                return Err("MCP stdio requires an absolute session cwd".to_string());
+            }
             use tokio::io::AsyncBufReadExt;
             let mut cmd = tokio::process::Command::new(&cfg.command);
             cmd.args(&cfg.args)
-                .current_dir(if cwd.is_empty() {
-                    Path::new(".")
-                } else {
-                    Path::new(cwd)
-                })
+                .current_dir(cwd)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null())
@@ -689,7 +691,7 @@ async fn connect_transport(
                 stdout: tokio::io::BufReader::new(stdout).lines(),
                 next_id: 0,
             };
-            Ok(Transport::Stdio(sess))
+            Ok(Transport::Stdio(Box::new(sess)))
         }
         other => Err(format!("unsupported type \"{other}\"")),
     }
@@ -1045,11 +1047,11 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let xdg = home.path().join("xdg");
         let cwd = home.path().join("proj");
-        std::fs::create_dir_all(xdg.join("atom")).unwrap();
+        std::fs::create_dir_all(xdg.join(atom_core::build::dir_leaf())).unwrap();
         std::fs::create_dir_all(cwd.join(".cursor")).unwrap();
 
         std::fs::write(
-            xdg.join("atom").join("mcp.json"),
+            xdg.join(atom_core::build::dir_leaf()).join("mcp.json"),
             r#"{"mcpServers":{
                 "github":{"command":"npx","args":["-y","@modelcontextprotocol/server-github"]},
                 "gone":{"command":"echo","disabled":true},
@@ -1068,7 +1070,7 @@ mod tests {
 
         let cfgs = load_mcp_configs_in(
             &cwd.display().to_string(),
-            Some(&xdg.join("atom")),
+            Some(&xdg.join(atom_core::build::dir_leaf())),
             Some(home.path()),
         );
         assert!(
@@ -1083,13 +1085,17 @@ mod tests {
     fn environment_aliases_env_when_env_missing() {
         let home = tempfile::tempdir().unwrap();
         let xdg = home.path().join("xdg");
-        std::fs::create_dir_all(xdg.join("atom")).unwrap();
+        std::fs::create_dir_all(xdg.join(atom_core::build::dir_leaf())).unwrap();
         std::fs::write(
-            xdg.join("atom").join("mcp.json"),
+            xdg.join(atom_core::build::dir_leaf()).join("mcp.json"),
             r#"{"mcpServers":{"srv":{"command":"run","environment":{"KEY":"v"}}}}"#,
         )
         .unwrap();
-        let cfgs = load_mcp_configs_in("/", Some(&xdg.join("atom")), Some(home.path()));
+        let cfgs = load_mcp_configs_in(
+            "/",
+            Some(&xdg.join(atom_core::build::dir_leaf())),
+            Some(home.path()),
+        );
         assert_eq!(cfgs["srv"].env["KEY"], "v");
     }
 

@@ -6,6 +6,8 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+mod update;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct LastModel {
     #[serde(default)]
@@ -53,11 +55,18 @@ fn save_last_model_state(provider_name: &str, model: &str, thinking: &str) {
     }
 }
 
-const USAGE: &str = "usage: atom [-serve] [-model id] [-key key] [-url base] [-session id]
+const USAGE: &str = "usage: atom [-model id] [-key key] [-url base] [-session id]
                      [-stats [-stats-days N]] [--output-test] [--hot] [-no-deps]";
 
+fn help_text() -> String {
+    format!(
+        "{USAGE}\n\nversion: {}\nbuild: {}",
+        atom_core::build::version_label(),
+        atom_core::build::build_label()
+    )
+}
+
 struct Args {
-    serve: bool,
     model: String,
     key: String,
     url: String,
@@ -72,7 +81,6 @@ struct Args {
 
 fn parse_args() -> Result<Args> {
     let mut a = Args {
-        serve: false,
         model: String::new(),
         key: String::new(),
         url: String::new(),
@@ -101,7 +109,6 @@ fn parse_args() -> Result<Args> {
                 .ok_or_else(|| anyhow!("flag needs an argument: -{name}"))
         };
         match name.as_str() {
-            "serve" => a.serve = true,
             "model" => a.model = next_val()?,
             "key" => a.key = next_val()?,
             "url" => a.url = next_val()?,
@@ -113,7 +120,11 @@ fn parse_args() -> Result<Args> {
             "hot-state" => a.hot_state = Some(next_val()?),
             "no-deps" => a.no_deps = true,
             "h" | "help" => {
-                println!("{USAGE}");
+                println!("{}", help_text());
+                std::process::exit(0);
+            }
+            "v" | "version" => {
+                println!("{}", atom_core::build::version_label());
                 std::process::exit(0);
             }
             other => return Err(anyhow!("unknown flag: -{other}\n{USAGE}")),
@@ -133,18 +144,25 @@ async fn main() {
 async fn run() -> Result<()> {
     let args = parse_args()?;
 
-    // Ensure required tool dependencies (rg, uvx) exist before the
-    // server spawns or the TUI takes over the terminal, while it is
-    // still in a clean, non-raw state. Interactive on a TTY client;
-    // headless (-serve) warns only, unless ATOM_DEPS_AUTOINSTALL=1.
-    if !args.no_deps && !args.output_test && !args.stats {
-        let interactive = !args.serve && unsafe { libc::isatty(libc::STDIN_FILENO) == 1 };
-        atom_core::deps::ensure_on_startup(interactive, &atom_core::deps::RealInstaller).await;
+    // Interactive launch (everything but stats/output-test/hot): print a
+    // startup line, then auto-update before the deps check and TUI, so
+    // the upgrade flow is visible on the clean terminal:
+    //
+    //   [atom] initializing…
+    //   [atom] new version found: v0.1.1 — upgrading from v0.1.0…
+    //   [atom] success! restarting…        (or: upgrade failed, falling back)
+    if !args.stats && !args.output_test && !args.hot {
+        eprintln!("[atom] initializing…");
+        update::run().await;
     }
 
-    // Server mode: start the server and block until it shuts down.
-    if args.serve {
-        return atom_server::http::run_server().await;
+    // Ensure required tool dependencies (rg, uvx, merman-cli) exist
+    // before the server spawns or the TUI takes over the terminal, while
+    // it is still in a clean, non-raw state. Interactive on a TTY client;
+    // headless (-serve) warns only, unless ATOM_DEPS_AUTOINSTALL=1.
+    if !args.no_deps && !args.output_test && !args.stats {
+        let interactive = unsafe { libc::isatty(libc::STDIN_FILENO) == 1 };
+        atom_core::deps::ensure_on_startup(interactive, &atom_core::deps::RealInstaller).await;
     }
 
     // Output-test mode: canned session demo, no server or key involved.
@@ -299,6 +317,18 @@ async fn run() -> Result<()> {
     };
 
     launch_tui(providers, sel_provider, sel_model, args, Some(session)).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn help_identifies_version_and_build() {
+        let help = help_text();
+        assert!(help.contains(env!("CARGO_PKG_VERSION")));
+        assert!(help.contains(atom_core::build::build_label()));
+    }
 }
 
 async fn launch_tui(

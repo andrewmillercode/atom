@@ -340,11 +340,7 @@ pub fn parse_unified_diff(diff: &str) -> (String, String, Vec<DiffSideLine>) {
                 new_parts.push(code);
             }
             _ => {
-                let code = if line.starts_with(' ') {
-                    &line[1..]
-                } else {
-                    line
-                };
+                let code = line.strip_prefix(' ').unwrap_or(line);
                 rows.push(DiffSideLine {
                     kind: b' ',
                     code: code.to_string(),

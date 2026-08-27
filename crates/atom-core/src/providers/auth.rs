@@ -56,10 +56,7 @@ pub fn load_auth_store() -> HashMap<String, AuthEntry> {
         Ok(b) => b,
         Err(_) => return HashMap::new(),
     };
-    match serde_json::from_slice::<HashMap<String, AuthEntry>>(&b) {
-        Ok(store) => store,
-        Err(_) => HashMap::new(),
-    }
+    serde_json::from_slice::<HashMap<String, AuthEntry>>(&b).unwrap_or_default()
 }
 
 pub fn save_auth_store(store: &HashMap<String, AuthEntry>) -> anyhow::Result<()> {

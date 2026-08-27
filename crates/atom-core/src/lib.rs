@@ -1,5 +1,6 @@
 //! atom-core: shared types and pure logic for the Rust port of atom.
 
+pub mod build;
 pub mod config;
 pub mod deps;
 pub mod providers;

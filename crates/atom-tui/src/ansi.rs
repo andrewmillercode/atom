@@ -53,6 +53,9 @@ pub fn c_card_light() -> Color {
 pub fn c_select() -> Color {
     theme_color(atom_core::render::colors::ThemeColor::Select)
 }
+pub fn c_syntax_type() -> Color {
+    theme_color(atom_core::render::colors::ThemeColor::SyntaxType)
+}
 
 fn theme_color(role: atom_core::render::colors::ThemeColor) -> Color {
     hex_color(&atom_core::render::colors::theme_color(role))
@@ -98,6 +101,11 @@ pub fn style_prompt_border() -> Style {
 pub fn style_img_chip() -> Style {
     Style::new().fg(c_background()).bg(c_primary())
 }
+pub fn style_file_chip() -> Style {
+    Style::new()
+        .fg(c_syntax_type())
+        .add_modifier(Modifier::BOLD)
+}
 pub fn style_query_sel() -> Style {
     Style::new().fg(c_background()).bg(c_primary())
 }
@@ -115,7 +123,7 @@ pub fn frame_style() -> Style {
 // ANSI parsing.
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Default)]
 struct Attrs {
     fg: Option<Color>,
     bg: Option<Color>,
@@ -124,20 +132,6 @@ struct Attrs {
     underline: bool,
     crossed_out: bool,
     dim: bool,
-}
-
-impl Default for Attrs {
-    fn default() -> Self {
-        Attrs {
-            fg: None,
-            bg: None,
-            bold: false,
-            italic: false,
-            underline: false,
-            crossed_out: false,
-            dim: false,
-        }
-    }
 }
 
 impl Attrs {
@@ -218,9 +212,8 @@ fn indexed_color(n: u16) -> Color {
 
 enum Tok {
     Text(String),
-    /// OSC 8 link open (uri dropped: we strip OSC8 but keep the text
-    /// styled secondary + underlined).
-    LinkStart,
+    /// OSC 8 link open, carrying the target URI.
+    LinkStart(String),
     LinkEnd,
 }
 
@@ -281,7 +274,7 @@ fn tokenize(s: &str) -> Vec<Tok> {
                         toks.push(if uri.is_empty() {
                             Tok::LinkEnd
                         } else {
-                            Tok::LinkStart
+                            Tok::LinkStart(uri.to_string())
                         });
                     }
                 }
@@ -344,6 +337,105 @@ fn apply_sgr(attrs: &mut Attrs, params: &[u16]) {
     }
 }
 
+/// A clickable OSC 8 hyperlink region on one rendered line: visible
+/// cells [c0, c1) open `uri`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkRegion {
+    pub c0: usize,
+    pub c1: usize,
+    pub uri: String,
+}
+
+/// Parser state threaded across the lines of one ANSI block so
+/// multi-line links keep their URI (the wrapper never re-emits an open
+/// sequence on continuation lines).
+#[derive(Default)]
+struct ParseState {
+    attrs: Attrs,
+    link: Option<String>,
+}
+
+/// Accumulates one line's spans while tracking visible columns, so
+/// link text can be recorded as cell ranges.
+#[derive(Default)]
+struct LineBuilder {
+    spans: Vec<Span<'static>>,
+    regions: Vec<LinkRegion>,
+    buf: String,
+    /// visible column where `buf` starts
+    buf_col: usize,
+    /// visible column just past `buf`
+    col: usize,
+}
+
+impl LineBuilder {
+    fn push_text(&mut self, t: &str) {
+        use unicode_width::UnicodeWidthStr;
+        self.buf.push_str(t);
+        self.col += t.width();
+    }
+
+    fn flush(&mut self, st: &ParseState, link_override: Option<Style>) {
+        if self.buf.is_empty() {
+            return;
+        }
+        let style = if st.link.is_some() {
+            merge_link_style(st.attrs.style(), link_override)
+        } else {
+            st.attrs.style()
+        };
+        let content = std::mem::take(&mut self.buf);
+        self.spans.push(Span::styled(content, style));
+        if let Some(uri) = st.link.as_ref() {
+            let (c0, c1) = (self.buf_col, self.col);
+            match self.regions.last_mut() {
+                Some(last) if last.uri == *uri && last.c1 == c0 => last.c1 = c1,
+                _ => self.regions.push(LinkRegion {
+                    c0,
+                    c1,
+                    uri: uri.clone(),
+                }),
+            }
+        }
+        self.buf_col = self.col;
+    }
+}
+
+fn parse_line_linked(
+    s: &str,
+    link_override: Option<Style>,
+    st: &mut ParseState,
+) -> (Line<'static>, Vec<LinkRegion>) {
+    let mut lb = LineBuilder::default();
+    for tok in tokenize(s) {
+        match tok {
+            Tok::Text(t) => {
+                if t.starts_with('\x1b') && t.ends_with('m') && t.len() > 2 {
+                    lb.flush(st, link_override);
+                    let inner = &t[2..t.len() - 1];
+                    let params: Vec<u16> = inner
+                        .split(';')
+                        .map(|p| p.parse::<u16>().unwrap_or(0))
+                        .collect();
+                    apply_sgr(&mut st.attrs, &params);
+                } else {
+                    lb.push_text(&t);
+                }
+            }
+            Tok::LinkStart(uri) => {
+                lb.flush(st, link_override);
+                st.link = Some(uri);
+            }
+            Tok::LinkEnd => {
+                lb.flush(st, link_override);
+                st.link = None;
+            }
+        }
+    }
+    lb.flush(st, link_override);
+    (Line::from(lb.spans), lb.regions)
+}
+
 /// Converts an ANSI-styled string into one ratatui Line. OSC 8 wrappers
 /// are stripped; link text keeps secondary+underline styling per spec.
 pub fn ansi_to_line(s: &str) -> Line<'static> {
@@ -352,75 +444,37 @@ pub fn ansi_to_line(s: &str) -> Line<'static> {
 
 /// Like [`ansi_to_line`] but `link_style` overrides the default link look.
 pub fn ansi_to_line_with(s: &str, link_override: Option<Style>) -> Line<'static> {
-    let mut attrs = Attrs::default();
-    let mut in_link = false;
-    ansi_to_line_with_state(s, link_override, &mut attrs, &mut in_link)
+    let mut st = ParseState::default();
+    parse_line_linked(s, link_override, &mut st).0
 }
 
-fn ansi_to_line_with_state(
-    s: &str,
-    link_override: Option<Style>,
-    attrs: &mut Attrs,
-    in_link: &mut bool,
-) -> Line<'static> {
-    let mut spans: Vec<Span> = Vec::new();
-    let mut buf = String::new();
+/// Like [`ansi_to_line`] but also returns the clickable link regions
+/// (visible-cell ranges plus URI) of the single line.
+pub fn ansi_to_line_linked(s: &str) -> (Line<'static>, Vec<LinkRegion>) {
+    let mut st = ParseState::default();
+    parse_line_linked(s, None, &mut st)
+}
 
-    for tok in tokenize(s) {
-        match tok {
-            Tok::Text(t) => {
-                if t.starts_with('\x1b') && t.ends_with('m') && t.len() > 2 {
-                    let inner = &t[2..t.len() - 1];
-                    let params: Vec<u16> = inner
-                        .split(';')
-                        .map(|p| p.parse::<u16>().unwrap_or(0))
-                        .collect();
-                    if !buf.is_empty() {
-                        let st = if *in_link {
-                            merge_link_style(attrs.style(), link_override)
-                        } else {
-                            attrs.style()
-                        };
-                        spans.push(Span::styled(std::mem::take(&mut buf), st));
-                    }
-                    apply_sgr(attrs, &params);
-                } else {
-                    buf.push_str(&t);
-                }
-            }
-            Tok::LinkStart => {
-                if !buf.is_empty() {
-                    let st = if *in_link {
-                        merge_link_style(attrs.style(), link_override)
-                    } else {
-                        attrs.style()
-                    };
-                    spans.push(Span::styled(std::mem::take(&mut buf), st));
-                }
-                *in_link = true;
-            }
-            Tok::LinkEnd => {
-                if !buf.is_empty() {
-                    let st = if *in_link {
-                        merge_link_style(attrs.style(), link_override)
-                    } else {
-                        attrs.style()
-                    };
-                    spans.push(Span::styled(std::mem::take(&mut buf), st));
-                }
-                *in_link = false;
-            }
-        }
+/// Styled lines plus, per line, the OSC 8 clickable regions.
+pub struct LinkedLines {
+    pub lines: Vec<Line<'static>>,
+    /// Same length as `lines`; regions in visible-column coordinates.
+    pub links: Vec<Vec<LinkRegion>>,
+}
+
+/// Like [`ansi_to_lines`] but also returns the clickable link regions,
+/// threading link state across lines so a link wrapped onto several
+/// rows is clickable on each of them.
+pub fn ansi_to_lines_linked(s: &str) -> LinkedLines {
+    let mut st = ParseState::default();
+    let mut lines = Vec::new();
+    let mut links = Vec::new();
+    for part in s.split('\n') {
+        let (line, regions) = parse_line_linked(part, None, &mut st);
+        lines.push(line);
+        links.push(regions);
     }
-    if !buf.is_empty() {
-        let st = if *in_link {
-            merge_link_style(attrs.style(), link_override)
-        } else {
-            attrs.style()
-        };
-        spans.push(Span::styled(buf, st));
-    }
-    Line::from(spans)
+    LinkedLines { lines, links }
 }
 
 fn merge_link_style(base: Style, override_style: Option<Style>) -> Style {
@@ -437,11 +491,7 @@ fn merge_link_style(base: Style, override_style: Option<Style>) -> Style {
 
 /// Splits an ANSI string into multiple styled Lines on '\n'.
 pub fn ansi_to_lines(s: &str) -> Vec<Line<'static>> {
-    let mut attrs = Attrs::default();
-    let mut in_link = false;
-    s.split('\n')
-        .map(|line| ansi_to_line_with_state(line, None, &mut attrs, &mut in_link))
-        .collect()
+    ansi_to_lines_linked(s).lines
 }
 
 /// Plain-text content of a styled line.
@@ -502,7 +552,11 @@ pub fn style_line_range(line: &Line<'static>, c0: usize, c1: usize, style: Style
             out.push(Span::raw(piece(hi, w)));
         }
     }
-    Line::from(out)
+    // Keep the line-level style: math placeholder rows carry the Kitty
+    // image id there, and a selection wipe would blank the formula.
+    let mut selected = Line::from(out);
+    selected.style = line.style;
+    selected
 }
 
 /// Cuts a line's visible cells to [c0, c1).
@@ -563,6 +617,68 @@ mod tests {
             .add_modifier
             .contains(Modifier::UNDERLINED));
         assert!(!text.contains('\x1b'));
+    }
+
+    #[test]
+    fn osc8_regions_capture_uri_and_cells() {
+        let s = format!(
+            "{}link{} tail",
+            atom_core::render::links::osc8_open("https://x.co"),
+            atom_core::render::links::osc8_close()
+        );
+        let (line, regions) = ansi_to_line_linked(&s);
+        assert_eq!(line_plain(&line), "link tail");
+        assert_eq!(
+            regions,
+            vec![LinkRegion {
+                c0: 0,
+                c1: 4,
+                uri: "https://x.co".to_string(),
+            }]
+        );
+        assert_eq!(cut_line_range(&line, 0, 4), "link");
+    }
+
+    #[test]
+    fn osc8_regions_thread_across_lines() {
+        let s = format!(
+            "{}first\nsecond{}",
+            atom_core::render::links::osc8_open("https://x.co"),
+            atom_core::render::links::osc8_close()
+        );
+        let linked = ansi_to_lines_linked(&s);
+        assert_eq!(linked.lines.len(), 2);
+        assert_eq!(linked.links.len(), 2);
+        assert_eq!(linked.links[0][0].c0, 0);
+        assert_eq!(linked.links[0][0].c1, 5);
+        assert_eq!(linked.links[1][0].c0, 0);
+        assert_eq!(linked.links[1][0].c1, 6);
+        assert!(linked.links.iter().all(|rs| rs[0].uri == "https://x.co"));
+    }
+
+    #[test]
+    fn wrapped_link_is_clickable_on_every_row() {
+        use atom_core::render::links::wrap_linked;
+        let body = wrap_linked(
+            "prose before and then https://example.com/very/long/url and some prose after",
+            24,
+            "",
+            "",
+        );
+        let linked = ansi_to_lines_linked(&body);
+        let hits: Vec<String> = linked
+            .lines
+            .iter()
+            .zip(&linked.links)
+            .filter_map(|(line, regions)| regions.first().map(|r| cut_line_range(line, r.c0, r.c1)))
+            .collect();
+        assert!(!hits.is_empty(), "wrapped link produced no regions");
+        for frag in &hits {
+            assert!(
+                "https://example.com/very/long/url".contains(frag.as_str()),
+                "fragment {frag:?} is not part of the link"
+            );
+        }
     }
 
     #[test]
@@ -648,5 +764,18 @@ mod tests {
         assert_eq!(styled.spans.len(), 3);
         assert_eq!(styled.spans[1].content.as_ref(), "llo w");
         assert_eq!(styled.spans[1].style.bg, Some(Color::Red));
+    }
+
+    #[test]
+    fn range_styling_keeps_the_line_level_style() {
+        // Math placeholder rows carry the Kitty image id as the Line-level
+        // fg; selecting text over them must not strip it (blank formula).
+        let line = Line::styled(
+            "\u{10EEEE}\u{0305}\u{030D}",
+            Style::new().fg(Color::Rgb(9, 8, 7)),
+        );
+        let styled = style_line_range(&line, 0, 1, Style::new().bg(Color::Red));
+        assert_eq!(styled.style.fg, Some(Color::Rgb(9, 8, 7)));
+        assert_eq!(styled.spans[0].style.bg, Some(Color::Red));
     }
 }

@@ -10,7 +10,8 @@ use atom_core::providers::codex::{
     do_openai_codex_round, marshal_openai_codex_request, openai_codex_auth_for_key,
 };
 use atom_core::providers::{
-    bedrock_style_for_url, context_window_tokens, provider_name_for_url, reasoning_field_for_url,
+    anthropic_style_for_url, bedrock_style_for_url, context_window_tokens,
+    model_supports_image_input, provider_name_for_url, reasoning_field_for_url, stream_anthropic,
     stream_bedrock, stream_chat,
 };
 use atom_core::session::compaction::{
@@ -18,15 +19,17 @@ use atom_core::session::compaction::{
     llm_messages, should_compact_with_threshold, COMPACTION_MODEL_ID,
 };
 use atom_core::session::store::{usage_for_display, Session};
-use atom_core::session::title::{generate_and_store_title, title_provider};
+use atom_core::session::title::{generate_title, title_provider};
 use atom_core::types::{
     ChatRequest, Message, StreamOptions, StreamResult, StreamToolCallDelta, ToolCall,
 };
 use atom_tools::defs::without_tool;
 use chrono::Local;
-use futures::{Stream, StreamExt};
+use futures::{FutureExt, Stream, StreamExt};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -36,6 +39,19 @@ use std::time::{Duration, Instant};
 /// calls queued, the turn ended with no done event, and a later "?" got
 /// "I'm mid-implementation".
 pub const MAX_TOOL_ROUNDS: usize = 500;
+pub const MAX_TOOL_OUTPUT_BYTES: usize = 128 * 1024;
+
+fn cap_tool_output(text: &mut String) {
+    if text.len() <= MAX_TOOL_OUTPUT_BYTES {
+        return;
+    }
+    let mut end = MAX_TOOL_OUTPUT_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text.push_str("\n... truncated at tool output byte limit");
+}
 
 // ---------------------------------------------------------------------------
 // NDJSON output sink.
@@ -72,6 +88,23 @@ fn event(map: Vec<(&str, Value)>) -> Value {
         obj.insert(k.to_string(), v);
     }
     Value::Object(obj)
+}
+
+/// strip_images_for_text_only_model removes attached images from every
+/// message so a text-only model does not reject the request with a 400.
+/// Messages that carried only an image (no text) get a placeholder so
+/// their content is not empty, which some APIs reject outright. Only the
+/// outgoing messages are touched; the persisted session keeps the images.
+fn strip_images_for_text_only_model(msgs: &mut [Message]) {
+    for m in msgs.iter_mut() {
+        if m.images.is_empty() {
+            continue;
+        }
+        m.images.clear();
+        if m.content.trim().is_empty() {
+            m.content = "[image attached]".to_string();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -209,6 +242,7 @@ pub fn assistant_message(
         role: "assistant".into(),
         content: result.content.clone(),
         reasoning: result.reasoning.clone(),
+        reasoning_signature: result.reasoning_signature.clone(),
         reasoning_ms: result.reasoning_ms,
         tool_calls: tool_calls.map(|t| t.to_vec()).unwrap_or_default(),
         provider: provider_name_for_url(base_url),
@@ -228,6 +262,7 @@ pub fn assistant_message(
 /// before the server split. When either cancellation token fires (the
 /// turn was paused), it stops reading and returns the partial reply so
 /// far.
+#[allow(clippy::too_many_arguments)]
 pub async fn stream_model_to_client<S>(
     state: &AppState,
     out: &EventOut,
@@ -235,6 +270,7 @@ pub async fn stream_model_to_client<S>(
     chunks: S,
     turn_cancel: &CancelToken,
     parent_cancel: &CancelToken,
+    round_cancel: &CancelToken,
     reasoning_field: &str,
 ) -> anyhow::Result<StreamResult>
 where
@@ -242,6 +278,7 @@ where
 {
     let mut reply = String::new();
     let mut reasoning = String::new();
+    let mut reasoning_signature = String::new();
     let mut accumulator = ToolCallAccumulator::default();
     let mut usage = None;
     let mut finish_reason = String::new();
@@ -251,12 +288,14 @@ where
     loop {
         // Stop reading when the turn was paused. The cancelled request
         // also closes the body, so this is just a fast path.
-        if turn_cancel.is_cancelled() || parent_cancel.is_cancelled() {
+        if turn_cancel.is_cancelled() || parent_cancel.is_cancelled() || round_cancel.is_cancelled()
+        {
             break;
         }
         let item = tokio::select! {
             _ = turn_cancel.cancelled() => None,
             _ = parent_cancel.cancelled() => None,
+            _ = round_cancel.cancelled() => None,
             item = chunks.next() => item,
         };
         let chunk = match item {
@@ -285,6 +324,12 @@ where
                 }
             } else if rt.is_empty() && !choice.delta.reasoning_content.is_empty() {
                 rt = choice.delta.reasoning_content.clone();
+            }
+            // Claude/Bedrock attach an opaque signature to each thinking
+            // block. Keep the latest one so the assistant turn can be
+            // replayed with it (reasoning preserved across turns).
+            if !choice.delta.reasoning_signature.is_empty() {
+                reasoning_signature = choice.delta.reasoning_signature.clone();
             }
             if !rt.is_empty() {
                 let ev = event(vec![("type", json!("reasoning")), ("text", json!(rt))]);
@@ -324,6 +369,7 @@ where
     Ok(StreamResult {
         content: reply,
         reasoning,
+        reasoning_signature,
         reasoning_ms: 0,
         tool_calls: accumulator.list(),
         usage,
@@ -339,37 +385,49 @@ fn empty_response(result: &StreamResult) -> bool {
 // Persistence helpers.
 // ---------------------------------------------------------------------------
 
-/// Propagates the fields Go mutated through the shared *Session pointer
-/// onto the stored session so the next save persists them (the Rust
-/// store hands out clones).
-fn sync_back(store: &atom_core::session::store::SessionStore, id: &str, sess: &Session) {
-    store.modify(id, |s| {
-        s.usage = sess.usage.clone();
-        s.compaction_summary = sess.compaction_summary.clone();
-        s.compacted_through = sess.compacted_through;
-        s.thinking = sess.thinking.clone();
-    });
+async fn save_turn_snapshot(state: &Arc<AppState>, sess: &Session, id: &str) -> bool {
+    let snapshot = sess.clone();
+    let title = fallback_title(sess);
+    let id = id.to_string();
+    state
+        .store_call(move |store| store.update_turn_snapshot(&id, &snapshot, &title))
+        .await
 }
 
 /// persistSession saves a session's messages. A generated LLM title is
 /// kept; otherwise the first user message (truncated) is used so the
 /// picker has a name immediately. Title generation runs in the background.
 pub async fn persist_session(state: &Arc<AppState>, sess: &Session, id: &str) {
-    let mut title = String::new();
-    if !sess.title_generated {
-        for m in &sess.messages {
-            if m.role == "user" {
-                title = truncate_bytes_ellipsis(&m.content, 60);
-                break;
-            }
-        }
+    if !save_turn_snapshot(state, sess, id).await {
+        return;
     }
-    sync_back(&state.store, id, sess);
-    state.store.update(id, sess.messages.clone(), &title);
     state.subs.broadcast(id, &json!({"type": "saved"}));
     if !sess.title_generated {
         kickoff_title_generation(state, id.to_string());
     }
+}
+
+/// persistSessionNow saves a session's messages mid-turn without a
+/// `saved` broadcast (that would trigger a racy full reload on viewing
+/// clients while the stream is live) and without scheduling title
+/// generation — the end-of-turn persist still kicks title generation
+/// once. Viewing clients learn about the user message from the
+/// dedicated `user_message` event broadcast at turn start.
+async fn persist_session_now(state: &Arc<AppState>, sess: &Session, id: &str) {
+    save_turn_snapshot(state, sess, id).await;
+}
+
+/// fallbackTitle derives the picker name from the first user message.
+fn fallback_title(sess: &Session) -> String {
+    if sess.title_generated {
+        return String::new();
+    }
+    for m in &sess.messages {
+        if m.role == "user" {
+            return truncate_bytes_ellipsis(&m.content, 60);
+        }
+    }
+    String::new()
 }
 
 /// Go slices the title bytes raw (`title[:60]`); truncate at the last
@@ -392,15 +450,36 @@ pub fn kickoff_title_generation(state: &Arc<AppState>, id: String) {
     let state = state.clone();
     tokio::spawn(async move {
         let target = title_provider().await;
-        if let Some(title) = generate_and_store_title(
-            &state.store,
-            &id,
-            &target.base_url,
-            &target.key,
-            &target.model,
-        )
-        .await
-        {
+        let load_id = id.clone();
+        let Some(sess) = state.store_call(move |store| store.get(&load_id)).await else {
+            return;
+        };
+        if sess.title_generated {
+            return;
+        }
+        let Ok(title) =
+            generate_title(&sess, None, &target.base_url, &target.key, &target.model).await
+        else {
+            return;
+        };
+        if title.is_empty() {
+            return;
+        }
+        let update_id = id.clone();
+        let stored_title = title.clone();
+        let stored = state
+            .store_call(move |store| {
+                if store
+                    .get(&update_id)
+                    .is_none_or(|session| session.title_generated)
+                {
+                    return false;
+                }
+                store.update_title(&update_id, &stored_title);
+                true
+            })
+            .await;
+        if stored {
             state
                 .subs
                 .broadcast(&id, &json!({"type": "title", "text": title}));
@@ -448,7 +527,6 @@ pub async fn fold_session(
         let ev = usage_event(&shown);
         emit(state, out, id, &ev).await;
     }
-    persist_session(state, sess, id).await;
     Ok(())
 }
 
@@ -486,6 +564,23 @@ impl TurnCtx {
     }
 }
 
+async fn await_round<F, T>(
+    future: F,
+    turn_cancel: &CancelToken,
+    parent_cancel: &CancelToken,
+    round_cancel: &CancelToken,
+) -> Option<T>
+where
+    F: Future<Output = T>,
+{
+    tokio::select! {
+        _ = turn_cancel.cancelled() => None,
+        _ = parent_cancel.cancelled() => None,
+        _ = round_cancel.cancelled() => None,
+        output = future => Some(output),
+    }
+}
+
 fn fold_error_event(err: &anyhow::Error) -> Value {
     event(vec![
         ("type", json!("error")),
@@ -507,6 +602,30 @@ fn done_event(duration_ms: i64, model: &str) -> Value {
         "duration_ms": duration_ms,
         "model": model,
     })
+}
+
+/// runSessionTurnGuarded wraps run_session_turn so a turn task that dies
+/// mid-flight (a panic, most commonly) can never wedge the session: its
+/// turn-table registration — or the pre-start reservation — would
+/// otherwise stay behind, and every later /send would be rejected with
+/// 409 "session already has an active turn" until the server restarted.
+/// On the healthy path end_turn already deregistered the turn and
+/// force_end_session_turns is a no-op.
+pub async fn run_session_turn_guarded(
+    state: &Arc<AppState>,
+    sess: &mut Session,
+    id: &str,
+    opts: TurnOpts,
+    out: EventOut,
+    parent: CancelToken,
+) {
+    let res = AssertUnwindSafe(run_session_turn(state, sess, id, opts, out, parent))
+        .catch_unwind()
+        .await;
+    if res.is_err() {
+        eprintln!("atoms: turn task for session {id} panicked; clearing active-turn state");
+    }
+    state.turns.force_end_session_turns(id);
 }
 
 /// runSessionTurn processes one chat turn: it appends the user's
@@ -538,15 +657,33 @@ pub async fn run_session_turn(
             images: opts.images.clone(),
             ..Default::default()
         });
+        // Persist the session log now so the user message is on the
+        // server before generation starts, and tell viewing clients to
+        // show it right away (a dedicated event appends the user block
+        // without forcing a reload that would wipe the live stream).
+        // No `saved` broadcast or title-gen kick here — the end-of-turn
+        // persist handles both, once.
+        persist_session_now(state, sess, id).await;
+        if !opts.message.is_empty() {
+            state
+                .subs
+                .broadcast(id, &json!({"type": "user_message", "text": opts.message}));
+        }
     }
 
     let handle = state.turns.start_turn(id, &opts.turn_id);
     let ctx = TurnCtx { handle, parent };
     let parent_id = sess.parent_id.clone();
     if !parent_id.is_empty() {
+        let child_id = id.to_string();
         state
-            .store
-            .update_delegate_status(id, atom_core::session::store::DelegateStatus::Working);
+            .store_call(move |store| {
+                store.update_delegate_status(
+                    &child_id,
+                    atom_core::session::store::DelegateStatus::Working,
+                )
+            })
+            .await;
         state
             .subs
             .broadcast(&parent_id, &json!({"type": "children"}));
@@ -567,21 +704,26 @@ pub async fn run_session_turn(
         if let Err(err) = fold_session(state, sess, &out, id, &opts.compact_instructions).await {
             emit(state, &out, id, &fold_error_event(&err)).await;
         }
+        persist_session(state, sess, id).await;
         let done = done_event(turn_duration_ms(started_at), "");
         emit(state, &out, id, &done).await;
-        persist_session(state, sess, id).await;
-        end_of_turn(state, id, &ctx.handle, &parent_id);
+        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
         return;
     }
 
     let mut finished = false;
     let mut nudge_attempt: usize = 0;
     let mut empty_response_attempt: usize = 0;
+    // The "current time" system note is captured once per turn, not per
+    // round: it is folded into the system prefix of every request, and a
+    // per-minute regeneration would rewrite that prefix each round,
+    // invalidating the provider's prompt cache for the whole conversation.
+    let now_note = Local::now().format("%D,%H:%M").to_string();
     'rounds: for _round in 0..MAX_TOOL_ROUNDS {
         // Stop immediately when the turn was paused.
         if ctx.err() {
             finish_paused_turn(state, sess, &out, id).await;
-            end_of_turn(state, id, &ctx.handle, &parent_id);
+            end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
             return;
         }
 
@@ -622,61 +764,100 @@ pub async fn run_session_turn(
             sess.instructions.len().min(msgs.len()),
             Message {
                 role: "system".into(),
-                content: Local::now().format("%D,%H:%M").to_string(),
+                content: now_note.clone(),
                 ..Default::default()
             },
         );
+        // A text-only model rejects any request carrying an image with a
+        // 400 ("this model does not support image input"). When the
+        // models.dev catalog explicitly lists the selected model as
+        // text-only, drop attached images so the turn still goes through.
+        // Models the catalog does not know keep their images (a custom
+        // model may be multimodal even if it is not catalogued). Only the
+        // outgoing request is affected; the session log still keeps the
+        // images for display and replay.
+        if matches!(
+            model_supports_image_input(&provider, &sess.model),
+            Some(false)
+        ) {
+            strip_images_for_text_only_model(&mut msgs);
+        }
         let reasoning_field = if !opts.reasoning_field.is_empty() {
             opts.reasoning_field.clone()
         } else {
             reasoning_field_for_url(&base_url)
         };
         let round_cancel = CancelToken::new();
-        ctx.handle.set_round_cancel(Some(round_cancel));
+        let turn_cancel = ctx.handle.cancel_token();
+        ctx.handle.set_round_cancel(Some(round_cancel.clone()));
 
         let result: StreamResult = if bedrock_style_for_url(&base_url) {
             // Bedrock Converse: bearer-token auth, per-request regional
             // endpoint, binary eventstream response. Chunks come back in
             // the shared OpenAI-delta shape, so the relay below is
             // unchanged.
-            let chunks = match stream_bedrock(&base_url, &key, &sess.model, &msgs, &tools).await {
-                Ok(c) => c,
-                Err(err) => {
+            let opened = await_round(
+                stream_bedrock(&base_url, &key, &sess.model, &msgs, &tools, &opts.thinking),
+                &turn_cancel,
+                &ctx.parent,
+                &round_cancel,
+            )
+            .await;
+            let chunks = match opened {
+                None => {
                     ctx.handle.set_round_cancel(None);
                     if ctx.err() {
                         finish_paused_turn(state, sess, &out, id).await;
-                        end_of_turn(state, id, &ctx.handle, &parent_id);
+                        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
                         return;
                     }
                     if let Some(extra) = ctx.handle.take_compact() {
                         if let Err(ferr) = fold_session(state, sess, &out, id, &extra).await {
                             emit(state, &out, id, &fold_error_event(&ferr)).await;
                         }
-                        continue 'rounds;
                     }
-                    let msg = provider_error_message(&err, &base_url);
-                    let ev = event(vec![
-                        ("type", json!("error")),
-                        ("message", json!(msg.clone())),
-                    ]);
-                    emit(state, &out, id, &ev).await;
-                    sess.messages.push(Message {
-                        role: "error".into(),
-                        content: msg,
-                        ..Default::default()
-                    });
-                    persist_session(state, sess, id).await;
-                    end_of_turn(state, id, &ctx.handle, &parent_id);
-                    return;
+                    continue 'rounds;
                 }
+                Some(result) => match result {
+                    Ok(c) => c,
+                    Err(err) => {
+                        ctx.handle.set_round_cancel(None);
+                        if ctx.err() {
+                            finish_paused_turn(state, sess, &out, id).await;
+                            end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                            return;
+                        }
+                        if let Some(extra) = ctx.handle.take_compact() {
+                            if let Err(ferr) = fold_session(state, sess, &out, id, &extra).await {
+                                emit(state, &out, id, &fold_error_event(&ferr)).await;
+                            }
+                            continue 'rounds;
+                        }
+                        let msg = provider_error_message(&err, &base_url);
+                        let ev = event(vec![
+                            ("type", json!("error")),
+                            ("message", json!(msg.clone())),
+                        ]);
+                        emit(state, &out, id, &ev).await;
+                        sess.messages.push(Message {
+                            role: "error".into(),
+                            content: msg,
+                            ..Default::default()
+                        });
+                        persist_session(state, sess, id).await;
+                        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                        return;
+                    }
+                },
             };
             let r = stream_model_to_client(
                 state,
                 &out,
                 id,
                 chunks,
-                &ctx.handle.cancel_token(),
+                &turn_cancel,
                 &ctx.parent,
+                &round_cancel,
                 &reasoning_field,
             )
             .await;
@@ -686,7 +867,7 @@ pub async fn run_session_turn(
                 Err(err) => {
                     if ctx.err() {
                         finish_paused_turn(state, sess, &out, id).await;
-                        end_of_turn(state, id, &ctx.handle, &parent_id);
+                        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
                         return;
                     }
                     let msg = provider_error_message(&err, &base_url);
@@ -701,7 +882,106 @@ pub async fn run_session_turn(
                         ..Default::default()
                     });
                     persist_session(state, sess, id).await;
-                    end_of_turn(state, id, &ctx.handle, &parent_id);
+                    end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                    return;
+                }
+            }
+        } else if anthropic_style_for_url(&base_url) {
+            // Anthropic Messages dialect: first-party api.anthropic.com
+            // plus gateways exposing an /anthropic/ path (MiniMax's
+            // /anthropic/v1 mirror). Routing these to stream_chat would
+            // POST {base}/chat/completions — a path the Messages-only
+            // mirrors answer with a plain-text "404 page not found".
+            // stream_anthropic POSTs {base}/messages and translates the
+            // SSE events into the shared OpenAI-delta shape, so the
+            // relay below is unchanged.
+            let opened = await_round(
+                stream_anthropic(&base_url, &key, &sess.model, &msgs, &tools, &opts.thinking),
+                &turn_cancel,
+                &ctx.parent,
+                &round_cancel,
+            )
+            .await;
+            let chunks = match opened {
+                None => {
+                    ctx.handle.set_round_cancel(None);
+                    if ctx.err() {
+                        finish_paused_turn(state, sess, &out, id).await;
+                        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                        return;
+                    }
+                    if let Some(extra) = ctx.handle.take_compact() {
+                        if let Err(ferr) = fold_session(state, sess, &out, id, &extra).await {
+                            emit(state, &out, id, &fold_error_event(&ferr)).await;
+                        }
+                    }
+                    continue 'rounds;
+                }
+                Some(result) => match result {
+                    Ok(c) => c,
+                    Err(err) => {
+                        ctx.handle.set_round_cancel(None);
+                        if ctx.err() {
+                            finish_paused_turn(state, sess, &out, id).await;
+                            end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                            return;
+                        }
+                        if let Some(extra) = ctx.handle.take_compact() {
+                            if let Err(ferr) = fold_session(state, sess, &out, id, &extra).await {
+                                emit(state, &out, id, &fold_error_event(&ferr)).await;
+                            }
+                            continue 'rounds;
+                        }
+                        let msg = provider_error_message(&err, &base_url);
+                        let ev = event(vec![
+                            ("type", json!("error")),
+                            ("message", json!(msg.clone())),
+                        ]);
+                        emit(state, &out, id, &ev).await;
+                        sess.messages.push(Message {
+                            role: "error".into(),
+                            content: msg,
+                            ..Default::default()
+                        });
+                        persist_session(state, sess, id).await;
+                        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                        return;
+                    }
+                },
+            };
+            let r = stream_model_to_client(
+                state,
+                &out,
+                id,
+                chunks,
+                &turn_cancel,
+                &ctx.parent,
+                &round_cancel,
+                &reasoning_field,
+            )
+            .await;
+            ctx.handle.set_round_cancel(None);
+            match r {
+                Ok(result) => result,
+                Err(err) => {
+                    if ctx.err() {
+                        finish_paused_turn(state, sess, &out, id).await;
+                        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                        return;
+                    }
+                    let msg = provider_error_message(&err, &base_url);
+                    let ev = event(vec![
+                        ("type", json!("error")),
+                        ("message", json!(msg.clone())),
+                    ]);
+                    emit(state, &out, id, &ev).await;
+                    sess.messages.push(Message {
+                        role: "error".into(),
+                        content: msg,
+                        ..Default::default()
+                    });
+                    persist_session(state, sess, id).await;
+                    end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
                     return;
                 }
             }
@@ -723,23 +1003,44 @@ pub async fn run_session_turn(
                             ..Default::default()
                         });
                         persist_session(state, sess, id).await;
-                        end_of_turn(state, id, &ctx.handle, &parent_id);
+                        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
                         return;
                     }
                 };
-            match do_openai_codex_round(&key, &codex_body).await {
-                Ok(outcome) => {
+            let opened = await_round(
+                do_openai_codex_round(&key, &codex_body),
+                &turn_cancel,
+                &ctx.parent,
+                &round_cancel,
+            )
+            .await;
+            match opened {
+                None => {
+                    ctx.handle.set_round_cancel(None);
+                    if ctx.err() {
+                        finish_paused_turn(state, sess, &out, id).await;
+                        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                        return;
+                    }
+                    if let Some(extra) = ctx.handle.take_compact() {
+                        if let Err(ferr) = fold_session(state, sess, &out, id, &extra).await {
+                            emit(state, &out, id, &fold_error_event(&ferr)).await;
+                        }
+                    }
+                    continue 'rounds;
+                }
+                Some(Ok(outcome)) => {
                     key = outcome.key;
                     for ev in &outcome.events {
                         emit(state, &out, id, ev).await;
                     }
                     outcome.result
                 }
-                Err(round_err) => {
+                Some(Err(round_err)) => {
                     ctx.handle.set_round_cancel(None);
                     if ctx.err() {
                         finish_paused_turn(state, sess, &out, id).await;
-                        end_of_turn(state, id, &ctx.handle, &parent_id);
+                        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
                         return;
                     }
                     if let Some(extra) = ctx.handle.take_compact() {
@@ -760,7 +1061,7 @@ pub async fn run_session_turn(
                         ..Default::default()
                     });
                     persist_session(state, sess, id).await;
-                    end_of_turn(state, id, &ctx.handle, &parent_id);
+                    end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
                     return;
                 }
             }
@@ -776,13 +1077,34 @@ pub async fn run_session_turn(
                 }),
             };
 
-            let chunks = match stream_chat(&base_url, &key, req_body).await {
-                Ok(c) => c,
-                Err(err) => {
+            let opened = await_round(
+                stream_chat(&base_url, &key, req_body, &reasoning_field),
+                &turn_cancel,
+                &ctx.parent,
+                &round_cancel,
+            )
+            .await;
+            let chunks = match opened {
+                None => {
                     ctx.handle.set_round_cancel(None);
                     if ctx.err() {
                         finish_paused_turn(state, sess, &out, id).await;
-                        end_of_turn(state, id, &ctx.handle, &parent_id);
+                        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                        return;
+                    }
+                    if let Some(extra) = ctx.handle.take_compact() {
+                        if let Err(ferr) = fold_session(state, sess, &out, id, &extra).await {
+                            emit(state, &out, id, &fold_error_event(&ferr)).await;
+                        }
+                    }
+                    continue 'rounds;
+                }
+                Some(Ok(c)) => c,
+                Some(Err(err)) => {
+                    ctx.handle.set_round_cancel(None);
+                    if ctx.err() {
+                        finish_paused_turn(state, sess, &out, id).await;
+                        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
                         return;
                     }
                     if let Some(extra) = ctx.handle.take_compact() {
@@ -803,7 +1125,7 @@ pub async fn run_session_turn(
                         ..Default::default()
                     });
                     persist_session(state, sess, id).await;
-                    end_of_turn(state, id, &ctx.handle, &parent_id);
+                    end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
                     return;
                 }
             };
@@ -815,8 +1137,9 @@ pub async fn run_session_turn(
                 &out,
                 id,
                 chunks,
-                &ctx.handle.cancel_token(),
+                &turn_cancel,
                 &ctx.parent,
+                &round_cancel,
                 &reasoning_field,
             )
             .await;
@@ -826,7 +1149,7 @@ pub async fn run_session_turn(
                 Err(err) => {
                     if ctx.err() {
                         finish_paused_turn(state, sess, &out, id).await;
-                        end_of_turn(state, id, &ctx.handle, &parent_id);
+                        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
                         return;
                     }
                     let msg = provider_error_message(&err, &base_url);
@@ -841,7 +1164,7 @@ pub async fn run_session_turn(
                         ..Default::default()
                     });
                     persist_session(state, sess, id).await;
-                    end_of_turn(state, id, &ctx.handle, &parent_id);
+                    end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
                     return;
                 }
             }
@@ -863,7 +1186,7 @@ pub async fn run_session_turn(
                 emit(state, &out, id, &retry_ev).await;
                 if sleep_ctx(ctx.handle.cancel_token(), &ctx.parent, delay).await {
                     finish_paused_turn(state, sess, &out, id).await;
-                    end_of_turn(state, id, &ctx.handle, &parent_id);
+                    end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
                     return;
                 }
                 continue 'rounds;
@@ -883,7 +1206,7 @@ pub async fn run_session_turn(
                 ..Default::default()
             });
             persist_session(state, sess, id).await;
-            end_of_turn(state, id, &ctx.handle, &parent_id);
+            end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
             return;
         }
         empty_response_attempt = 0;
@@ -907,7 +1230,7 @@ pub async fn run_session_turn(
                     .push(assistant_message(&sess.model, &base_url, &result, None));
             }
             finish_paused_turn(state, sess, &out, id).await;
-            end_of_turn(state, id, &ctx.handle, &parent_id);
+            end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
             return;
         }
 
@@ -946,7 +1269,7 @@ pub async fn run_session_turn(
                     .unwrap_or(Duration::from_secs(15));
                 if sleep_ctx(ctx.handle.cancel_token(), &ctx.parent, delay).await {
                     finish_paused_turn(state, sess, &out, id).await;
-                    end_of_turn(state, id, &ctx.handle, &parent_id);
+                    end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
                     return;
                 }
                 nudge_attempt += 1;
@@ -961,8 +1284,6 @@ pub async fn run_session_turn(
                     emit(state, &out, id, &fold_error_event(&ferr)).await;
                 }
             }
-            let done = done_event(duration_ms, &sess.model);
-            emit(state, &out, id, &done).await;
             finished = true;
             break;
         }
@@ -978,10 +1299,10 @@ pub async fn run_session_turn(
             &result,
             Some(&result.tool_calls),
         ));
-        persist_session(state, sess, id).await;
+        persist_session_now(state, sess, id).await;
 
         // Execute each tool and feed the result back to the model.
-        for tc in &result.tool_calls {
+        for (tool_index, tc) in result.tool_calls.iter().enumerate() {
             let ev = event(vec![
                 ("type", json!("tool")),
                 ("name", json!(tc.function.name)),
@@ -993,6 +1314,7 @@ pub async fn run_session_turn(
                 state.clone(),
                 id.to_string(),
                 out.clone(),
+                Some(ctx.handle.cancel_token()),
             );
             let bridge = crate::dispatch::DispatchBridge::new(
                 state.clone(),
@@ -1014,9 +1336,10 @@ pub async fn run_session_turn(
                 spawner: Some(&bridge),
                 file_seen: Some(seen.as_ref()),
             };
-            let outcome =
+            let mut outcome =
                 atom_tools::execute_tool(&tool_ctx, &tc.function.name, &tc.function.arguments)
                     .await;
+            cap_tool_output(&mut outcome.text);
 
             sess.messages.push(Message {
                 role: "tool".into(),
@@ -1028,7 +1351,7 @@ pub async fn run_session_turn(
             });
             // Save each tool result immediately. Besides crash safety, this
             // makes an in-progress blocking dispatch visible after navigation.
-            persist_session(state, sess, id).await;
+            persist_session_now(state, sess, id).await;
             let result_ev = event(vec![
                 ("type", json!("tool_result")),
                 ("text", json!(outcome.text)),
@@ -1045,8 +1368,16 @@ pub async fn run_session_turn(
             }
             // Stop between tools when the turn was paused.
             if ctx.err() {
+                for skipped in &result.tool_calls[tool_index + 1..] {
+                    sess.messages.push(Message {
+                        role: "tool".into(),
+                        tool_call_id: skipped.id.clone(),
+                        content: "error: tool execution cancelled before it started".into(),
+                        ..Default::default()
+                    });
+                }
                 finish_paused_turn(state, sess, &out, id).await;
-                end_of_turn(state, id, &ctx.handle, &parent_id);
+                end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
                 return;
             }
         }
@@ -1068,35 +1399,45 @@ pub async fn run_session_turn(
             ),
         ]);
         emit(state, &out, id, &ev).await;
-        let done = done_event(turn_duration_ms(started_at), "");
-        emit(state, &out, id, &done).await;
     }
 
     persist_session(state, sess, id).await;
-    end_of_turn(state, id, &ctx.handle, &parent_id);
+    let done = done_event(
+        turn_duration_ms(started_at),
+        if finished { &sess.model } else { "" },
+    );
+    emit(state, &out, id, &done).await;
+    end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
 }
 
 /// Shared tail of run_session_turn: deregister the turn and notify the
 /// parent session's viewers (Go's deferred endTurn/children broadcast).
-fn end_of_turn(state: &Arc<AppState>, id: &str, handle: &Arc<TurnHandle>, parent_id: &str) {
+async fn end_of_turn(
+    state: &Arc<AppState>,
+    sess: &Session,
+    id: &str,
+    handle: &Arc<TurnHandle>,
+    parent_id: &str,
+) {
     state.turns.end_turn(id, handle);
     if !parent_id.is_empty() {
-        if let Some(child) = state.store.get(id) {
-            let status = if child.cancelled {
-                atom_core::session::store::DelegateStatus::Cancelled
-            } else if child
-                .messages
-                .iter()
-                .rev()
-                .find(|message| matches!(message.role.as_str(), "assistant" | "error"))
-                .is_some_and(|message| message.role == "error")
-            {
-                atom_core::session::store::DelegateStatus::Error
-            } else {
-                atom_core::session::store::DelegateStatus::Done
-            };
-            state.store.update_delegate_status(id, status);
-        }
+        let status = if sess.cancelled {
+            atom_core::session::store::DelegateStatus::Cancelled
+        } else if sess
+            .messages
+            .iter()
+            .rev()
+            .find(|message| matches!(message.role.as_str(), "assistant" | "error"))
+            .is_some_and(|message| message.role == "error")
+        {
+            atom_core::session::store::DelegateStatus::Error
+        } else {
+            atom_core::session::store::DelegateStatus::Done
+        };
+        let child_id = id.to_string();
+        state
+            .store_call(move |store| store.update_delegate_status(&child_id, status))
+            .await;
         state
             .subs
             .broadcast(parent_id, &json!({"type": "children"}));
@@ -1395,6 +1736,15 @@ mod tests {
     }
 
     #[test]
+    fn tool_output_is_byte_bounded_at_utf8_boundary() {
+        let mut text = "é".repeat(MAX_TOOL_OUTPUT_BYTES);
+        cap_tool_output(&mut text);
+        assert!(text.len() < MAX_TOOL_OUTPUT_BYTES + 100);
+        assert!(text.contains("truncated at tool output byte limit"));
+        assert!(text.is_char_boundary(text.len()));
+    }
+
+    #[test]
     fn empty_provider_result_is_not_a_successful_reply() {
         assert!(empty_response(&StreamResult::default()));
         assert!(empty_response(&StreamResult {
@@ -1423,6 +1773,43 @@ mod tests {
             truncate_bytes_ellipsis(&long, 60),
             format!("{}...", "x".repeat(60))
         );
+    }
+
+    #[test]
+    fn strip_images_for_text_only_model_drops_images() {
+        let img = || atom_core::types::ImageData {
+            mime: "image/png".into(),
+            data: "AAAA".into(),
+        };
+        let mut msgs = vec![
+            // text + image: image dropped, text kept.
+            Message {
+                role: "user".into(),
+                content: "look".into(),
+                images: vec![img()],
+                ..Default::default()
+            },
+            // image only: becomes a placeholder so content isn't empty.
+            Message {
+                role: "user".into(),
+                content: "".into(),
+                images: vec![img()],
+                ..Default::default()
+            },
+            // no images: untouched.
+            Message {
+                role: "assistant".into(),
+                content: "hi".into(),
+                ..Default::default()
+            },
+        ];
+        strip_images_for_text_only_model(&mut msgs);
+        assert!(msgs[0].images.is_empty());
+        assert_eq!(msgs[0].content, "look");
+        assert!(msgs[1].images.is_empty());
+        assert_eq!(msgs[1].content, "[image attached]");
+        assert!(msgs[2].images.is_empty());
+        assert_eq!(msgs[2].content, "hi");
     }
 
     #[tokio::test]
@@ -1458,6 +1845,7 @@ mod tests {
             &out,
             "s1",
             futures::stream::iter(chunks),
+            &CancelToken::new(),
             &CancelToken::new(),
             &CancelToken::new(),
             "reasoning_content",
@@ -1515,6 +1903,7 @@ mod tests {
             futures::stream::iter(chunks),
             &CancelToken::new(),
             &CancelToken::new(),
+            &CancelToken::new(),
             "reasoning",
         )
         .await
@@ -1564,11 +1953,32 @@ mod tests {
             futures::stream::iter(chunks),
             &CancelToken::new(),
             &CancelToken::new(),
+            &CancelToken::new(),
             "reasoning",
         )
         .await
         .unwrap_err();
 
         assert_eq!(err.to_string(), "connection reset");
+    }
+
+    #[tokio::test]
+    async fn provider_handshake_wait_observes_round_cancellation() {
+        let turn = CancelToken::new();
+        let parent = CancelToken::new();
+        let round = CancelToken::new();
+        let cancel = round.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            cancel.cancel();
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(250),
+            await_round(std::future::pending::<()>(), &turn, &parent, &round),
+        )
+        .await
+        .expect("provider handshake ignored cancellation");
+        assert!(result.is_none());
     }
 }

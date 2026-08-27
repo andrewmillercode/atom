@@ -14,11 +14,13 @@ pub mod app;
 pub mod blocks;
 pub mod events;
 pub mod hot;
+pub mod math;
 pub mod outputtest;
 pub mod overlays;
 pub mod preview;
 pub mod prompt;
 pub mod settings;
+pub mod spinner;
 pub mod statusbar;
 pub mod view;
 
@@ -91,6 +93,10 @@ pub async fn run_output_test(
 
 type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
 
+/// Heartbeat interval: bounds the damage of any lost wakeup to one hiccup
+/// instead of a permanent freeze. See event_loop.
+const HEARTBEAT_TICK_MS: u64 = 250;
+
 fn setup_terminal() -> Result<Term> {
     use crossterm::event::{
         EnableBracketedPaste, EnableFocusChange, EnableMouseCapture, KeyboardEnhancementFlags,
@@ -128,6 +134,9 @@ fn restore_terminal(terminal: &mut Term) {
     use crossterm::event::{DisableBracketedPaste, DisableFocusChange, DisableMouseCapture};
     use crossterm::execute;
     use crossterm::terminal::*;
+    // A blocking paint task may still be mid-payload when we tear down;
+    // serialize with it so the exit sequence cannot interleave.
+    let _tty = preview::lock_tty();
     let _ = execute!(
         terminal.backend_mut(),
         DisableBracketedPaste,
@@ -164,7 +173,25 @@ async fn event_loop(
         sub_sid: String::new(),
         last_title: String::new(),
     };
-    let mut crossterm_stream = crossterm::event::EventStream::new();
+
+    // Display math (`$$…$$` in assistant messages): one engine per
+    // process, only when the terminal speaks the Kitty graphics
+    // protocol. Completion callbacks arrive here as AppMsg::MathWake.
+    math::init(tx.clone());
+
+    // Terminal input lives in its own task so the EventStream is only ever
+    // polled by one persistent future with a real waker.  Polling it via
+    // now_or_never() (no-op waker) or dropping it mid-poll from select!
+    // can permanently wedge crossterm's single-slot task protocol.
+    let (input_tx, mut input_rx) = mpsc::unbounded_channel::<crossterm::event::Event>();
+    tokio::spawn(async move {
+        let mut stream = crossterm::event::EventStream::new();
+        while let Some(Ok(ev)) = stream.next().await {
+            if input_tx.send(ev).is_err() {
+                break;
+            }
+        }
+    });
 
     let mut effects = initial_effects(app, test_mode);
 
@@ -174,7 +201,19 @@ async fn event_loop(
         tokio::time::interval(tokio::time::Duration::from_millis(app::SPLASH_TICK_MS));
     let mut scene_tick =
         tokio::time::interval(tokio::time::Duration::from_secs(app::TEST_SCENE_TICK_SECS));
-    for tick in [&mut spinner_tick, &mut splash_tick, &mut scene_tick] {
+    // Safety net against lost wakeups: any future that permanently fails to
+    // fire would otherwise freeze the TUI with no way to detect or recover.
+    // A 250ms heartbeat bounds the worst case to a brief input hiccup while
+    // costing ~4 idle wakes/sec (ratatui's diff emits no bytes for a static
+    // frame). The select! re-arms every wakeup source on each heartbeat.
+    let mut heartbeat_tick =
+        tokio::time::interval(tokio::time::Duration::from_millis(HEARTBEAT_TICK_MS));
+    for tick in [
+        &mut spinner_tick,
+        &mut splash_tick,
+        &mut scene_tick,
+        &mut heartbeat_tick,
+    ] {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         tick.reset();
     }
@@ -194,10 +233,21 @@ async fn event_loop(
         let title = window_title(app);
         if title != st.last_title {
             st.last_title = title.clone();
+            // Locked: SetTitle bytes must not interleave with a concurrent
+            // kitty paint payload (same tty, different writers).
+            let _guard = preview::lock_tty();
             let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle(title));
         }
 
         let mut cursor_pos: Option<(u16, u16)> = None;
+        // Hold the tty write lock across the whole frame — draw, flush and
+        // cursor update are one escape sequence burst; a concurrent kitty
+        // paint interleaving here is what garbled the TUI until resize.
+        let tty_guard = preview::lock_tty();
+        // Flush newly rendered formula uploads/placements before the frame
+        // that displays their placeholder cells (same guard: these bytes
+        // must not interleave with the frame).
+        math::flush_terminal_commands();
         terminal.draw(|f| {
             cursor_pos = view::draw(app, f.area(), f.buffer_mut());
         })?;
@@ -209,6 +259,15 @@ async fn event_loop(
             None => {
                 let _ = terminal.hide_cursor();
             }
+        }
+        drop(tty_guard);
+        // A first frame can discover the real terminal width before a
+        // crossterm Resize event arrives. If that changes diagram geometry,
+        // paint the matching kitty placement after the placeholder grid is
+        // on screen instead of leaving a stale/blank reserved area.
+        if app.preview_dirty && preview::kitty_terminal() {
+            effects.push(Effect::PaintPreviews);
+            run_effects(app, &tx, &mut st, &mut effects).await;
         }
         if app.quitting {
             return Ok(());
@@ -248,12 +307,12 @@ async fn event_loop(
 
         let msg: Option<AppMsg> = tokio::select! {
             m = rx.recv() => m,
-            ev = crossterm_stream.next() => match ev {
-                Some(Ok(crossterm::event::Event::Key(k))) => Some(AppMsg::Key(k)),
-                Some(Ok(crossterm::event::Event::Mouse(m))) => Some(AppMsg::Mouse(m)),
-                Some(Ok(crossterm::event::Event::Resize(w, h))) => Some(AppMsg::Resize(w, h)),
-                Some(Ok(crossterm::event::Event::Paste(s))) => Some(AppMsg::Paste(s)),
-                Some(Ok(crossterm::event::Event::FocusGained)) => Some(AppMsg::Redraw),
+            ev = input_rx.recv() => match ev {
+                Some(crossterm::event::Event::Key(k)) => Some(AppMsg::Key(k)),
+                Some(crossterm::event::Event::Mouse(m)) => Some(AppMsg::Mouse(m)),
+                Some(crossterm::event::Event::Resize(w, h)) => Some(AppMsg::Resize(w, h)),
+                Some(crossterm::event::Event::Paste(s)) => Some(AppMsg::Paste(s)),
+                Some(crossterm::event::Event::FocusGained) => Some(AppMsg::Redraw),
                 _ => None,
             },
             v = send_next(&mut st.send_rx) => v,
@@ -281,22 +340,81 @@ async fn event_loop(
                     std::future::pending::<()>().await;
                 }
             } => Some(AppMsg::TestSceneTick),
+            _ = heartbeat_tick.tick() => Some(AppMsg::Heartbeat),
         };
 
         let Some(msg) = msg else { continue };
 
-        if matches!(msg, AppMsg::Redraw) {
-            terminal.clear()?;
+        // Process this first message, then drain any other immediately
+        // available events before rendering.  This coalesces bursts of
+        // scroll / key events into a single frame, making input feel
+        // instant even under heavy streaming load.
+        if dispatch_msg(app, &mut st, &mut effects, msg, terminal, hot_enabled)? {
             continue;
         }
+        if !effects.is_empty() {
+            run_effects(app, &tx, &mut st, &mut effects).await;
+        }
 
-        // --hot rebuild finished: save state + exec the new binary.
-        if let AppMsg::HotRebuilt(result) = msg {
-            match result {
-                Ok(build) => {
-                    if !hot_enabled {
-                        continue;
-                    }
+        // Drain further pending messages (up to a budget per frame).
+        //
+        // Both the app-internal channel AND the input channel are drained
+        // here so input (Esc, Enter) is picked up instantly even during
+        // heavy streaming bursts. The input channel is a regular tokio mpsc
+        // fed by a dedicated task — try_recv is always safe (no waker
+        // involvement, unlike the raw EventStream).
+        const MAX_DRAIN: usize = 128;
+        for _ in 0..MAX_DRAIN {
+            let next = rx.try_recv().ok().or_else(|| {
+                input_rx.try_recv().ok().and_then(|ev| match ev {
+                    crossterm::event::Event::Key(k) => Some(AppMsg::Key(k)),
+                    crossterm::event::Event::Mouse(m) => Some(AppMsg::Mouse(m)),
+                    crossterm::event::Event::Resize(w, h) => Some(AppMsg::Resize(w, h)),
+                    crossterm::event::Event::Paste(s) => Some(AppMsg::Paste(s)),
+                    crossterm::event::Event::FocusGained => Some(AppMsg::Redraw),
+                    _ => None,
+                })
+            });
+            let Some(extra) = next else { break };
+            dispatch_msg(app, &mut st, &mut effects, extra, terminal, hot_enabled)?;
+        }
+    }
+}
+
+/// Dispatch a single AppMsg.  Returns Ok(true) when the caller should
+/// `continue` (skip rendering this iteration - e.g. Redraw cleared the
+/// terminal and the next loop pass will repaint).
+fn dispatch_msg(
+    app: &mut App,
+    st: &mut LoopState,
+    effects: &mut Vec<Effect>,
+    msg: AppMsg,
+    terminal: &mut Term,
+    hot_enabled: bool,
+) -> Result<bool> {
+    // Heartbeat exists purely to re-arm the select! wakeup sources; no
+    // state change, no redraw request.
+    if matches!(msg, AppMsg::Heartbeat) {
+        return Ok(false);
+    }
+    if matches!(msg, AppMsg::Redraw) {
+        terminal.clear()?;
+        return Ok(true);
+    }
+    if matches!(msg, AppMsg::MathWake) {
+        // A display formula finished rendering in the background. Mark the
+        // viewport dirty so stale LaTeX fallbacks re-render into placeholder
+        // rows on the next frame; no full-screen clear needed (ratatui diffs
+        // the changed rows).
+        app.viewport_dirty = true;
+        return Ok(false);
+    }
+
+    // --hot rebuild finished: save state + exec the new binary.
+    if let AppMsg::HotRebuilt(result) = msg {
+        match result {
+            Ok(build) => {
+                if hot_enabled {
                     let path = app
                         .hot_state_path
                         .clone()
@@ -305,62 +423,63 @@ async fn event_loop(
                         app.err_msg = e.to_string();
                         app.refresh_viewport();
                     } else {
-                        return Ok(()); // unreachable: exec replaced us
+                        return Ok(true); // unreachable: exec replaced us
                     }
                 }
-                Err(build_err) => {
-                    // A failed build keeps the old binary running and
-                    // shows the compiler output; watch_sources keeps
-                    // polling so the next save retries.
-                    app.err_msg = build_err;
-                    app.refresh_viewport();
-                }
             }
-            continue;
-        }
-        if let AppMsg::ThemeReloaded(result) = msg {
-            match result {
-                Ok(elapsed) => {
-                    if app.err_msg.starts_with("theme:") {
-                        app.err_msg.clear();
-                    }
-                    app.invalidate_all_blocks();
-                    app.preview_dirty = true;
-                    app.refresh_viewport();
-                    app.copied_msg = format!("theme reloaded in {} ms", elapsed.as_millis());
-                    app.copied_at = Some(std::time::Instant::now());
-                    effects.push(Effect::PaintPreviews);
-                    terminal.clear()?;
-                }
-                Err(error) => {
-                    app.err_msg = error;
-                    app.refresh_viewport();
-                }
+            Err(build_err) => {
+                app.err_msg = build_err;
+                app.refresh_viewport();
             }
-            continue;
         }
-        if let AppMsg::SubscribeNow(id) = msg {
-            effects.push(Effect::Subscribe { id });
-            continue;
-        }
-        // A spawned dial finished: install its channel, then drive the
-        // state machine with the corresponding *Started msg so the working
-        // state flips on the instant the stream is ready (not when the
-        // first chunk arrives).
-        if let AppMsg::SendReady { sid, rx } = msg {
-            st.send_rx = Some(rx);
-            effects = app.handle_msg(AppMsg::SendStarted { sid });
-            continue;
-        }
-        if let AppMsg::SubReady { sid, rx } = msg {
-            st.sub_rx = Some(rx);
-            st.sub_sid = sid.clone();
-            effects = app.handle_msg(AppMsg::SubStarted { sid });
-            continue;
-        }
-
-        effects = app.handle_msg(msg);
+        return Ok(false);
     }
+    if let AppMsg::ThemeReloaded(result) = msg {
+        match result {
+            Ok(elapsed) => {
+                if app.err_msg.starts_with("theme:") {
+                    app.err_msg.clear();
+                }
+                app.invalidate_all_blocks();
+                app.preview_dirty = true;
+                app.refresh_viewport();
+                app.copied_msg = format!("theme reloaded in {} ms", elapsed.as_millis());
+                app.copied_at = Some(std::time::Instant::now());
+                effects.push(Effect::PaintPreviews);
+                let _guard = preview::lock_tty();
+                terminal.clear()?;
+            }
+            Err(error) => {
+                app.err_msg = error;
+                app.refresh_viewport();
+            }
+        }
+        return Ok(false);
+    }
+    if let AppMsg::SubscribeNow(id) = msg {
+        effects.push(Effect::Subscribe { id });
+        return Ok(false);
+    }
+    if let AppMsg::SendReady { sid, rx } = msg {
+        if sid != app.session.id {
+            return Ok(false);
+        }
+        st.send_rx = Some(rx);
+        effects.extend(app.handle_msg(AppMsg::SendStarted { sid }));
+        return Ok(false);
+    }
+    if let AppMsg::SubReady { sid, rx } = msg {
+        if sid != app.session.id {
+            return Ok(false);
+        }
+        st.sub_rx = Some(rx);
+        st.sub_sid = sid.clone();
+        effects.extend(app.handle_msg(AppMsg::SubStarted { sid }));
+        return Ok(false);
+    }
+
+    effects.extend(app.handle_msg(msg));
+    Ok(false)
 }
 
 fn initial_effects(app: &App, test_mode: bool) -> Vec<Effect> {
@@ -522,12 +641,13 @@ async fn run_effects(
                 // Dial off the event loop so input/render/Esc stay live while
                 // the server warms up the stream (provider TTFB can be seconds).
                 tokio::spawn(async move {
-                    let mut resp = api::stream_send(&req).await;
+                    let mut resp = api::stream_send_healed(&req).await;
                     // The server may have shut down; restart and retry once.
-                    if resp.is_err() && !api::is_running().await {
-                        if api::ensure_server().await.is_ok() {
-                            resp = atom_server::client::stream_send(&session_id, &body).await;
-                        }
+                    if resp.is_err()
+                        && !api::is_running().await
+                        && api::ensure_server().await.is_ok()
+                    {
+                        resp = atom_server::client::stream_send(&session_id, &body).await;
                     }
                     match resp {
                         Ok(rx) => {
@@ -557,7 +677,12 @@ async fn run_effects(
                 let providers = app.providers.clone();
                 let tx = tx.clone();
                 tokio::spawn(async move {
-                    let pairs = api::fetch_all_models(&providers).await;
+                    let pairs = tokio::time::timeout(
+                        tokio::time::Duration::from_secs(7),
+                        api::fetch_all_models(&providers),
+                    )
+                    .await
+                    .unwrap_or_default();
                     let entries: Vec<atom_core::providers::providers::ModelEntry> = pairs
                         .into_iter()
                         .map(
@@ -575,7 +700,7 @@ async fn run_effects(
                 tokio::spawn(async move {
                     match api::list_sessions().await {
                         Ok(mut sessions) => {
-                            sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+                            sessions.sort_by_key(|a| std::cmp::Reverse(a.updated_at));
                             let _ = tx.send(AppMsg::SessionsLoaded(sessions));
                         }
                         Err(e) => {
@@ -619,14 +744,17 @@ async fn run_effects(
                 let cwd = app.cwd.clone();
                 let tx = tx.clone();
                 tokio::spawn(async move {
+                    let tools = atom_tools::tool_definitions();
                     let rows = match api::get_session(&id).await {
-                        Ok(sess) => atom_core::session::context_breakdown::context_breakdown(&sess),
+                        Ok(sess) => {
+                            atom_core::session::context_breakdown::context_breakdown(&sess, &tools)
+                        }
                         Err(_) => {
                             let sess = atom_core::session::store::Session {
                                 cwd,
                                 ..Default::default()
                             };
-                            atom_core::session::context_breakdown::context_breakdown(&sess)
+                            atom_core::session::context_breakdown::context_breakdown(&sess, &tools)
                         }
                     };
                     let _ = tx.send(AppMsg::ContextLoaded(rows));
@@ -705,12 +833,17 @@ async fn run_effects(
                     if let Err(e) = api::pause_turn(&id, &pause_turn_id).await {
                         let _ = tx.send(AppMsg::Errored(e.to_string()));
                     }
-                    let mut resp = api::stream_send(&req).await;
+                    // The pause targeted the turn that was streaming, but the
+                    // server may have another registration behind it (raced
+                    // pause, stale entry): heal the same way a plain send
+                    // would instead of surfacing a 409.
+                    let mut resp = api::stream_send_healed(&req).await;
                     // The server may have shut down; restart and retry once.
-                    if resp.is_err() && !api::is_running().await {
-                        if api::ensure_server().await.is_ok() {
-                            resp = atom_server::client::stream_send(&id, &body).await;
-                        }
+                    if resp.is_err()
+                        && !api::is_running().await
+                        && api::ensure_server().await.is_ok()
+                    {
+                        resp = atom_server::client::stream_send(&id, &body).await;
                     }
                     match resp {
                         Ok(rx) => {
@@ -790,8 +923,44 @@ async fn run_effects(
                     }
                 });
             }
+            Effect::OpenLink { uri } => {
+                atom_core::util::open_url(&uri);
+            }
             Effect::PaintPreviews => {
-                if !preview::kitty_terminal() || !app.preview_dirty {
+                if !preview::kitty_terminal() {
+                    continue;
+                }
+                // Diagram ids and geometry are (re)derived here so freshly
+                // attached diagrams still paint even if a render pass has
+                // not filled them in yet. When either changes, the
+                // placeholder grid on screen (cached block lines) is stale:
+                // invalidate it and defer the kitty paint to the post-draw
+                // check, which fires after the frame shows the new grid.
+                // Painting immediately would transmit placements whose
+                // c/r dims match nothing on screen — tiles then stretch
+                // over unrelated content until a resize.
+                let inner = app.inner_width().saturating_sub(2).max(1);
+                let mut changed = crate::blocks::assign_block_diagram_ids(&mut app.blocks);
+                for block in app.blocks.iter_mut() {
+                    if let Some(d) = block.diagram.as_mut() {
+                        if crate::blocks::diagram_geometry(d, inner) {
+                            changed = true;
+                        }
+                    }
+                }
+                if changed {
+                    for block in app.blocks.iter_mut() {
+                        if block.diagram.is_some() {
+                            block.lines = None;
+                        }
+                    }
+                    app.viewport_dirty = true;
+                    // The post-draw check only fires when this flag is set;
+                    // make the deferred repaint unconditional.
+                    app.preview_dirty = true;
+                    continue;
+                }
+                if !app.preview_dirty {
                     continue;
                 }
                 app.preview_dirty = false;
@@ -817,7 +986,32 @@ async fn run_effects(
                         }
                     }
                 }
-                tokio::task::spawn_blocking(move || preview::paint_kitty_previews(&entries));
+                // Diagrams: current placements plus every diagram id no
+                // longer referenced, which gets deleted on the tty.
+                let mut diagram_specs: Vec<preview::DiagramSpec> = Vec::new();
+                let mut diagram_ids: Vec<usize> = Vec::new();
+                for block in app.blocks.iter() {
+                    if let Some(d) = &block.diagram {
+                        if d.id > 0 && d.cols > 0 && d.rows > 0 {
+                            diagram_ids.push(d.id);
+                            diagram_specs.push(preview::DiagramSpec {
+                                id: d.id,
+                                svg: d.svg.clone(),
+                                png: d.png.clone(),
+                                cols: d.cols,
+                                rows: d.rows,
+                            });
+                        }
+                    }
+                }
+                let stale: Vec<usize> = (crate::blocks::MIN_KITTY_DIAGRAM_ID
+                    ..=crate::blocks::MAX_KITTY_DIAGRAM_ID)
+                    .filter(|id| !diagram_ids.contains(id))
+                    .collect();
+                tokio::task::spawn_blocking(move || {
+                    preview::paint_kitty_diagrams(&diagram_specs, &stale);
+                    preview::paint_kitty_previews(&entries);
+                });
             }
         }
     }

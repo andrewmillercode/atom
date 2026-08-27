@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify, Semaphore};
 
 /// idleShutdownAfter: the server exits when no client connections have
 /// been open for this long. Every running TUI holds a long-lived /events
@@ -74,17 +74,16 @@ impl SessionSubs {
     }
 
     /// broadcastSession sends an event to all subscribers of a session.
-    /// It never blocks — if a subscriber's channel is full, the event is
-    /// dropped.
+    /// It never blocks. A lagging subscriber is disconnected instead of
+    /// silently losing terminal events; the client reconnects and reloads.
     pub fn broadcast(&self, id: &str, event: &Value) {
-        let senders: Vec<EventTx> = {
-            let subs = self.subs.lock().unwrap();
-            subs.get(id)
-                .map(|l| l.iter().map(|(_, tx)| tx.clone()).collect())
-                .unwrap_or_default()
+        let mut subs = self.subs.lock().unwrap();
+        let Some(list) = subs.get_mut(id) else {
+            return;
         };
-        for tx in senders {
-            let _ = tx.try_send(event.clone());
+        list.retain(|(_, tx)| tx.try_send(event.clone()).is_ok());
+        if list.is_empty() {
+            subs.remove(id);
         }
     }
 
@@ -249,11 +248,17 @@ impl TurnHandle {
 #[derive(Default)]
 struct TurnMaps {
     turns: HashMap<String, Vec<Arc<TurnHandle>>>,
+    reserved: std::collections::HashSet<String>,
     pending_pauses: HashMap<String, Vec<String>>,
     /// Sessions whose most recently prepared turn reached end_turn. This
     /// closes the race where a detached dispatch turn starts and finishes
     /// between result(wait:true) polls.
     completed: std::collections::HashSet<String>,
+    /// Notified (one permit) whenever end_turn removes a turn, so a
+    /// caller blocked in wait_idle wakes to re-check whether the session
+    /// is idle. Wrapped in Arc so wait_idle can clone the handle out of
+    /// the lock and register interest without holding the Mutex.
+    notify: Arc<Notify>,
 }
 
 /// Registry of each session's active turns plus pauses that raced ahead
@@ -276,6 +281,7 @@ impl TurnTable {
             }),
         });
         let mut maps = self.0.lock().unwrap();
+        maps.reserved.remove(id);
         maps.completed.remove(id);
         if let Some(pauses) = maps.pending_pauses.get_mut(id) {
             if let Some(pos) = pauses.iter().position(|p| p == turn_id) {
@@ -318,6 +324,7 @@ impl TurnTable {
                 maps.completed.insert(id.to_string());
             }
         }
+        maps.notify.notify_one();
     }
 
     /// cancelSessionTurns cancels every active turn for a session. Used
@@ -326,7 +333,7 @@ impl TurnTable {
     pub fn cancel_session_turns(&self, id: &str) {
         let turns = {
             let mut maps = self.0.lock().unwrap();
-            let turns = maps.turns.remove(id).unwrap_or_default();
+            let turns = maps.turns.get(id).cloned().unwrap_or_default();
             maps.pending_pauses.remove(id);
             turns
         };
@@ -342,19 +349,12 @@ impl TurnTable {
     pub fn pause_session(&self, id: &str, turn_id: &str) {
         let mut maps = self.0.lock().unwrap();
         let mut cancelled = false;
-        if let Some(turns) = maps.turns.get_mut(id) {
-            let mut remaining = Vec::new();
-            for t in turns.drain(..) {
+        if let Some(turns) = maps.turns.get(id) {
+            for t in turns {
                 if turn_id.is_empty() || t.turn_id == turn_id {
                     t.cancel.cancel();
                     cancelled = true;
-                } else {
-                    remaining.push(t);
                 }
-            }
-            *turns = remaining;
-            if turns.is_empty() {
-                maps.turns.remove(id);
             }
         }
         if !cancelled && !turn_id.is_empty() {
@@ -366,13 +366,32 @@ impl TurnTable {
     }
 
     pub fn session_has_active_turn(&self, id: &str) -> bool {
-        self.0
-            .lock()
-            .unwrap()
-            .turns
-            .get(id)
-            .map(|t| !t.is_empty())
-            .unwrap_or(false)
+        let maps = self.0.lock().unwrap();
+        maps.reserved.contains(id) || maps.turns.get(id).map(|t| !t.is_empty()).unwrap_or(false)
+    }
+
+    /// Block (up to `timeout`) until the session has no active turn —
+    /// i.e. the prior turn has fully unwound and reached end_turn, so a
+    /// follow-up /send won't race it. Returns true if idle, false on
+    /// timeout. Uses notify_one() permits so a wakeup that fires between
+    /// the active-turn check and registering interest is not lost.
+    pub async fn wait_idle(&self, id: &str, timeout: std::time::Duration) -> bool {
+        let notify = self.0.lock().unwrap().notify.clone();
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if !self.session_has_active_turn(id) {
+                return true;
+            }
+            let Some(remain) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                return !self.session_has_active_turn(id);
+            };
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            tokio::select! {
+                _ = &mut notified => continue,
+                _ = tokio::time::sleep(remain) => return !self.session_has_active_turn(id),
+            }
+        }
     }
 
     pub fn session_turn_completed(&self, id: &str) -> bool {
@@ -383,7 +402,50 @@ impl TurnTable {
     /// prevents result(wait:true) from treating a previous completion as the
     /// completion of a just-started follow-up.
     pub fn prepare_session_turn(&self, id: &str) {
-        self.0.lock().unwrap().completed.remove(id);
+        let mut maps = self.0.lock().unwrap();
+        maps.completed.remove(id);
+        maps.reserved.insert(id.to_string());
+    }
+
+    /// Atomically reserves an idle session before its detached turn task is
+    /// spawned. This closes the gap where two sends could load independent
+    /// session snapshots before either registered an active TurnHandle.
+    pub fn try_prepare_session_turn(&self, id: &str) -> bool {
+        let mut maps = self.0.lock().unwrap();
+        if maps.reserved.contains(id)
+            || maps
+                .turns
+                .get(id)
+                .map(|turns| !turns.is_empty())
+                .unwrap_or(false)
+        {
+            return false;
+        }
+        maps.completed.remove(id);
+        maps.reserved.insert(id.to_string());
+        true
+    }
+
+    /// Release a reservation made by try_prepare_session_turn without
+    /// starting a turn. Used when auto-continue decides not to proceed.
+    pub fn release_prepared(&self, id: &str) {
+        let mut maps = self.0.lock().unwrap();
+        maps.reserved.remove(id);
+    }
+
+    /// Backstop for turn tasks that die mid-flight (a panic, most
+    /// commonly): removes every registered turn and releases the
+    /// reservation. A healthy turn already deregistered itself via
+    /// end_turn, so this is a no-op then. Without it, a dead turn task
+    /// would wedge the session — every later /send would be rejected
+    /// with 409 "session already has an active turn" until restart.
+    pub fn force_end_session_turns(&self, id: &str) {
+        let mut maps = self.0.lock().unwrap();
+        maps.reserved.remove(id);
+        if maps.turns.remove(id).is_some() {
+            maps.completed.insert(id.to_string());
+        }
+        maps.notify.notify_one();
     }
 
     pub fn clear_pending_pauses(&self, id: &str) {
@@ -478,6 +540,7 @@ impl PendingApprovals {
 
 pub struct AppState {
     pub store: Arc<SessionStore>,
+    store_io: Arc<Semaphore>,
     pub subs: SessionSubs,
     pub turns: TurnTable,
     pub approvals: PendingApprovals,
@@ -493,6 +556,7 @@ impl AppState {
         store.reconcile_delegate_statuses();
         AppState {
             store,
+            store_io: Arc::new(Semaphore::new(1)),
             subs: SessionSubs::default(),
             turns: TurnTable::default(),
             approvals: PendingApprovals::default(),
@@ -500,6 +564,29 @@ impl AppState {
             tracker,
             files: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Runs synchronous SQLite/session work away from Tokio's workers.
+    /// The permit is moved into the blocking task so cancellation cannot
+    /// release it while the underlying operation is still running.
+    pub async fn store_call<T, F>(&self, f: F) -> T
+    where
+        T: Send + 'static,
+        F: FnOnce(&SessionStore) -> T + Send + 'static,
+    {
+        let permit = self
+            .store_io
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("session store semaphore closed");
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            f(&store)
+        })
+        .await
+        .expect("session store task panicked")
     }
 
     /// Get-or-create the FileSeen cache for a session.
@@ -573,9 +660,13 @@ mod tests {
 
         // Empty turn_id pauses every active turn.
         let a = tt.start_turn("s2", "a");
-        let _b = tt.start_turn("s2", "b");
+        let b = tt.start_turn("s2", "b");
         tt.pause_session("s2", "");
         assert!(a.is_cancelled());
+        assert!(b.is_cancelled());
+        assert!(tt.session_has_active_turn("s2"));
+        tt.end_turn("s2", &a);
+        tt.end_turn("s2", &b);
         assert!(!tt.session_has_active_turn("s2"));
 
         // Non-matching id records another pending pause.
@@ -603,6 +694,86 @@ mod tests {
 
         tt.prepare_session_turn("child");
         assert!(!tt.session_turn_completed("child"));
+    }
+
+    #[test]
+    fn turn_table_reserves_only_one_pending_turn_per_session() {
+        let tt = TurnTable::default();
+        assert!(tt.try_prepare_session_turn("s"));
+        assert!(!tt.try_prepare_session_turn("s"));
+        assert!(tt.session_has_active_turn("s"));
+
+        let handle = tt.start_turn("s", "t");
+        assert!(tt.session_has_active_turn("s"));
+        assert!(!tt.try_prepare_session_turn("s"));
+
+        tt.end_turn("s", &handle);
+        assert!(tt.try_prepare_session_turn("s"));
+    }
+
+    #[test]
+    fn force_end_session_turns_unwedges_a_dead_turn() {
+        let tt = TurnTable::default();
+        // A registered turn whose task died mid-flight.
+        let _handle = tt.start_turn("w", "t");
+        // A reservation leaked before the turn task ever started.
+        assert!(tt.try_prepare_session_turn("r"));
+        assert!(tt.session_has_active_turn("w"));
+        assert!(tt.session_has_active_turn("r"));
+
+        tt.force_end_session_turns("w");
+        tt.force_end_session_turns("r");
+        assert!(!tt.session_has_active_turn("w"));
+        assert!(!tt.session_has_active_turn("r"));
+
+        // The session must accept new turns again after the backstop.
+        assert!(tt.try_prepare_session_turn("w"));
+        assert!(tt.try_prepare_session_turn("r"));
+    }
+
+    #[tokio::test]
+    async fn wait_idle_returns_when_turn_ends() {
+        let tt = Arc::new(TurnTable::default());
+        let h = tt.start_turn("s", "t");
+        assert!(tt.session_has_active_turn("s"));
+
+        let tt2 = tt.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            tt2.end_turn("s", &h);
+        });
+
+        let res = tokio::time::timeout(
+            Duration::from_secs(1),
+            tt.wait_idle("s", Duration::from_secs(2)),
+        )
+        .await;
+        assert!(
+            res.is_ok(),
+            "wait_idle should return well before the timeout"
+        );
+        assert!(
+            res.unwrap(),
+            "wait_idle should report idle once the turn ends"
+        );
+        assert!(!tt.session_has_active_turn("s"));
+    }
+
+    #[tokio::test]
+    async fn wait_idle_times_out_for_never_ending_turn() {
+        let tt = TurnTable::default();
+        let _h = tt.start_turn("x", "t");
+        assert!(tt.session_has_active_turn("x"));
+
+        let start = std::time::Instant::now();
+        let idle = tt.wait_idle("x", Duration::from_millis(100)).await;
+        let elapsed = start.elapsed();
+        assert!(!idle, "never-ending turn must not report idle");
+        assert!(
+            elapsed >= Duration::from_millis(90),
+            "wait_idle should block close to the timeout, took {elapsed:?}"
+        );
+        assert!(tt.session_has_active_turn("x"));
     }
 
     #[test]
@@ -634,6 +805,57 @@ mod tests {
         );
         assert_eq!(subs.subscriber_count("sess"), 0);
         assert!(!subs.unsubscribe("sess", 999));
+    }
+
+    #[test]
+    fn lagging_subscriber_is_disconnected_instead_of_losing_events() {
+        let subs = SessionSubs::default();
+        let mut subscriber = subs.subscribe("sess");
+        for i in 0..64 {
+            subs.broadcast("sess", &serde_json::json!({"seq": i}));
+        }
+        assert_eq!(subs.subscriber_count("sess"), 1);
+
+        subs.broadcast("sess", &serde_json::json!({"type": "done"}));
+        assert_eq!(subs.subscriber_count("sess"), 0);
+        for _ in 0..64 {
+            subscriber.rx.try_recv().unwrap();
+        }
+        assert!(matches!(
+            subscriber.rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn store_call_keeps_runtime_workers_available() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(AppState::new(
+            Arc::new(SessionStore::open_in_dir(dir.path()).unwrap()),
+            SandboxConfig::default(),
+            Arc::new(ConnTracker::default()),
+        ));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker_state = state.clone();
+        let worker = tokio::spawn(async move {
+            worker_state
+                .store_call(move |_| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+                .await;
+        });
+        entered_rx.await.unwrap();
+
+        let heartbeat = tokio::time::timeout(
+            Duration::from_millis(250),
+            tokio::time::sleep(Duration::from_millis(10)),
+        )
+        .await;
+        release_tx.send(()).unwrap();
+        worker.await.unwrap();
+        assert!(heartbeat.is_ok(), "blocking store work starved Tokio");
     }
 
     #[test]

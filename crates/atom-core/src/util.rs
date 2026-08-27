@@ -38,6 +38,21 @@ pub fn sha256_hash(data: &[u8]) -> String {
     hex::encode(h.finalize())
 }
 
+/// openURL opens a URL with the platform opener (`open` on macOS,
+/// `xdg-open` on Linux); used for clicked OSC 8 hyperlinks and any
+/// other user-facing URL. Spawn failures are ignored: the URL is
+/// already visible in the transcript.
+pub fn open_url(url: &str) {
+    let result = if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg(url).spawn()
+    } else if cfg!(target_os = "linux") {
+        std::process::Command::new("xdg-open").arg(url).spawn()
+    } else {
+        return;
+    };
+    let _ = result;
+}
+
 /// addStreamUsage folds src into dst field-wise (Go session.go).
 pub fn add_stream_usage(dst: &mut crate::types::StreamUsage, src: &crate::types::StreamUsage) {
     dst.prompt_tokens += src.prompt_tokens;

@@ -300,7 +300,7 @@ mod tests {
     fn key_for_prefers_rule_id_then_hashes_command() {
         assert_eq!(
             key_for("curl", "curl x", Path::new("/ws")),
-            format!("curl\u{1f}/ws")
+            "curl\u{1f}/ws".to_string()
         );
         let k = key_for("", "weird -cmd", Path::new("/w"));
         assert!(k.starts_with(&command_fallback_key("weird -cmd")));

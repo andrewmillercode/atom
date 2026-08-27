@@ -42,6 +42,10 @@ pub struct AtomConfig {
     pub compaction: Option<CompactionConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_search: Option<WebSearchConfig>,
+    /// `None` means auto-update is enabled (the default). Set to `false`
+    /// to disable the startup auto-updater.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_update: Option<bool>,
 }
 
 const fn config_version() -> u32 {
@@ -54,11 +58,18 @@ impl Default for AtomConfig {
             version: CONFIG_VERSION,
             compaction: None,
             web_search: None,
+            auto_update: None,
         }
     }
 }
 
 impl AtomConfig {
+    /// Whether the startup auto-updater is enabled. `None` (the default)
+    /// and `Some(true)` both enable it; only an explicit `false` disables.
+    pub fn resolved_auto_update(&self) -> bool {
+        self.auto_update.unwrap_or(true)
+    }
+
     pub fn resolved_compaction(&self) -> CompactionConfig {
         let mut value = self.compaction.clone().unwrap_or_default();
         if value.provider.trim().is_empty() {
@@ -153,12 +164,12 @@ pub fn bundled_web_search_profile(id: &str) -> Option<WebSearchProfile> {
 
 pub fn config_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME").filter(|dir| !dir.is_empty()) {
-        return PathBuf::from(dir).join("atom");
+        return PathBuf::from(dir).join(crate::build::dir_leaf());
     }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".config")
-        .join("atom")
+        .join(crate::build::dir_leaf())
 }
 
 pub fn config_path() -> PathBuf {
@@ -235,12 +246,17 @@ mod tests {
 
     #[test]
     fn custom_web_search_requires_an_explicit_tool() {
-        let mut config = AtomConfig::default();
-        config.compaction = Some(config.resolved_compaction());
-        config.web_search = Some(WebSearchConfig {
-            server: "custom".into(),
-            tool: String::new(),
-        });
+        let mut config = AtomConfig {
+            compaction: Some(CompactionConfig {
+                provider: DEFAULT_COMPACTION_PROVIDER.into(),
+                model: DEFAULT_COMPACTION_MODEL.into(),
+            }),
+            web_search: Some(WebSearchConfig {
+                server: "custom".into(),
+                tool: String::new(),
+            }),
+            ..AtomConfig::default()
+        };
         assert!(!config.setup_complete());
         assert!(config.resolved_web_search().tool.is_empty());
 
@@ -261,15 +277,17 @@ mod tests {
     fn round_trip_and_replace_atomically() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested/config.json");
-        let mut config = AtomConfig::default();
-        config.compaction = Some(CompactionConfig {
-            provider: "openai".into(),
-            model: "gpt-5".into(),
-        });
-        config.web_search = Some(WebSearchConfig {
-            server: "exa".into(),
-            tool: "web_search_exa".into(),
-        });
+        let config = AtomConfig {
+            compaction: Some(CompactionConfig {
+                provider: "openai".into(),
+                model: "gpt-5".into(),
+            }),
+            web_search: Some(WebSearchConfig {
+                server: "exa".into(),
+                tool: "web_search_exa".into(),
+            }),
+            ..AtomConfig::default()
+        };
         save_to(&path, &config).unwrap();
         assert_eq!(load_from(&path).unwrap(), config);
         assert_eq!(

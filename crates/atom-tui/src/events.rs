@@ -198,6 +198,11 @@ pub enum Effect {
     CopyToClipboard {
         text: String,
     },
+    /// Open a clicked OSC 8 hyperlink (http(s) or file URL) with the
+    /// platform opener.
+    OpenLink {
+        uri: String,
+    },
     PaintPreviews,
 }
 
@@ -258,8 +263,15 @@ pub enum AppMsg {
     TickSpinner,
     TickSplash(f64),
     TestSceneTick,
+    /// Periodic safety-net: re-arms all select! wakeup sources so a lost
+    /// crossterm wakeup self-heals within one heartbeat interval.
+    Heartbeat,
     /// Internal: the terminal view regained focus and needs a full repaint.
     Redraw,
+    /// Internal: the math engine finished rendering one or more display
+    /// formulas; the viewport must rescan blocks for newly ready
+    /// placeholder rows. Handled by the loop, not the state machine.
+    MathWake,
     OAuthDone(Result<AuthEntry, String>),
     HotRebuilt(Result<crate::hot::HotBuild, String>),
     ThemeReloaded(Result<std::time::Duration, String>),
@@ -301,7 +313,9 @@ impl std::fmt::Debug for AppMsg {
             AppMsg::TickSpinner => write!(f, "TickSpinner"),
             AppMsg::TickSplash(t) => write!(f, "TickSplash({t})"),
             AppMsg::TestSceneTick => write!(f, "TestSceneTick"),
+            AppMsg::Heartbeat => write!(f, "Heartbeat"),
             AppMsg::Redraw => write!(f, "Redraw"),
+            AppMsg::MathWake => write!(f, "MathWake"),
             AppMsg::OAuthDone(r) => write!(f, "OAuthDone({r:?})"),
             AppMsg::HotRebuilt(r) => write!(f, "HotRebuilt({r:?})"),
             AppMsg::ThemeReloaded(r) => write!(f, "ThemeReloaded({r:?})"),

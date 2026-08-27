@@ -12,10 +12,13 @@ use super::colors::{ansi_bg, ansi_fg, COLOR_SECONDARY};
 
 /// linkRe matches http(s) and file URLs, home-relative paths, and
 /// absolute Unix paths with at least two segments (so /thinking and
-/// other slash-commands stay plain text).
+/// other slash-commands stay plain text). A backticked or double-quoted
+/// span that starts with a path prefix links in full, so paths
+/// containing spaces (`~/Library/Application Support/...` or
+/// "/Users/me/My Docs/...") aren't truncated at the space.
 static LINK_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-    r#"(?i)\bhttps?://[^\s<>\[\]"'`]+|file://[^\s<>\[\]"'`]+|~/(?:[A-Za-z0-9._+-]+/)*[A-Za-z0-9._+-]+|/(?:[A-Za-z0-9._+-]+/){1,}[A-Za-z0-9._+-]+"#,
+    r#"(?i)`(?:~/|/)[^`\n]+`|"(?:~/|/)[^"\n]+"|\bhttps?://[^\s<>\[\]"'`]+|file://[^\s<>\[\]"'`]+|~/(?:[A-Za-z0-9._+-]+/)*[A-Za-z0-9._+-]+|/(?:[A-Za-z0-9._+-]+/){1,}[A-Za-z0-9._+-]+"#,
 ).unwrap()
 });
 
@@ -49,7 +52,29 @@ pub fn linkify(text: &str, restore_fg: &str, restore_bg: &str) -> String {
     let mut sb = String::with_capacity(text.len() + 64);
     let mut last = 0usize;
     for m in LINK_RE.find_iter(text) {
-        let display = trim_link(m.as_str());
+        let raw = m.as_str();
+        // Backticked or double-quoted paths: the delimiter characters
+        // stay as plain text and the path inside — spaces included —
+        // becomes the hyperlink.
+        if let Some(inner) = raw
+            .strip_prefix('`')
+            .and_then(|s| s.strip_suffix('`'))
+            .or_else(|| raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
+        {
+            let delim = raw.chars().next().expect("delimited match is non-empty");
+            sb.push_str(&text[last..m.start()]);
+            sb.push(delim);
+            sb.push_str(&render_link(
+                inner,
+                &link_uri(inner),
+                restore_fg,
+                restore_bg,
+            ));
+            sb.push(delim);
+            last = m.end();
+            continue;
+        }
+        let display = trim_link(raw);
         if display.is_empty() {
             continue;
         }
@@ -75,7 +100,11 @@ pub fn linkify_path(display: &str, restore_fg: &str, restore_bg: &str) -> String
 
 pub fn path_file_uri(display: &str) -> String {
     let mut p = display.to_string();
-    if p.len() >= 7 && p[..7].eq_ignore_ascii_case("file://") {
+    // get(..7) instead of [..7]: a leading multi-byte rune can make byte 7
+    // a non-boundary; the ASCII check then simply fails, as it should.
+    if p.get(..7)
+        .is_some_and(|s| s.eq_ignore_ascii_case("file://"))
+    {
         return p;
     }
     if let Some(rest) = p.strip_prefix("~/") {
@@ -115,8 +144,16 @@ pub fn trim_link(s: &str) -> &str {
 }
 
 pub fn link_uri(display: &str) -> String {
-    let lower_prefix =
-        |p: &str| display.len() >= p.len() && display[..p.len()].eq_ignore_ascii_case(p);
+    // Byte-wise prefix check: matched text can contain multi-byte runes
+    // (e.g. "https://" + em dash), so a p.len() byte cut may land mid-rune
+    // and slicing there panics. ASCII case-insensitive comparison on bytes
+    // is equivalent for these ASCII prefixes and never panics.
+    let lower_prefix = |p: &str| {
+        display
+            .as_bytes()
+            .get(..p.len())
+            .is_some_and(|b| b.eq_ignore_ascii_case(p.as_bytes()))
+    };
     if lower_prefix("http://") || lower_prefix("https://") || lower_prefix("file://") {
         display.to_string()
     } else if let Some(rest) = display.strip_prefix("~/") {
@@ -154,11 +191,10 @@ fn should_escape_path(ch: char) -> bool {
     if ch.is_ascii_alphanumeric() {
         return false;
     }
-    match ch {
-        '-' | '_' | '.' | '~' => false,
-        '$' | '&' | '+' | ',' | '/' | ':' | ';' | '=' | '@' => false,
-        _ => true,
-    }
+    !matches!(
+        ch,
+        '-' | '_' | '.' | '~' | '$' | '&' | '+' | ',' | '/' | ':' | ';' | '=' | '@'
+    )
 }
 
 /// lexical_abs stands in for Go's filepath.Abs: pure lexical join with
@@ -393,9 +429,7 @@ fn flush_word(st: &mut WrapState<'_>, _limit: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::render::colors::{
-        ansi_bg, ansi_fg, COLOR_CARD_DARK, COLOR_FOREGROUND, COLOR_SECONDARY,
-    };
+    use crate::render::colors::{ansi_fg, COLOR_CARD_DARK, COLOR_FOREGROUND, COLOR_SECONDARY};
 
     #[test]
     fn slash_commands_stay_plain() {
@@ -444,6 +478,40 @@ mod tests {
     }
 
     #[test]
+    fn linkify_backticked_path_with_space() {
+        let in_text = "`~/Library/Application Support/atom/diagrams/`";
+        let home = dirs::home_dir().unwrap().display().to_string();
+        let out = linkify(in_text, "", "");
+        // The full path — space included — becomes the URI, escaped.
+        assert!(out.contains(&osc8_open(&file_uri(&format!(
+            "{home}/Library/Application Support/atom/diagrams/"
+        )))));
+        // Backticks remain visible and no text is lost.
+        assert_eq!(visible_width(&out), visible_width(in_text));
+        // Absolute backticked paths behave the same.
+        let out = linkify("`/Users/a/My Docs/x.md`", "", "");
+        assert!(out.contains(&osc8_open(&file_uri("/Users/a/My Docs/x.md"))));
+    }
+
+    #[test]
+    fn linkify_double_quoted_path_with_space() {
+        // The visualize tool marker quotes artifact paths; a
+        // space-containing path must not truncate at the space.
+        let in_text = "png=\"/Users/a/My Docs/x.png\" html=\"/Users/a/My Docs/x.html\"";
+        let out = linkify(in_text, "", "");
+        assert!(out.contains(&osc8_open(&file_uri("/Users/a/My Docs/x.png"))));
+        assert!(out.contains(&osc8_open(&file_uri("/Users/a/My Docs/x.html"))));
+        // The full display text survives (no truncation at the space).
+        assert!(out.contains("/Users/a/My Docs/x.png"));
+        assert!(out.contains("/Users/a/My Docs/x.html"));
+        // The double quotes stay visible as plain text.
+        assert!(out.contains("png=\""));
+        assert!(out.contains("\" html=\""));
+        assert!(out.ends_with('"'));
+        assert_eq!(visible_width(&out), visible_width(in_text));
+    }
+
+    #[test]
     fn linkify_path_relative_makes_absolute_uri() {
         for rel in ["tui.go", "src/main.go"] {
             let out = linkify_path(rel, COLOR_FOREGROUND, COLOR_CARD_DARK);
@@ -465,6 +533,28 @@ mod tests {
         assert_eq!(file_uri("/plain/path.txt"), "file:///plain/path.txt");
     }
 
+    /// Regression: prefix checks in link_uri/path_file_uri used to slice at
+    /// a fixed byte offset, panicking when a multi-byte rune (em dash,
+    /// CJK, accented text) straddled that offset right after the scheme.
+    #[test]
+    fn linkify_multibyte_after_scheme_no_panic() {
+        for text in [
+            "see https://\u{2014} now",
+            "see https://\u{2014}abc end",
+            "open file://\u{2014} today",
+            "hit http://\u{4e2d}\u{6587} ok",
+            "accent \u{e9}\u{e9}\u{e9}\u{e9}\u{e9} plain",
+        ] {
+            let out = linkify(text, "", "");
+            assert_eq!(visible_width(&out), visible_width(text), "{text}");
+            assert!(out.contains('\u{2014}') || !text.contains('\u{2014}'));
+        }
+        // Direct calls with multi-byte leading runes must not panic either.
+        let _ = link_uri("\u{2014}\u{2014}\u{2014}");
+        let _ = link_uri("\u{e9}\u{e9}\u{e9}\u{e9}");
+        let _ = path_file_uri("\u{2014}\u{2014}\u{2014}/x");
+    }
+
     /// Golden captured from charmbracelet/x/ansi v0.11.8 via the real
     /// renderLink + Wrap pipeline in the Go build.
     #[test]
@@ -473,7 +563,7 @@ mod tests {
         let got = wrap_linked(&format!("prefix {url} suffix"), 20, COLOR_FOREGROUND, "");
         let want = "prefix \x1b]8;;https://ness-health.com/a/very/long/path/that/will/wrap\x07\
 \x1b[38;2;180;145;176m\x1b[4mhttps://ness-\nhealth.com/a/very/lo\nng/path/that/will/wr\nap\
-\x1b[24m\x1b[38;2;222;227;232m\x1b]8;;\x07 suffix";
+\x1b[24m\x1b[38;2;206;213;217m\x1b]8;;\x07 suffix";
         assert_eq!(got, want, "\ngot:  {:?}\nwant: {:?}", got, want);
     }
 

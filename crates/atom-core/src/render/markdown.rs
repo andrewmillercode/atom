@@ -11,7 +11,7 @@
 
 use super::colors::{ansi_fg, COLOR_FOREGROUND, COLOR_MUTED, COLOR_SECONDARY, COLOR_SYNTAX_STRING};
 use super::highlight::highlight_code;
-use super::links::ansi_wrap;
+use super::links::{ansi_wrap, osc8_close, osc8_open};
 
 const BOLD: &str = "\x1b[1m";
 const ITALIC: &str = "\x1b[3m";
@@ -552,16 +552,21 @@ pub fn render_inlines(src: &str) -> String {
             '[' => match parse_link(&chars, i, false) {
                 Some((end, label_src, url)) => {
                     let body = if label_src.trim().is_empty() {
-                        url
+                        url.clone()
                     } else {
                         render_inlines(&label_src)
                     };
+                    // OSC 8 wrapper so terminals (and the TUI click
+                    // handler) can open the target; the label body keeps
+                    // its nested inline styling.
                     out.push_str(&format!(
-                        "{}{}{}{}",
+                        "{}{}{}{}{}{}",
+                        osc8_open(&url),
                         ansi_fg(COLOR_SECONDARY),
                         UNDERLINE,
                         body,
-                        RESET
+                        RESET,
+                        osc8_close()
                     ));
                     i = end;
                 }
@@ -589,11 +594,13 @@ pub fn render_inlines(src: &str) -> String {
                 if let Some(end) = autolink_end(&chars, i) {
                     let url: String = chars[i + 1..end].iter().collect();
                     out.push_str(&format!(
-                        "{}{}{}{}",
+                        "{}{}{}{}{}{}",
+                        osc8_open(&url),
                         ansi_fg(COLOR_SECONDARY),
                         UNDERLINE,
                         url,
-                        RESET
+                        RESET,
+                        osc8_close()
                     ));
                     i = end + 1;
                 } else {
@@ -820,6 +827,26 @@ mod tests {
     fn link_label_rendered() {
         let got = strip(&render_markdown("[label](https://example.com)", 80));
         assert!(got.contains("label"), "{}", got);
+    }
+
+    #[test]
+    fn links_carry_osc8_targets() {
+        let got = render_markdown("[label](https://example.com)", 80);
+        assert!(
+            got.contains("\x1b]8;;https://example.com\x07"),
+            "missing OSC 8 open: {got:?}"
+        );
+        assert!(got.contains(crate::render::links::osc8_close()));
+
+        let got = render_markdown("<https://example.com/a>", 80);
+        assert!(
+            got.contains("\x1b]8;;https://example.com/a\x07"),
+            "missing OSC 8 open for autolink: {got:?}"
+        );
+
+        // Plain text never gains hyperlink wrappers.
+        let got = render_markdown("no links here", 80);
+        assert!(!got.contains("\x1b]8;;"), "{got:?}");
     }
 
     #[test]

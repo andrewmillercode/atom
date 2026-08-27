@@ -30,7 +30,8 @@ pub fn execute_read_file(arguments: &str, ctx: &ToolCtx<'_>) -> ToolOutcome {
             }
         }
     };
-    let content = match std::fs::read(&args.path) {
+    let path = crate::exec::resolve_tool_path(&ctx.cwd, &args.path);
+    let content = match std::fs::read(&path) {
         Ok(c) => c,
         Err(e) => {
             return ToolOutcome {
@@ -39,7 +40,7 @@ pub fn execute_read_file(arguments: &str, ctx: &ToolCtx<'_>) -> ToolOutcome {
             }
         }
     };
-    file_edit::remember_file(ctx, &args.path, &content);
+    file_edit::remember_file(ctx, &path, &content);
     if sniff_image_mime(&content).is_some() {
         if content.len() > atom_core::types::MAX_IMAGE_SOURCE_BYTES {
             return ToolOutcome {
@@ -85,7 +86,7 @@ pub fn execute_read_file(arguments: &str, ctx: &ToolCtx<'_>) -> ToolOutcome {
 // ---------------------------------------------------------------------------
 
 fn b64_len(n: usize) -> usize {
-    ((n + 2) / 3) * 4
+    n.div_ceil(3) * 4
 }
 
 pub(crate) fn normalize_image(data: &[u8]) -> Result<(Vec<u8>, String), String> {
@@ -257,7 +258,7 @@ mod tests {
         // instead just verify a moderately sized image round-trips.
         let img = image::RgbaImage::from_pixel(3000, 2000, [255u8; 4].into());
         let mut buf = Vec::new();
-        image::DynamicImage::ImageRgba8(img.into())
+        image::DynamicImage::ImageRgba8(img)
             .write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)
             .unwrap();
         let (out, mime) = normalize_image(&buf).unwrap();

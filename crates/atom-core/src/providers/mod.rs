@@ -9,6 +9,9 @@ pub mod modelsdev;
 #[cfg(test)]
 pub mod modelsdev_go_compat;
 pub mod oauth;
+// `providers::providers` mirrors the Go package layout (providers/
+// providers.go); renaming it would ripple through every caller.
+#[allow(clippy::module_inception)]
 pub mod providers;
 pub mod retry;
 
@@ -23,10 +26,11 @@ pub use codex::{
 pub use modelsdev::{
     anthropic_style_for_url, bedrock_style_for_url, catalog_free_model_ids, context_window_tokens,
     derive_reasoning_levels, ensure_models_dev_catalog, find_catalog_model,
-    load_models_dev_catalog_bytes, models_dev_style, provider_is_anthropic_style,
-    provider_is_bedrock, reasoning_levels_for, set_models_dev_catalog_for_test,
-    suggest_catalog_model_ids, thinking_off_value, valid_thinking_level, ModelsDevCatalog,
-    ModelsDevCost, ModelsDevLimit, ModelsDevModel, ModelsDevProvider,
+    load_models_dev_catalog_bytes, model_supports_image_input, models_dev_style,
+    provider_is_anthropic_style, provider_is_bedrock, reasoning_levels_for,
+    set_models_dev_catalog_for_test, suggest_catalog_model_ids, thinking_off_value,
+    valid_thinking_level, ModelsDevCatalog, ModelsDevCost, ModelsDevLimit, ModelsDevModalities,
+    ModelsDevModel, ModelsDevProvider,
 };
 pub use oauth::{
     ensure_openai_auth, new_openai_oauth_flow, redact_oauth_text, refresh_openai_token,
@@ -46,7 +50,4 @@ pub use retry::{
 #[cfg(test)]
 pub(crate) use self::providers::testutil;
 #[cfg(test)]
-pub(crate) use self::providers::testutil::{
-    clear_builtin_provider_env, inject_models_dev, isolate_data_dir, set_env, test_lock,
-    CatalogGuard, DataDirGuard, EnvVarGuard, StubServer,
-};
+pub(crate) use self::providers::testutil::{isolate_data_dir, test_lock, StubServer};

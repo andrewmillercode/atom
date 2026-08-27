@@ -126,10 +126,10 @@ pub fn aggregate_stats(store: &SessionStore, days: i64) -> StatsReport {
         }
         report.total_sessions += 1;
         report.total_messages += sess.messages.len() as i64;
-        if earliest.map_or(true, |e| sess.created_at < e) {
+        if earliest.is_none_or(|e| sess.created_at < e) {
             earliest = Some(sess.created_at);
         }
-        if latest.map_or(true, |l| sess.updated_at > l) {
+        if latest.is_none_or(|l| sess.updated_at > l) {
             latest = Some(sess.updated_at);
         }
 
@@ -202,7 +202,7 @@ pub fn aggregate_stats(store: &SessionStore, days: i64) -> StatsReport {
             tokens_total(&report.total_tokens) / report.total_sessions as f64;
         session_totals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let mid = session_totals.len() / 2;
-        report.median_tokens_per_session = if session_totals.len() % 2 == 0 {
+        report.median_tokens_per_session = if session_totals.len().is_multiple_of(2) {
             (session_totals[mid - 1] + session_totals[mid]) / 2.0
         } else {
             session_totals[mid]
@@ -289,12 +289,7 @@ pub fn render_stats(report: &StatsReport, width: i32, color: bool) -> Vec<String
     if width <= 0 {
         width = 56;
     }
-    if width < 34 {
-        width = 34;
-    }
-    if width > 64 {
-        width = 64;
-    }
+    width = width.clamp(34, 64);
 
     let box_line = |corner: &str| -> String {
         let line = format!("{}{}{}", corner, "─".repeat((width - 2) as usize), corner);
@@ -339,17 +334,17 @@ pub fn render_stats(report: &StatsReport, width: i32, color: bool) -> Vec<String
         }];
     }
 
-    let mut lines: Vec<String> = Vec::new();
-
-    // Overview: session and message counts plus the span in days.
-    lines.push(box_line("┌"));
-    lines.push(title("OVERVIEW"));
-    lines.push(box_line("├"));
-    lines.push(row("Sessions", &report.total_sessions.to_string()));
-    lines.push(row("Messages", &report.total_messages.to_string()));
-    lines.push(row("Days", &report.days.to_string()));
-    lines.push(box_line("└"));
-    lines.push(String::new());
+    let mut lines: Vec<String> = vec![
+        // Overview: session and message counts plus the span in days.
+        box_line("┌"),
+        title("OVERVIEW"),
+        box_line("├"),
+        row("Sessions", &report.total_sessions.to_string()),
+        row("Messages", &report.total_messages.to_string()),
+        row("Days", &report.days.to_string()),
+        box_line("└"),
+        String::new(),
+    ];
 
     // Tokens (and cost, when any provider reported it).
     let heading = if report.total_cost > 0.0 {

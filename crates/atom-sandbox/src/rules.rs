@@ -12,8 +12,9 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 /// How a single command segment is judged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Verdict {
+    #[default]
     #[serde(rename = "allow")]
     Allow,
     #[serde(rename = "ask")]
@@ -29,12 +30,6 @@ impl Verdict {
             Verdict::Ask => "ask",
             Verdict::Deny => "deny",
         }
-    }
-}
-
-impl Default for Verdict {
-    fn default() -> Self {
-        Verdict::Allow
     }
 }
 

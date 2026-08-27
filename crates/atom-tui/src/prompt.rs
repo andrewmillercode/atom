@@ -335,6 +335,46 @@ impl Prompt {
         layout.cursor_position(self.char_boundary_at_or_before(self.cursor))
     }
 
+    /// Maps a wrapped display row + cell column to a byte offset in `value`.
+    ///
+    /// `display_row` is the row index within the full wrapped layout (so a
+    /// caller must add `scroll_y` before calling). Clicking anywhere on a
+    /// wide char snaps to the char boundary before it, combining marks are
+    /// advanced past (zero-width), and clicking past the end of a row places
+    /// the cursor at the end of that row's text. Out-of-range rows clamp to
+    /// the last wrapped row. The returned offset is always on a char boundary.
+    pub fn offset_at_display(&self, width: usize, display_row: usize, col: usize) -> usize {
+        let layout = self.wrapped_layout(width);
+        let total = layout.rows.len();
+        if total == 0 {
+            return self.value.len();
+        }
+        let row = &layout.rows[display_row.min(total - 1)];
+
+        let mut acc = 0usize;
+        for unit in &row.units {
+            if unit.cells == 0 {
+                continue;
+            }
+            if col < acc + unit.cells {
+                return self.char_boundary_at_or_before(unit.source_start);
+            }
+            acc += unit.cells;
+        }
+
+        // Past the end of the visible text: place at the end of the last
+        // non-empty unit so a discarded wrap space is skipped but a trailing
+        // combining mark is included.
+        let end = row
+            .units
+            .iter()
+            .rev()
+            .find(|unit| !unit.text.is_empty())
+            .map(|unit| unit.source_end)
+            .unwrap_or(row.source_start);
+        self.char_boundary_at_or_before(end)
+    }
+
     fn wrapped_layout(&self, width: usize) -> WrappedLayout {
         let width = width.max(1);
         let mut rows = Vec::new();
@@ -789,5 +829,86 @@ mod tests {
         p.sel = Some((3, 6));
         let _ = p.selected_text();
         let _ = p.view(2, 8);
+    }
+
+    #[test]
+    fn offset_at_display_maps_wrapped_cells_to_byte_offsets() {
+        let mut p = Prompt::new();
+        p.set_value("aaa éé"); // width 4 wraps to ["aaa", "éé"]
+        assert_eq!(p.wrapped(4), ["aaa", "éé"]);
+
+        // Row 0: "aaa" (the space is a discarded wrap artifact).
+        assert_eq!(p.offset_at_display(4, 0, 0), 0);
+        assert_eq!(p.offset_at_display(4, 0, 2), 2);
+        assert_eq!(
+            p.offset_at_display(4, 0, 3),
+            3,
+            "past end -> end of row text"
+        );
+        assert_eq!(
+            p.offset_at_display(4, 0, 99),
+            3,
+            "click far right -> end of row"
+        );
+
+        // Row 1: "éé"; each é is 1 display cell (2 bytes each).
+        assert_eq!(p.offset_at_display(4, 1, 0), 4);
+        assert_eq!(p.offset_at_display(4, 1, 1), 6, "second é");
+        assert_eq!(p.offset_at_display(4, 1, 2), 8, "past end -> end of row");
+        assert_eq!(p.offset_at_display(4, 1, 99), 8);
+
+        // An out-of-range row clamps to the last wrapped row.
+        assert_eq!(p.offset_at_display(4, 7, 99), 8);
+    }
+
+    #[test]
+    fn offset_at_display_handles_combining_and_cjk() {
+        let mut p = Prompt::new();
+        p.set_value("e\u{301}界x"); // é + CJK 界 + x, width 3 wraps to ["e\u{301}界", "x"]
+        assert_eq!(p.wrapped(3), ["e\u{301}界", "x"]);
+
+        // Row 0: the accent is zero-width; the 界 spans 2 cells.
+        assert_eq!(p.offset_at_display(3, 0, 0), 0, "before é");
+        assert_eq!(
+            p.offset_at_display(3, 0, 1),
+            3,
+            "before 界 (accent skipped)"
+        );
+        assert_eq!(p.offset_at_display(3, 0, 2), 3, "wide 界 snaps before it");
+        assert_eq!(p.offset_at_display(3, 0, 3), 6, "past end -> after 界");
+
+        // Row 1: "x".
+        assert_eq!(p.offset_at_display(3, 1, 0), 6);
+        assert_eq!(p.offset_at_display(3, 1, 1), 7, "past end -> end of text");
+    }
+
+    #[test]
+    fn offset_at_display_snaps_wide_cells_before_the_char() {
+        let mut p = Prompt::new();
+        p.set_value("界界"); // two CJK chars, 2 cells each
+        assert_eq!(p.wrapped(4), ["界界"]);
+
+        // Either cell of a wide char snaps to its char boundary (before it).
+        assert_eq!(p.offset_at_display(4, 0, 0), 0, "first 界 first cell");
+        assert_eq!(p.offset_at_display(4, 0, 1), 0, "first 界 second cell");
+        assert_eq!(p.offset_at_display(4, 0, 2), 3, "second 界 first cell");
+        assert_eq!(p.offset_at_display(4, 0, 3), 3, "second 界 second cell");
+        assert_eq!(p.offset_at_display(4, 0, 4), 6, "past end -> end");
+    }
+
+    #[test]
+    fn offset_at_display_clamps_out_of_range_rows_and_byte_boundaries() {
+        let mut p = Prompt::new();
+        p.set_value("one\ntwo"); // two logical lines, one wrapped row each
+        assert_eq!(p.wrapped(80), ["one", "two"]);
+
+        // Clicking past the last content row clamps to the last row's end.
+        assert_eq!(p.offset_at_display(80, 1, 99), 7, "end of 'two'");
+        assert_eq!(p.offset_at_display(80, 9, 99), 7);
+
+        // Empty value returns a valid (zero) boundary.
+        let empty = Prompt::new();
+        assert_eq!(empty.offset_at_display(80, 0, 0), 0);
+        assert_eq!(empty.offset_at_display(80, 3, 5), 0);
     }
 }

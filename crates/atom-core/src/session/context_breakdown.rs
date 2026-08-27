@@ -29,7 +29,7 @@ pub const CONTEXT_CATEGORY_ORDER: [&str; 5] = [
 
 /// estimateTokens is the char/4 heuristic used for session usage.
 pub fn estimate_tokens(n: usize) -> i64 {
-    ((n + 3) / 4) as i64
+    n.div_ceil(4) as i64
 }
 
 pub fn estimate_message_chars(m: &Message) -> i64 {
@@ -61,7 +61,8 @@ pub fn classify_instruction(content: &str) -> &'static str {
     if src == "skills" {
         return CONTEXT_CAT_REPO;
     }
-    if src == "TOOLS.md" {
+    // Bundled atom instructions (instructions/...).
+    if src.starts_with("instructions/") {
         return CONTEXT_CAT_ATOM;
     }
     if src.contains("/atom/AGENTS.md") || src.ends_with("atom/AGENTS.md") {
@@ -107,14 +108,11 @@ pub fn allocate_percents(parts: &[i64]) -> Vec<i64> {
 }
 
 /// contextBreakdown estimates live model-context occupancy by category.
-/// Tool definitions are the builtins; pass MCP tool defs via
-/// [`context_breakdown_with_tools`] once the server discovers them
-/// (Go's toolDefinitionsFor(cwd) = builtins + MCP tools for cwd).
-pub fn context_breakdown(sess: &Session) -> Vec<ContextRow> {
-    context_breakdown_with_tools(sess, &[])
-}
-
-pub fn context_breakdown_with_tools(sess: &Session, extra_tools: &[ToolDef]) -> Vec<ContextRow> {
+/// The caller passes the tool definitions to count: the builtins live in
+/// atom-tools (`atom_tools::tool_definitions`, plus MCP tools for cwd
+/// in Go's toolDefinitionsFor(cwd)), and atom-core cannot depend on
+/// atom-tools without a cycle.
+pub fn context_breakdown(sess: &Session, tools: &[ToolDef]) -> Vec<ContextRow> {
     let mut chars: std::collections::HashMap<&'static str, usize> =
         CONTEXT_CATEGORY_ORDER.iter().map(|&c| (c, 0)).collect();
 
@@ -122,8 +120,6 @@ pub fn context_breakdown_with_tools(sess: &Session, extra_tools: &[ToolDef]) -> 
         *chars.entry(classify_instruction(&m.content)).or_insert(0) += m.content.len();
     }
 
-    let mut tools = builtin_tool_definitions();
-    tools.extend_from_slice(extra_tools);
     if let Ok(raw) = serde_json::to_vec(&tools) {
         *chars.get_mut(CONTEXT_CAT_TOOLS).unwrap() += raw.len();
     }
@@ -162,71 +158,6 @@ pub fn context_row_meta(row: &ContextRow) -> String {
         crate::session::stats::format_tokens(row.tokens),
         row.pct
     )
-}
-
-/// builtinToolDefinitions is the built-in OpenAI tool list, including
-/// skill (main.go and friends). Only its serialized JSON length is used
-/// here today, but the definitions are byte-faithful ports so other
-/// crates can reuse them.
-pub fn builtin_tool_definitions() -> Vec<ToolDef> {
-    use serde_json::json;
-    macro_rules! def {
-        ($name:expr, $desc:expr, $params:expr) => {
-            ToolDef::new($name, $desc, $params)
-        };
-    }
-    vec![
-        def!(
-            "web_search",
-            "Search the web for current information. Returns search result titles, URLs, and snippets.",
-            json!({"type":"object","properties":{"query":{"type":"string","description":"The search query"}},"required":["query"]})
-        ),
-        def!(
-            "read_file",
-            "Read a file. Returns a window of lines (offset defaults to 0, limit defaults to 1000). After this, edit_file and write_file may be used on the path. If the file later changes on disk, those tools return a short diff of the change — do not re-read the whole file. Image files (png, jpg, gif, webp, bmp) are returned as images so vision-capable models can see them.",
-            json!({"type":"object","properties":{"path":{"type":"string","description":"Absolute or relative path to the file to read"},"offset":{"type":"integer","description":"0-based line offset to start reading from. Defaults to 0."},"limit":{"type":"integer","description":"Maximum number of lines to return. Defaults to 1000."}},"required":["path"]})
-        ),
-        def!(
-            "write_file",
-            "Create or overwrite a file with the given content. Existing files must be observed with read_file first. The file is re-checked automatically; if it changed since the last observation, the write is skipped and a short diff is returned. New files do not need a prior read. Do not use bash to write files.",
-            json!({"type":"object","properties":{"path":{"type":"string","description":"Absolute or relative path to the file to create or overwrite"},"content":{"type":"string","description":"The full content to write to the file"}},"required":["path","content"]})
-        ),
-        def!(
-            "edit_file",
-            "Edit a file by replacing unique exact text. Call read_file on the path once first (a window is enough). The file is re-checked automatically. If it changed since the last observation, the edit is skipped and a short diff is returned. After a successful edit, do not read_file again unless the next edit fails.",
-            json!({"type":"object","properties":{"path":{"type":"string","description":"Absolute or relative path to the file to edit"},"old_text":{"type":"string","description":"The exact text to find in the file"},"new_text":{"type":"string","description":"The replacement text"}},"required":["path","old_text","new_text"]})
-        ),
-        def!(
-            "bash",
-            "Last resort. Run a shell command only when no other built-in tool can do the job (tests, git, package installs). Do not use bash for file search, reading, editing, or web search.",
-            json!({"type":"object","properties":{"command":{"type":"string","description":"The shell command to execute"}},"required":["command"]})
-        ),
-        def!(
-            "vector_search",
-            "Search a local directory or git URL for relevant code by meaning or identifier. Returns matching snippets with file paths and line ranges. Prefer this over grep when looking for how something works. Does not search the web.",
-            json!({"type":"object","properties":{"query":{"type":"string","description":"Natural-language or identifier query"},"path":{"type":"string","description":"Local directory or https git URL. Defaults to the current directory."},"content":{"type":"string","enum":["code","docs","config","all"],"description":"What to search. Defaults to code."},"top_k":{"type":"integer","description":"Maximum number of snippets to return"},"max_snippet_lines":{"type":"integer","description":"Show only the first N lines of each snippet. 0 returns path and line range only."}},"required":["query"]})
-        ),
-        def!(
-            "grep",
-            "Find every literal or regex occurrence of a string in files. Honors .gitignore. Use this instead of bash grep/rg when you need exact matches. Prefer vector_search when looking up how something works.",
-            json!({"type":"object","properties":{"pattern":{"type":"string","description":"Text to search for. Literal by default; set regex true for a regex."},"path":{"type":"string","description":"File or directory to search. Defaults to the current directory."},"glob":{"type":"string","description":"Only search files matching this glob, e.g. *.go"},"regex":{"type":"boolean","description":"Treat pattern as a regex. Default false (faster literal search)."},"case_insensitive":{"type":"boolean","description":"Case-insensitive search. Default false; otherwise smart-case."},"head_limit":{"type":"integer","description":"Maximum matches to return. Defaults to 100."}},"required":["pattern"]})
-        ),
-        def!(
-            "glob",
-            "Find files by glob pattern (e.g. **/*.go, src/**/*.md). Honors .gitignore. Use this instead of bash find/fd/ls.",
-            json!({"type":"object","properties":{"pattern":{"type":"string","description":"Glob to match, e.g. **/*_test.go"},"path":{"type":"string","description":"Directory to search. Defaults to the current directory."},"head_limit":{"type":"integer","description":"Maximum paths to return. Defaults to 200."}},"required":["pattern"]})
-        ),
-        def!(
-            "dispatch",
-            "Manage subagents through one bulk interface. Use action=models to discover models; spawn creates one subagent per task string; inspect, send, and cancel target IDs, a batch, or all owned subagents.",
-            json!({"type":"object","properties":{"action":{"type":"string","enum":["models","spawn","inspect","send","cancel"]},"tasks":{"type":"array","minItems":1,"maxItems":100,"items":{"type":"string"}},"provider":{"type":"string"},"model":{"type":"string"},"thinking":{"type":"string"},"batch_id":{"type":"string"},"ids":{"type":"array","items":{"type":"string"}},"prompt":{"type":"string"},"messages":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"prompt":{"type":"string"}},"required":["id","prompt"]}},"wait":{"type":"string","enum":["none","any","all"]},"results":{"type":"boolean"},"statuses":{"type":"array","items":{"type":"string"}},"query":{"type":"string"}},"required":["action"]})
-        ),
-        def!(
-            "skill",
-            "Load a skill's full instructions by exact name from the skills catalog. Call this when the user's request matches a listed skill. Then follow those instructions.",
-            json!({"type":"object","properties":{"name":{"type":"string","description":"Exact skill name from the catalog"}},"required":["name"]})
-        ),
-    ]
 }
 
 #[cfg(test)]
@@ -274,12 +205,29 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// A stand-in tool list, since the defs live in atom-tools and this
+    /// crate cannot depend on it.
+    fn some_tools() -> Vec<ToolDef> {
+        vec![ToolDef::new(
+            "bash",
+            "Run commands that require a shell, such as tests, builds, git, and package managers.",
+            serde_json::json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}),
+        )]
+    }
+
     #[test]
     fn classify_instruction_categories() {
         const ATOM: &str = CONTEXT_CAT_ATOM;
         const REPO: &str = CONTEXT_CAT_REPO;
         let cases = [
-            ("Instructions from: TOOLS.md\nbundled tools", ATOM),
+            (
+                "Instructions from: instructions/system-prompt.md\nbundled prompt",
+                ATOM,
+            ),
+            (
+                "Instructions from: instructions/notes.md\nbundled extra",
+                ATOM,
+            ),
             ("Instructions from: skills\n- pack: Pack files", REPO),
             (
                 "Instructions from: /Users/me/proj/AGENTS.md\nproject rules",
@@ -305,7 +253,10 @@ mod tests {
     fn breakdown_instruction_buckets() {
         let mut sess = ctx_session();
         sess.instructions = vec![
-            sys_msg(&format!("Instructions from: TOOLS.md\n{}", "T".repeat(400))),
+            sys_msg(&format!(
+                "Instructions from: instructions/notes.md\n{}",
+                "T".repeat(400)
+            )),
             sys_msg(&format!("Instructions from: skills\n{}", "S".repeat(400))),
             sys_msg(&format!(
                 "Instructions from: /tmp/proj/AGENTS.md\n{}",
@@ -316,13 +267,13 @@ mod tests {
                 "G".repeat(400)
             )),
         ];
-        let rows = context_breakdown(&sess);
+        let rows = context_breakdown(&sess, &[]);
         assert_eq!(rows.len(), 5);
         let atom = row_by_name(&rows, CONTEXT_CAT_ATOM);
         let repo = row_by_name(&rows, CONTEXT_CAT_REPO);
         assert!(
             atom.tokens > 0,
-            "TOOLS.md + config AGENTS.md should count as atom"
+            "instructions/notes.md + config AGENTS.md should count as atom"
         );
         assert!(
             repo.tokens > 0,
@@ -369,7 +320,7 @@ mod tests {
             },
             role_msg("nudge", "please continue"),
         ];
-        let rows = context_breakdown(&sess);
+        let rows = context_breakdown(&sess, &[]);
         let user = row_by_name(&rows, CONTEXT_CAT_USER);
         let agent = row_by_name(&rows, CONTEXT_CAT_AGENT);
         assert!(
@@ -406,7 +357,7 @@ mod tests {
 
     #[test]
     fn breakdown_tools_and_percents() {
-        let rows = context_breakdown(&ctx_session());
+        let rows = context_breakdown(&ctx_session(), &some_tools());
         assert_eq!(rows.len(), 5, "empty session rows");
         let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
         let sum: i64 = rows.iter().map(|r| r.pct).sum();
@@ -414,7 +365,7 @@ mod tests {
         let tools = row_by_name(&rows, CONTEXT_CAT_TOOLS);
         assert!(
             tools.tokens > 0,
-            "builtin tool definitions should be present"
+            "tool definitions passed by the caller should be counted"
         );
         assert_eq!(sum, 100);
     }
@@ -424,8 +375,12 @@ mod tests {
         let got = allocate_percents(&[0, 0, 0, 0, 0]);
         assert_eq!(got.len(), 5);
         assert!(got.iter().all(|p| *p == 0));
-        let rows = context_breakdown(&ctx_session());
+        let rows = context_breakdown(&ctx_session(), &[]);
         assert_eq!(rows.len(), 5);
+        let tools = row_by_name(&rows, CONTEXT_CAT_TOOLS);
+        // An empty slice still serializes as "[]" (2 chars -> 1 token);
+        // it must stay negligible compared with the builtin list.
+        assert!(tools.tokens <= 1);
     }
 
     #[test]
@@ -438,15 +393,15 @@ mod tests {
     #[test]
     fn instruction_source_extraction() {
         assert_eq!(
-            instruction_source("Instructions from: TOOLS.md\nbody"),
-            "TOOLS.md"
+            instruction_source("Instructions from: instructions/notes.md\nbody"),
+            "instructions/notes.md"
         );
         assert_eq!(instruction_source("no prefix"), "");
         assert_eq!(
             instruction_source("Instructions from:   /x/y AGENTS.md  \nnext"),
             "/x/y AGENTS.md"
         );
-        let rows = context_breakdown(&Session::default());
+        let rows = context_breakdown(&Session::default(), &[]);
         assert!(row_by_name(&rows, CONTEXT_CAT_USER).pct >= 0);
         let _ = compaction_prompt_text("x"); // touch import for parity helpers
     }

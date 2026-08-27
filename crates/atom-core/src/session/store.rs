@@ -3,10 +3,11 @@
 use crate::types::{Message, StreamUsage};
 use crate::util::{add_stream_usage, sha256_hash};
 use chrono::{DateTime, Utc};
+use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -205,7 +206,9 @@ pub struct SessionInfo {
     pub updated_at: DateTime<Utc>,
 }
 
-/// atom data directory, honouring XDG_DATA_HOME (~/.local/share/atom).
+/// atom data directory, honouring XDG_DATA_HOME
+/// (~/.local/share/atom, or atom-dev for dev builds — see
+/// atom_core::build).
 pub fn data_dir() -> PathBuf {
     let base = std::env::var("XDG_DATA_HOME")
         .ok()
@@ -213,7 +216,7 @@ pub fn data_dir() -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|h| h.join(".local/share")))
         .unwrap_or_else(|| std::env::temp_dir().join("atom"));
-    let d = base.join("atom");
+    let d = base.join(crate::build::dir_leaf());
     let _ = std::fs::create_dir_all(&d);
     d
 }
@@ -223,7 +226,7 @@ pub fn socket_path() -> PathBuf {
     data_dir().join("atom.sock")
 }
 
-/// Directory where session JSON files live.
+/// Directory where the session database lives.
 pub fn sessions_dir() -> PathBuf {
     data_dir().join("sessions")
 }
@@ -235,12 +238,13 @@ pub fn new_session_id() -> String {
     hex::encode(b)
 }
 
-/// SessionStore keeps a compact session index in memory and persists each
-/// full session as a JSON file in its directory. Full transcripts are read
-/// on demand and discarded after each operation.
+/// SessionStore keeps a compact session index in memory. Full transcripts are
+/// loaded from the normalized SQLite tables on demand.
 pub struct SessionStore {
     dir: PathBuf,
-    index: Mutex<HashMap<String, SessionInfo>>,
+    db: Mutex<Connection>,
+    index: RwLock<HashMap<String, SessionInfo>>,
+    mutation: Mutex<()>,
     /// Per-session file observations (session ID -> canonical path ->
     /// entry). Mirrors Session.fileSeen; never persisted.
     file_seen: Mutex<HashMap<String, HashMap<String, FileSeenEntry>>>,
@@ -258,12 +262,55 @@ impl SessionStore {
     pub fn open_in_dir(dir: impl Into<PathBuf>) -> anyhow::Result<Self> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)?;
+        let db = Connection::open(dir.join("sessions.sqlite3"))?;
+        db.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+
+             CREATE TABLE IF NOT EXISTS sessions (
+                 id TEXT PRIMARY KEY,
+                 title TEXT NOT NULL,
+                 title_generated INTEGER NOT NULL,
+                 model TEXT NOT NULL,
+                 provider TEXT NOT NULL,
+                 cwd TEXT NOT NULL,
+                 usage TEXT,
+                 compaction_summary TEXT NOT NULL,
+                 compacted_through INTEGER NOT NULL,
+                 parent_id TEXT NOT NULL,
+                 thinking TEXT NOT NULL,
+                 cancelled INTEGER NOT NULL,
+                 status TEXT NOT NULL,
+                 batch_id TEXT NOT NULL,
+                 batch_index INTEGER NOT NULL,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL,
+                 message_count INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS session_messages (
+                 session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                 position INTEGER NOT NULL,
+                 message TEXT NOT NULL,
+                 PRIMARY KEY (session_id, position)
+             );
+             CREATE TABLE IF NOT EXISTS session_instructions (
+                 session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                 position INTEGER NOT NULL,
+                 message TEXT NOT NULL,
+                 PRIMARY KEY (session_id, position)
+             );
+             CREATE INDEX IF NOT EXISTS sessions_parent_id_idx ON sessions(parent_id);
+             CREATE INDEX IF NOT EXISTS sessions_updated_at_idx ON sessions(updated_at DESC);",
+        )?;
         let s = SessionStore {
             dir,
-            index: Mutex::new(HashMap::new()),
+            db: Mutex::new(db),
+            index: RwLock::new(HashMap::new()),
+            mutation: Mutex::new(()),
             file_seen: Mutex::new(HashMap::new()),
         };
-        s.load_all();
+        s.load_all()?;
         Ok(s)
     }
 
@@ -271,45 +318,29 @@ impl SessionStore {
         &self.dir
     }
 
-    /// loadAll builds the compact index, discarding each full session once
-    /// its listing metadata has been extracted.
-    fn load_all(&self) {
-        let entries = match std::fs::read_dir(&self.dir) {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-        let mut index = self.index.lock().unwrap();
-        for e in entries.flatten() {
-            let path = e.path();
-            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                continue;
-            }
-            if !e.file_name().to_string_lossy().ends_with(".json") {
-                continue;
-            }
-            let b = match std::fs::read(&path) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            let mut info = match session_info_from_slice(&b) {
-                Ok(info) => info,
-                Err(_) => continue,
-            };
-            // Old files may predate persisted fallback titles. Preserve the
-            // recognizable first-message title for that rare case without
-            // allocating every transcript during normal startup.
-            if info.title.is_empty() && info.message_count > 0 {
-                if let Ok(sess) = session_from_slice(&b) {
-                    info = sess.info();
-                }
-            }
+    /// loadAll reads only scalar listing metadata. Transcript tables are not
+    /// consulted during startup.
+    fn load_all(&self) -> anyhow::Result<()> {
+        let db = self.db.lock().unwrap();
+        let mut stmt = db.prepare(
+            "SELECT id, title, model, provider, message_count, usage, parent_id,
+                    thinking, cancelled, status, batch_id, batch_index,
+                    created_at, updated_at
+             FROM sessions",
+        )?;
+        let rows = stmt.query_map([], session_info_from_row)?;
+        let mut index = self.index.write().unwrap();
+        for info in rows {
+            let info = info?;
             index.insert(info.id.clone(), info);
         }
+        Ok(())
     }
 
     /// Create makes a new session with the given model, cwd, and
     /// instructions, persists it, and returns it.
     pub fn create(&self, model: &str, cwd: &str, instructions: Vec<Message>) -> Session {
+        let _mutation = self.mutation.lock().unwrap();
         let sess = Session {
             id: new_session_id(),
             model: model.into(),
@@ -317,9 +348,11 @@ impl SessionStore {
             instructions,
             ..Default::default()
         };
-        let mut index = self.index.lock().unwrap();
         self.save(&sess);
-        index.insert(sess.id.clone(), sess.info());
+        self.index
+            .write()
+            .unwrap()
+            .insert(sess.id.clone(), sess.info());
         sess
     }
 
@@ -336,6 +369,7 @@ impl SessionStore {
         title: &str,
         instructions: Vec<Message>,
     ) -> Session {
+        let _mutation = self.mutation.lock().unwrap();
         let mut title = title.to_string();
         if title.is_empty() {
             if let Some(last) = instructions.last() {
@@ -353,9 +387,11 @@ impl SessionStore {
             status: DelegateStatus::Queued,
             ..Default::default()
         };
-        let mut index = self.index.lock().unwrap();
         self.save(&sess);
-        index.insert(sess.id.clone(), sess.info());
+        self.index
+            .write()
+            .unwrap()
+            .insert(sess.id.clone(), sess.info());
         sess
     }
 
@@ -365,7 +401,7 @@ impl SessionStore {
         if child_id.is_empty() || ancestor_id.is_empty() || child_id == ancestor_id {
             return false;
         }
-        let index = self.index.lock().unwrap();
+        let index = self.index.read().unwrap();
         let mut seen = std::collections::HashSet::new();
         let mut id = child_id.to_string();
         for _ in 0..32 {
@@ -391,10 +427,13 @@ impl SessionStore {
     /// Children returns sessions whose ParentID matches, newest
     /// CreatedAt first. Empty (0-message) children are included.
     pub fn children(&self, parent_id: &str) -> Vec<Session> {
-        let index = self.index.lock().unwrap();
-        let mut children: Vec<&SessionInfo> = index
+        let mut children: Vec<SessionInfo> = self
+            .index
+            .read()
+            .unwrap()
             .values()
             .filter(|info| info.parent_id == parent_id)
+            .cloned()
             .collect();
         children.sort_by_key(|info| std::cmp::Reverse(info.created_at));
         children
@@ -408,7 +447,7 @@ impl SessionStore {
     pub fn children_info(&self, parent_id: &str) -> Vec<SessionInfo> {
         let mut children: Vec<SessionInfo> = self
             .index
-            .lock()
+            .read()
             .unwrap()
             .values()
             .filter(|info| info.parent_id == parent_id)
@@ -420,17 +459,23 @@ impl SessionStore {
 
     /// Get loads a full session by ID, or returns None if not found.
     pub fn get(&self, id: &str) -> Option<Session> {
-        let index = self.index.lock().unwrap();
-        index.contains_key(id).then(|| self.load(id)).flatten()
+        if !self.index.read().unwrap().contains_key(id) {
+            return None;
+        }
+        self.load(id)
+    }
+
+    /// GetInfo returns listing metadata without loading the transcript.
+    pub fn get_info(&self, id: &str) -> Option<SessionInfo> {
+        self.index.read().unwrap().get(id).cloned()
     }
 
     /// List returns all sessions sorted by UpdatedAt descending (most
     /// recent first). Full sessions are loaded from disk for the caller but
     /// are not retained by the store.
     pub fn list(&self) -> Vec<Session> {
-        let index = self.index.lock().unwrap();
-        let mut infos: Vec<&SessionInfo> = index.values().collect();
-        infos.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        let mut infos: Vec<SessionInfo> = self.index.read().unwrap().values().cloned().collect();
+        infos.sort_by_key(|a| std::cmp::Reverse(a.updated_at));
         infos
             .into_iter()
             .filter_map(|info| self.load(&info.id))
@@ -440,8 +485,8 @@ impl SessionStore {
     /// ListInfo returns compact listing metadata without loading session
     /// transcripts, sorted by UpdatedAt descending.
     pub fn list_info(&self) -> Vec<SessionInfo> {
-        let mut list: Vec<SessionInfo> = self.index.lock().unwrap().values().cloned().collect();
-        list.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        let mut list: Vec<SessionInfo> = self.index.read().unwrap().values().cloned().collect();
+        list.sort_by_key(|a| std::cmp::Reverse(a.updated_at));
         list
     }
 
@@ -453,70 +498,210 @@ impl SessionStore {
             sess.messages = messages;
             if !title.is_empty() && !sess.title_generated {
                 sess.title = title.to_string();
+            } else if sess.title.is_empty() {
+                // Persist the fallback so future startup indexing never has
+                // to inspect conversation content to recover a title.
+                sess.title = session_name(&sess.messages);
             }
             sess.updated_at = Utc::now();
         });
     }
 
+    /// Persists the fields owned by an in-flight turn in one transaction.
+    /// Metadata that may change concurrently (provider, generated title,
+    /// cancellation, and delegate state) remains sourced from the store.
+    pub fn update_turn_snapshot(&self, id: &str, snapshot: &Session, title: &str) -> bool {
+        self.mutate(id, |sess| {
+            sess.messages = snapshot.messages.clone();
+            sess.usage = snapshot.usage.clone();
+            sess.compaction_summary = snapshot.compaction_summary.clone();
+            sess.compacted_through = snapshot.compacted_through;
+            sess.thinking = snapshot.thinking.clone();
+            if !title.is_empty() && !sess.title_generated {
+                sess.title = title.to_string();
+            } else if sess.title.is_empty() {
+                sess.title = session_name(&sess.messages);
+            }
+            sess.updated_at = Utc::now();
+        })
+    }
+
     /// UpdateTitle sets Title, marks TitleGenerated, and saves. Messages
     /// are left unchanged.
     pub fn update_title(&self, id: &str, title: &str) {
-        self.mutate(id, |sess| {
-            sess.title = title.to_string();
-            sess.title_generated = true;
-            sess.updated_at = Utc::now();
-        });
+        let _mutation = self.mutation.lock().unwrap();
+        if !self.index.read().unwrap().contains_key(id) {
+            return;
+        }
+        let now = Utc::now();
+        if self
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET title = ?1, title_generated = 1, updated_at = ?2 WHERE id = ?3",
+                params![title, now.to_rfc3339(), id],
+            )
+            .is_ok()
+        {
+            if let Some(info) = self.index.write().unwrap().get_mut(id) {
+                info.title = title.to_string();
+                info.updated_at = now;
+            }
+        }
     }
 
     /// UpdateModel changes the model that answers future messages in a
     /// session. The conversation history is kept; only the model used
     /// for new turns changes. It's a no-op if the session doesn't exist.
     pub fn update_model(&self, id: &str, model: &str) {
-        self.mutate(id, |sess| {
-            sess.model = model.to_string();
-            sess.updated_at = Utc::now();
-        });
+        let _mutation = self.mutation.lock().unwrap();
+        if !self.index.read().unwrap().contains_key(id) {
+            return;
+        }
+        let now = Utc::now();
+        if self
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET model = ?1, updated_at = ?2 WHERE id = ?3",
+                params![model, now.to_rfc3339(), id],
+            )
+            .is_ok()
+        {
+            if let Some(info) = self.index.write().unwrap().get_mut(id) {
+                info.model = model.to_string();
+                info.updated_at = now;
+            }
+        }
     }
 
     /// UpdateProvider records the backend selected for a dispatched child.
     pub fn update_provider(&self, id: &str, provider: &str) {
-        self.mutate(id, |sess| {
-            sess.provider = provider.to_string();
-            sess.updated_at = Utc::now();
-        });
+        let _mutation = self.mutation.lock().unwrap();
+        if !self.index.read().unwrap().contains_key(id) {
+            return;
+        }
+        let now = Utc::now();
+        if self
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET provider = ?1, updated_at = ?2 WHERE id = ?3",
+                params![provider, now.to_rfc3339(), id],
+            )
+            .is_ok()
+        {
+            if let Some(info) = self.index.write().unwrap().get_mut(id) {
+                info.provider = provider.to_string();
+                info.updated_at = now;
+            }
+        }
     }
 
     /// UpdateThinking stores the TUI's current reasoning_effort for this
     /// session so Tab/Ctrl+T cycles survive reloads after a turn saves.
     pub fn update_thinking(&self, id: &str, thinking: &str) {
-        self.mutate(id, |sess| {
-            sess.thinking = thinking.to_string();
-            sess.updated_at = Utc::now();
-        });
+        let _mutation = self.mutation.lock().unwrap();
+        if !self.index.read().unwrap().contains_key(id) {
+            return;
+        }
+        let now = Utc::now();
+        if self
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET thinking = ?1, updated_at = ?2 WHERE id = ?3",
+                params![thinking, now.to_rfc3339(), id],
+            )
+            .is_ok()
+        {
+            if let Some(info) = self.index.write().unwrap().get_mut(id) {
+                info.thinking = thinking.to_string();
+                info.updated_at = now;
+            }
+        }
     }
 
     /// SetCancelled records whether a dispatched subagent was explicitly
     /// killed by its parent (true) or revived by a follow-up (false).
     pub fn set_cancelled(&self, id: &str, cancelled: bool) -> bool {
-        self.mutate(id, |sess| {
-            sess.cancelled = cancelled;
-            sess.updated_at = Utc::now();
-        })
+        let _mutation = self.mutation.lock().unwrap();
+        if !self.index.read().unwrap().contains_key(id) {
+            return false;
+        }
+        let now = Utc::now();
+        if self
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET cancelled = ?1, updated_at = ?2 WHERE id = ?3",
+                params![cancelled, now.to_rfc3339(), id],
+            )
+            .is_err()
+        {
+            return false;
+        }
+        if let Some(info) = self.index.write().unwrap().get_mut(id) {
+            info.cancelled = cancelled;
+            info.updated_at = now;
+        }
+        true
     }
 
     pub fn update_delegate_status(&self, id: &str, status: DelegateStatus) -> bool {
-        self.mutate(id, |sess| {
-            sess.status = status;
-            sess.updated_at = Utc::now();
-        })
+        let _mutation = self.mutation.lock().unwrap();
+        if !self.index.read().unwrap().contains_key(id) {
+            return false;
+        }
+        let now = Utc::now();
+        if self
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET status = ?1, updated_at = ?2 WHERE id = ?3",
+                params![status.as_str(), now.to_rfc3339(), id],
+            )
+            .is_err()
+        {
+            return false;
+        }
+        if let Some(info) = self.index.write().unwrap().get_mut(id) {
+            info.status = status;
+            info.updated_at = now;
+        }
+        true
     }
 
     pub fn update_delegate_batch(&self, id: &str, batch_id: &str, batch_index: usize) -> bool {
-        self.mutate(id, |sess| {
-            sess.batch_id = batch_id.to_string();
-            sess.batch_index = batch_index as i64;
-            sess.updated_at = Utc::now();
-        })
+        let _mutation = self.mutation.lock().unwrap();
+        if !self.index.read().unwrap().contains_key(id) {
+            return false;
+        }
+        let now = Utc::now();
+        if self
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET batch_id = ?1, batch_index = ?2, updated_at = ?3 WHERE id = ?4",
+                params![batch_id, batch_index as i64, now.to_rfc3339(), id],
+            )
+            .is_err()
+        {
+            return false;
+        }
+        if let Some(info) = self.index.write().unwrap().get_mut(id) {
+            info.batch_id = batch_id.to_string();
+            info.batch_index = batch_index as i64;
+            info.updated_at = now;
+        }
+        true
     }
 
     /// Turns left active by a daemon exit cannot still be running after a
@@ -525,7 +710,7 @@ impl SessionStore {
     pub fn reconcile_delegate_statuses(&self) {
         let ids: Vec<String> = self
             .index
-            .lock()
+            .read()
             .unwrap()
             .values()
             .filter(|info| !info.parent_id.is_empty() && info.status.is_active())
@@ -536,11 +721,21 @@ impl SessionStore {
         }
     }
 
-    /// Delete removes a session from memory and disk.
+    /// Delete removes a session and its related rows.
     pub fn delete(&self, id: &str) {
-        self.index.lock().unwrap().remove(id);
+        let _mutation = self.mutation.lock().unwrap();
+        let mut db = self.db.lock().unwrap();
+        if let Ok(tx) = db.transaction() {
+            if tx
+                .execute("DELETE FROM sessions WHERE id = ?1", [id])
+                .is_ok()
+            {
+                let _ = tx.commit();
+            }
+        };
+        drop(db);
+        self.index.write().unwrap().remove(id);
         self.file_seen.lock().unwrap().remove(id);
-        let _ = std::fs::remove_file(self.dir.join(format!("{id}.json")));
     }
 
     /// modify loads the stored session, applies f, and persists the result.
@@ -577,136 +772,242 @@ impl SessionStore {
             .cloned()
     }
 
-    /// load reads a full session from its JSON file. Callers hold the index
-    /// lock so a concurrent mutation cannot interleave with the read.
+    /// load reads a full session and its ordered child rows. Callers hold the
+    /// index lock so a concurrent mutation cannot interleave with the read.
     fn load(&self, id: &str) -> Option<Session> {
-        let b = std::fs::read(self.dir.join(format!("{id}.json"))).ok()?;
-        session_from_slice(&b).ok()
+        self.load_result(id).ok().flatten()
+    }
+
+    fn load_result(&self, id: &str) -> anyhow::Result<Option<Session>> {
+        let db = self.db.lock().unwrap();
+        let sess = db
+            .query_row(
+                "SELECT id, title, title_generated, model, provider, cwd, usage,
+                        compaction_summary, compacted_through, parent_id, thinking,
+                        cancelled, status, batch_id, batch_index, created_at, updated_at
+                 FROM sessions WHERE id = ?1",
+                [id],
+                session_from_row,
+            )
+            .optional()?;
+        let Some(mut sess) = sess else {
+            return Ok(None);
+        };
+        sess.messages = load_message_rows(
+            &db,
+            "SELECT message FROM session_messages WHERE session_id = ?1 ORDER BY position",
+            id,
+        )?;
+        sess.instructions = load_message_rows(
+            &db,
+            "SELECT message FROM session_instructions WHERE session_id = ?1 ORDER BY position",
+            id,
+        )?;
+        Ok(Some(sess))
     }
 
     /// mutate serializes a full-session read/modify/write with all other
     /// session operations and refreshes the compact index.
     fn mutate<F: FnOnce(&mut Session)>(&self, id: &str, f: F) -> bool {
-        let mut index = self.index.lock().unwrap();
-        if !index.contains_key(id) {
+        let _mutation = self.mutation.lock().unwrap();
+        if !self.index.read().unwrap().contains_key(id) {
             return false;
         }
         let Some(mut sess) = self.load(id) else {
             return false;
         };
         f(&mut sess);
-        self.save(&sess);
-        index.insert(id.to_string(), sess.info());
+        if self.save_result(&sess).is_err() {
+            return false;
+        }
+        self.index
+            .write()
+            .unwrap()
+            .insert(id.to_string(), sess.info());
         true
     }
 
-    /// save writes a session to its Go-compatible JSON file. Callers hold
-    /// the index lock to keep disk and metadata updates ordered.
+    /// save replaces all persisted session state atomically. Callers hold the
+    /// index lock to keep SQLite and metadata updates ordered.
     fn save(&self, sess: &Session) {
-        let b = match serde_json::to_string_pretty(sess) {
-            Ok(b) => b,
-            Err(_) => return,
-        };
-        let _ = std::fs::write(self.dir.join(format!("{}.json", sess.id)), b);
+        let _ = self.save_result(sess);
+    }
+
+    fn save_result(&self, sess: &Session) -> anyhow::Result<()> {
+        let usage = sess.usage.as_ref().map(serde_json::to_string).transpose()?;
+        let messages: Vec<String> = sess
+            .messages
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<_, _>>()?;
+        let instructions: Vec<String> = sess
+            .instructions
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<_, _>>()?;
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        tx.execute(
+            "INSERT INTO sessions (
+                 id, title, title_generated, model, provider, cwd, usage,
+                 compaction_summary, compacted_through, parent_id, thinking,
+                 cancelled, status, batch_id, batch_index, created_at, updated_at,
+                 message_count
+             ) VALUES (
+                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                 ?14, ?15, ?16, ?17, ?18
+             ) ON CONFLICT(id) DO UPDATE SET
+                 title=excluded.title, title_generated=excluded.title_generated,
+                 model=excluded.model, provider=excluded.provider, cwd=excluded.cwd,
+                 usage=excluded.usage, compaction_summary=excluded.compaction_summary,
+                 compacted_through=excluded.compacted_through,
+                 parent_id=excluded.parent_id, thinking=excluded.thinking,
+                 cancelled=excluded.cancelled, status=excluded.status,
+                 batch_id=excluded.batch_id, batch_index=excluded.batch_index,
+                 created_at=excluded.created_at, updated_at=excluded.updated_at,
+                 message_count=excluded.message_count",
+            params![
+                sess.id,
+                sess.title,
+                sess.title_generated,
+                sess.model,
+                sess.provider,
+                sess.cwd,
+                usage,
+                sess.compaction_summary,
+                sess.compacted_through,
+                sess.parent_id,
+                sess.thinking,
+                sess.cancelled,
+                sess.status.as_str(),
+                sess.batch_id,
+                sess.batch_index,
+                sess.created_at.to_rfc3339(),
+                sess.updated_at.to_rfc3339(),
+                sess.messages.len() as i64,
+            ],
+        )?;
+        tx.execute(
+            "DELETE FROM session_messages WHERE session_id = ?1",
+            [&sess.id],
+        )?;
+        tx.execute(
+            "DELETE FROM session_instructions WHERE session_id = ?1",
+            [&sess.id],
+        )?;
+        {
+            let mut statement = tx.prepare_cached(
+                "INSERT INTO session_messages (session_id, position, message) VALUES (?1, ?2, ?3)",
+            )?;
+            for (position, message) in messages.iter().enumerate() {
+                statement.execute(params![sess.id, position as i64, message])?;
+            }
+        }
+        {
+            let mut statement = tx.prepare_cached(
+                "INSERT INTO session_instructions (session_id, position, message) VALUES (?1, ?2, ?3)",
+            )?;
+            for (position, message) in instructions.iter().enumerate() {
+                statement.execute(params![sess.id, position as i64, message])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 }
 
-/// Session files contain StreamUsage's canonical persisted fields, while
-/// provider responses use nested reasoning and total_cost fields. Normalize
-/// the persisted aliases before invoking the provider-oriented deserializer.
-fn session_from_slice(b: &[u8]) -> serde_json::Result<Session> {
-    let mut value: serde_json::Value = serde_json::from_slice(b)?;
-    if let Some(obj) = value.as_object_mut() {
-        normalize_persisted_usage(obj.get_mut("usage"));
-        if let Some(serde_json::Value::Array(messages)) = obj.get_mut("messages") {
-            for message in messages {
-                normalize_persisted_usage(message.get_mut("usage"));
-            }
-        }
+fn session_info_from_row(row: &Row<'_>) -> rusqlite::Result<SessionInfo> {
+    Ok(SessionInfo {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        model: row.get(2)?,
+        provider: row.get(3)?,
+        message_count: row.get::<_, i64>(4)? as usize,
+        usage: usage_from_json(row.get(5)?)?,
+        parent_id: row.get(6)?,
+        thinking: row.get(7)?,
+        cancelled: row.get(8)?,
+        status: status_from_str(&row.get::<_, String>(9)?)?,
+        batch_id: row.get(10)?,
+        batch_index: row.get(11)?,
+        created_at: datetime_from_str(&row.get::<_, String>(12)?)?,
+        updated_at: datetime_from_str(&row.get::<_, String>(13)?)?,
+    })
+}
+
+fn session_from_row(row: &Row<'_>) -> rusqlite::Result<Session> {
+    Ok(Session {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        title_generated: row.get(2)?,
+        messages: Vec::new(),
+        model: row.get(3)?,
+        provider: row.get(4)?,
+        cwd: row.get(5)?,
+        instructions: Vec::new(),
+        usage: usage_from_json(row.get(6)?)?,
+        compaction_summary: row.get(7)?,
+        compacted_through: row.get(8)?,
+        parent_id: row.get(9)?,
+        thinking: row.get(10)?,
+        cancelled: row.get(11)?,
+        status: status_from_str(&row.get::<_, String>(12)?)?,
+        batch_id: row.get(13)?,
+        batch_index: row.get(14)?,
+        created_at: datetime_from_str(&row.get::<_, String>(15)?)?,
+        updated_at: datetime_from_str(&row.get::<_, String>(16)?)?,
+    })
+}
+
+fn load_message_rows(db: &Connection, sql: &str, id: &str) -> anyhow::Result<Vec<Message>> {
+    let mut stmt = db.prepare(sql)?;
+    let rows = stmt.query_map([id], |row| row.get::<_, String>(0))?;
+    let mut messages = Vec::new();
+    for row in rows {
+        messages.push(message_from_json(&row?)?);
     }
+    Ok(messages)
+}
+
+fn message_from_json(json: &str) -> serde_json::Result<Message> {
+    let mut value: serde_json::Value = serde_json::from_str(json)?;
+    normalize_persisted_usage(value.get_mut("usage"));
     serde_json::from_value(value)
 }
 
-/// Reads only listing metadata from a session file. `IgnoredAny` lets serde
-/// validate and skip message/instruction bodies without allocating their
-/// strings, keeping daemon startup memory independent of transcript size.
-fn session_info_from_slice(b: &[u8]) -> serde_json::Result<SessionInfo> {
-    #[derive(Deserialize, Default)]
-    #[serde(default)]
-    struct IndexUsage {
-        prompt_tokens: i64,
-        completion_tokens: i64,
-        total_tokens: i64,
-        reasoning_tokens: i64,
-        cache_read_tokens: i64,
-        cache_write_tokens: i64,
-        cost: f64,
-    }
-
-    impl From<IndexUsage> for StreamUsage {
-        fn from(usage: IndexUsage) -> Self {
-            StreamUsage {
-                prompt_tokens: usage.prompt_tokens,
-                completion_tokens: usage.completion_tokens,
-                total_tokens: usage.total_tokens,
-                reasoning_tokens: usage.reasoning_tokens,
-                cache_read_tokens: usage.cache_read_tokens,
-                cache_write_tokens: usage.cache_write_tokens,
-                cost: usage.cost,
-                prompt_tokens_all: 0,
-            }
-        }
-    }
-
-    #[derive(Deserialize)]
-    struct IndexRecord {
-        id: String,
-        #[serde(default)]
-        title: String,
-        #[serde(
-            default,
-            deserialize_with = "crate::serde_null::null_elements_as_default"
-        )]
-        messages: Vec<serde::de::IgnoredAny>,
-        #[serde(default)]
-        model: String,
-        #[serde(default)]
-        provider: String,
-        #[serde(default)]
-        usage: Option<IndexUsage>,
-        #[serde(default, rename = "parent_id")]
-        parent_id: String,
-        #[serde(default)]
-        thinking: String,
-        #[serde(default)]
-        status: DelegateStatus,
-        #[serde(default, rename = "batch_id")]
-        batch_id: String,
-        #[serde(default)]
-        batch_index: i64,
-        #[serde(default)]
-        cancelled: bool,
-        created_at: DateTime<Utc>,
-        updated_at: DateTime<Utc>,
-    }
-
-    let record: IndexRecord = serde_json::from_slice(b)?;
-    Ok(SessionInfo {
-        id: record.id,
-        title: record.title,
-        model: record.model,
-        provider: record.provider,
-        message_count: record.messages.len(),
-        usage: record.usage.map(Into::into),
-        parent_id: record.parent_id,
-        thinking: record.thinking,
-        cancelled: record.cancelled,
-        status: record.status,
-        batch_id: record.batch_id,
-        batch_index: record.batch_index,
-        created_at: record.created_at,
-        updated_at: record.updated_at,
+fn usage_from_json(json: Option<String>) -> rusqlite::Result<Option<StreamUsage>> {
+    json.map(|json| {
+        let mut value: serde_json::Value = serde_json::from_str(&json).map_err(sql_json_error)?;
+        normalize_persisted_usage(Some(&mut value));
+        serde_json::from_value(value).map_err(sql_json_error)
     })
+    .transpose()
+}
+
+fn datetime_from_str(value: &str) -> rusqlite::Result<DateTime<Utc>> {
+    value.parse::<DateTime<Utc>>().map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
+    })
+}
+
+fn status_from_str(value: &str) -> rusqlite::Result<DelegateStatus> {
+    match value {
+        "queued" => Ok(DelegateStatus::Queued),
+        "working" => Ok(DelegateStatus::Working),
+        "sandbox" => Ok(DelegateStatus::Sandbox),
+        "error" => Ok(DelegateStatus::Error),
+        "done" => Ok(DelegateStatus::Done),
+        "cancelled" => Ok(DelegateStatus::Cancelled),
+        _ => Err(rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            format!("invalid delegate status: {value}").into(),
+        )),
+    }
+}
+
+fn sql_json_error(error: serde_json::Error) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
 }
 
 fn normalize_persisted_usage(value: Option<&mut serde_json::Value>) {
@@ -1143,6 +1444,14 @@ mod tests {
         );
         drop(store);
 
+        let db = Connection::open(d.path().join("sessions.sqlite3")).unwrap();
+        db.execute(
+            "UPDATE session_messages SET message = 'not json' WHERE session_id = ?1",
+            [&sess.id],
+        )
+        .unwrap();
+        drop(db);
+
         let reload = SessionStore::open_in_dir(d.path()).unwrap();
         let infos = reload.list_info();
         assert_eq!(infos.len(), 1);
@@ -1150,11 +1459,7 @@ mod tests {
         assert_eq!(infos[0].title, "recognizable title");
         assert_eq!(infos[0].model, "large-model");
         assert_eq!(infos[0].message_count, 1);
-
-        // Listing remains available after startup without consulting the
-        // transcript, while get still requires and lazily reads that file.
-        std::fs::remove_file(d.path().join(format!("{}.json", sess.id))).unwrap();
-        assert_eq!(reload.list_info().len(), 1);
+        // Startup and metadata listing never deserialize transcript rows.
         assert!(reload.get(&sess.id).is_none());
     }
 
@@ -1193,18 +1498,81 @@ mod tests {
     }
 
     #[test]
+    fn metadata_listing_does_not_wait_for_transcript_mutation() {
+        let (_d, store) = temp_store("metadata-during-mutation");
+        let store = std::sync::Arc::new(store);
+        let sess = store.create("m", "/tmp", vec![]);
+        let id = sess.id.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let writer_store = store.clone();
+        let writer = std::thread::spawn(move || {
+            writer_store.modify(&id, |_| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+        });
+        entered_rx.recv().unwrap();
+
+        let (listed_tx, listed_rx) = std::sync::mpsc::channel();
+        let list_store = store.clone();
+        let reader = std::thread::spawn(move || {
+            listed_tx.send(list_store.list_info()).unwrap();
+        });
+        let listed = listed_rx.recv_timeout(Duration::from_millis(250));
+        release_tx.send(()).unwrap();
+        assert!(writer.join().unwrap());
+        reader.join().unwrap();
+
+        let listed = listed.expect("metadata listing blocked behind transcript work");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, sess.id);
+    }
+
+    #[test]
+    fn turn_snapshot_preserves_concurrent_metadata() {
+        let (_d, store) = temp_store("turn-snapshot");
+        let child = store.create_child("parent", "m", "/tmp", "low", "fallback", vec![]);
+        store.update_title(&child.id, "Generated title");
+        store.update_delegate_status(&child.id, DelegateStatus::Working);
+
+        let mut snapshot = store.get(&child.id).unwrap();
+        snapshot.messages = vec![user_msg("new transcript")];
+        snapshot.compaction_summary = "summary".into();
+        snapshot.compacted_through = 3;
+        snapshot.thinking = "high".into();
+        assert!(store.update_turn_snapshot(&child.id, &snapshot, "new fallback"));
+
+        let got = store.get(&child.id).unwrap();
+        assert_eq!(got.title, "Generated title");
+        assert!(got.title_generated);
+        assert_eq!(got.status, DelegateStatus::Working);
+        assert_eq!(got.messages[0].content, "new transcript");
+        assert_eq!(got.compaction_summary, "summary");
+        assert_eq!(got.compacted_through, 3);
+        assert_eq!(got.thinking, "high");
+    }
+
+    #[test]
     fn session_store_delete() {
         let (d, store) = temp_store("delete");
-        let sess = store.create("m", "/tmp", vec![]);
-        let path = d.path().join(format!("{}.json", sess.id));
-        assert!(path.exists(), "session file missing after create");
+        let sess = store.create("m", "/tmp", vec![user_msg("instruction")]);
+        store.update(&sess.id, vec![user_msg("message")], "title");
 
         store.delete(&sess.id);
         assert!(
             store.get(&sess.id).is_none(),
             "get after delete should return None"
         );
-        assert!(!path.exists(), "session file still exists");
+        let db = Connection::open(d.path().join("sessions.sqlite3")).unwrap();
+        for table in ["sessions", "session_messages", "session_instructions"] {
+            let count: i64 = db
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "rows remain in {table}");
+        }
         store.delete("unknown-id"); // must not panic
     }
 
@@ -1225,8 +1593,8 @@ mod tests {
     }
 
     #[test]
-    fn session_files_stay_interchangeable_with_go() {
-        let (d, store) = temp_store("json");
+    fn session_store_uses_normalized_rows_only() {
+        let (d, store) = temp_store("normalized");
         let sess = store.create_child("parent123", "m", "/tmp", "low", "", vec![user_msg("x")]);
         store.update(
             &sess.id,
@@ -1241,30 +1609,40 @@ mod tests {
             "",
         );
         store.update_title(&sess.id, "T");
-        let raw = std::fs::read_to_string(d.path().join(format!("{}.json", sess.id))).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        // compacted_through is omitempty and zero here, so absent like Go.
-        for key in [
-            "id",
-            "title",
-            "title_generated",
-            "messages",
-            "model",
-            "cwd",
-            "instructions",
-            "thinking",
-            "created_at",
-            "updated_at",
-        ] {
-            assert!(v.get(key).is_some(), "missing JSON key {key}");
-        }
-        assert!(v.get("parent_id").is_some());
-        // Round-trips through the store loader.
+        drop(store);
+
+        assert!(!d.path().join(format!("{}.json", sess.id)).exists());
+        let db = Connection::open(d.path().join("sessions.sqlite3")).unwrap();
+        let counts: (i64, i64, i64) = (
+            db.query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))
+                .unwrap(),
+            db.query_row("SELECT count(*) FROM session_messages", [], |row| {
+                row.get(0)
+            })
+            .unwrap(),
+            db.query_row("SELECT count(*) FROM session_instructions", [], |row| {
+                row.get(0)
+            })
+            .unwrap(),
+        );
+        assert_eq!(counts, (1, 2, 1));
+        drop(db);
+
         let reload = SessionStore::open_in_dir(d.path()).unwrap();
         let got = reload.get(&sess.id).unwrap();
         assert_eq!(got.title, "T");
         assert!(got.title_generated);
         assert_eq!(got.parent_id, "parent123");
+    }
+
+    #[test]
+    fn session_store_ignores_json_files() {
+        let (d, store) = temp_store("ignore-json");
+        std::fs::write(d.path().join("legacy.json"), r#"{"id":"legacy"}"#).unwrap();
+        drop(store);
+
+        let reload = SessionStore::open_in_dir(d.path()).unwrap();
+        assert!(reload.list_info().is_empty());
     }
 
     #[test]

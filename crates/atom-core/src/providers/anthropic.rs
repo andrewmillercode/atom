@@ -221,6 +221,20 @@ pub fn marshal_anthropic_request(
             }
             "assistant" => {
                 let mut blocks: Vec<Value> = Vec::new();
+                // Replay prior reasoning WITH its signature so thinking
+                // survives across turns. Anthropic requires an opaque
+                // `signature` on any thinking block it receives back, and
+                // thinking blocks must precede the turn's text/tool_use.
+                // History without a signature (saved before signatures were
+                // captured, or a non-thinking turn) omits the block —
+                // emitting one without a signature would 400.
+                if !m.reasoning.is_empty() && !m.reasoning_signature.is_empty() {
+                    blocks.push(json!({
+                        "type": "thinking",
+                        "thinking": m.reasoning,
+                        "signature": m.reasoning_signature,
+                    }));
+                }
                 if !m.content.is_empty() {
                     blocks.push(text_block(&m.content));
                 }
@@ -283,7 +297,7 @@ pub fn marshal_anthropic_request(
         })
         .collect();
 
-    let tool_defs: Vec<Value> = tools
+    let mut tool_defs: Vec<Value> = tools
         .iter()
         .filter(|t| !t.function.name.is_empty())
         .map(|t| {
@@ -303,12 +317,30 @@ pub fn marshal_anthropic_request(
     body.insert("model".into(), json!(model));
     body.insert("max_tokens".into(), json!(max_tokens));
     body.insert("messages".into(), Value::Array(messages));
+    // Prompt-cache breakpoints on the stable prefix only (tools and
+    // system never change between rounds of a conversation; messages do,
+    // so they stay uncached). Anthropic-style endpoints — first-party
+    // api.anthropic.com and MiniMax's documented /anthropic mirror alike
+    // — cache everything up to a cache_control block and report
+    // cache_read_input_tokens / cache_creation_input_tokens in usage.
+    // The system string is sent as a one-block array because the string
+    // form has nowhere to hang the marker.
+    if !tool_defs.is_empty() {
+        if let Some(last) = tool_defs.last_mut() {
+            last["cache_control"] = json!({"type": "ephemeral"});
+        }
+        body.insert("tools".into(), Value::Array(tool_defs));
+    }
     let system = system_parts.join("\n\n");
     if !system.is_empty() {
-        body.insert("system".into(), json!(system));
-    }
-    if !tool_defs.is_empty() {
-        body.insert("tools".into(), Value::Array(tool_defs));
+        body.insert(
+            "system".into(),
+            json!([{
+                "type": "text",
+                "text": system,
+                "cache_control": {"type": "ephemeral"},
+            }]),
+        );
     }
     if let Some(t) = thinking_config(thinking, max_tokens) {
         body.insert("thinking".into(), t);
@@ -477,6 +509,16 @@ where
                         }],
                         ..Default::default()
                     }),
+                    "signature_delta" => Some(StreamChunk {
+                        choices: vec![crate::types::StreamChunkChoice {
+                            delta: StreamDelta {
+                                reasoning_signature: str_field(delta, "signature"),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
                     "input_json_delta" => Some(Self::tool_delta(
                         index,
                         "",
@@ -565,5 +607,139 @@ where
                 return Some((Ok(chunk), self));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{marshal_anthropic_request, AnthropicStreamState, SseLineReader};
+    use crate::types::{Message, ToolDef};
+    use serde_json::{json, Value};
+
+    fn msgs_with_signed_reasoning() -> Vec<Message> {
+        vec![
+            Message {
+                role: "user".into(),
+                content: "hi".into(),
+                ..Default::default()
+            },
+            Message {
+                role: "assistant".into(),
+                content: "hello".into(),
+                reasoning: "I considered greeting.".into(),
+                reasoning_signature: "sig-abc".into(),
+                ..Default::default()
+            },
+            Message {
+                role: "user".into(),
+                content: "again".into(),
+                ..Default::default()
+            },
+        ]
+    }
+
+    #[test]
+    fn marshal_replays_thinking_with_signature() {
+        // A prior assistant turn with a signature replays its thinking
+        // block (type:thinking, thinking, signature) BEFORE the text
+        // block, so reasoning survives across turns. Anthropic requires
+        // the signature on any thinking block it receives back.
+        let msgs = msgs_with_signed_reasoning();
+        let body = marshal_anthropic_request("claude-opus-4-6", &msgs, &[], "max", 32000).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        let blocks = messages[1]["content"].as_array().unwrap();
+        assert_eq!(messages[1]["role"], "assistant");
+        // thinking block first, then text.
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "thinking");
+        assert_eq!(blocks[0]["thinking"], "I considered greeting.");
+        assert_eq!(blocks[0]["signature"], "sig-abc");
+        assert_eq!(blocks[1]["type"], "text");
+        assert_eq!(blocks[1]["text"], "hello");
+    }
+
+    #[test]
+    fn marshal_sets_cache_breakpoints_on_stable_prefix() {
+        // Prompt-cache breakpoints land on the stable prefix only: the
+        // last tool def and the system block (sent as a one-block array
+        // because the string form cannot carry cache_control). Messages
+        // change every round, so they carry no marker.
+        let msgs = vec![
+            Message {
+                role: "system".into(),
+                content: "be helpful".into(),
+                ..Default::default()
+            },
+            Message {
+                role: "user".into(),
+                content: "hi".into(),
+                ..Default::default()
+            },
+        ];
+        let tools = vec![
+            ToolDef::new("get_weather", "weather lookup", json!({"type": "object"})),
+            ToolDef::new("get_time", "clock", serde_json::Value::Null),
+        ];
+        let body = marshal_anthropic_request("MiniMax-M2.7", &msgs, &tools, "", 8192).unwrap();
+        let system = body["system"].as_array().expect("system is block array");
+        assert_eq!(system[0]["type"], "text");
+        assert_eq!(system[0]["cache_control"]["type"], "ephemeral");
+        let sent_tools = body["tools"].as_array().unwrap();
+        assert_eq!(sent_tools.len(), 2);
+        assert_eq!(sent_tools[1]["name"], "get_time");
+        // Breakpoint on the FINAL tool so the whole tools list caches.
+        assert_eq!(sent_tools[1]["cache_control"]["type"], "ephemeral");
+        assert!(sent_tools[0].get("cache_control").is_none());
+        for m in body["messages"].as_array().unwrap() {
+            for b in m["content"].as_array().unwrap() {
+                assert!(
+                    b.get("cache_control").is_none(),
+                    "message blocks must not carry cache_control: {b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn marshal_omits_thinking_without_signature() {
+        // History without a signature (saved before signatures were
+        // captured, or a non-thinking turn) omits the thinking block —
+        // emitting one without a signature would 400.
+        let mut msgs = msgs_with_signed_reasoning();
+        msgs[1].reasoning_signature = String::new();
+        let body = marshal_anthropic_request("claude-opus-4-6", &msgs, &[], "max", 32000).unwrap();
+        let blocks = body["messages"].as_array().unwrap()[1]["content"]
+            .as_array()
+            .unwrap();
+        // only the text block; no thinking block.
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "hello");
+        assert!(
+            !blocks
+                .iter()
+                .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("thinking")),
+            "no thinking block without a signature"
+        );
+    }
+
+    #[test]
+    fn signature_delta_captures_signature() {
+        // A streamed signature_delta event populates delta.reasoning
+        // _signature (text/reasoning stay empty) so the thinking block
+        // can be replayed across turns. The reader is unused since we
+        // drive handle_event directly with a synthetic event.
+        let reader = SseLineReader::new(futures::stream::empty());
+        let mut st = AnthropicStreamState::new(reader);
+        let v: Value = json!({
+            "type": "content_block_delta",
+            "index": 1,
+            "delta": { "type": "signature_delta", "signature": "sig-xyz" }
+        });
+        let chunk = st.handle_event(&v).expect("signature_delta emits a chunk");
+        assert_eq!(chunk.choices[0].delta.reasoning_signature, "sig-xyz");
+        assert!(chunk.choices[0].delta.reasoning.is_empty());
+        assert!(chunk.choices[0].delta.content.is_empty());
     }
 }

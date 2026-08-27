@@ -51,6 +51,9 @@ pub struct Message {
     pub content: String,
     pub images: Vec<ImageData>,
     pub reasoning: String,
+    /// Claude/Bedrock opaque signature for the thinking block, so prior
+    /// reasoning can be replayed across turns without a 400.
+    pub reasoning_signature: String,
     /// provider or measured thinking duration
     pub reasoning_ms: i64,
     pub tool_calls: Vec<ToolCall>,
@@ -75,6 +78,9 @@ fn message_plain_fields(m: &Message) -> serde_json::Value {
     let obj = v.as_object_mut().unwrap();
     if !m.reasoning.is_empty() {
         obj.insert("reasoning".into(), json!(m.reasoning));
+    }
+    if !m.reasoning_signature.is_empty() {
+        obj.insert("reasoning_signature".into(), json!(m.reasoning_signature));
     }
     if m.reasoning_ms != 0 {
         obj.insert("reasoning_ms".into(), json!(m.reasoning_ms));
@@ -138,6 +144,8 @@ impl<'de> Deserialize<'de> for Message {
             content: serde_json::Value,
             #[serde(default)]
             reasoning: String,
+            #[serde(default)]
+            reasoning_signature: String,
             #[serde(default, rename = "reasoning_ms")]
             reasoning_ms: i64,
             #[serde(default, deserialize_with = "crate::serde_null::null_as_default")]
@@ -161,6 +169,7 @@ impl<'de> Deserialize<'de> for Message {
             content: String::new(),
             images: Vec::new(),
             reasoning: std::mem::take(&mut raw.reasoning),
+            reasoning_signature: std::mem::take(&mut raw.reasoning_signature),
             reasoning_ms: raw.reasoning_ms,
             tool_calls: std::mem::take(&mut raw.tool_calls),
             tool_call_id: std::mem::take(&mut raw.tool_call_id),
@@ -371,6 +380,11 @@ pub struct StreamDelta {
     /// Ollama-style thinking field
     #[serde(default, deserialize_with = "crate::serde_null::null_as_default")]
     pub reasoning: String,
+    /// Claude/Bedrock opaque signature for a thinking block (streamed
+    /// separately from the text); replayed with the text so reasoning
+    /// survives across turns.
+    #[serde(default, deserialize_with = "crate::serde_null::null_as_default")]
+    pub reasoning_signature: String,
     /// OpenCode Go / DeepSeek-style field
     #[serde(
         rename = "reasoning_content",
@@ -401,6 +415,9 @@ pub struct ChatRequest {
 pub struct StreamResult {
     pub content: String,
     pub reasoning: String,
+    /// Claude/Bedrock opaque signature, captured during streaming and
+    /// replayed with the reasoning text so thinking survives across turns.
+    pub reasoning_signature: String,
     pub reasoning_ms: i64,
     pub tool_calls: Vec<ToolCall>,
     pub usage: Option<StreamUsage>,

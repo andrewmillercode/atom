@@ -15,7 +15,7 @@ use serde_json::json;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// How long an approval prompt waits for POST /approval before denying.
+/// Default timeout for test approvers (production approvals block indefinitely).
 pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// dispatch result: how long `wait:true` blocks for a subagent's turn to
@@ -124,7 +124,9 @@ pub struct ServerApprover {
     state: Arc<AppState>,
     session_id: String,
     out: crate::turn::EventOut,
-    pub timeout: Duration,
+    /// Cancel token for the current turn — allows Esc/pause to interrupt
+    /// an indefinitely-blocking approval prompt.
+    cancel: Option<crate::cancel::CancelToken>,
 }
 
 /// Builds the `approval_request` event for one pending prompt. When the
@@ -146,7 +148,7 @@ pub fn approval_request_event(
         "rule_id": req.rule_id,
         "reason": req.reason,
     });
-    if let Some(child) = state.store.get(session_id) {
+    if let Some(child) = state.store.get_info(session_id) {
         if !child.parent_id.is_empty() {
             ev["from_subagent"] = json!(true);
             let title = if !child.title.is_empty() {
@@ -169,26 +171,39 @@ impl ServerApprover {
             state,
             session_id,
             out: crate::turn::EventOut::Discard,
-            timeout: APPROVAL_TIMEOUT,
+            cancel: None,
         }
     }
 
-    pub fn for_turn(state: Arc<AppState>, session_id: String, out: crate::turn::EventOut) -> Self {
+    pub fn for_turn(
+        state: Arc<AppState>,
+        session_id: String,
+        out: crate::turn::EventOut,
+        cancel: Option<crate::cancel::CancelToken>,
+    ) -> Self {
         ServerApprover {
             state,
             session_id,
             out,
-            timeout: APPROVAL_TIMEOUT,
+            cancel,
         }
     }
 
-    /// Test/short-timeout variant.
+    /// Test/short-timeout variant (uses a fixed timeout instead of blocking
+    /// indefinitely).
     pub fn with_timeout(state: Arc<AppState>, session_id: String, timeout: Duration) -> Self {
+        // For tests: use a cancellation token that fires after `timeout`.
+        let cancel = crate::cancel::CancelToken::new();
+        let c2 = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(timeout).await;
+            c2.cancel();
+        });
         ServerApprover {
             state,
             session_id,
             out: crate::turn::EventOut::Discard,
-            timeout,
+            cancel: Some(cancel),
         }
     }
 }
@@ -201,15 +216,18 @@ impl Approver for ServerApprover {
         self.state
             .approvals
             .register(&self.session_id, &id, req.clone(), tx);
-        let child = self.state.store.get(&self.session_id);
+        let child = self.state.store.get_info(&self.session_id);
         let parent_id = child
             .as_ref()
             .filter(|session| !session.parent_id.is_empty())
             .map(|session| session.parent_id.clone());
         if let Some(parent_id) = &parent_id {
+            let session_id = self.session_id.clone();
             self.state
-                .store
-                .update_delegate_status(&self.session_id, DelegateStatus::Sandbox);
+                .store_call(move |store| {
+                    store.update_delegate_status(&session_id, DelegateStatus::Sandbox)
+                })
+                .await;
             self.state
                 .subs
                 .broadcast(parent_id, &json!({"type": "children"}));
@@ -221,17 +239,28 @@ impl Approver for ServerApprover {
         if let Some(parent_id) = &parent_id {
             self.state.subs.broadcast(parent_id, &ev);
         }
-        let decision = match tokio::time::timeout(self.timeout, rx).await {
-            Ok(Ok(decision)) => decision,
-            // Timeout or dropped waiter -> Deny.
-            _ => Decision::Deny,
+        let decision = match &self.cancel {
+            Some(cancel) => {
+                tokio::select! {
+                    res = rx => res.unwrap_or(Decision::Deny),
+                    _ = cancel.cancelled() => Decision::Deny,
+                }
+            }
+            None => {
+                // No cancel token: block indefinitely until user responds
+                // or the oneshot sender is dropped (session cleanup).
+                rx.await.unwrap_or(Decision::Deny)
+            }
         };
         self.state.approvals.remove(&self.session_id, &id);
-        if let Some(child) = self.state.store.get(&self.session_id) {
+        if let Some(child) = self.state.store.get_info(&self.session_id) {
             if !child.parent_id.is_empty() && !child.cancelled {
+                let session_id = self.session_id.clone();
                 self.state
-                    .store
-                    .update_delegate_status(&self.session_id, DelegateStatus::Working);
+                    .store_call(move |store| {
+                        store.update_delegate_status(&session_id, DelegateStatus::Working)
+                    })
+                    .await;
                 self.state
                     .subs
                     .broadcast(&child.parent_id, &json!({"type": "children"}));
@@ -278,17 +307,26 @@ impl DispatchBridge {
     }
 
     /// ownedDispatchChild validates shape, existence, and ownership.
-    fn owned_child(&self, child_id: &str) -> Result<atom_core::session::store::Session, String> {
+    fn owned_child_info(&self, child_id: &str) -> Result<SessionInfo, String> {
         if !atom_tools::is_dispatch_session_id(child_id) {
             return Err("error: session_id must be a 16-character hex session id".into());
         }
-        let Some(child) = self.state.store.get(child_id) else {
+        let Some(child) = self.state.store.get_info(child_id) else {
             return Err("error: subagent not found".into());
         };
         if !self.state.store.is_descendant_of(child_id, &self.parent_id) {
             return Err("error: not your subagent".into());
         }
         Ok(child)
+    }
+
+    async fn owned_child(&self, child_id: &str) -> Result<Session, String> {
+        self.owned_child_info(child_id)?;
+        let child_id = child_id.to_string();
+        self.state
+            .store_call(move |store| store.get(&child_id))
+            .await
+            .ok_or_else(|| "error: subagent not found".into())
     }
 
     fn current_provider(&self) -> atom_core::providers::Provider {
@@ -367,7 +405,12 @@ impl SubagentHandle for DispatchBridge {
         // The daemon does not retain the multi-megabyte catalog at idle.
         // Dispatch is the first server-only operation that needs it.
         atom_core::providers::modelsdev::ensure_models_dev_catalog().await;
-        let Some(parent) = self.state.store.get(&self.parent_id) else {
+        let parent_id = self.parent_id.clone();
+        let Some(parent) = self
+            .state
+            .store_call(move |store| store.get(&parent_id))
+            .await
+        else {
             return "error: dispatch requires an active session".into();
         };
 
@@ -399,32 +442,46 @@ impl SubagentHandle for DispatchBridge {
         if !parent.parent_id.is_empty() {
             return "error: subagents cannot dispatch nested subagents".into();
         }
-        let mut cwd = parent.cwd.clone();
-        if cwd.is_empty() {
-            cwd = std::env::current_dir()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default();
+        let cwd = parent.cwd.clone();
+        if !std::path::Path::new(&cwd).is_absolute() {
+            return "error: parent session has no absolute cwd".into();
         }
-        let instr = load_instructions_from(&cwd);
         let title = first_line_trunc(&plan.prompt, 60);
-        let mut child =
-            self.state
-                .store
-                .create_child(&parent.id, &model, &cwd, &plan.thinking, &title, instr);
-        self.state.store.update_provider(&child.id, &provider.name);
-        self.state
-            .store
-            .update_delegate_batch(&child.id, &plan.batch_id, plan.batch_index);
-        child.provider = provider.name.clone();
-        child.batch_id = plan.batch_id.clone();
-        child.batch_index = plan.batch_index as i64;
-        let messages = vec![atom_core::types::Message {
-            role: "user".into(),
-            content: plan.prompt.clone(),
-            ..Default::default()
-        }];
-        self.state.store.update(&child.id, messages, &child.title);
-        crate::turn::kickoff_title_generation(&self.state, child.id.clone());
+        let store_parent_id = parent.id.clone();
+        let store_model = model.clone();
+        let store_cwd = cwd.clone();
+        let store_thinking = plan.thinking.clone();
+        let store_title = title.clone();
+        let store_provider = provider.name.clone();
+        let store_batch_id = plan.batch_id.clone();
+        let store_batch_index = plan.batch_index;
+        let store_prompt = plan.prompt.clone();
+        let child = self
+            .state
+            .store_call(move |store| {
+                let instr = load_instructions_from(&store_cwd);
+                let mut child = store.create_child(
+                    &store_parent_id,
+                    &store_model,
+                    &store_cwd,
+                    &store_thinking,
+                    &store_title,
+                    instr,
+                );
+                store.update_provider(&child.id, &store_provider);
+                store.update_delegate_batch(&child.id, &store_batch_id, store_batch_index);
+                child.provider = store_provider;
+                child.batch_id = store_batch_id;
+                child.batch_index = store_batch_index as i64;
+                let messages = vec![atom_core::types::Message {
+                    role: "user".into(),
+                    content: store_prompt,
+                    ..Default::default()
+                }];
+                store.update(&child.id, messages, &child.title);
+                child
+            })
+            .await;
         self.state.turns.prepare_session_turn(&child.id);
         kickoff_dispatch_turn(
             &self.state,
@@ -448,7 +505,7 @@ impl SubagentHandle for DispatchBridge {
     /// continueDispatch posts a follow-up prompt to an owned, idle child.
     async fn cont(&self, plan: DispatchPlan) -> String {
         atom_core::providers::modelsdev::ensure_models_dev_catalog().await;
-        let child = match self.owned_child(&plan.session_id) {
+        let child = match self.owned_child(&plan.session_id).await {
             Ok(c) => c,
             Err(e) => return e,
         };
@@ -482,24 +539,41 @@ impl SubagentHandle for DispatchBridge {
             return "error: subagent is still active; cancel it before sending a follow-up".into();
         }
         self.state.turns.clear_pending_pauses(&child.id);
-        // A follow-up explicitly revives a previously killed subagent.
-        if child.cancelled {
-            self.state.store.set_cancelled(&child.id, false);
-        }
-        if !thinking.is_empty() && thinking != child.thinking {
-            self.state.store.update_thinking(&child.id, &thinking);
-        }
         let mut messages = child.messages.clone();
         messages.push(atom_core::types::Message {
             role: "user".into(),
             content: plan.prompt.clone(),
             ..Default::default()
         });
-        self.state.store.update(&child.id, messages, "");
-        self.state.turns.prepare_session_turn(&child.id);
+        let child_id = child.id.clone();
+        let was_cancelled = child.cancelled;
+        let update_thinking = !thinking.is_empty() && thinking != child.thinking;
+        let stored_thinking = thinking.clone();
         self.state
-            .store
-            .update_delegate_status(&child.id, DelegateStatus::Queued);
+            .store_call(move |store| {
+                // A follow-up explicitly revives a previously killed subagent.
+                if was_cancelled {
+                    store.set_cancelled(&child_id, false);
+                }
+                if update_thinking {
+                    store.update_thinking(&child_id, &stored_thinking);
+                }
+                store.update(&child_id, messages, "");
+                store.update_delegate_status(&child_id, DelegateStatus::Queued);
+            })
+            .await;
+        // Show the follow-up to every client viewing the child (and the
+        // parent's panel) immediately, not after the child's turn ends.
+        // The child's detached turn runs with skip_append, so this is the
+        // only place the user_message event can be emitted for it.
+        self.state.subs.broadcast(
+            &child.id,
+            &json!({"type": "user_message", "text": plan.prompt.clone()}),
+        );
+        self.state
+            .subs
+            .broadcast(&self.parent_id, &json!({"type": "children"}));
+        self.state.turns.prepare_session_turn(&child.id);
         kickoff_dispatch_turn(
             &self.state,
             &child.id,
@@ -519,8 +593,8 @@ impl SubagentHandle for DispatchBridge {
         let load_target_infos = || -> Result<Vec<SessionInfo>, String> {
             if !plan.session_id.is_empty() {
                 return self
-                    .owned_child(&plan.session_id)
-                    .map(|child| vec![child.info()]);
+                    .owned_child_info(&plan.session_id)
+                    .map(|child| vec![child]);
             }
             let mut children: Vec<SessionInfo> = self
                 .state
@@ -569,10 +643,11 @@ impl SubagentHandle for DispatchBridge {
         if !plan.include_results {
             return status_snapshot_info(&plan.batch_id, &infos);
         }
-        let children: Vec<Session> = infos
-            .iter()
-            .filter_map(|info| self.state.store.get(&info.id))
-            .collect();
+        let ids: Vec<String> = infos.iter().map(|info| info.id.clone()).collect();
+        let children: Vec<Session> = self
+            .state
+            .store_call(move |store| ids.iter().filter_map(|id| store.get(id)).collect())
+            .await;
         status_snapshot(&plan.batch_id, &children, true)
     }
 
@@ -582,14 +657,17 @@ impl SubagentHandle for DispatchBridge {
     /// follow-up), but the TUI only shows subagents that were never
     /// explicitly killed.
     async fn cancel(&self, sid: &str) -> String {
-        if let Err(e) = self.owned_child(sid) {
+        if let Err(e) = self.owned_child_info(sid) {
             return e;
         }
         pause_dispatch_session(&self.state, sid);
-        self.state.store.set_cancelled(sid, true);
+        let sid_owned = sid.to_string();
         self.state
-            .store
-            .update_delegate_status(sid, DelegateStatus::Cancelled);
+            .store_call(move |store| {
+                store.set_cancelled(&sid_owned, true);
+                store.update_delegate_status(&sid_owned, DelegateStatus::Cancelled);
+            })
+            .await;
         self.state
             .subs
             .broadcast(&self.parent_id, &json!({"type": "children"}));
@@ -621,6 +699,11 @@ pub fn kickoff_dispatch_turn(
 ) {
     let state = state.clone();
     let id = id.to_string();
+    // Keep the parent's provider credentials for a potential auto-continue
+    // turn after the child finishes (dispatch inherits the caller's provider).
+    let parent_key = key.to_string();
+    let parent_base_url = base_url.to_string();
+    let parent_reasoning_field = reasoning_field.to_string();
     let opts = crate::turn::TurnOpts {
         message: String::new(),
         thinking: thinking.to_string(),
@@ -634,15 +717,13 @@ pub fn kickoff_dispatch_turn(
         skip_append: true,
     };
     tokio::spawn(async move {
-        if state.store.get(&id).is_none() {
-            return;
-        }
         let out = crate::turn::EventOut::Discard;
-        let mut sess = match state.store.get(&id) {
+        let load_id = id.clone();
+        let mut sess = match state.store_call(move |store| store.get(&load_id)).await {
             Some(s) => s,
             None => return,
         };
-        crate::turn::run_session_turn(
+        crate::turn::run_session_turn_guarded(
             &state,
             &mut sess,
             &id,
@@ -655,17 +736,129 @@ pub fn kickoff_dispatch_turn(
         // main agent (and the TUI) learn about completion without polling.
         let parent_id = sess.parent_id.clone();
         if !parent_id.is_empty() {
-            let status = state
+            let child_status = state
                 .store
-                .get(&id)
-                .map(|child| child.status.as_str())
-                .unwrap_or("error");
+                .get_info(&id)
+                .map(|child| child.status)
+                .unwrap_or(DelegateStatus::Error);
             state.subs.broadcast(
                 &parent_id,
-                &json!({"type": "dispatch_result", "child": id, "status": status}),
+                &json!({"type": "dispatch_result", "child": id, "status": child_status.as_str()}),
             );
+            // Auto-continue: when the child reached a terminal state and the
+            // parent session is idle, start a follow-up turn so the parent
+            // agent can inspect results and report to the user.
+            if !child_status.is_active() {
+                maybe_auto_continue_parent(
+                    &state,
+                    &parent_id,
+                    &parent_key,
+                    &parent_base_url,
+                    &parent_reasoning_field,
+                )
+                .await;
+            }
         }
     });
+}
+
+/// Small delay before auto-continuing the parent to batch multiple
+/// near-simultaneous subagent completions into one parent turn.
+const AUTO_CONTINUE_DEBOUNCE: Duration = Duration::from_millis(600);
+
+/// Attempt to auto-continue the parent session when one or more subagents
+/// reach a terminal state. Uses `try_prepare_session_turn` for atomic
+/// reservation so concurrent completions don't race: only the first one
+/// that wins the reservation triggers the turn. Only fires when ALL alive
+/// (non-cancelled) children have reached a terminal state so the parent
+/// gets one clean turn with complete results rather than being woken
+/// repeatedly for partial completions.
+async fn maybe_auto_continue_parent(
+    state: &Arc<AppState>,
+    parent_id: &str,
+    key: &str,
+    base_url: &str,
+    reasoning_field: &str,
+) {
+    // Short debounce: if multiple subagents finish around the same time,
+    // we want one parent turn that sees them all rather than several turns
+    // each seeing only one.
+    tokio::time::sleep(AUTO_CONTINUE_DEBOUNCE).await;
+
+    // Gather children status to decide whether to proceed.
+    let children: Vec<SessionInfo> = state
+        .store
+        .children_info(parent_id)
+        .into_iter()
+        .filter(|child| !child.cancelled)
+        .collect();
+
+    if children.is_empty() {
+        return;
+    }
+
+    // Only auto-continue when ALL alive children are terminal (done/error).
+    let all_terminal = children.iter().all(|c| !c.status.is_active());
+    if !all_terminal {
+        return;
+    }
+
+    // Atomically reserve the parent — if it's already running (user sent
+    // a message, or another auto-continue won the race) we bail out.
+    if !state.turns.try_prepare_session_turn(parent_id) {
+        return;
+    }
+
+    let done_count = children
+        .iter()
+        .filter(|c| c.status == DelegateStatus::Done)
+        .count();
+    let error_count = children
+        .iter()
+        .filter(|c| c.status == DelegateStatus::Error)
+        .count();
+    let total = children.len();
+
+    let status_summary = if error_count > 0 {
+        format!("{done_count} done, {error_count} errored (out of {total})")
+    } else {
+        format!("all {total} done")
+    };
+
+    let notification = format!(
+        "[system: your subagents have finished ({status_summary}). \
+         Use dispatch action=inspect to collect their results and report back to the user.]"
+    );
+
+    let load_id = parent_id.to_string();
+    let Some(mut parent_sess) = state.store_call(move |store| store.get(&load_id)).await else {
+        state.turns.release_prepared(parent_id);
+        return;
+    };
+
+    let parent_thinking = parent_sess.thinking.clone();
+    let parent_id_owned = parent_id.to_string();
+    let opts = crate::turn::TurnOpts {
+        message: notification,
+        thinking: parent_thinking,
+        key: key.to_string(),
+        base_url: base_url.to_string(),
+        reasoning_field: reasoning_field.to_string(),
+        turn_id: format!("auto-continue-{parent_id_owned}"),
+        images: Vec::new(),
+        compact: false,
+        compact_instructions: String::new(),
+        skip_append: false,
+    };
+    crate::turn::run_session_turn_guarded(
+        state,
+        &mut parent_sess,
+        &parent_id_owned,
+        opts,
+        crate::turn::EventOut::Discard,
+        crate::cancel::CancelToken::new(),
+    )
+    .await;
 }
 
 #[cfg(test)]

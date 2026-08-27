@@ -34,9 +34,12 @@ pub const MINIDOT_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴"
 /// inputMaxHeight is the tallest the prompt field may grow, in rows.
 pub const INPUT_MAX_HEIGHT: usize = 8;
 
-/// workingStatusRows is the reserved chrome above the prompt's top border.
-pub const WORKING_STATUS_ROWS: usize = 1;
 pub const VIEWPORT_VPAD: usize = 1;
+/// Blank rows left at the bottom of the message viewport (between the
+/// last content row and the prompt) when no footer menu is open. The
+/// scrollbar and viewport rect still span the full region; only content
+/// is clipped short of this padding.
+pub const VIEWPORT_BOTTOM_PAD: usize = 1;
 pub const PROMPT_PAD: usize = 1;
 /// Rows below the status bar reserved for the card-dark cwd footer
 /// (the directory the agent was invoked from).
@@ -45,11 +48,14 @@ pub const STATUS_FOOTER_ROWS: usize = 1;
 /// tuiHPad is the left/right inset in cells.
 pub const TUI_HPAD: usize = 1;
 
+/// Width of the scrollbar gutter in columns.
+pub const SCROLLBAR_WIDTH: usize = 2;
+
 /// splashTickInterval drives the empty-session atom animation.
 pub const SPLASH_TICK_MS: u64 = 33;
 
-/// MiniDot runs at 12 fps (bubbles).
-pub const SPINNER_TICK_MS: u64 = 83;
+/// MiniDot runs at ~24 fps for smooth animation.
+pub const SPINNER_TICK_MS: u64 = 42;
 
 /// outputTestSceneDuration backs the --output-test scene timer.
 pub const TEST_SCENE_TICK_SECS: u64 = 3;
@@ -95,6 +101,9 @@ pub struct App {
     // conversation
     pub blocks: Vec<Block>,
     pub content_lines: Vec<Arc<Line<'static>>>,
+    /// Per content line, clickable OSC 8 link regions (parallel to
+    /// content_lines).
+    pub link_lines: Vec<Vec<crate::ansi::LinkRegion>>,
     pub block_start: Vec<usize>,
     pub content_width: usize,
     /// pinned to the newest output until the user scrolls up
@@ -102,12 +111,21 @@ pub struct App {
     /// viewport YOffset analog
     pub scroll_y: usize,
 
+    // scrollbar mouse interaction
+    pub scrollbar_dragging: bool,
+
+    // performance: skip redundant refresh_viewport work during pure scrolls
+    pub viewport_dirty: bool,
+
     // mouse text selection over the viewport ((line,col) pairs)
     pub sel_anchor: Option<(usize, usize)>,
     pub sel_end: Option<(usize, usize)>,
     pub selecting: bool,
     pub sel_active: bool,
     pub prompt_selecting: bool,
+    /// URI armed by pressing on a link; opened on release unless the
+    /// press turned into a drag selection.
+    pub link_pending: Option<String>,
     pub copied_msg: String,
     pub copied_at: Option<Instant>,
 
@@ -189,6 +207,12 @@ pub struct App {
     pub reasoning_visible: bool,
     pub reasoning_sel: usize,
 
+    // @ file-mention menu
+    pub at_menu_visible: bool,
+    pub at_menu_items: Vec<String>,
+    pub at_menu_sel: usize,
+    pub at_menu_query: String,
+
     // pasted images attached to the pending prompt
     pub pending: Vec<PendingImage>,
     pub preview_dirty: bool,
@@ -224,15 +248,19 @@ impl App {
             show_reasoning: true,
             blocks: Vec::new(),
             content_lines: Vec::new(),
+            link_lines: Vec::new(),
             block_start: Vec::new(),
             content_width: 0,
             following: true,
             scroll_y: 0,
+            scrollbar_dragging: false,
+            viewport_dirty: true,
             sel_anchor: None,
             sel_end: None,
             selecting: false,
             sel_active: false,
             prompt_selecting: false,
+            link_pending: None,
             copied_msg: String::new(),
             copied_at: None,
             splash_t: 0.0,
@@ -285,6 +313,10 @@ impl App {
             context_sel: 0,
             reasoning_visible: false,
             reasoning_sel: 0,
+            at_menu_visible: false,
+            at_menu_items: Vec::new(),
+            at_menu_sel: 0,
+            at_menu_query: String::new(),
             pending: Vec::new(),
             preview_dirty: false,
             approval: None,
@@ -331,7 +363,10 @@ impl App {
     // -- layout helpers ----------------------------------------------------
 
     pub fn inner_width(&self) -> usize {
-        (self.width as usize).saturating_sub(2 * TUI_HPAD).max(1)
+        // left pad (TUI_HPAD) + content + right pad (1) + scrollbar (SCROLLBAR_WIDTH)
+        (self.width as usize)
+            .saturating_sub(2 * TUI_HPAD + SCROLLBAR_WIDTH)
+            .max(1)
     }
 
     pub fn input_width(&self) -> usize {
@@ -350,14 +385,9 @@ impl App {
         let status_rows = crate::statusbar::status_bar_rows(self);
         let max = (self.height as usize)
             .saturating_sub(
-                1 + status_rows
-                    + STATUS_FOOTER_ROWS
-                    + WORKING_STATUS_ROWS
-                    + 2 * PROMPT_PAD
-                    + self.preview_row_count(),
+                1 + status_rows + STATUS_FOOTER_ROWS + 2 * PROMPT_PAD + self.preview_row_count(),
             )
-            .min(INPUT_MAX_HEIGHT)
-            .max(1);
+            .clamp(1, INPUT_MAX_HEIGHT);
         lines.min(max).max(1)
     }
 
@@ -494,17 +524,18 @@ impl App {
                 BlockKind::Reasoning => {
                     if b.active {
                         b.lines = None;
+                        self.viewport_dirty = true;
                     }
                 }
                 BlockKind::Compaction => {
                     if b.active {
                         b.lines = None;
+                        self.viewport_dirty = true;
                     }
                 }
-                BlockKind::Tool => {
-                    if !b.tool_done {
-                        b.lines = None;
-                    }
+                BlockKind::Tool if !b.tool_done => {
+                    b.lines = None;
+                    self.viewport_dirty = true;
                 }
                 _ => {}
             }
@@ -515,6 +546,7 @@ impl App {
         for block in &mut self.blocks {
             block.lines = None;
         }
+        self.viewport_dirty = true;
     }
 
     pub fn refresh_viewport(&mut self) {
@@ -528,7 +560,7 @@ impl App {
             }
             self.content_width = width;
             self.rebuild_content_from(0, width);
-        } else {
+        } else if self.viewport_dirty || self.block_start.len() != self.blocks.len() {
             let first = self
                 .blocks
                 .iter()
@@ -542,10 +574,11 @@ impl App {
                 }
             }
         }
+        self.viewport_dirty = false;
         let max_scroll = self
             .content_lines
             .len()
-            .saturating_sub(self.viewport_height());
+            .saturating_sub(self.content_viewport_height());
         if self.following {
             self.scroll_y = max_scroll;
         } else {
@@ -553,40 +586,82 @@ impl App {
         }
     }
 
-    pub fn rebuild_content_from(&mut self, _idx: usize, width: usize) {
+    pub fn rebuild_content_from(&mut self, idx: usize, width: usize) {
         let frame = MINIDOT_FRAMES[self.spinner_frame % MINIDOT_FRAMES.len()].to_string();
-        for i in 0..self.blocks.len() {
+
+        // Re-render any blocks whose cached lines are stale.
+        for i in idx..self.blocks.len() {
             let show_r = self.show_reasoning;
             let b = &mut self.blocks[i];
             if !b.lines_valid(width, show_r) {
-                let rendered = blocks::render_block(b, width, show_r, &frame)
-                    .into_iter()
-                    .map(Arc::new)
-                    .collect::<Vec<_>>();
-                b.lines = Some(rendered.clone());
+                let rendered = blocks::render_block_linked(b, width, show_r, &frame);
+                let lines = rendered.lines.into_iter().map(Arc::new).collect();
+                b.lines = Some(lines);
+                b.line_links = rendered.links;
                 b.line_width = width;
                 b.line_show_r = show_r;
                 b.line_expanded = b.expanded;
             }
         }
 
-        self.content_lines.clear();
-        self.block_start.clear();
-        let mut has_visible_block = false;
-        for block in &self.blocks {
+        // Incremental content_lines assembly: truncate back to `idx` and
+        // rebuild only the tail.  For the common streaming case (only the
+        // last block changed) this avoids re-cloning thousands of Arc lines.
+        if idx > 0 && idx <= self.block_start.len() {
+            // block_start[idx] is where block idx's content begins.
+            // The separator line between block idx-1 and block idx (if any)
+            // sits one position before that, so we truncate to the end of
+            // block idx-1's content (i.e. where block idx's separator would
+            // start).  We detect the separator by checking the slot just
+            // before block_start[idx].
+            let raw = if idx < self.block_start.len() {
+                self.block_start[idx]
+            } else {
+                self.content_lines.len()
+            };
+            // Remove the separator line that was inserted before block idx.
+            let keep_lines = if raw > 0
+                && idx < self.block_start.len()
+                && self
+                    .content_lines
+                    .get(raw.wrapping_sub(1))
+                    .is_some_and(|l| l.spans.is_empty())
+            {
+                raw - 1
+            } else {
+                raw
+            };
+            self.content_lines.truncate(keep_lines);
+            self.link_lines.truncate(keep_lines);
+            self.block_start.truncate(idx);
+        } else {
+            self.content_lines.clear();
+            self.link_lines.clear();
+            self.block_start.clear();
+        }
+
+        let start_block = if self.block_start.is_empty() { 0 } else { idx };
+        let mut has_visible_block = !self.content_lines.is_empty();
+        for i in start_block..self.blocks.len() {
+            let block = &self.blocks[i];
             let lines = block.lines.as_deref().unwrap_or_default();
             let visible = lines
                 .iter()
                 .any(|line| line.spans.iter().any(|span| !span.content.is_empty()));
             if !visible {
                 self.block_start.push(self.content_lines.len());
+                self.link_lines.push(Vec::new());
                 continue;
             }
             if has_visible_block {
                 self.content_lines.push(Arc::new(Line::from("")));
+                self.link_lines.push(Vec::new());
             }
             self.block_start.push(self.content_lines.len());
             self.content_lines.extend(lines.iter().cloned());
+            self.link_lines.extend(
+                (0..lines.len()).map(|i| block.line_links.get(i).cloned().unwrap_or_default()),
+            );
             has_visible_block = true;
         }
     }
@@ -596,17 +671,31 @@ impl App {
         let vp = (self.height as usize).saturating_sub(
             crate::statusbar::status_bar_rows(self)
                 + STATUS_FOOTER_ROWS
-                + WORKING_STATUS_ROWS
                 + 2 * PROMPT_PAD
                 + self.input_height()
                 + self.preview_row_count(),
         );
-        vp.saturating_sub(2 * VIEWPORT_VPAD).max(1)
+        // Reserve only the top viewport padding: the prompt card sits
+        // directly below the scrolling region with no empty row in
+        // between. Footer menus float over the viewport's bottom rows.
+        vp.saturating_sub(VIEWPORT_VPAD).max(1)
     }
 
     pub fn viewport_height(&self) -> usize {
+        // Footer menus overlay the viewport's last rows instead of
+        // taking dedicated rows, so the viewport never shrinks.
         self.base_viewport_height()
-            .saturating_sub(crate::overlays::footer_menu_height(self))
+    }
+
+    /// Number of content rows actually drawn in the message viewport.
+    /// The scrollbar and viewport rect keep their full height
+    /// (`viewport_height()`); this reserves a small bottom padding row
+    /// of blank space between the last content row and the prompt.
+    /// An open footer menu floats over the viewport's bottom rows and
+    /// does not change the scrollable content height.
+    pub fn content_viewport_height(&self) -> usize {
+        self.viewport_height()
+            .saturating_sub(VIEWPORT_BOTTOM_PAD)
             .max(1)
     }
 
@@ -636,7 +725,7 @@ impl App {
         let Some(y) = y.checked_sub(VIEWPORT_VPAD) else {
             return -1;
         };
-        if y >= self.viewport_height() {
+        if y >= self.content_viewport_height() {
             return -1;
         }
         self.block_index_at_content_line(self.scroll_y + y)
@@ -697,6 +786,7 @@ impl App {
                     let last = self.blocks.last_mut().unwrap();
                     last.text.push_str(&ev.text);
                     last.lines = None;
+                    self.viewport_dirty = true;
                 } else {
                     self.blocks.push(Block {
                         kind: BlockKind::Assistant,
@@ -714,6 +804,7 @@ impl App {
                     let last = self.blocks.last_mut().unwrap();
                     last.text.push_str(&ev.text);
                     last.lines = None;
+                    self.viewport_dirty = true;
                 } else {
                     self.blocks.push(Block {
                         kind: BlockKind::Reasoning,
@@ -751,6 +842,15 @@ impl App {
             }
             "tool_result" => {
                 blocks::attach_tool_result(&mut self.blocks, &ev.text, "");
+                self.viewport_dirty = true;
+                if blocks::assign_block_diagram_ids(&mut self.blocks) {
+                    self.preview_dirty = true;
+                    // Tool results arrive after the visualize card was
+                    // rendered. Assigning an id only marks the preview as
+                    // dirty; explicitly schedule the kitty transmission so
+                    // the reserved placeholder grid is not left blank.
+                    effects.push(Effect::PaintPreviews);
+                }
                 if !self.session.id.is_empty()
                     && !atom_tools::parse_dispatch_session_id(&ev.text).is_empty()
                 {
@@ -764,6 +864,7 @@ impl App {
                     if b.kind == BlockKind::Tool && b.diff.is_empty() {
                         b.diff = ev.diff.clone();
                         b.lines = None;
+                        self.viewport_dirty = true;
                         break;
                     }
                 }
@@ -823,23 +924,59 @@ impl App {
                 }
             }
             "approval_request" => {
-                // Pause input behind the sandbox approval box. When the
-                // request comes from a dispatched subagent, `session_id`
-                // names the child session the decision must be posted to.
+                // `emit` fans the event out on both the /send stream and
+                // the session subscription, and sub_event forwards it even
+                // while this client's own stream is live (so a subagent's
+                // prompt is never dropped). The same id therefore arrives
+                // twice; handle it only once or two identical approval
+                // cards would be stacked in the transcript.
+                if self.approval.as_ref().is_some_and(|p| p.id == ev.id)
+                    || self
+                        .blocks
+                        .iter()
+                        .any(|b| b.approval.as_ref().is_some_and(|a| a.id == ev.id))
+                {
+                    return effects;
+                }
+                // Render the sandbox approval inline as a tool block with
+                // clickable buttons. The block stays active (tool_done=false)
+                // until the user responds.
+                let sid = if ev.session_id.is_empty() {
+                    self.session.id.clone()
+                } else {
+                    ev.session_id.clone()
+                };
                 self.approval = Some(ApprovalPrompt {
                     id: ev.id.clone(),
                     command: ev.command.clone(),
                     cwd: ev.cwd.clone(),
                     rule_id: ev.rule_id.clone(),
                     reason: ev.reason.clone(),
-                    session_id: if ev.session_id.is_empty() {
-                        self.session.id.clone()
-                    } else {
-                        ev.session_id.clone()
-                    },
+                    session_id: sid.clone(),
                     child_title: ev.child_title.clone(),
                     from_subagent: ev.from_subagent,
                 });
+                self.blocks.push(Block {
+                    kind: BlockKind::Tool,
+                    title: "Sandbox".to_string(),
+                    tool_name: "sandbox".to_string(),
+                    text: ev.command.clone(),
+                    approval: Some(blocks::InlineApproval {
+                        id: ev.id.clone(),
+                        session_id: sid,
+                        command: ev.command.clone(),
+                        cwd: ev.cwd.clone(),
+                        rule_id: ev.rule_id.clone(),
+                        reason: ev.reason.clone(),
+                        from_subagent: ev.from_subagent,
+                        child_title: ev.child_title.clone(),
+                    }),
+                    expanded: true,
+                    ..Default::default()
+                });
+                self.viewport_dirty = true;
+                self.following = true;
+                self.refresh_viewport();
             }
             "paused" => {
                 self.finalize_reasoning(None);
@@ -860,6 +997,7 @@ impl App {
                         block.model = ev.model.clone();
                         block.turn_duration = ev.duration;
                         block.lines = None;
+                        self.viewport_dirty = true;
                     }
                 }
             }
@@ -889,6 +1027,7 @@ impl App {
             dur.unwrap_or_else(|| b.started_at.map(|t| t.elapsed()).unwrap_or(Duration::ZERO)),
         );
         b.lines = None;
+        self.viewport_dirty = true;
     }
 
     pub fn finalize_compaction(&mut self) {
@@ -901,6 +1040,7 @@ impl App {
             b.active = false;
             b.dur = Some(b.started_at.map(|t| t.elapsed()).unwrap_or(Duration::ZERO));
             b.lines = None;
+            self.viewport_dirty = true;
         }
     }
 
@@ -909,6 +1049,7 @@ impl App {
             if b.kind == BlockKind::Tool && !b.tool_done {
                 b.tool_done = true;
                 b.lines = None;
+                self.viewport_dirty = true;
             }
         }
     }
@@ -952,6 +1093,73 @@ impl App {
     pub fn close_reasoning_menu(&mut self) {
         self.reasoning_visible = false;
         self.reasoning_sel = 0;
+    }
+
+    pub fn close_at_menu(&mut self) {
+        self.at_menu_visible = false;
+        self.at_menu_items.clear();
+        self.at_menu_sel = 0;
+        self.at_menu_query.clear();
+    }
+
+    /// Extracts the @-query token at the cursor (the word immediately
+    /// after the last `@` before the cursor that has no spaces).
+    fn at_query_at_cursor(&self) -> Option<String> {
+        let value = &self.input.value;
+        let cursor = self.input.cursor.min(value.len());
+        let before = &value[..cursor];
+        // Find the last `@` before the cursor.
+        let at_pos = before.rfind('@')?;
+        let after_at = &before[at_pos + 1..];
+        // The @-query must not contain spaces (it's a single token).
+        if after_at.contains([' ', '\t', '\n']) {
+            return None;
+        }
+        Some(after_at.to_string())
+    }
+
+    /// Syncs the @-mention file menu based on the current input.
+    fn sync_at_menu(&mut self) {
+        let Some(query) = self.at_query_at_cursor() else {
+            self.close_at_menu();
+            return;
+        };
+        // Build file list from cwd
+        let items = list_project_files(&self.cwd, &query);
+        if items.is_empty() {
+            self.close_at_menu();
+            return;
+        }
+        self.at_menu_query = query;
+        self.at_menu_items = items;
+        if self.at_menu_sel >= self.at_menu_items.len() {
+            self.at_menu_sel = 0;
+        }
+        self.at_menu_visible = true;
+    }
+
+    /// Selects the highlighted @-menu item: replaces the @query with the
+    /// full path.
+    pub fn select_at_menu_item(&mut self) -> Vec<Effect> {
+        if self.at_menu_sel >= self.at_menu_items.len() {
+            self.close_at_menu();
+            return Vec::new();
+        }
+        let selected = self.at_menu_items[self.at_menu_sel].clone();
+        // Replace the @query in the input with @selected
+        let value = &self.input.value;
+        let cursor = self.input.cursor.min(value.len());
+        let before = &value[..cursor];
+        if let Some(at_pos) = before.rfind('@') {
+            let prefix = value[..at_pos].to_string();
+            let suffix = value[cursor..].to_string();
+            let new_value = format!("{}@{}{}", prefix, selected, suffix);
+            let new_cursor = at_pos + 1 + selected.len();
+            self.input.set_value(&new_value);
+            self.input.cursor = new_cursor;
+        }
+        self.close_at_menu();
+        Vec::new()
     }
 
     pub fn hide_manage_menu(&mut self) {
@@ -1024,8 +1232,9 @@ impl App {
             return self.open_picker(kind);
         }
 
-        let passthrough =
-            !text.starts_with('/') || overlays::is_catalog_prompt(text, &self.slash_commands);
+        let passthrough = !text.starts_with('/')
+            || overlays::is_catalog_prompt(text, &self.slash_commands)
+            || overlays::looks_like_file_path(text);
         if passthrough && (self.streaming || self.remote_working) {
             // Mid-stream submit: the interruption rides in the effect.
             // Pause the running turn via the server first, then dial the
@@ -1040,6 +1249,7 @@ impl App {
             self.dismiss_manage_menu();
             self.close_picker();
             self.close_context_menu();
+            self.close_at_menu();
             self.err_msg.clear();
             self.paused = true;
             self.interrupting = true;
@@ -1080,6 +1290,7 @@ impl App {
         self.dismiss_manage_menu();
         self.close_picker();
         self.close_context_menu();
+        self.close_at_menu();
         self.err_msg.clear();
 
         if passthrough {
@@ -1178,7 +1389,7 @@ impl App {
                 self.overlay_scroll = 0;
                 self.pending_model_provider.clear();
                 self.working_msg = "loading models...".into();
-                vec![Effect::ReloadProviders]
+                vec![Effect::FetchModels]
             }
             "/reasoning" => {
                 self.reasoning_visible = true;
@@ -1223,6 +1434,7 @@ impl App {
                     if block.kind == BlockKind::Reasoning {
                         block.expanded = self.show_reasoning;
                         block.lines = None;
+                        self.viewport_dirty = true;
                     }
                 }
                 self.refresh_viewport();
@@ -1377,6 +1589,9 @@ impl App {
             AppMsg::Resize(w, h) => self.resize(w, h),
             AppMsg::Paste(content) => self.paste(content),
             AppMsg::ModelsLoaded(entries) => {
+                if self.overlay != Some(OverlayKind::Model) {
+                    return Vec::new();
+                }
                 self.overlay_entries = entries;
                 self.overlay_sel = overlays::first_model_row(self);
                 self.overlay_scroll = 0;
@@ -1386,14 +1601,15 @@ impl App {
                 Vec::new()
             }
             AppMsg::SessionsLoaded(sessions) => {
+                if self.overlay != Some(OverlayKind::Session) {
+                    return Vec::new();
+                }
                 self.overlay_sessions = sessions;
                 self.overlay_q.clear();
                 self.overlay_sel = 0;
                 self.overlay_scroll = 0;
-                if self.overlay == Some(OverlayKind::Session) {
-                    self.overlay_sel = overlays::first_session_row(self);
-                    overlays::sync_session_scroll(self);
-                }
+                self.overlay_sel = overlays::first_session_row(self);
+                overlays::sync_session_scroll(self);
                 self.working_msg.clear();
                 Vec::new()
             }
@@ -1556,15 +1772,21 @@ impl App {
             AppMsg::SubEvent(v) => self.sub_event(v),
             AppMsg::SubEnded { sid } => {
                 if sid == self.session.id && !self.session.id.is_empty() {
-                    return vec![Effect::SubscribeAfter {
-                        id: sid,
+                    let mut effects = vec![Effect::SubscribeAfter {
+                        id: sid.clone(),
                         delay_ms: 1000,
                     }];
+                    if self.streaming {
+                        self.pending_saved = true;
+                    } else {
+                        effects.push(Effect::LoadSession { id: sid });
+                    }
+                    return effects;
                 }
                 Vec::new()
             }
             AppMsg::TickSpinner => {
-                self.spinner_frame = (self.spinner_frame + 1) % MINIDOT_FRAMES.len();
+                self.spinner_frame = self.spinner_frame.wrapping_add(1);
                 if self.streaming || self.remote_working || self.test_mode {
                     self.invalidate_live_blocks();
                 }
@@ -1589,6 +1811,8 @@ impl App {
             | AppMsg::HotRebuilt(_)
             | AppMsg::ThemeReloaded(_)
             | AppMsg::Redraw
+            | AppMsg::MathWake
+            | AppMsg::Heartbeat
             | AppMsg::SendReady { .. }
             | AppMsg::SubReady { .. } => Vec::new(),
         }
@@ -1750,6 +1974,9 @@ impl App {
         }
         let reserved: Vec<usize> = self.pending.iter().map(|p| p.num).collect();
         blocks::assign_block_image_nums(&mut self.blocks, &reserved);
+        if blocks::assign_block_diagram_ids(&mut self.blocks) {
+            self.preview_dirty = true;
+        }
         if self
             .blocks
             .iter()
@@ -1761,6 +1988,7 @@ impl App {
             let prev2 = prev.clone();
             blocks::restore_reasoning_durations(&mut self.blocks, &prev2);
         }
+        self.viewport_dirty = true;
         self.refresh_viewport();
 
         let mut fx = Vec::new();
@@ -1771,7 +1999,12 @@ impl App {
         fx.push(Effect::Subscribe {
             id: self.session.id.clone(),
         });
-        fx.push(Effect::PaintPreviews);
+        // Don't push PaintPreviews here; preview_dirty is already set and
+        // the post-draw check in the event loop will fire it AFTER the
+        // first frame renders placeholder cells at the correct terminal
+        // width. Pushing it here causes a race: the blocking paint task
+        // transmits kitty data before the draw, potentially with stale
+        // geometry (default 80-col width before the real size is known).
         if !self.session.id.is_empty() {
             fx.push(Effect::ListChildren {
                 id: self.session.id.clone(),
@@ -1831,6 +2064,19 @@ impl App {
             return Vec::new();
         }
         if ev.event_type == "subscribed" {
+            return Vec::new();
+        }
+        if ev.event_type == "user_message" {
+            // Another client sent a message on this session. Append it
+            // directly instead of reloading — a reload mid-turn would
+            // wipe the live streaming view. The sender is live and was
+            // skipped above, so this only reaches viewing clients.
+            self.blocks.push(Block {
+                kind: BlockKind::User,
+                text: ev.text.clone(),
+                ..Default::default()
+            });
+            self.refresh_viewport();
             return Vec::new();
         }
         match ev.event_type.as_str() {
@@ -1895,12 +2141,23 @@ impl App {
         self.height = h;
         if w != prev_w {
             self.refresh_viewport();
+            if self.blocks.iter().any(|block| block.diagram.is_some()) {
+                self.preview_dirty = true;
+            }
         }
     }
 
     fn resize(&mut self, w: u16, h: u16) -> Vec<Effect> {
+        let width_changed = w != self.width;
         self.apply_resize(w, h);
-        Vec::new()
+        if width_changed && self.blocks.iter().any(|block| block.diagram.is_some()) {
+            // refresh_viewport recomputes each diagram's placeholder grid;
+            // transmit a matching virtual placement for the new geometry.
+            self.preview_dirty = true;
+            vec![Effect::PaintPreviews]
+        } else {
+            Vec::new()
+        }
     }
 
     fn paste(&mut self, content: String) -> Vec<Effect> {
@@ -1944,7 +2201,8 @@ impl App {
         // Slash menu visibility follows the typed prefix; a Ctrl+P-opened
         // menu (menu_virtual) stays open against the prompt as-is.
         let typed = self.menu_typed();
-        if typed.starts_with('/') || self.menu_virtual {
+        if (typed.starts_with('/') && !overlays::looks_like_file_path(&typed)) || self.menu_virtual
+        {
             let n = overlays::match_commands(&typed, &self.slash_commands).len();
             if n > 0 {
                 self.set_menu_visible(true);
@@ -1957,6 +2215,10 @@ impl App {
         } else {
             self.set_menu_visible(false);
         }
+
+        // @ file-mention menu: trigger when the cursor is inside an @word.
+        self.sync_at_menu();
+
         effects
     }
 
@@ -2014,6 +2276,11 @@ impl App {
                         id: self.session.parent_id.clone(),
                     }];
                 }
+                // On the parent, Shift+Up closes the subagent menu
+                // (the mirror of Shift+Down opening it).
+                if self.manage_visible {
+                    self.dismiss_manage_menu();
+                }
                 return Vec::new();
             }
         }
@@ -2038,6 +2305,10 @@ impl App {
             }
         } else if self.menu_visible {
             if let Some(fx) = self.menu_key(k.code) {
+                return fx;
+            }
+        } else if self.at_menu_visible {
+            if let Some(fx) = self.at_menu_key(k.code) {
                 return fx;
             }
         }
@@ -2129,7 +2400,7 @@ impl App {
                     self.input.up();
                     return Vec::new();
                 }
-                let half = (self.viewport_height() / 2).max(1) as i64;
+                let half = (self.content_viewport_height() / 2).max(1) as i64;
                 self.scroll_viewport(-half);
             }
             KeyCode::Down => {
@@ -2137,14 +2408,14 @@ impl App {
                     self.input.down();
                     return Vec::new();
                 }
-                let half = (self.viewport_height() / 2).max(1) as i64;
+                let half = (self.content_viewport_height() / 2).max(1) as i64;
                 self.scroll_viewport(half);
             }
             KeyCode::PageUp => {
-                self.scroll_viewport(-(self.viewport_height() as i64));
+                self.scroll_viewport(-(self.content_viewport_height() as i64));
             }
             KeyCode::PageDown => {
-                self.scroll_viewport(self.viewport_height() as i64);
+                self.scroll_viewport(self.content_viewport_height() as i64);
             }
             KeyCode::Home => {
                 self.following = false;
@@ -2178,10 +2449,35 @@ impl App {
 
     pub fn scroll_viewport(&mut self, delta: i64) {
         let total = self.content_lines.len() as i64;
-        let vp = self.viewport_height() as i64;
+        let vp = self.content_viewport_height() as i64;
         let max = (total - vp).max(0);
         self.scroll_y = (self.scroll_y as i64 + delta).clamp(0, max.max(0)) as usize;
         self.following = self.scroll_y as i64 >= max.max(0);
+    }
+
+    /// Jumps scroll position so the scrollbar thumb tracks the given screen Y.
+    /// Used for click/drag on the scrollbar track.
+    fn scroll_to_scrollbar_y(&mut self, y: usize) {
+        let track = self.viewport_height();
+        if track == 0 {
+            return;
+        }
+        let content_visible = self.content_viewport_height();
+        let total = self.content_lines.len();
+        let max_scroll = total.saturating_sub(content_visible);
+        if max_scroll == 0 {
+            return;
+        }
+        // Map y (screen row) to a position within the track [0, track-1].
+        let row_in_track = y.saturating_sub(VIEWPORT_VPAD).min(track.saturating_sub(1));
+        // Proportional scroll: row_in_track / (track - 1) ≈ scroll_y / max_scroll.
+        let new_scroll = if track <= 1 {
+            0
+        } else {
+            row_in_track * max_scroll / (track - 1)
+        };
+        self.scroll_y = new_scroll.min(max_scroll);
+        self.following = self.scroll_y >= max_scroll;
     }
 
     /// Returns None for keys the menu does not own (they fall through).
@@ -2267,6 +2563,29 @@ impl App {
                 }
             }
             KeyCode::Enter => return Some(self.select_manage_agent()),
+            _ => return None,
+        }
+        Some(Vec::new())
+    }
+
+    fn at_menu_key(&mut self, code: KeyCode) -> Option<Vec<Effect>> {
+        match code {
+            KeyCode::Esc => {
+                self.close_at_menu();
+            }
+            KeyCode::Up => {
+                if self.at_menu_sel > 0 {
+                    self.at_menu_sel -= 1;
+                }
+            }
+            KeyCode::Down => {
+                if self.at_menu_sel + 1 < self.at_menu_items.len() {
+                    self.at_menu_sel += 1;
+                }
+            }
+            KeyCode::Enter | KeyCode::Tab => {
+                return Some(self.select_at_menu_item());
+            }
             _ => return None,
         }
         Some(Vec::new())
@@ -2496,7 +2815,7 @@ impl App {
         }
         let _ = auth::remove_auth(&e.id);
         auth::remove_legacy_provider_key(&e.id);
-        return vec![Effect::ReloadProviders];
+        vec![Effect::ReloadProviders]
     }
 
     fn delete_selected_session(&mut self) -> Vec<Effect> {
@@ -2797,7 +3116,7 @@ impl App {
                     self.overlay_sel = 0;
                     self.overlay_scroll = 0;
                     self.working_msg = "loading models...".into();
-                    vec![Effect::ReloadProviders]
+                    vec![Effect::FetchModels]
                 }
                 1 => {
                     self.overlay = Some(OverlayKind::WebSearch);
@@ -2846,6 +3165,7 @@ impl App {
         };
         match decision {
             Some((wire, note)) => {
+                self.resolve_approval_block(&req.id, note);
                 self.approval = None;
                 self.copied_msg = format!("sandbox: {note}");
                 self.copied_at = Some(Instant::now());
@@ -2857,6 +3177,103 @@ impl App {
             }
             None => Vec::new(),
         }
+    }
+
+    /// Mark the inline approval block as resolved (tool_done + result text).
+    fn resolve_approval_block(&mut self, approval_id: &str, note: &str) {
+        for b in self.blocks.iter_mut().rev() {
+            if b.kind == BlockKind::Tool {
+                if let Some(ref appr) = b.approval {
+                    if appr.id == approval_id {
+                        b.tool_done = true;
+                        b.result = format!("sandbox: {note}");
+                        b.approval = None;
+                        b.lines = None;
+                        self.viewport_dirty = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Check if a click at viewport (x, y) lands anywhere on a visualize
+    /// block. The entire card is the click target — header, summary rows,
+    /// and the inline image alike — and opens the browser pan/zoom viewer.
+    /// The block spans `block_start` (content row of its top pad row)
+    /// through `block_start + lines.len() - 1`.
+    fn diagram_open_hit(&self, bi: usize, x: usize, y: usize) -> Option<String> {
+        let d = self.blocks.get(bi)?.diagram.as_ref()?;
+        if d.html.is_empty() {
+            return None;
+        }
+        let block_start = *self.block_start.get(bi)?;
+        let content_row = y.checked_sub(VIEWPORT_VPAD)? + self.scroll_y;
+        let lines = self.blocks[bi].lines.as_ref()?;
+        let last_row = block_start + lines.len().saturating_sub(1);
+        if content_row < block_start || content_row > last_row {
+            return None;
+        }
+        // Column: anywhere across the card (the boxed text starts one pad
+        // column in and spans the full inner width).
+        let inner = self.inner_width().saturating_sub(2).max(1);
+        let col = x.checked_sub(TUI_HPAD)?;
+        if col <= inner + 1 {
+            Some(d.html.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Check if a click at (content_row, col) falls on an approval button in
+    /// block `bi`. Returns the decision string ("allow_once" etc.) or None.
+    fn approval_button_hit(&self, bi: usize, content_row: usize, col: usize) -> Option<String> {
+        // The buttons are on the last rendered line of the block.
+        // Determine which content line the buttons are on by finding the
+        // block start + offset.
+        let block_start = *self.block_start.get(bi)?;
+        let block_lines = self.blocks[bi].lines.as_ref()?;
+        let button_row = block_start + block_lines.len().saturating_sub(2); // penultimate = buttons row
+        if content_row != button_row {
+            return None;
+        }
+        // Button layout: "  [a] allow   [s] session   [g] always   [d] deny  "
+        let buttons = blocks::approval_buttons();
+        for btn in &buttons {
+            if col >= btn.col_start && col < btn.col_end {
+                return Some(btn.decision.to_string());
+            }
+        }
+        None
+    }
+
+    /// Handle clicking an approval button: resolve the block and emit the
+    /// approval effect.
+    fn resolve_approval_click(&mut self, bi: usize, decision: &str) -> Vec<Effect> {
+        let appr = match self.blocks[bi].approval.take() {
+            Some(a) => a,
+            None => return Vec::new(),
+        };
+        let note = match decision {
+            "allow_once" => "allow once",
+            "allow_session" => "allowed this session",
+            "allow_global" => "always allowed",
+            "deny" => "denied",
+            _ => "denied",
+        };
+        self.blocks[bi].tool_done = true;
+        self.blocks[bi].result = format!("sandbox: {note}");
+        self.blocks[bi].lines = None;
+        self.viewport_dirty = true;
+        self.approval = None;
+        self.copied_msg = format!("sandbox: {note}");
+        self.copied_at = Some(Instant::now());
+        self.refresh_viewport();
+        vec![Effect::RespondApproval {
+            sid: appr.session_id,
+            id: appr.id,
+            decision: decision.to_string(),
+        }]
     }
 
     // -- mouse ---------------------------------------------------------------
@@ -2884,6 +3301,20 @@ impl App {
     }
 
     fn click(&mut self, x: usize, y: usize) -> Vec<Effect> {
+        self.link_pending = None;
+        // Scrollbar click: the rightmost SCROLLBAR_WIDTH columns within the
+        // viewport region. The wider target also helps in terminal
+        // multiplexer splits where the absolute last column's mouse events
+        // are intercepted for pane-resize handling.
+        if x >= (self.width as usize).saturating_sub(SCROLLBAR_WIDTH)
+            && y >= VIEWPORT_VPAD
+            && y < VIEWPORT_VPAD + self.viewport_height()
+            && !self.content_lines.is_empty()
+        {
+            self.scrollbar_dragging = true;
+            self.scroll_to_scrollbar_y(y);
+            return Vec::new();
+        }
         let viewport_y = y.checked_sub(VIEWPORT_VPAD);
         if self.context_visible {
             if let Some(row) = viewport_y.and_then(|y| overlays::context_row_at_y(self, y)) {
@@ -2919,16 +3350,51 @@ impl App {
             }
             return Vec::new();
         }
+        if self.at_menu_visible {
+            if let Some(row) = viewport_y.and_then(|y| overlays::at_menu_row_at_y(self, y)) {
+                self.at_menu_sel = row;
+                return self.select_at_menu_item();
+            }
+            return Vec::new();
+        }
         if self.mouse_in_prompt(y) {
             if self.sel_active {
                 self.clear_selection();
             }
             self.prompt_selecting = true;
+            // A click on an actual editable text row repositions the cursor
+            // at the clicked (wrapped, scrolled) display position. Padding /
+            // border rows and the image-preview rows are left untouched.
+            let geo = crate::view::Layout::compute(self);
+            let text_top = geo.prompt_top_y + PROMPT_PAD;
+            let text_bottom = text_top + self.input_height();
+            if y >= text_top && y < text_bottom {
+                self.input.clear_selection();
+                let col = x.saturating_sub(TUI_HPAD + PROMPT_PAD);
+                let wrapped_row = (y - text_top) + self.input.scroll_y;
+                let offset = self
+                    .input
+                    .offset_at_display(self.input_width(), wrapped_row, col);
+                self.input.cursor = offset;
+            }
             return Vec::new();
         }
         self.input.clear_selection();
         if self.sel_active {
             self.clear_selection();
+        }
+        // A press on an OSC 8 link arms it: opened on release unless the
+        // press turns into a drag selection. Takes priority over the
+        // collapse/expand toggles below so clicking a link inside a
+        // collapsed card opens it instead of toggling.
+        if let Some(uri) = self.link_hit(x, y) {
+            self.link_pending = Some(uri);
+            if let Some(pos) = self.content_pos_at(x, y) {
+                self.selecting = true;
+                self.sel_anchor = Some(pos);
+                self.sel_end = Some(pos);
+            }
+            return Vec::new();
         }
         let mut effects = Vec::new();
         let idx = self.block_index_at_viewport_y(y);
@@ -2946,6 +3412,7 @@ impl App {
             if on_reasoning_header {
                 self.blocks[bi].expanded = !self.blocks[bi].expanded;
                 self.blocks[bi].lines = None;
+                self.viewport_dirty = true;
                 self.refresh_viewport();
                 return Vec::new();
             }
@@ -2961,13 +3428,32 @@ impl App {
             if self.blocks[bi].kind == BlockKind::User && self.blocks[bi].user_collapsible(inner) {
                 self.blocks[bi].expanded = !self.blocks[bi].expanded;
                 self.blocks[bi].lines = None;
+                self.viewport_dirty = true;
                 self.refresh_viewport();
                 return Vec::new();
             }
             if self.blocks[bi].kind == BlockKind::Tool {
+                // Approval block: check if click lands on a button.
+                if self.blocks[bi].approval.is_some() {
+                    let col = x.saturating_sub(TUI_HPAD);
+                    if let Some(content_row) =
+                        y.checked_sub(VIEWPORT_VPAD).map(|vy| self.scroll_y + vy)
+                    {
+                        if let Some(decision) = self.approval_button_hit(bi, content_row, col) {
+                            return self.resolve_approval_click(bi, &decision);
+                        }
+                    }
+                    return Vec::new();
+                }
+                if let Some(uri) = self.diagram_open_hit(bi, x, y) {
+                    self.copied_msg = "opening diagram viewer".into();
+                    self.copied_at = Some(Instant::now());
+                    return vec![Effect::OpenLink { uri }];
+                }
                 if self.blocks[bi].tool_collapsible(inner, inner) {
                     self.blocks[bi].expanded = !self.blocks[bi].expanded;
                     self.blocks[bi].lines = None;
+                    self.viewport_dirty = true;
                     self.refresh_viewport();
                     return Vec::new();
                 }
@@ -2981,6 +3467,10 @@ impl App {
     }
 
     fn drag(&mut self, x: usize, y: usize) -> Vec<Effect> {
+        if self.scrollbar_dragging {
+            self.scroll_to_scrollbar_y(y);
+            return Vec::new();
+        }
         if self.prompt_selecting {
             return Vec::new();
         }
@@ -2990,19 +3480,22 @@ impl App {
                 if self.scroll_y > 0 {
                     self.scroll_y -= 1;
                 }
-            } else if self.viewport_height() > 0 && y >= VIEWPORT_VPAD + self.viewport_height() - 1
+            } else if self.content_viewport_height() > 0
+                && y >= VIEWPORT_VPAD + self.content_viewport_height() - 1
             {
                 self.scroll_y += 1;
                 let max = self
                     .content_lines
                     .len()
-                    .saturating_sub(self.viewport_height());
+                    .saturating_sub(self.content_viewport_height());
                 self.following = self.scroll_y >= max;
             }
             if let Some(pos) = self.content_pos_at(x, y) {
                 if self.sel_end != Some(pos) {
                     self.sel_end = Some(pos);
                     self.sel_active = true;
+                    // The press became a selection, not a link open.
+                    self.link_pending = None;
                 }
             }
         }
@@ -3010,6 +3503,21 @@ impl App {
     }
 
     fn release(&mut self, _x: usize, _y: usize) -> Vec<Effect> {
+        if self.scrollbar_dragging {
+            self.scrollbar_dragging = false;
+            return Vec::new();
+        }
+        if let Some(uri) = self.link_pending.take() {
+            if !self.sel_active {
+                // Plain click on a link: open it.
+                self.clear_selection();
+                self.copied_msg =
+                    format!("opening {}", atom_core::util::first_line_trunc(&uri, 48));
+                self.copied_at = Some(Instant::now());
+                return vec![Effect::OpenLink { uri }];
+            }
+            // The press turned into a drag selection; copy path below.
+        }
         if self.selecting {
             self.selecting = false;
             if self.sel_active {
@@ -3063,7 +3571,7 @@ impl App {
     }
 
     pub fn content_pos_at(&self, x: usize, y: usize) -> Option<(usize, usize)> {
-        let vp_h = self.viewport_height();
+        let vp_h = self.content_viewport_height();
         let y = y.checked_sub(VIEWPORT_VPAD)?;
         if y >= vp_h || self.content_lines.is_empty() {
             return None;
@@ -3072,6 +3580,17 @@ impl App {
         let col = x.saturating_sub(TUI_HPAD);
         let w = ansi_line_width(&self.content_lines[line]);
         Some((line, col.min(w)))
+    }
+
+    /// The OSC 8 URI under a viewport position, if any.
+    pub fn link_hit(&self, x: usize, y: usize) -> Option<String> {
+        let (line, col) = self.content_pos_at(x, y)?;
+        let region = self
+            .link_lines
+            .get(line)?
+            .iter()
+            .find(|r| col >= r.c0 && col < r.c1)?;
+        Some(region.uri.clone())
     }
 }
 
@@ -3089,6 +3608,93 @@ pub(crate) fn new_turn_id() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos().to_string())
         .unwrap_or_default()
+}
+
+/// Lists project files relative to `cwd`, filtered by query.
+/// Walks the directory tree respecting .gitignore and common ignores,
+/// returning up to 50 matches sorted by relevance.
+fn list_project_files(cwd: &str, query: &str) -> Vec<String> {
+    use std::path::Path;
+
+    let root = Path::new(cwd);
+    if !root.is_dir() {
+        return Vec::new();
+    }
+
+    let mut files: Vec<String> = Vec::new();
+    collect_files(root, root, &mut files, 0);
+    files.sort();
+
+    // Filter by query (case-insensitive substring match on any component)
+    let query_lower = query.to_lowercase();
+    let filtered: Vec<String> = if query_lower.is_empty() {
+        files.into_iter().take(50).collect()
+    } else {
+        files
+            .into_iter()
+            .filter(|f| f.to_lowercase().contains(&query_lower))
+            .take(50)
+            .collect()
+    };
+    filtered
+}
+
+/// Recursively collect files, skipping common non-project directories.
+fn collect_files(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    out: &mut Vec<String>,
+    depth: usize,
+) {
+    const MAX_DEPTH: usize = 6;
+    const MAX_FILES: usize = 5000;
+    const IGNORE_DIRS: &[&str] = &[
+        "target",
+        "node_modules",
+        ".git",
+        ".hg",
+        ".svn",
+        "dist",
+        "build",
+        "__pycache__",
+        ".next",
+        ".venv",
+        "venv",
+    ];
+
+    if depth > MAX_DEPTH || out.len() >= MAX_FILES {
+        return;
+    }
+
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        if out.len() >= MAX_FILES {
+            break;
+        }
+        let path = entry.path();
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        // Skip hidden files/dirs (starting with .) except a few
+        if name_str.starts_with('.') && name_str != ".github" {
+            continue;
+        }
+
+        if path.is_dir() {
+            if IGNORE_DIRS.contains(&name_str.as_ref()) {
+                continue;
+            }
+            collect_files(root, &path, out, depth + 1);
+        } else {
+            if let Ok(rel) = path.strip_prefix(root) {
+                out.push(rel.to_string_lossy().to_string());
+            }
+        }
+    }
 }
 
 pub(crate) fn join_prompt(cur: &str, insert: &str) -> String {
@@ -3240,6 +3846,40 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_approval_request_yields_one_card() {
+        // The server fans each approval_request out on both the /send
+        // stream and the session subscription, and sub_event forwards it
+        // even while this client's own stream is live. Both copies reach
+        // the app; only one approval card may be added per unique id.
+        let mut app = App::new_test(90, 30);
+        let ev = parse_stream_event(&serde_json::json!({
+            "type": "approval_request",
+            "id": "req1",
+            "session_id": "sess1",
+            "command": "grep -n resvg Cargo.toml",
+            "cwd": "/work",
+            "rule_id": "grep-search",
+            "reason": "grep-search rule",
+        }));
+        app.handle_stream_event(&ev);
+        app.handle_stream_event(&ev);
+        let cards = app
+            .blocks
+            .iter()
+            .filter(|b| b.approval.as_ref().is_some_and(|a| a.id == "req1"))
+            .count();
+        assert_eq!(cards, 1, "one approval card per unique request id");
+        assert_eq!(app.approval.as_ref().map(|p| p.id.as_str()), Some("req1"));
+
+        // A different request id still gets its own card.
+        let mut ev2 = ev.clone();
+        ev2.id = "req2".into();
+        app.handle_stream_event(&ev2);
+        let cards = app.blocks.iter().filter(|b| b.approval.is_some()).count();
+        assert_eq!(cards, 2);
+    }
+
+    #[test]
     fn tab_and_ctrl_t_cycle_thinking() {
         let mut app = App::new_test(90, 30);
         app.thinking_levels = vec!["none".into(), "low".into(), "high".into()];
@@ -3280,6 +3920,27 @@ mod tests {
         assert_eq!(app.input.value, "line\n\n");
         // Plain enter would send; ensure it did not run here.
         assert!(!app.streaming);
+    }
+
+    #[test]
+    fn shift_up_closes_subagent_menu_on_parent() {
+        let mut app = App::new_test(90, 30);
+        app.session.id = "parent".into();
+
+        // Opening the subagent menu on the parent, then Shift+Up closes it.
+        let fx = app.key(key(KeyCode::Down, KeyModifiers::SHIFT));
+        assert!(app.manage_visible);
+        assert!(fx.iter().any(|e| matches!(e, Effect::ListChildren { .. })));
+        let fx = app.key(key(KeyCode::Up, KeyModifiers::SHIFT));
+        assert!(!app.manage_visible);
+        assert!(fx.is_empty());
+
+        // Inside a subagent, Shift+Up still navigates to the parent.
+        app.session.parent_id = "parent".into();
+        let fx = app.key(key(KeyCode::Up, KeyModifiers::SHIFT));
+        assert!(fx
+            .iter()
+            .any(|e| matches!(e, Effect::LoadSession { id } if id == "parent")));
     }
 
     #[test]
@@ -3431,7 +4092,7 @@ mod tests {
         );
         assert!(effects
             .iter()
-            .any(|effect| matches!(effect, Effect::ReloadProviders)));
+            .any(|effect| matches!(effect, Effect::FetchModels)));
 
         app.overlay_entries = vec![model_entry("openai", "compact-model")];
         app.overlay_sel = overlays::first_model_row(&app);
@@ -3548,7 +4209,7 @@ mod tests {
             text: "hi".into(),
             ..Default::default()
         });
-        let long: String = std::iter::repeat("row line\n").take(20).collect();
+        let long: String = "row line\n".repeat(20);
         app.blocks.push(Block {
             kind: BlockKind::Tool,
             title: "Bash".into(),
@@ -3579,6 +4240,89 @@ mod tests {
         };
         let _ = app.mouse(ev);
         assert!(!app.blocks[1].expanded, "second click collapsed the block");
+    }
+
+    #[test]
+    fn click_anywhere_on_diagram_block_opens_viewer() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = App::new_test(80, 40);
+        app.blocks.push(Block {
+            kind: BlockKind::Tool,
+            title: "Visualize".into(),
+            tool_name: "visualize".into(),
+            tool_done: true,
+            result:
+                "rendered diagram\n [atom-diagram] png=/a.png html=/a.html width=400 height=200"
+                    .into(),
+            diagram: Some(crate::blocks::DiagramRef {
+                png: "/a.png".into(),
+                html: "file:///a.html".into(),
+                w: 400,
+                h: 200,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        app.refresh_viewport();
+
+        // The whole card is the click target. Header row: block start + 1
+        // (offset 0 is the top pad row).
+        let y = (VIEWPORT_VPAD + app.block_start[0] + 1 - app.scroll_y) as u16;
+        let inner = app.inner_width().saturating_sub(2).max(1);
+        let x_hint = (TUI_HPAD + inner) as u16; // last text column
+        let ev = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x_hint,
+            row: y,
+            modifiers: KeyModifiers::empty(),
+        };
+        let fx = app.mouse(ev);
+        assert!(
+            fx.iter()
+                .any(|e| matches!(e, Effect::OpenLink { uri } if uri == "file:///a.html")),
+            "hint click must open the viewer: {fx:?}"
+        );
+
+        // A click on the left side of the same header row also opens.
+        let ev = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 4,
+            row: y,
+            modifiers: KeyModifiers::empty(),
+        };
+        let fx = app.mouse(ev);
+        assert!(
+            fx.iter()
+                .any(|e| matches!(e, Effect::OpenLink { uri } if uri == "file:///a.html")),
+            "header click outside the hint must also open: {fx:?}"
+        );
+
+        // A click on a body row (the inline image grid) opens too.
+        let lines = app.blocks[0].lines.as_ref().expect("block rendered");
+        let y_body = (VIEWPORT_VPAD + app.block_start[0] + lines.len().saturating_sub(1)
+            - app.scroll_y) as u16;
+        let ev = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x_hint,
+            row: y_body,
+            modifiers: KeyModifiers::empty(),
+        };
+        let fx = app.mouse(ev);
+        assert!(
+            fx.iter()
+                .any(|e| matches!(e, Effect::OpenLink { uri } if uri == "file:///a.html")),
+            "body click must open the viewer: {fx:?}"
+        );
+
+        // A click strictly above the card does nothing.
+        let ev = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x_hint,
+            row: y.saturating_sub(2),
+            modifiers: KeyModifiers::empty(),
+        };
+        let fx = app.mouse(ev);
+        assert!(!fx.iter().any(|e| matches!(e, Effect::OpenLink { .. })));
     }
 
     #[test]
@@ -3616,6 +4360,65 @@ mod tests {
     }
 
     #[test]
+    fn click_on_link_opens_and_drag_selects() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = App::new_test(80, 40);
+        app.blocks.push(Block {
+            kind: BlockKind::Assistant,
+            text: "see [the docs](https://docs.example.com) for more".into(),
+            ..Default::default()
+        });
+        app.refresh_viewport();
+        let line_idx = app
+            .content_lines
+            .iter()
+            .position(|l| crate::ansi::line_plain(l).contains("the docs"))
+            .expect("label in content lines");
+        let col = crate::ansi::line_plain(&app.content_lines[line_idx])
+            .find("the docs")
+            .unwrap() as u16;
+        assert_eq!(
+            app.link_lines.len(),
+            app.content_lines.len(),
+            "link table stays parallel to content lines"
+        );
+
+        let press = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: TUI_HPAD as u16 + col,
+            row: (VIEWPORT_VPAD + line_idx - app.scroll_y) as u16,
+            modifiers: KeyModifiers::empty(),
+        };
+        let _ = app.mouse(press);
+        assert_eq!(
+            app.link_pending.as_deref(),
+            Some("https://docs.example.com")
+        );
+        let release = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            ..press
+        };
+        let effects = app.mouse(release);
+        let opened = effects.iter().find_map(|e| match e {
+            Effect::OpenLink { uri } => Some(uri.clone()),
+            _ => None,
+        });
+        assert_eq!(opened.as_deref(), Some("https://docs.example.com"));
+        assert!(app.link_pending.is_none());
+
+        // Press then drag: a selection, not an open.
+        let _ = app.mouse(press);
+        let drag = MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: press.column + 6,
+            ..press
+        };
+        let _ = app.mouse(drag);
+        assert!(app.link_pending.is_none());
+        assert!(app.sel_active);
+    }
+
+    #[test]
     fn click_toggles_only_the_reasoning_header() {
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
         let mut app = App::new_test(80, 40);
@@ -3646,6 +4449,73 @@ mod tests {
         assert!(
             !app.blocks[0].expanded,
             "second header click collapses reasoning"
+        );
+    }
+
+    #[test]
+    fn click_on_prompt_text_repositions_cursor() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = App::new_test(80, 40);
+        app.input.set_value("hello world");
+
+        let geo = crate::view::Layout::compute(&app);
+        let text_row = geo.prompt_top_y + PROMPT_PAD;
+        let click = |col: u16, row: u16| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::empty(),
+        };
+
+        // Click on the 'w' (cell 6) of the first editable row.
+        let x = (TUI_HPAD + PROMPT_PAD + 6) as u16;
+        let _ = app.mouse(click(x, text_row as u16));
+        assert_eq!(app.input.cursor, 6, "click on 'w' placed the cursor there");
+
+        // A click in the top padding row must NOT reposition the cursor.
+        let _ = app.mouse(click(x, geo.prompt_top_y as u16));
+        assert_eq!(app.input.cursor, 6, "top padding row keeps the cursor put");
+
+        // A click in the bottom padding row (inside the box, below the text)
+        // must also NOT reposition the cursor.
+        let bottom_pad = (geo.prompt_top_y + PROMPT_PAD + app.input_height()) as u16;
+        let _ = app.mouse(click(x, bottom_pad));
+        assert_eq!(
+            app.input.cursor, 6,
+            "bottom padding row keeps the cursor put"
+        );
+    }
+
+    #[test]
+    fn click_on_prompt_wrapped_row_respects_scroll() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = App::new_test(50, 20);
+        let long = (0..20)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.input.set_value(&long);
+
+        // Simulate an internal scroll so the last logical line is at the top
+        // of the field (as `view()` would after pinning the cursor there).
+        app.input.scroll_y = app.input.content_lines(app.input_width()) - 1;
+
+        let geo = crate::view::Layout::compute(&app);
+        let text_row = geo.prompt_top_y + PROMPT_PAD;
+        // Click column 0 on the first visible (scrolled) text row.
+        let x = (TUI_HPAD + PROMPT_PAD) as u16;
+        let y = text_row as u16;
+        let ev = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::empty(),
+        };
+        let _ = app.mouse(ev);
+        let expected = long.find("line19").unwrap();
+        assert_eq!(
+            app.input.cursor, expected,
+            "scrolled click lands on the start of line19"
         );
     }
 
@@ -3745,6 +4615,126 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(app.sel_provider.name, "ollama");
+    }
+
+    #[test]
+    fn loading_same_sized_session_rebuilds_cached_viewport() {
+        fn session(id: &str, user: &str, assistant: &str) -> atom_core::session::store::Session {
+            atom_core::session::store::Session {
+                id: id.into(),
+                messages: vec![
+                    atom_core::types::Message {
+                        role: "user".into(),
+                        content: user.into(),
+                        ..Default::default()
+                    },
+                    atom_core::types::Message {
+                        role: "assistant".into(),
+                        content: assistant.into(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }
+        }
+        fn viewport_text(app: &App) -> String {
+            app.content_lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .map(|span| span.content.as_ref())
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+
+        let mut app = App::new_test(80, 20);
+        app.session_loaded(session("a", "first user", "first answer"));
+        assert!(viewport_text(&app).contains("first answer"));
+
+        app.session_loaded(session("b", "second user", "second answer"));
+        let text = viewport_text(&app);
+        assert!(text.contains("second answer"));
+        assert!(!text.contains("first answer"));
+    }
+
+    #[test]
+    fn tool_result_invalidates_cached_viewport() {
+        let mut app = App::new_test(80, 20);
+        app.blocks.push(Block {
+            kind: BlockKind::Tool,
+            title: "Read".into(),
+            text: "file".into(),
+            ..Default::default()
+        });
+        app.refresh_viewport();
+        assert!(!app.viewport_dirty);
+
+        app.handle_stream_event(&StreamEvent {
+            event_type: "tool_result".into(),
+            text: "new result".into(),
+            ..Default::default()
+        });
+
+        assert!(app.viewport_dirty);
+        app.refresh_viewport();
+        assert!(app.content_lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.content.contains("new result"))
+        }));
+    }
+
+    #[test]
+    fn visualize_tool_result_schedules_inline_preview_paint() {
+        let mut app = App::new_test(80, 20);
+        app.blocks.push(Block {
+            kind: BlockKind::Tool,
+            title: "Visualize".into(),
+            tool_name: "visualize".into(),
+            text: "Architecture".into(),
+            ..Default::default()
+        });
+
+        let fx = app.handle_stream_event(&StreamEvent {
+            event_type: "tool_result".into(),
+            text: "rendered diagram\n[atom-diagram] png=/a.png png-dark=/a-dark.png html=/a.html width=400 height=200".into(),
+            ..Default::default()
+        });
+
+        let diagram = app.blocks[0].diagram.as_ref().expect("diagram attached");
+        assert!(diagram.id >= crate::blocks::MIN_KITTY_DIAGRAM_ID);
+        assert!(app.preview_dirty);
+        assert!(fx
+            .iter()
+            .any(|effect| matches!(effect, Effect::PaintPreviews)));
+    }
+
+    #[test]
+    fn resizing_a_diagram_schedules_a_matching_kitty_placement() {
+        let mut app = App::new_test(80, 20);
+        app.blocks.push(Block {
+            kind: BlockKind::Tool,
+            title: "Visualize".into(),
+            tool_name: "visualize".into(),
+            tool_done: true,
+            diagram: Some(crate::blocks::DiagramRef {
+                png: "/a.png".into(),
+                png_dark: "/a-dark.png".into(),
+                html: "/a.html".into(),
+                w: 400,
+                h: 200,
+                id: crate::blocks::MIN_KITTY_DIAGRAM_ID,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        app.preview_dirty = false;
+
+        let fx = app.handle_msg(AppMsg::Resize(120, 20));
+
+        assert!(app.preview_dirty);
+        assert!(fx
+            .iter()
+            .any(|effect| matches!(effect, Effect::PaintPreviews)));
     }
 
     #[test]
@@ -4193,6 +5183,41 @@ mod tests {
     }
 
     #[test]
+    fn user_message_from_other_client_appends_block() {
+        let mut app = App::new_test(90, 30);
+        app.session.id = "sess1".into();
+        // Not streaming: this client is only viewing the session.
+        app.streaming = false;
+
+        let fx = app.handle_msg(AppMsg::SubEvent(serde_json::json!({
+            "type": "user_message",
+            "text": "from another client",
+        })));
+
+        assert!(fx.is_empty());
+        let last = app.blocks.last().unwrap();
+        assert_eq!(last.kind, BlockKind::User);
+        assert_eq!(last.text, "from another client");
+    }
+
+    #[test]
+    fn user_message_while_live_is_skipped() {
+        let mut app = App::new_test(90, 30);
+        app.session.id = "sess1".into();
+        // This client is streaming its own turn, so the echo of the
+        // message it just sent must not append a duplicate block.
+        app.streaming = true;
+
+        let fx = app.handle_msg(AppMsg::SubEvent(serde_json::json!({
+            "type": "user_message",
+            "text": "our own message",
+        })));
+
+        assert!(fx.is_empty());
+        assert!(app.blocks.is_empty());
+    }
+
+    #[test]
     fn stale_saved_during_interrupt_does_not_reload() {
         let mut app = App::new_test(90, 30);
         app.session.id = "sess1".into();
@@ -4311,5 +5336,67 @@ mod tests {
         assert_eq!(last.images[0].num, 1);
         assert!(fx.iter().any(|e| matches!(e, Effect::PaintPreviews)));
         assert!(fx.iter().any(|e| matches!(e, Effect::SendTurn(_))));
+    }
+
+    #[test]
+    fn scrollbar_track_click_navigates() {
+        let mut app = App::new_test(80, 24);
+        // Fill content with many lines so scrollbar is visible.
+        app.content_lines = (0..200)
+            .map(|i| std::sync::Arc::new(Line::from(format!("line {i}"))))
+            .collect();
+        app.scroll_y = 0;
+        let vp = app.viewport_height();
+        // Click near the bottom of the scrollbar track (left column of the
+        // 2-wide scrollbar gutter: width - SCROLLBAR_WIDTH = 78).
+        let click_row = VIEWPORT_VPAD + vp - 2;
+        let ev = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 78, // left column of scrollbar gutter (width - 2)
+            row: click_row as u16,
+            modifiers: KeyModifiers::empty(),
+        };
+        let _ = app.mouse(ev);
+        // scroll_y should have jumped significantly from 0.
+        assert!(
+            app.scroll_y > 0,
+            "scrollbar track click should scroll: scroll_y = {}",
+            app.scroll_y
+        );
+        // It should be proportional to where we clicked (near the bottom).
+        let max_scroll = app
+            .content_lines
+            .len()
+            .saturating_sub(app.content_viewport_height());
+        assert!(
+            app.scroll_y > max_scroll / 2,
+            "clicking near bottom should scroll past halfway: scroll_y={}, max={}",
+            app.scroll_y,
+            max_scroll
+        );
+    }
+
+    #[test]
+    fn scrollbar_track_click_works_at_rightmost_column() {
+        // Clicking the right column of the 2-wide scrollbar also works.
+        let mut app = App::new_test(80, 24);
+        app.content_lines = (0..200)
+            .map(|i| std::sync::Arc::new(Line::from(format!("line {i}"))))
+            .collect();
+        app.scroll_y = 0;
+        let vp = app.viewport_height();
+        let click_row = VIEWPORT_VPAD + vp - 2;
+        let ev = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 79, // rightmost column (width - 1)
+            row: click_row as u16,
+            modifiers: KeyModifiers::empty(),
+        };
+        let _ = app.mouse(ev);
+        assert!(
+            app.scroll_y > 0,
+            "scrollbar click at width-1 should scroll: scroll_y = {}",
+            app.scroll_y
+        );
     }
 }

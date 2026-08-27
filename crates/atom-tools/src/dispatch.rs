@@ -298,6 +298,7 @@ struct DispatchArgs {
     thinking: String,
     #[serde(default)]
     prompt: String,
+    #[serde(default, deserialize_with = "string_or_vec")]
     tasks: Vec<String>,
     batch_id: String,
     ids: Vec<String>,
@@ -312,6 +313,40 @@ struct DispatchArgs {
 struct DispatchMessage {
     id: String,
     prompt: String,
+}
+
+/// Accept `tasks` as either a list of strings or a single string (which
+/// becomes the first — and only — element of the list).
+fn string_or_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct StringOrVec;
+
+    impl<'de> serde::de::Visitor<'de> for StringOrVec {
+        type Value = Vec<String>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a string or a list of strings")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+            Ok(vec![value.to_string()])
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut tasks = Vec::new();
+            while let Some(task) = seq.next_element::<String>()? {
+                tasks.push(task);
+            }
+            Ok(tasks)
+        }
+    }
+
+    deserializer.deserialize_any(StringOrVec)
 }
 
 /// executeDispatch spawns a child, posts a follow-up to one, fetches a

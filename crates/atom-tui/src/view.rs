@@ -1,11 +1,12 @@
 //! view.rs renders the whole frame into the ratatui buffer: the
 //! conversation viewport (windowed by scroll offset, with mouse-drag
 //! selection wash and footer-menu overlays), the animated splash, the
-//! bordered prompt with image previews, the working/status rows, the
+//! bordered prompt with image previews, the status row, the
 //! full-screen overlays, and the sandbox approval box.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block as RtBlock, Borders, Clear};
 
@@ -18,7 +19,6 @@ use crate::prompt::wrap_plain;
 /// Geometry of the fixed footer chrome, in screen rows (0-based tops).
 pub struct Layout {
     pub viewport_h: usize,
-    pub working_y: usize,
     pub prompt_top_y: usize,
     pub preview_y: usize,
     pub status_y: usize,
@@ -38,7 +38,6 @@ impl Layout {
         // returns (viewport_h, prompt_top)
         let reserved = status_rows
             + crate::app::STATUS_FOOTER_ROWS
-            + crate::app::WORKING_STATUS_ROWS
             + 2 * crate::app::PROMPT_PAD
             + input_h
             + preview_rows;
@@ -59,19 +58,19 @@ impl Layout {
         let preview_rows = preview::preview_row_count(app);
         let reserved = status_rows
             + crate::app::STATUS_FOOTER_ROWS
-            + crate::app::WORKING_STATUS_ROWS
             + 2 * crate::app::PROMPT_PAD
             + input_h
             + preview_rows;
         let viewport_h = (app.height as usize).saturating_sub(reserved).max(1);
-        let working_y = viewport_h;
-        let prompt_top_y = working_y + crate::app::WORKING_STATUS_ROWS;
+        // The prompt's top border sits directly below the viewport; the
+        // former working row now shares the status bar (see statusbar.rs),
+        // so no chrome is reserved above the prompt.
+        let prompt_top_y = viewport_h;
         let preview_y = prompt_top_y + crate::app::PROMPT_PAD + input_h;
         let status_y = preview_y + preview_rows + crate::app::PROMPT_PAD;
         let cwd_y = status_y + status_rows;
         Layout {
             viewport_h,
-            working_y,
             prompt_top_y,
             preview_y,
             status_y,
@@ -107,7 +106,10 @@ pub fn draw(app: &mut App, area: Rect, buf: &mut Buffer) -> Option<(u16, u16)> {
     }
 
     let geo = Layout::compute(app);
-    let inner_w = app.inner_width().min(area.width.saturating_sub(2) as usize);
+    let inner_w = app.inner_width().min(
+        (area.width as usize)
+            .saturating_sub(2 * crate::app::TUI_HPAD + crate::app::SCROLLBAR_WIDTH),
+    );
 
     // --- conversation viewport -------------------------------------------
     let vp_rect = Rect::new(
@@ -118,30 +120,31 @@ pub fn draw(app: &mut App, area: Rect, buf: &mut Buffer) -> Option<(u16, u16)> {
     );
     draw_viewport(app, vp_rect, buf);
 
-    // Footer menus take their own rows between the conversation and prompt,
-    // so opening one never paints over conversation content.
+    // Footer menus float over the last viewport rows, just above the
+    // prompt, so opening one never moves the conversation.
     let menu_h = overlays::footer_menu_height(app) as u16;
     if menu_h > 0 {
         draw_footer_menu(
             app,
-            Rect::new(vp_rect.x, vp_rect.bottom(), vp_rect.width, menu_h),
+            Rect::new(
+                vp_rect.x,
+                vp_rect.bottom().saturating_sub(menu_h),
+                vp_rect.width,
+                menu_h,
+            ),
             buf,
         );
     }
     draw_scrollbar(
         app,
-        Rect::new(area.right().saturating_sub(1), vp_rect.y, 1, vp_rect.height),
+        Rect::new(
+            area.right()
+                .saturating_sub(crate::app::SCROLLBAR_WIDTH as u16),
+            vp_rect.y,
+            crate::app::SCROLLBAR_WIDTH as u16,
+            vp_rect.height,
+        ),
         buf,
-    );
-
-    // --- working row -------------------------------------------------------
-    let working = working_status_line(app);
-    write_line(
-        buf,
-        area.x + 1,
-        area.y + geo.working_y as u16,
-        inner_w,
-        &working,
     );
 
     // --- prompt input ------------------------------------------------------
@@ -196,12 +199,8 @@ pub fn draw(app: &mut App, area: Rect, buf: &mut Buffer) -> Option<(u16, u16)> {
         &cwd_line,
     );
 
-    // --- sandbox approval box floats above the prompt -----------------------
-    if let Some(req) = app.approval.clone() {
-        draw_approval_box(app, req, area, buf, &geo);
-    }
-
-    // Terminal cursor over the prompt.
+    // --- sandbox approval renders inline as a tool block now ----------------
+    // Hide cursor while approval is pending so the user focuses on the block.
     if app.approval.is_some() {
         return None;
     }
@@ -217,6 +216,10 @@ pub fn draw(app: &mut App, area: Rect, buf: &mut Buffer) -> Option<(u16, u16)> {
 
 /// Footer line showing the directory the agent was invoked from.
 fn cwd_footer_line(app: &App, width: usize) -> Line<'static> {
+    // Show the Knight Rider loader bar while streaming (main + subagents)
+    if app.streaming || app.remote_working {
+        return crate::spinner::loader_line(app.spinner_frame);
+    }
     let path = if app.cwd.is_empty() {
         ".".to_string()
     } else {
@@ -252,12 +255,17 @@ fn write_line(buf: &mut Buffer, x: u16, y: u16, max_w: usize, line: &Line<'_>) {
     if y < buf.area.top() || y >= buf.area.bottom() || x >= buf.area.right() || max_w == 0 {
         return;
     }
+    // Line-level style sits under every span style (ratatui's draw model);
+    // math placeholder rows carry the Kitty image id there, so dropping it
+    // would leave the formula's reserved cells unresolvable (blank).
+    let base = ansi::frame_style().patch(line.style);
     let mut col = x;
     let mut last_col = None;
     let end = x
         .saturating_add(max_w.min(u16::MAX as usize) as u16)
         .min(buf.area.right());
     for span in &line.spans {
+        let span_style = base.patch(span.style);
         for ch in span.content.chars() {
             use unicode_width::UnicodeWidthChar;
             if ch == '\t' {
@@ -265,9 +273,7 @@ fn write_line(buf: &mut Buffer, x: u16, y: u16, max_w: usize, line: &Line<'_>) {
                     if col >= end {
                         return;
                     }
-                    buf[(col, y)]
-                        .set_char(' ')
-                        .set_style(ansi::frame_style().patch(span.style));
+                    buf[(col, y)].set_char(' ').set_style(span_style);
                     last_col = Some(col);
                     col += 1;
                 }
@@ -287,9 +293,7 @@ fn write_line(buf: &mut Buffer, x: u16, y: u16, max_w: usize, line: &Line<'_>) {
             if col.saturating_add(w as u16) > end {
                 return;
             }
-            buf[(col, y)]
-                .set_char(ch)
-                .set_style(ansi::frame_style().patch(span.style));
+            buf[(col, y)].set_char(ch).set_style(span_style);
             last_col = Some(col);
             col += w.max(1) as u16;
         }
@@ -301,14 +305,15 @@ fn write_line(buf: &mut Buffer, x: u16, y: u16, max_w: usize, line: &Line<'_>) {
 // ---------------------------------------------------------------------------
 
 fn draw_viewport(app: &mut App, rect: Rect, buf: &mut Buffer) {
-    let vp_h = rect.height as usize;
+    // The scrollbar and viewport rect span the full `rect.height`, but
+    // content is clipped to `content_viewport_height()` so a small blank
+    // padding row is left at the bottom (when no footer menu is open).
+    let vp_h = app.content_viewport_height().min(rect.height as usize);
     if app.blocks.is_empty() {
-        // Empty-conversation atom animation fills the viewport.
-        let art = atom_core::render::atom3d::render_atom3d(
-            rect.width as i64,
-            rect.height as i64,
-            app.splash_t,
-        );
+        // Empty-conversation atom animation fills the content rows; the
+        // remaining bottom padding row(s) stay blank (base background).
+        let art =
+            atom_core::render::atom3d::render_atom3d(rect.width as i64, vp_h as i64, app.splash_t);
         let lines = ansi::ansi_to_lines(&art);
         for (i, line) in lines.iter().take(vp_h).enumerate() {
             write_line(buf, rect.x, rect.y + i as u16, rect.width as usize, line);
@@ -352,33 +357,43 @@ fn draw_viewport(app: &mut App, rect: Rect, buf: &mut Buffer) {
 }
 
 fn draw_scrollbar(app: &App, rect: Rect, buf: &mut Buffer) {
-    let visible = rect.height.min(buf.area.bottom().saturating_sub(rect.y)) as usize;
+    let track = rect.height.min(buf.area.bottom().saturating_sub(rect.y)) as usize;
     let total = app.content_lines.len();
-    if visible == 0 || total <= visible || rect.x >= buf.area.right() {
+    if track == 0 || total <= track || rect.x >= buf.area.right() {
         return;
     }
 
-    let thumb_h = visible
-        .saturating_mul(visible)
+    // The track spans the full viewport height, but the thumb represents
+    // the visible *content* (which is padded short of the track when no
+    // footer menu is open), so its proportion reflects content_viewport.
+    let content_visible = if crate::overlays::footer_menu_height(app) > 0 {
+        track
+    } else {
+        track.saturating_sub(crate::app::VIEWPORT_BOTTOM_PAD)
+    };
+    let thumb_h = (track.saturating_mul(content_visible))
         .div_ceil(total)
         .max(1)
-        .min(visible.saturating_sub(1).max(1));
-    let max_scroll = total - visible;
+        .min(track.saturating_sub(1).max(1));
+    let max_scroll = total.saturating_sub(content_visible);
     let thumb_top = app
         .scroll_y
         .min(max_scroll)
-        .saturating_mul(visible - thumb_h)
-        / max_scroll;
+        .saturating_mul(track - thumb_h)
+        .checked_div(max_scroll)
+        .unwrap_or(0);
 
-    for row in 0..visible {
+    for row in 0..track {
         let thumb = row >= thumb_top && row < thumb_top + thumb_h;
+        let fg = if thumb {
+            ansi::c_muted()
+        } else {
+            ansi::c_card_dark()
+        };
+        // Draw only the first column; remaining width is right padding.
         buf[(rect.x, rect.y + row as u16)]
             .set_symbol("█")
-            .set_fg(if thumb {
-                ansi::c_muted()
-            } else {
-                ansi::c_card_dark()
-            });
+            .set_fg(fg);
     }
 }
 
@@ -395,6 +410,8 @@ fn draw_footer_menu(app: &mut App, rect: Rect, buf: &mut Buffer) {
         render_context_menu(app)
     } else if app.reasoning_visible {
         render_reasoning_menu(app)
+    } else if app.at_menu_visible {
+        render_at_menu(app)
     } else {
         return;
     };
@@ -599,6 +616,19 @@ fn render_picker_menu(app: &App) -> Vec<Line<'static>> {
     out
 }
 
+fn render_at_menu(app: &App) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    for (i, item) in app.at_menu_items.iter().enumerate() {
+        let name_style = if i == app.at_menu_sel {
+            ansi::style_selected()
+        } else {
+            ansi::style_inactive()
+        };
+        out.push(Line::from(Span::styled(item.clone(), name_style)));
+    }
+    out
+}
+
 fn render_context_menu(app: &App) -> Vec<Line<'static>> {
     let mut out = vec![Line::from(Span::styled("context", ansi::style_dim()))];
     if app.context_rows.is_empty() {
@@ -624,30 +654,11 @@ fn render_context_menu(app: &App) -> Vec<Line<'static>> {
 // Footer hint helpers.
 // ---------------------------------------------------------------------------
 
-/// Footer-menu and parent/child navigation hints above the prompt.
+/// Footer-menu and parent/child navigation hints. These now render inside
+/// the status bar (see [`crate::statusbar::nav_segments`]); this helper
+/// remains for direct unit tests of the hint text.
 pub fn working_status_line(app: &App) -> Line<'static> {
-    let mut segs: Vec<Vec<Span<'static>>> = Vec::new();
-
-    if app.manage_visible
-        || !matches!(app.picker_kind, PickerKind::None)
-        || app.context_visible
-        || app.reasoning_visible
-    {
-        segs.push(vec![Span::styled("esc to close", ansi::style_dim())]);
-    } else {
-        let n = app.manage_agents.len();
-        if n > 0 {
-            let label = if n == 1 {
-                "(1 subagent) Shift ↓".to_string()
-            } else {
-                format!("({n} subagents) Shift ↓")
-            };
-            segs.push(vec![Span::styled(label, ansi::style_dim())]);
-        }
-    }
-    if !app.session.parent_id.is_empty() {
-        segs.push(vec![Span::styled("Shift ↑ to return", ansi::style_dim())]);
-    }
+    let segs = crate::statusbar::nav_segments(app);
     if segs.is_empty() {
         return Line::from(" ");
     }
@@ -670,16 +681,10 @@ pub fn working_status_line(app: &App) -> Line<'static> {
 /// prompt row (e.g. the REVERSED selection style). Chip markers are
 /// replaced with same-width `[IMG n]` spans carrying the chip style, and
 /// the surrounding text keeps the original span's style.
+/// Additionally, `@path/to/file` references are rendered as orange inline
+/// tags, and pasted absolute file paths are rendered with a "File name" tag.
 fn line_with_chips_styled(line: &Line<'_>, app: &App) -> Line<'static> {
     let max_num = app.pending.iter().map(|p| p.num).max().unwrap_or(0);
-    if max_num == 0 {
-        return Line::from(
-            line.spans
-                .iter()
-                .map(|s| Span::styled(s.content.to_string(), s.style))
-                .collect::<Vec<_>>(),
-        );
-    }
     let selected = if app.input.has_selection() {
         app.input.selected_text()
     } else {
@@ -689,36 +694,96 @@ fn line_with_chips_styled(line: &Line<'_>, app: &App) -> Line<'static> {
     for span in &line.spans {
         let style = span.style;
         let mut rest = span.content.to_string();
-        loop {
-            let mut found: Option<(usize, usize)> = None;
-            for i in 1..=max_num {
-                let mark = preview::image_marker(i);
-                if selected.contains(&mark) {
-                    continue;
-                }
-                if let Some(pos) = rest.find(&mark) {
-                    if found.map(|(p, _)| pos < p).unwrap_or(true) {
-                        found = Some((pos, i));
+
+        // Process image markers
+        if max_num > 0 {
+            loop {
+                let mut found: Option<(usize, usize)> = None;
+                for i in 1..=max_num {
+                    let mark = preview::image_marker(i);
+                    if selected.contains(&mark) {
+                        continue;
+                    }
+                    if let Some(pos) = rest.find(&mark) {
+                        if found.map(|(p, _)| pos < p).unwrap_or(true) {
+                            found = Some((pos, i));
+                        }
                     }
                 }
-            }
-            match found {
-                Some((pos, num)) => {
-                    out.push(Span::styled(rest[..pos].to_string(), style));
-                    out.push(Span::styled(
-                        preview::image_chip(num),
-                        ansi::style_img_chip(),
-                    ));
-                    rest = rest[pos + preview::image_marker(num).len()..].to_string();
+                match found {
+                    Some((pos, num)) => {
+                        let before = rest[..pos].to_string();
+                        rest = rest[pos + preview::image_marker(num).len()..].to_string();
+                        emit_file_tagged_spans(&before, style, &mut out);
+                        out.push(Span::styled(
+                            preview::image_chip(num),
+                            ansi::style_img_chip(),
+                        ));
+                    }
+                    None => break,
                 }
-                None => break,
             }
         }
+
         if !rest.is_empty() {
-            out.push(Span::styled(rest, style));
+            emit_file_tagged_spans(&rest, style, &mut out);
         }
     }
     Line::from(out)
+}
+
+/// Processes text looking for @file references and absolute file paths,
+/// rendering them as orange inline tags. Non-matching text is emitted
+/// with the given style.
+fn emit_file_tagged_spans(text: &str, base_style: Style, out: &mut Vec<Span<'static>>) {
+    if text.is_empty() {
+        return;
+    }
+
+    // First check if the entire text is a single absolute file path
+    let trimmed = text.trim();
+    if trimmed.starts_with('/') && overlays::looks_like_file_path(trimmed) && !trimmed.contains(' ')
+    {
+        let short_name = file_chip_label(trimmed);
+        out.push(Span::styled(
+            format!(" File {} ", short_name),
+            ansi::style_file_chip(),
+        ));
+        return;
+    }
+
+    let mut rest = text;
+    while let Some(at_pos) = rest.find('@') {
+        // Emit text before the @
+        if at_pos > 0 {
+            out.push(Span::styled(rest[..at_pos].to_string(), base_style));
+        }
+        let after_at = &rest[at_pos + 1..];
+        // Extract the @word (no spaces)
+        let end = after_at
+            .find(|c: char| c.is_whitespace())
+            .unwrap_or(after_at.len());
+        let token = &after_at[..end];
+        if !token.is_empty() && token.contains('/') {
+            // File reference with path — render full @path in orange
+            out.push(Span::styled(format!("@{}", token), ansi::style_file_chip()));
+        } else if !token.is_empty() {
+            // Just a plain @ followed by a word with no slash — render normally
+            out.push(Span::styled(format!("@{}", token), ansi::style_file_chip()));
+        } else {
+            // Bare @ at end or followed by space
+            out.push(Span::styled("@".to_string(), base_style));
+        }
+        rest = &after_at[end..];
+    }
+    if !rest.is_empty() {
+        out.push(Span::styled(rest.to_string(), base_style));
+    }
+}
+
+/// Returns the short display label for a file chip: the last path component.
+fn file_chip_label(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
 }
 
 /// renderPreviews: Unicode placeholder cells for kitty virtual
@@ -779,13 +844,15 @@ fn render_previews(app: &App) -> Vec<Line<'static>> {
 // Sandbox approval box.
 // ---------------------------------------------------------------------------
 
+/// Legacy floating approval box — kept for test coverage of field layout.
+#[allow(dead_code)]
 fn draw_approval_box(app: &App, req: ApprovalPrompt, area: Rect, buf: &mut Buffer, geo: &Layout) {
     let inner_w = app.inner_width().min(area.width.saturating_sub(4) as usize);
     let body = approval_body(&req, inner_w);
     let box_h = (body.len() + 2).min(area.height as usize) as u16;
-    // Float just above the working row.
-    let top = if geo.working_y >= box_h as usize {
-        area.y + (geo.working_y - box_h as usize) as u16
+    // Float just above the prompt's top border.
+    let top = if geo.prompt_top_y >= box_h as usize {
+        area.y + (geo.prompt_top_y - box_h as usize) as u16
     } else {
         area.y
     };
@@ -810,6 +877,7 @@ fn draw_approval_box(app: &App, req: ApprovalPrompt, area: Rect, buf: &mut Buffe
     }
 }
 
+#[allow(dead_code)]
 fn approval_body(req: &ApprovalPrompt, width: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
     let mut body = vec![Line::from(Span::styled(
@@ -847,6 +915,7 @@ fn approval_body(req: &ApprovalPrompt, width: usize) -> Vec<Line<'static>> {
     body
 }
 
+#[allow(dead_code)]
 fn approval_field(body: &mut Vec<Line<'static>>, label: &'static str, value: &str, width: usize) {
     let label_width = label.len();
     if width <= label_width {
@@ -870,6 +939,7 @@ fn approval_field(body: &mut Vec<Line<'static>>, label: &'static str, value: &st
     }
 }
 
+#[allow(dead_code)]
 fn wrap_approval_text(text: &str, width: usize) -> Vec<String> {
     text.split('\n')
         .flat_map(|line| wrap_plain(line, width.max(1)))
@@ -927,7 +997,9 @@ fn blank() -> Line<'static> {
 
 fn render_overlay(app: &mut App, kind: OverlayKind) -> Vec<Line<'static>> {
     if !app.working_msg.is_empty() {
-        return vec![header_line(&app.working_msg)];
+        let frame =
+            crate::app::MINIDOT_FRAMES[app.spinner_frame % crate::app::MINIDOT_FRAMES.len()];
+        return vec![header_line(&format!("{frame} {}", app.working_msg))];
     }
     match kind {
         OverlayKind::Model => render_model_selector(app),
@@ -1021,28 +1093,7 @@ fn render_session_selector(app: &mut App) -> Vec<Line<'static>> {
         out.push(header_line("no matches"));
         return out;
     }
-    let counts: Vec<usize> = {
-        // Recompute per-row visual heights like the scroll math does.
-        rows.iter()
-            .enumerate()
-            .map(|(i, r)| {
-                if r.date {
-                    return 1;
-                }
-                let marker = if r
-                    .sess
-                    .as_ref()
-                    .map(|s| s.id == app.session.id)
-                    .unwrap_or(false)
-                {
-                    "→ "
-                } else {
-                    "  "
-                };
-                overlays::wrapped_label_line_count(&r.label, width, i == app.overlay_sel, marker)
-            })
-            .collect()
-    };
+    let counts: Vec<usize> = overlays::session_row_line_counts(app);
     let max_items = overlays::overlay_list_max_lines(app);
     let mut rendered = vec![false; rows.len()];
     overlays::overlay_for_each_visible(
@@ -1073,14 +1124,34 @@ fn render_session_selector(app: &mut App) -> Vec<Line<'static>> {
         } else {
             "  "
         };
-        if i == app.overlay_sel {
-            let label = format!("▸ {marker}{}", r.label);
-            for row in wrap_plain(&label, width) {
-                out.push(Line::from(Span::styled(row, ansi::style_selected())));
-            }
+        let is_sub = r.sess.as_ref().is_some_and(|s| !s.parent_id.is_empty());
+        let avail = if is_sub {
+            width.saturating_sub(overlays::SUBAGENT_TAG_WIDTH)
         } else {
-            for row in wrap_plain(&format!("{marker}{}", r.label), width) {
-                out.push(Line::from(Span::styled(row, ansi::style_inactive())));
+            width
+        };
+        let style = if i == app.overlay_sel {
+            ansi::style_selected()
+        } else {
+            ansi::style_inactive()
+        };
+        let label = if i == app.overlay_sel {
+            format!("▸ {marker}{}", r.label)
+        } else {
+            format!("{marker}{}", r.label)
+        };
+        for (li, row) in wrap_plain(&label, avail).into_iter().enumerate() {
+            if li == 0 && is_sub {
+                // Right-align the muted Subagent tag on the first line.
+                let used = ansi::line_width(&Line::from(row.as_str()));
+                let gap = avail.saturating_sub(used);
+                out.push(Line::from(vec![
+                    Span::styled(row, style),
+                    Span::raw(" ".repeat(gap + 2)),
+                    Span::styled(overlays::SUBAGENT_TAG.to_string(), ansi::style_dim()),
+                ]));
+            } else {
+                out.push(Line::from(Span::styled(row, style)));
             }
         }
     }
@@ -1180,8 +1251,7 @@ fn render_providers_overlay(app: &App) -> Vec<Line<'static>> {
     let max_items = overlays::overlay_list_max_lines(app);
     let scroll = overlays::overlay_list_scroll(app.overlay_sel, max_items, filtered.len());
     let end = (scroll + max_items).min(filtered.len());
-    for i in scroll..end {
-        let e = &filtered[i];
+    for (i, e) in filtered.iter().enumerate().take(end).skip(scroll) {
         let label = if e.status.is_empty() {
             e.label.clone()
         } else {
@@ -1305,6 +1375,23 @@ mod tests {
     }
 
     #[test]
+    fn loading_overlay_visibly_animates() {
+        let mut app = App::new_test(80, 24);
+        app.working_msg = "loading models...".into();
+        let first = render_overlay(&mut app, OverlayKind::Model)[0].spans[0]
+            .content
+            .to_string();
+        app.spinner_frame += 1;
+        let second = render_overlay(&mut app, OverlayKind::Model)[0].spans[0]
+            .content
+            .to_string();
+
+        assert_ne!(first, second);
+        assert!(first.contains("loading models..."));
+        assert!(second.contains("loading models..."));
+    }
+
+    #[test]
     fn frame_draws_prompt_chrome_and_status() {
         let mut app = App::new_test(80, 24);
         app.sel_model = "test-model".into();
@@ -1344,12 +1431,32 @@ mod tests {
             child_title: String::new(),
             from_subagent: false,
         });
+        // Inline approval block
+        app.blocks.push(crate::blocks::Block {
+            kind: crate::blocks::BlockKind::Tool,
+            title: "Sandbox".to_string(),
+            tool_name: "sandbox".to_string(),
+            text: "curl https://x.co".to_string(),
+            approval: Some(crate::blocks::InlineApproval {
+                id: "abc".into(),
+                session_id: "sess1".into(),
+                command: "curl https://x.co".into(),
+                cwd: "/tmp".into(),
+                rule_id: "net".into(),
+                reason: "ask network".into(),
+                from_subagent: false,
+                child_title: String::new(),
+            }),
+            expanded: true,
+            ..Default::default()
+        });
+        app.viewport_dirty = true;
+        app.refresh_viewport();
         let term = frame(&mut app, 90, 30);
         let s = text(&term);
-        assert!(s.contains("sandbox approval"));
-        assert!(s.contains("curl https://x.co"));
-        assert!(s.contains("/tmp"));
-        assert!(s.contains("a allow"));
+        assert!(s.contains("Sandbox"), "title visible: {s}");
+        assert!(s.contains("curl https://x.co"), "command visible: {s}");
+        assert!(s.contains("[a] allow"), "buttons visible: {s}");
     }
 
     #[test]
@@ -1365,11 +1472,34 @@ mod tests {
             child_title: "push the release".into(),
             from_subagent: true,
         });
+        app.blocks.push(crate::blocks::Block {
+            kind: crate::blocks::BlockKind::Tool,
+            title: "Sandbox".to_string(),
+            tool_name: "sandbox".to_string(),
+            text: "git push".to_string(),
+            approval: Some(crate::blocks::InlineApproval {
+                id: "abc".into(),
+                session_id: "child123".into(),
+                command: "git push".into(),
+                cwd: "/repo".into(),
+                rule_id: "git-push".into(),
+                reason: "push to remote".into(),
+                from_subagent: true,
+                child_title: "push the release".into(),
+            }),
+            expanded: true,
+            ..Default::default()
+        });
+        app.viewport_dirty = true;
+        app.refresh_viewport();
         let term = frame(&mut app, 90, 30);
         let s = text(&term);
-        assert!(s.contains("subagent \"push the release\" needs sandbox permission"));
-        assert!(s.contains("git push"));
-        assert!(s.contains("a allow"));
+        assert!(
+            s.contains("push the release") && s.contains("needs permission"),
+            "subagent hint visible: {s}"
+        );
+        assert!(s.contains("git push"), "command visible: {s}");
+        assert!(s.contains("[a] allow"), "buttons visible: {s}");
     }
 
     #[test]
@@ -1385,16 +1515,30 @@ mod tests {
             child_title: String::new(),
             from_subagent: false,
         });
-
+        app.blocks.push(crate::blocks::Block {
+            kind: crate::blocks::BlockKind::Tool,
+            title: "Sandbox".to_string(),
+            tool_name: "sandbox".to_string(),
+            text: "cargo test --workspace --all-features WRAP_SENTINEL".to_string(),
+            approval: Some(crate::blocks::InlineApproval {
+                id: "abc".into(),
+                session_id: "sess1".into(),
+                command: "cargo test --workspace --all-features WRAP_SENTINEL".into(),
+                cwd: "/tmp".into(),
+                rule_id: "exec".into(),
+                reason: "run workspace tests".into(),
+                from_subagent: false,
+                child_title: String::new(),
+            }),
+            expanded: true,
+            ..Default::default()
+        });
+        app.viewport_dirty = true;
+        app.refresh_viewport();
         let term = frame(&mut app, 40, 24);
         let s = text(&term);
-
-        assert!(s.contains("cargo test --workspace"));
-        assert!(
-            s.contains("WRAP_SENTINEL"),
-            "command tail was clipped:\n{s}"
-        );
-        assert!(s.contains("a allow"), "wrapped command hid approval keys");
+        assert!(s.contains("Sandbox"), "title visible: {s}");
+        assert!(s.contains("[a] allow"), "buttons visible: {s}");
     }
 
     #[test]
@@ -1587,28 +1731,31 @@ mod tests {
         app.content_lines = (0..20)
             .map(|i| std::sync::Arc::new(Line::from(i.to_string())))
             .collect();
-        let rect = Rect::new(9, 0, 1, 6);
+        let rect = Rect::new(8, 0, 2, 6);
 
         let mut top = Buffer::empty(Rect::new(0, 0, 10, 6));
         draw_scrollbar(&app, rect, &mut top);
-        assert_eq!(top[(9, 0)].symbol(), "█");
-        assert_eq!(top[(9, 0)].fg, ansi::c_muted());
-        assert_eq!(top[(9, 1)].symbol(), "█");
-        assert_eq!(top[(9, 5)].symbol(), "█");
-        assert_eq!(top[(9, 5)].fg, ansi::c_card_dark());
+        // First scrollbar column should be painted; second is padding.
+        assert_eq!(top[(8, 0)].symbol(), "█");
+        assert_eq!(top[(8, 0)].fg, ansi::c_muted());
+        assert_eq!(top[(9, 0)].symbol(), " ");
+        assert_eq!(top[(8, 1)].symbol(), "█");
+        assert_eq!(top[(8, 5)].symbol(), "█");
+        assert_eq!(top[(8, 5)].fg, ansi::c_card_dark());
 
-        app.scroll_y = 14;
+        app.scroll_y = 15;
         let mut bottom = Buffer::empty(Rect::new(0, 0, 10, 6));
         draw_scrollbar(&app, rect, &mut bottom);
-        assert_eq!(bottom[(9, 0)].symbol(), "█");
-        assert_eq!(bottom[(9, 0)].fg, ansi::c_card_dark());
-        assert_eq!(bottom[(9, 4)].symbol(), "█");
-        assert_eq!(bottom[(9, 5)].symbol(), "█");
-        assert_eq!(bottom[(9, 5)].fg, ansi::c_muted());
+        assert_eq!(bottom[(8, 0)].symbol(), "█");
+        assert_eq!(bottom[(8, 0)].fg, ansi::c_card_dark());
+        assert_eq!(bottom[(8, 4)].symbol(), "█");
+        assert_eq!(bottom[(8, 5)].symbol(), "█");
+        assert_eq!(bottom[(8, 5)].fg, ansi::c_muted());
 
         app.content_lines.truncate(6);
         let mut hidden = Buffer::empty(Rect::new(0, 0, 10, 6));
         draw_scrollbar(&app, rect, &mut hidden);
+        assert_eq!(hidden[(8, 0)].symbol(), " ");
         assert_eq!(hidden[(9, 0)].symbol(), " ");
     }
 
@@ -1663,6 +1810,39 @@ mod tests {
         assert!(ansi::line_plain(&lines[2]).contains("| Sandbox"));
     }
 
+    #[test]
+    fn session_picker_tags_subagents_on_the_right() {
+        let mut app = App::new_test(80, 24);
+        let mut top = crate::app::empty_session_info();
+        top.id = "top1".into();
+        top.title = "main chat".into();
+        let mut sub = crate::app::empty_session_info();
+        sub.id = "sub1".into();
+        sub.title = "worker".into();
+        sub.parent_id = "top1".into();
+        app.overlay = Some(OverlayKind::Session);
+        app.overlay_sessions = vec![top, sub];
+
+        let lines = render_overlay(&mut app, OverlayKind::Session);
+        let plain: Vec<String> = lines.iter().map(ansi::line_plain).collect();
+        let top_row = plain.iter().find(|l| l.contains("main chat")).unwrap();
+        let sub_row = plain.iter().find(|l| l.contains("worker")).unwrap();
+        assert!(!top_row.contains("Subagent"), "plain session untagged");
+        assert!(
+            sub_row.ends_with("Subagent"),
+            "subagent row carries the tag: {sub_row:?}"
+        );
+        // The tag sits flush right at the picker width.
+        assert_eq!(sub_row.chars().count(), 80);
+        let tagged = lines
+            .iter()
+            .find(|l| ansi::line_plain(l).ends_with("Subagent"))
+            .unwrap();
+        let last = tagged.spans.last().unwrap();
+        assert_eq!(last.content, "Subagent");
+        assert_eq!(last.style.fg, ansi::style_dim().fg, "tag renders muted");
+    }
+
     // -- Defect 1: palette colors must reach the buffer ----------------------
 
     #[test]
@@ -1696,6 +1876,42 @@ mod tests {
     }
 
     #[test]
+    fn wide_kitty_placeholder_uses_distinct_column_diacritics() {
+        // Regression: the old 16-entry table clamped every later column
+        // to the same diacritic, so wide image tiles aliased and kitty
+        // smeared the diagram over subsequent terminal content.
+        let lines = ansi::ansi_to_lines(&preview::placeholder_grid(17, 200, 1));
+        let mut buf = Buffer::empty(Rect::new(0, 0, 200, 1));
+        write_line(&mut buf, 0, 0, 200, &lines[0]);
+        let symbols: std::collections::HashSet<&str> =
+            (0..200).map(|x| buf[(x, 0)].symbol()).collect();
+        assert_eq!(symbols.len(), 200);
+        assert_eq!(buf[(15, 0)].symbol(), "\u{10EEEE}\u{0305}\u{0357}");
+        assert_eq!(buf[(16, 0)].symbol(), "\u{10EEEE}\u{0305}\u{035B}");
+
+        let rows = ansi::ansi_to_lines(&preview::placeholder_grid(17, 1, 60));
+        let row_symbols: std::collections::HashSet<&str> = rows
+            .iter()
+            .map(|row| row.spans[0].content.as_ref())
+            .collect();
+        assert_eq!(row_symbols.len(), 60, "row diacritics must not alias");
+    }
+
+    #[test]
+    fn kitty_transmit_uses_protocol_continuation_chunks() {
+        let encoded = preview::kitty_transmit(17, &[7; 5_000]);
+        let commands: Vec<&str> = encoded
+            .split("\x1b_G")
+            .filter(|command| !command.is_empty())
+            .collect();
+        assert_eq!(commands.len(), 2);
+        assert!(commands[0].starts_with("a=t,f=100,i=17,q=2,m=1;"));
+        assert!(commands[1].starts_with("q=2,m=0;"));
+        assert!(!commands[1].contains("a=t"));
+        assert!(!commands[1].contains("i=17"));
+    }
+
+    #[test]
     fn write_line_expands_tabs_and_ignores_controls() {
         let mut buf = Buffer::empty(Rect::new(0, 0, 10, 1));
         write_line(&mut buf, 0, 0, 10, &Line::from("a\tb\rc\u{0007}d\u{007f}e"));
@@ -1711,6 +1927,42 @@ mod tests {
 
         assert_eq!(buf[(0, 0)].symbol(), "e\u{0301}");
         assert_eq!(buf[(1, 0)].symbol(), "x");
+    }
+
+    #[test]
+    fn write_line_applies_line_level_styles() {
+        // Math placeholder rows carry the Kitty image id as the Line-level
+        // fg; the drawer must honor it or kitty cannot resolve the image.
+        let placeholder = "\u{10EEEE}\u{0305}\u{030D}\u{10EEEE}\u{0305}\u{030E}";
+        let mut buf = Buffer::empty(Rect::new(0, 0, 2, 1));
+        write_line(
+            &mut buf,
+            0,
+            0,
+            2,
+            &Line::styled(placeholder, Style::new().fg(Color::Rgb(9, 8, 7))),
+        );
+        assert_eq!(buf[(0, 0)].fg, Color::Rgb(9, 8, 7));
+        assert_eq!(buf[(1, 0)].fg, Color::Rgb(9, 8, 7));
+        // The frame background still applies underneath.
+        assert_eq!(buf[(0, 0)].bg, ansi::c_background());
+        assert_eq!(buf[(0, 0)].symbol(), "\u{10EEEE}\u{0305}\u{030D}");
+
+        // A span-level style still wins over the line-level style.
+        let mut buf = Buffer::empty(Rect::new(0, 0, 2, 1));
+        write_line(
+            &mut buf,
+            0,
+            0,
+            2,
+            &Line {
+                style: Style::new().fg(Color::Rgb(9, 8, 7)),
+                spans: vec![Span::styled("ab", Style::new().fg(Color::Rgb(1, 2, 3)))],
+                ..Default::default()
+            },
+        );
+        assert_eq!(buf[(0, 0)].fg, Color::Rgb(1, 2, 3));
+        assert_eq!(buf[(1, 0)].fg, Color::Rgb(1, 2, 3));
     }
 
     #[test]
@@ -1736,13 +1988,13 @@ mod tests {
         assert_eq!(x, 2);
         assert_eq!(cell(&term, x, 2).symbol(), "h");
         assert_eq!(cell(&term, x, 2).fg, ansi::c_foreground());
-        assert_eq!(cell(&term, 98, 2).bg, ansi::c_card_light());
+        assert_eq!(cell(&term, 96, 2).bg, ansi::c_card_light());
         assert_eq!(cell(&term, 1, 24).bg, ansi::c_background());
 
         // Prompt card has full-width card-light wash and one-cell padding.
         for y in 25..=27 {
             assert_eq!(cell(&term, 1, y).bg, ansi::c_card_light());
-            assert_eq!(cell(&term, 98, y).bg, ansi::c_card_light());
+            assert_eq!(cell(&term, 96, y).bg, ansi::c_card_light());
             assert!(!row_text(&term, y).contains('─'));
         }
 
@@ -1770,13 +2022,14 @@ mod tests {
         app.refresh_viewport();
         let term = frame(&mut app, 100, 30);
 
-        // viewport_h=24 → working=24, card top=25, input=26,
-        // card bottom=27, status=28, cwd footer=29.
+        // viewport_h=25 → card top=25, input=26, card bottom=27,
+        // status=28, cwd footer=29. The former working row now shares
+        // the status bar, so the viewport grew into row 24.
         assert!(
             row_text(&term, 2).contains("hello world"),
             "user content follows viewport and card padding"
         );
-        assert_eq!(row_text(&term, 24).trim(), "", "working row idle");
+        assert_eq!(row_text(&term, 24).trim(), "", "last viewport row is empty");
         for y in 25..=27 {
             assert!(
                 row_text(&term, y).trim().is_empty(),
@@ -1872,7 +2125,7 @@ mod tests {
         term.backend_mut().resize(80, 24);
         draw_into(&mut app, &mut term);
 
-        // 80x24: vp_h=18 → working=18, card top=19, input=20,
+        // 80x24: vp_h=19 → card top=19, input=20,
         // card bottom=21, status=22, cwd footer=23.
         assert_eq!(term.backend().buffer().area.width, 80);
         assert_eq!(term.backend().buffer().area.height, 24);
@@ -1899,6 +2152,9 @@ mod tests {
         for y in 19..=21 {
             assert_eq!(cell(&term, 1, y).bg, ansi::c_card_light());
         }
-        assert!(row_text(&term, 18).trim().is_empty(), "working row 18");
+        assert!(
+            row_text(&term, 18).trim().is_empty(),
+            "last viewport row 18"
+        );
     }
 }

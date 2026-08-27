@@ -125,8 +125,9 @@ pub static REAL_RG: RealRg = RealRg;
 // Argument construction.
 // ---------------------------------------------------------------------------
 
-/// rgGrepArgs builds a one-shot ripgrep invocation. Literal -F is used
-/// unless regex is set, so the SIMD matcher stays on the fast path.
+/// rgGrepArgs builds a one-shot ripgrep invocation. Regex matching is
+/// the default; --fixed-strings is added only when literal matching is
+/// requested, so opt-out callers stay on the SIMD fast path.
 pub fn rg_grep_args(
     pattern: &str,
     path: &str,
@@ -261,12 +262,16 @@ struct GrepArgs {
     path: String,
     #[serde(default)]
     glob: String,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     regex: bool,
     #[serde(default)]
     case_insensitive: bool,
     #[serde(default)]
     head_limit: usize,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 pub async fn grep_search_with(arguments: &str, cwd: &Path, runner: &dyn RgRunner) -> String {
@@ -406,12 +411,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn grep_search_runs_ripgrep_with_literal_flag() {
+    async fn grep_search_runs_ripgrep_without_literal_flag_by_default() {
         let fake = Arc::new(FakeRg::ok(b"main.go:1:hello\nmain.go:2:hello\n"));
         let out = grep_search_with(
             r#"{"pattern":"hello","path":"."}"#,
             Path::new("/workspace"),
             &*fake.clone(),
+        )
+        .await;
+        assert!(out.contains("main.go:1:hello"), "{out}");
+        let got = fake.recorded();
+        assert!(!got.contains(&"--fixed-strings".to_string()), "{got:?}");
+    }
+
+    #[tokio::test]
+    async fn grep_search_opt_out_uses_fixed_strings() {
+        let fake = Arc::new(FakeRg::ok(b"main.go:1:hello\n"));
+        let out = grep_search_with(
+            r#"{"pattern":"hello","regex":false}"#,
+            Path::new("/workspace"),
+            &*fake,
         )
         .await;
         assert!(out.contains("main.go:1:hello"), "{out}");

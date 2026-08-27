@@ -723,19 +723,19 @@ pub fn assign_block_diagram_ids(blocks: &mut [Block]) -> bool {
 /// diagram_geometry sizes the placeholder grid for a diagram, preserving
 /// its aspect at the approximate terminal cell geometry from preview.rs
 /// (PREVIEW_CELL_W x PREVIEW_CELL_H px per cell). The grid width tracks
-/// the render width — the old 60-col cap squeezed diagrams to half the
-/// TUI and made their text unreadable. Rows are capped by shrinking
-/// cols, never by breaking the aspect, so a very tall diagram cannot
-/// flood the viewport (kitty stretches the PNG to the placement box).
+/// the render width — capping it to a fraction of the TUI either
+/// squeezed the diagram (unreadable text) or, worse, clipped wide
+/// diagrams at the right edge. Rows are capped by shrinking cols, never
+/// by breaking the aspect, so a very tall diagram cannot flood the
+/// viewport (kitty stretches the PNG to the placement box).
 /// Returns true when the geometry changed.
 pub fn diagram_geometry(d: &mut DiagramRef, inner: usize) -> bool {
     if d.w == 0 || d.h == 0 {
         return false;
     }
+    // Max width truly is max width: use the full inner width (bounded
+    // by the 200-col kitty diacritic table).
     let mut cols = inner.saturating_sub(2 * PAD_CELL).clamp(10, 200);
-    // Cap cols to 2/3 of the available width so the preview is a compact
-    // thumbnail rather than a full-width image you need to scroll past.
-    cols = cols.min(inner * 2 / 3).max(10);
     // Displayed px: cols*CELL_W wide, rows*CELL_H tall; keep the w/h
     // ratio, i.e. rows = cols * (h/w) * (CELL_W/CELL_H).
     let cell_ratio = preview::PREVIEW_CELL_W as f64 / preview::PREVIEW_CELL_H as f64;
@@ -2350,24 +2350,39 @@ mod tests {
             ..Default::default()
         };
         assert!(diagram_geometry(&mut d, 62));
-        // cols capped at 2/3 of inner: 62*2/3 = 41
-        assert_eq!(d.cols, 41);
-        // rows = 41 * (200/400) * (32/64) = 10.25 -> 10
-        assert_eq!(d.rows, 10);
+        // cols use the full inner width: 62 - 2*PAD_CELL = 60
+        assert_eq!(d.cols, 60);
+        // rows = 60 * (200/400) * (32/64) = 15
+        assert_eq!(d.rows, 15);
         // Re-running with the same width is a no-op.
         assert!(!diagram_geometry(&mut d, 62));
         // Narrower width re-fits the grid.
         assert!(diagram_geometry(&mut d, 42));
-        // 42*2/3 = 28
-        assert_eq!(d.cols, 28);
-        assert_eq!(d.rows, 7);
-        // Wide render widths: 2/3 of 120 = 80
+        assert_eq!(d.cols, 40);
+        assert_eq!(d.rows, 10);
+        // Wide render widths: cols would be 118, but the row cap kicks
+        // in first and shrinks cols back to 80.
         assert!(diagram_geometry(&mut d, 120));
         assert_eq!(d.cols, 80);
-        assert_eq!(d.rows, 20); // 80 * (200/400) * (32/64) = 20
-                                // Zero dimensions are left untouched.
+        assert_eq!(d.rows, 20);
+        // Zero dimensions are left untouched.
         let mut empty = DiagramRef::default();
         assert!(!diagram_geometry(&mut empty, 62));
+    }
+
+    #[test]
+    fn diagram_geometry_uses_full_width_for_wide_diagrams() {
+        // A wide diagram (aspect 6:1) fits the full inner width without
+        // hitting the row cap — the old 2/3 col cap clipped it.
+        let mut d = DiagramRef {
+            w: 758,
+            h: 126,
+            ..Default::default()
+        };
+        assert!(diagram_geometry(&mut d, 180));
+        assert_eq!(d.cols, 178);
+        // rows = 178 * (126/758) * (32/64) = 14.79 -> 15
+        assert_eq!(d.rows, 15);
     }
 
     #[test]

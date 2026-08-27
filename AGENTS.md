@@ -70,10 +70,16 @@ There are two binaries in `crates/atom/Cargo.toml`:
 Both are built by `cargo build` and installed together by `make install-dev`
 or `make install`.
 
-## Tool documentation
+## Bundled instructions
 
-`TOOLS.md` is the atom system prompt's tools section — it is what agents
-see when they run inside atom. When you add a tool, or change one in a
-substantial way (new parameters, changed semantics, new workflow guidance),
-update `TOOLS.md` in the same change so the model-facing instructions stay
-accurate.
+`instructions/system-prompt.md` and `instructions/tools.md` are the bundled
+instructions agents see when they run inside atom — the system prompt and
+the tools section respectively. AGENTS.md files (this one included) are
+merged separately as extra project context; they never replace the bundled
+system prompt.
+
+When you add a tool, or change one in a substantial way (new parameters,
+changed semantics, new workflow guidance), update `instructions/tools.md`
+in the same change so the model-facing instructions stay accurate.
+Behavior guidance that is not tool-specific belongs in
+`instructions/system-prompt.md`.

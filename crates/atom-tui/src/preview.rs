@@ -75,7 +75,9 @@ static TTY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// to the tty outside of preview.rs (the frame draw itself) must hold the
 /// same guard so the two writers never interleave.
 pub fn lock_tty() -> std::sync::MutexGuard<'static, ()> {
-    TTY_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    TTY_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn write_tty(s: &str) {
@@ -735,6 +737,15 @@ fn rasterize_svg(svg_data: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
     use resvg::tiny_skia;
     use resvg::usvg;
 
+    // Normalize edge-label geometry before parsing. Fresh artifacts are
+    // already normalized at write time (atom-tools visualize); this also
+    // covers pre-existing artifact files on disk and any renderer output
+    // that skips that path. Idempotent.
+    let svg_data = match std::str::from_utf8(svg_data) {
+        Ok(s) => atom_core::render::mermaid::normalize_edge_labels(s).into_bytes(),
+        Err(_) => svg_data.to_vec(),
+    };
+
     let mut opt = usvg::Options::default();
     opt.fontdb_mut().load_system_fonts();
 
@@ -757,7 +768,7 @@ fn rasterize_svg(svg_data: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
     });
     opt.font_resolver = resolver;
 
-    let tree = usvg::Tree::from_data(svg_data, &opt).ok()?;
+    let tree = usvg::Tree::from_data(&svg_data, &opt).ok()?;
 
     let mut pixmap = tiny_skia::Pixmap::new(width, height)?;
 
@@ -931,6 +942,107 @@ mod tests {
 </svg>"##,
             bg.0, bg.1, bg.2, text
         )
+    }
+
+    /// A mermaid-shaped edge label, trimmed from a real merman-cli 0.7.0
+    /// render: the inner label g is translated by -W/2, so the text rows
+    /// (anchored at x=0) land W/2 left of the edge midpoint.
+    const EDGE_LABEL_SVG: &str = r#"<g class="edgeLabel" transform="translate(372.71,103.5)"><g class="label" data-id="L_D_B_0" transform="translate(-11.39,-11.5)"><g><rect class="background" style="" x="-2" y="-1" width="22.789" height="23"/><text y="-10.1" style="" text-anchor="middle"><tspan class="row text-outer-tspan" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">No</tspan></tspan></text></g></g></g>"#;
+
+    #[test]
+    fn edge_label_geometry_is_normalized_before_rasterizing() {
+        let fixed = atom_core::render::mermaid::normalize_edge_labels(EDGE_LABEL_SVG);
+        // Inner g loses its -W/2 x-offset (vertical -11.5 preserved).
+        assert!(
+            fixed.contains(r#"transform="translate(0,-11.5)""#),
+            "{fixed}"
+        );
+        // Rect re-centered with mermaid's 2px padding: -(22.789/2 + 2).
+        assert!(fixed.contains(r#"x="-13.3945""#), "{fixed}");
+        // The text element is untouched.
+        assert!(
+            fixed.contains(r#"<text y="-10.1" style="" text-anchor="middle">"#),
+            "{fixed}"
+        );
+        // The label content survives.
+        assert!(fixed.contains(">No</tspan>"), "{fixed}");
+        assert!(fixed.contains(r#"width="22.789" height="23""#), "{fixed}");
+    }
+
+    #[test]
+    fn edge_label_fix_ignores_unsized_node_label_rects() {
+        // Node labels carry `style="stroke: none"` with no width/height:
+        // they must pass through untouched.
+        let svg = r#"<g class="label" transform="translate(0,-9.5)"><rect/><g><rect class="background" style="stroke: none"/><text y="-10.1"><tspan>Input</tspan></text></g></g>"#;
+        assert_eq!(atom_core::render::mermaid::normalize_edge_labels(svg), svg);
+    }
+
+    #[test]
+    fn edge_label_fix_handles_attribute_order() {
+        // Same rect with width before x — the fix must still find it.
+        let svg = r#"<g class="label" transform="translate(-10,-11.5)"><g><rect class="background" height="23" y="-1" width="20" x="-2"/><text y="-10.1" text-anchor="middle"><tspan x="0">No</tspan></text></g></g>"#;
+        let fixed = atom_core::render::mermaid::normalize_edge_labels(svg);
+        assert!(
+            fixed.contains(r#"transform="translate(0,-11.5)""#),
+            "{fixed}"
+        );
+        assert!(fixed.contains(r#"x="-12""#), "{fixed}");
+        assert!(
+            fixed.contains(r#"height="23" y="-1" width="20""#),
+            "{fixed}"
+        );
+    }
+
+    #[test]
+    fn edge_label_fix_is_idempotent() {
+        let once = atom_core::render::mermaid::normalize_edge_labels(EDGE_LABEL_SVG);
+        let twice = atom_core::render::mermaid::normalize_edge_labels(&once);
+        assert_eq!(once, twice, "fix must be idempotent");
+    }
+
+    /// Regression: a wide merman edge label must not slide under the
+    /// source node. The label is centered at x=250 with the source node
+    /// covering x=0..200 (painted after the label, as mermaid does). The
+    /// merman shape puts the text at 250 - W/2 = 170, so its head is
+    /// hidden; after normalization the text is centered at 250 and glyphs
+    /// must appear in the strip x=265..335.
+    #[test]
+    fn edge_label_text_is_not_hidden_under_source_node() {
+        let bg = card_bg_rgba();
+        let svg = format!(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="400" height="200">
+  <rect width="400" height="200" fill="#{:02x}{:02x}{:02x}"/>
+  <g class="edgeLabel" transform="translate(250,100)">
+    <g class="label" transform="translate(-80,-15)">
+      <g>
+        <rect class="background" x="-2" y="-1" width="160" height="30" fill="#666" opacity="0.5"/>
+        <text y="-10.1" text-anchor="middle" fill="#ccc" font-size="16" font-family="sans-serif">
+          <tspan class="row text-outer-tspan" x="0" y="-0.1em" dy="1.1em" text-anchor="middle">socketfile-longlabel</tspan>
+        </text>
+      </g>
+    </g>
+  </g>
+  <g class="node" transform="translate(100,100)">
+    <rect x="-100" y="-25" width="200" height="50" fill="#1f2020"/>
+  </g>
+</svg>"##,
+            bg.0, bg.1, bg.2
+        );
+        let png = rasterize_svg(svg.as_bytes(), 800, 400).expect("rasterize edge-label SVG");
+        let img = decode_rgba(&png);
+        // Map SVG x=265..335 to pixels: scale = min(768/400, 368/200) = 1.84,
+        // tx = (800 - 400*1.84)/2 = 32.
+        let (x0, x1) = ((265.0 * 1.84 + 32.0) as u32, (335.0 * 1.84 + 32.0) as u32);
+        let bright = img
+            .enumerate_pixels()
+            .filter(|(x, _, p)| {
+                *x >= x0 && *x < x1 && p.0[0] > 0x80 && p.0[1] > 0x80 && p.0[2] > 0x80
+            })
+            .count();
+        assert!(
+            bright > 30,
+            "edge-label text must render right of the source node, got {bright} bright pixels"
+        );
     }
 
     #[test]

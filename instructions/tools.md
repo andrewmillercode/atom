@@ -42,7 +42,7 @@ If a render fails, the error names the offending line; fix the source and retry 
 
 ## Grep and glob
 
-- `grep`: exact matches. `pattern` is literal by default (faster). Set `regex` true for a regex. Optional `path`, `glob`, `case_insensitive`, `head_limit`.
+- `grep`: regex matches. `pattern` is a regular expression by default — escape metacharacters or set `regex: false` for a literal substring. Optional `path`, `glob`, `case_insensitive`, `head_limit`.
 - `glob`: file paths matching a glob. Optional `path`, `head_limit`.
 
 ## Dispatch

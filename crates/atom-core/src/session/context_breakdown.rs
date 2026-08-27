@@ -61,7 +61,8 @@ pub fn classify_instruction(content: &str) -> &'static str {
     if src == "skills" {
         return CONTEXT_CAT_REPO;
     }
-    if src == "TOOLS.md" {
+    // Bundled atom instructions (system-prompt.md, tools.md).
+    if src.starts_with("instructions/") {
         return CONTEXT_CAT_ATOM;
     }
     if src.contains("/atom/AGENTS.md") || src.ends_with("atom/AGENTS.md") {
@@ -203,8 +204,8 @@ pub fn builtin_tool_definitions() -> Vec<ToolDef> {
         ),
         def!(
             "grep",
-            "Fast exact text search with path, line number, and matching text. Use for identifiers, error strings, config keys, and regexes instead of running grep or rg in bash. The session workspace is searched by default and .gitignore is honored.",
-            json!({"type":"object","properties":{"pattern":{"type":"string","description":"Text to find. Literal by default, so common code symbols need no escaping."},"path":{"type":"string","description":"Optional file or directory, relative to the session workspace. Omit to search the workspace."},"glob":{"type":"string","description":"Optional file filter such as *.rs or **/*.test.ts"},"regex":{"type":"boolean","description":"Enable regular-expression matching. Defaults to false for fast literal search."},"case_insensitive":{"type":"boolean","description":"Force case-insensitive matching. Otherwise smart-case is used."},"head_limit":{"type":"integer","description":"Maximum matches returned. Defaults to 100."}},"required":["pattern"]})
+            "Fast regex text search with path, line number, and matching text. The pattern is a regular expression by default; set regex to false to match literal text. Use for identifiers, error strings, config keys, and structural patterns instead of running grep or rg in bash. The session workspace is searched by default and .gitignore is honored.",
+            json!({"type":"object","properties":{"pattern":{"type":"string","description":"Regular expression to find. Defaults to regex mode; set regex to false to match this string literally."},"path":{"type":"string","description":"Optional file or directory, relative to the session workspace. Omit to search the workspace."},"glob":{"type":"string","description":"Optional file filter such as *.rs or **/*.test.ts"},"regex":{"type":"boolean","description":"Set to false to disable regex matching and treat the pattern as a literal substring. Defaults to true."},"case_insensitive":{"type":"boolean","description":"Force case-insensitive matching. Otherwise smart-case is used."},"head_limit":{"type":"integer","description":"Maximum matches returned. Defaults to 100."}},"required":["pattern"]})
         ),
         def!(
             "glob",
@@ -284,7 +285,14 @@ mod tests {
         const ATOM: &str = CONTEXT_CAT_ATOM;
         const REPO: &str = CONTEXT_CAT_REPO;
         let cases = [
-            ("Instructions from: TOOLS.md\nbundled tools", ATOM),
+            (
+                "Instructions from: instructions/system-prompt.md\nbundled prompt",
+                ATOM,
+            ),
+            (
+                "Instructions from: instructions/tools.md\nbundled tools",
+                ATOM,
+            ),
             ("Instructions from: skills\n- pack: Pack files", REPO),
             (
                 "Instructions from: /Users/me/proj/AGENTS.md\nproject rules",
@@ -310,7 +318,10 @@ mod tests {
     fn breakdown_instruction_buckets() {
         let mut sess = ctx_session();
         sess.instructions = vec![
-            sys_msg(&format!("Instructions from: TOOLS.md\n{}", "T".repeat(400))),
+            sys_msg(&format!(
+                "Instructions from: instructions/tools.md\n{}",
+                "T".repeat(400)
+            )),
             sys_msg(&format!("Instructions from: skills\n{}", "S".repeat(400))),
             sys_msg(&format!(
                 "Instructions from: /tmp/proj/AGENTS.md\n{}",
@@ -327,7 +338,7 @@ mod tests {
         let repo = row_by_name(&rows, CONTEXT_CAT_REPO);
         assert!(
             atom.tokens > 0,
-            "TOOLS.md + config AGENTS.md should count as atom"
+            "tools.md + config AGENTS.md should count as atom"
         );
         assert!(
             repo.tokens > 0,
@@ -443,8 +454,8 @@ mod tests {
     #[test]
     fn instruction_source_extraction() {
         assert_eq!(
-            instruction_source("Instructions from: TOOLS.md\nbody"),
-            "TOOLS.md"
+            instruction_source("Instructions from: instructions/tools.md\nbody"),
+            "instructions/tools.md"
         );
         assert_eq!(instruction_source("no prefix"), "");
         assert_eq!(

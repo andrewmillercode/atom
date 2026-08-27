@@ -100,7 +100,11 @@ pub fn linkify_path(display: &str, restore_fg: &str, restore_bg: &str) -> String
 
 pub fn path_file_uri(display: &str) -> String {
     let mut p = display.to_string();
-    if p.len() >= 7 && p[..7].eq_ignore_ascii_case("file://") {
+    // get(..7) instead of [..7]: a leading multi-byte rune can make byte 7
+    // a non-boundary; the ASCII check then simply fails, as it should.
+    if p.get(..7)
+        .is_some_and(|s| s.eq_ignore_ascii_case("file://"))
+    {
         return p;
     }
     if let Some(rest) = p.strip_prefix("~/") {
@@ -140,8 +144,16 @@ pub fn trim_link(s: &str) -> &str {
 }
 
 pub fn link_uri(display: &str) -> String {
-    let lower_prefix =
-        |p: &str| display.len() >= p.len() && display[..p.len()].eq_ignore_ascii_case(p);
+    // Byte-wise prefix check: matched text can contain multi-byte runes
+    // (e.g. "https://" + em dash), so a p.len() byte cut may land mid-rune
+    // and slicing there panics. ASCII case-insensitive comparison on bytes
+    // is equivalent for these ASCII prefixes and never panics.
+    let lower_prefix = |p: &str| {
+        display
+            .as_bytes()
+            .get(..p.len())
+            .is_some_and(|b| b.eq_ignore_ascii_case(p.as_bytes()))
+    };
     if lower_prefix("http://") || lower_prefix("https://") || lower_prefix("file://") {
         display.to_string()
     } else if let Some(rest) = display.strip_prefix("~/") {
@@ -522,6 +534,28 @@ mod tests {
     fn file_uri_escapes_like_go_url() {
         assert_eq!(file_uri("/a b/c.md"), "file:///a%20b/c.md");
         assert_eq!(file_uri("/plain/path.txt"), "file:///plain/path.txt");
+    }
+
+    /// Regression: prefix checks in link_uri/path_file_uri used to slice at
+    /// a fixed byte offset, panicking when a multi-byte rune (em dash,
+    /// CJK, accented text) straddled that offset right after the scheme.
+    #[test]
+    fn linkify_multibyte_after_scheme_no_panic() {
+        for text in [
+            "see https://\u{2014} now",
+            "see https://\u{2014}abc end",
+            "open file://\u{2014} today",
+            "hit http://\u{4e2d}\u{6587} ok",
+            "accent \u{e9}\u{e9}\u{e9}\u{e9}\u{e9} plain",
+        ] {
+            let out = linkify(text, "", "");
+            assert_eq!(visible_width(&out), visible_width(text), "{text}");
+            assert!(out.contains('\u{2014}') || !text.contains('\u{2014}'));
+        }
+        // Direct calls with multi-byte leading runes must not panic either.
+        let _ = link_uri("\u{2014}\u{2014}\u{2014}");
+        let _ = link_uri("\u{e9}\u{e9}\u{e9}\u{e9}");
+        let _ = path_file_uri("\u{2014}\u{2014}\u{2014}/x");
     }
 
     /// Golden captured from charmbracelet/x/ansi v0.11.8 via the real

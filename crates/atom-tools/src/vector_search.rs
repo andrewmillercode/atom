@@ -5,8 +5,8 @@ use crate::search::RunError;
 use std::path::Path;
 use std::time::Duration;
 
-/// Bundled TOOLS.md embedded like Go's //go:embed.
-pub const BUNDLED_TOOLS: &str = include_str!("../../../TOOLS.md");
+/// Bundled instructions/tools.md embedded like Go's //go:embed.
+pub const BUNDLED_TOOLS: &str = include_str!("../../../instructions/tools.md");
 
 /// Pin Semble so atom always invokes the same CLI, not whatever is on PATH.
 pub const SEMBLE_VERSION: &str = "0.5.5";

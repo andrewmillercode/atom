@@ -251,7 +251,12 @@ pub fn parse_stats_days(text: &str) -> i64 {
     if rest.is_empty() {
         return 0;
     }
-    let rest = if rest.len() >= 4 && rest[..4].eq_ignore_ascii_case("days") {
+    // get(..4) instead of [..4]: typed text may contain multi-byte runes,
+    // and a fixed byte cut can land mid-rune and panic on slice.
+    let rest = if rest
+        .get(..4)
+        .is_some_and(|s| s.eq_ignore_ascii_case("days"))
+    {
         rest[4..].trim()
     } else {
         rest
@@ -1283,6 +1288,9 @@ mod tests {
         assert_eq!(parse_stats_days("/stats days 7"), 7);
         assert_eq!(parse_stats_days("/stats -5"), 0);
         assert_eq!(parse_stats_days("hello"), 0);
+        // Multi-byte runes must not panic on the fixed byte-offset check.
+        assert_eq!(parse_stats_days("/stats\u{2014}\u{2014}days30"), 0);
+        assert_eq!(parse_stats_days("/stats \u{e9}\u{e9}\u{e9}"), 0);
     }
 
     #[test]

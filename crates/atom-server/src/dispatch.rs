@@ -710,7 +710,9 @@ async fn cancel_active_children(state: &Arc<AppState>, parent_id: &str) {
             .await;
     }
     if !parent_id.is_empty() {
-        state.subs.broadcast(parent_id, &json!({"type": "children"}));
+        state
+            .subs
+            .broadcast(parent_id, &json!({"type": "children"}));
     }
 }
 

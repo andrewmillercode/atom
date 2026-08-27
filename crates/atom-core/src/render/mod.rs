@@ -7,3 +7,4 @@ pub mod diff;
 pub mod highlight;
 pub mod links;
 pub mod markdown;
+pub mod mermaid;

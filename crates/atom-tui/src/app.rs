@@ -931,6 +931,20 @@ impl App {
                 }
             }
             "approval_request" => {
+                // `emit` fans the event out on both the /send stream and
+                // the session subscription, and sub_event forwards it even
+                // while this client's own stream is live (so a subagent's
+                // prompt is never dropped). The same id therefore arrives
+                // twice; handle it only once or two identical approval
+                // cards would be stacked in the transcript.
+                if self.approval.as_ref().is_some_and(|p| p.id == ev.id)
+                    || self
+                        .blocks
+                        .iter()
+                        .any(|b| b.approval.as_ref().is_some_and(|a| a.id == ev.id))
+                {
+                    return effects;
+                }
                 // Render the sandbox approval inline as a tool block with
                 // clickable buttons. The block stays active (tool_done=false)
                 // until the user responds.
@@ -3830,6 +3844,40 @@ mod tests {
         // Ctrl+C still quits.
         let fx = app.key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(matches!(fx.last(), Some(Effect::Quit)));
+    }
+
+    #[test]
+    fn duplicate_approval_request_yields_one_card() {
+        // The server fans each approval_request out on both the /send
+        // stream and the session subscription, and sub_event forwards it
+        // even while this client's own stream is live. Both copies reach
+        // the app; only one approval card may be added per unique id.
+        let mut app = App::new_test(90, 30);
+        let ev = parse_stream_event(&serde_json::json!({
+            "type": "approval_request",
+            "id": "req1",
+            "session_id": "sess1",
+            "command": "grep -n resvg Cargo.toml",
+            "cwd": "/work",
+            "rule_id": "grep-search",
+            "reason": "grep-search rule",
+        }));
+        app.handle_stream_event(&ev);
+        app.handle_stream_event(&ev);
+        let cards = app
+            .blocks
+            .iter()
+            .filter(|b| b.approval.as_ref().is_some_and(|a| a.id == "req1"))
+            .count();
+        assert_eq!(cards, 1, "one approval card per unique request id");
+        assert_eq!(app.approval.as_ref().map(|p| p.id.as_str()), Some("req1"));
+
+        // A different request id still gets its own card.
+        let mut ev2 = ev.clone();
+        ev2.id = "req2".into();
+        app.handle_stream_event(&ev2);
+        let cards = app.blocks.iter().filter(|b| b.approval.is_some()).count();
+        assert_eq!(cards, 2);
     }
 
     #[test]

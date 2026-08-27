@@ -396,6 +396,18 @@ pub async fn execute_visualize(args_json: &str, _ctx: &ToolCtx<'_>) -> ToolOutco
         Ok(v) => v,
         Err(e) => return ToolOutcome::from_text(format!("error: {e}")),
     };
+
+    // Normalize edge-label geometry before the SVG goes anywhere: merman
+    // anchors edge-label text W/2 left of the edge midpoint (real Mermaid
+    // offsets the background rect instead). Without this the label slides
+    // under the source node when rasterized, and SVGs downloaded from the
+    // browser viewer are broken in other tools too. Idempotent; see
+    // atom_core::render::mermaid for the geometry.
+    let svg = {
+        let text = String::from_utf8_lossy(&svg).into_owned();
+        atom_core::render::mermaid::normalize_edge_labels(&text).into_bytes()
+    };
+
     let Some((w, h)) = svg_size(&svg) else {
         return ToolOutcome::from_text("error: rendered SVG has no dimensions".into());
     };

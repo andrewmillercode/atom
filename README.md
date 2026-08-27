@@ -21,3 +21,7 @@ curl -fsSL https://raw.githubusercontent.com/andrewmillercode/atom/main/install.
 ```
 
 That installs `atom` (the TUI) and `atoms` (the session server) into `~/.local/bin`, adds them to your PATH, and checks the runtime deps (`rg`, `uv`, `merman-cli`). Then just run `atom` in a repo — it starts the server for you. To build from source instead, use `make install` (or `make install-dev` for a separate `atomdev`/`atomsdev` setup).
+
+## Contributions
+
+This harness is mostly a personal project, but contributions are welcome. You are free to fork / clone / modify atom to your liking and taste, or provide feature requests/suggestions via Issues.

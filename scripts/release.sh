@@ -8,13 +8,24 @@
 # .github/workflows/release.yml; use this script only for manual releases.
 #
 # Usage:
-#   scripts/release.sh <vX.Y.Z>
+#   scripts/release.sh [vX.Y.Z]
+#
+# The tag is optional: it defaults to the version in [workspace.package]
+# (Cargo.toml) — the same source the release workflow uses. Pass it only
+# to override.
 #
 # Requires: cargo, git, gh (authenticated: gh auth login).
 # Commit your work first — the tag points at whatever is committed.
 set -euo pipefail
 
-TAG="${1:?usage: scripts/release.sh <vX.Y.Z>  (e.g. v0.1.1)}"
+if [ $# -ge 1 ]; then
+  TAG="$1"
+else
+  VER="$(awk '/^\[workspace\.package\]/{f=1;next} /^\[/{f=0} f && $1 == "version" {sub(/^version[[:space:]]*=[[:space:]]*"/, ""); sub(/".*$/, ""); print; exit}' Cargo.toml)"
+  [ -n "$VER" ] || { echo "error: could not read [workspace.package] version from Cargo.toml; pass a tag explicitly" >&2; exit 1; }
+  TAG="v${VER}"
+  echo "==> version ${TAG} (from Cargo.toml)"
+fi
 
 if ! git diff --quiet; then
   echo "error: working tree has uncommitted changes; commit first" >&2

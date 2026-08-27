@@ -23,6 +23,21 @@ case "$ARCH" in
 esac
 [ "$OS" = "Darwin" ] || { echo "error: releases are macOS-only (got $OS)" >&2; exit 1; }
 
+# confirm <prompt> [y|n] — loop until y/n; empty takes the default.
+confirm() {
+  local DEF="${2:-y}" A
+  while true; do
+    if [ "$DEF" = "y" ]; then printf "%s [Y/n]: " "$1"; else printf "%s [y/N]: " "$1"; fi
+    read -r A
+    A="${A:-$DEF}"
+    case "$A" in
+      y|Y|yes|Yes|YES) return 0 ;;
+      n|N|no|No|NO)    return 1 ;;
+      *) echo "    please answer y or n" ;;
+    esac
+  done
+}
+
 ver_from() {
   awk '/^\[workspace\.package\]/{f=1;next} /^\[/{f=0} f && $1 == "version" {sub(/^version[[:space:]]*=[[:space:]]*"/, ""); sub(/".*$/, ""); print; exit}' "$1"
 }
@@ -31,12 +46,14 @@ ver_from() {
 VERSION="$(ver_from Cargo.toml)"
 [ -n "$VERSION" ] || { echo "error: could not read [workspace.package] version from Cargo.toml" >&2; exit 1; }
 
-printf "==> Cargo.toml says %s — release version [v%s]: " "$VERSION" "$VERSION"
-read -r ANSWER
-ANSWER="${ANSWER:-$VERSION}"
-WANT="${ANSWER#v}"
+if confirm "release v${VERSION}?"; then
+  :
+else
+  printf "new version (e.g. 0.1.2, or empty to abort): "
+  read -r ANSWER
+  WANT="${ANSWER#v}"
+  [ -n "$WANT" ] || { echo "aborted" >&2; exit 1; }
 
-if [ "$WANT" != "$VERSION" ]; then
   N="$(grep -cE '^version = "' Cargo.toml || true)"
   [ "$N" = "1" ] || { echo "error: expected exactly one version line in root Cargo.toml, found ${N:-0} — bump manually" >&2; exit 1; }
   sed -i.bak -E "s/^version = \".*\"/version = \"${WANT}\"/" Cargo.toml
@@ -57,37 +74,44 @@ if ! git diff --quiet -- Cargo.toml Cargo.lock; then
   git add Cargo.toml Cargo.lock
   git commit -m "bump version to ${VERSION}"
   git push origin HEAD
-  echo "    (the bump commit is unpushed on other branches — tag accordingly)"
 fi
 git diff --quiet || { echo "error: uncommitted changes — commit or stash first" >&2; exit 1; }
 
 # --- 3. notes ----------------------------------------------------------------
-NOTES_DEFAULT="releases/${TAG}.md"
-echo "==> release notes:"
-i=1
-for f in releases/*.md; do
-  [ -e "$f" ] || continue
-  printf "  %d) %s\n" "$i" "$f"
-  i=$((i+1))
-done
-printf "notes file [%s]: " "$NOTES_DEFAULT"
-read -r NOTES_FILE
-NOTES_FILE="${NOTES_FILE:-$NOTES_DEFAULT}"
-if [ ! -f "$NOTES_FILE" ]; then
-  printf "%s not found — create and edit it now? [Y/n]: " "$NOTES_FILE"
-  read -r CREATE
-  case "$CREATE" in n*|N*) exit 1 ;; esac
+NOTES_FILE="releases/${TAG}.md"
+if [ -f "$NOTES_FILE" ]; then
+  confirm "use ${NOTES_FILE} for notes?" || {
+    i=1
+    for f in releases/*.md; do
+      [ -e "$f" ] || continue
+      printf "  %d) %s\n" "$i" "$f"
+      i=$((i+1))
+    done
+    printf "notes file (number or path): "
+    read -r PICK
+    case "$PICK" in
+      ''|*[!0-9]*) NOTES_FILE="$PICK" ;;
+      *) NOTES_FILE="$(ls releases/*.md | sed -n "${PICK}p")" ;;
+    esac
+    [ -n "$NOTES_FILE" ] && [ -f "$NOTES_FILE" ] || { echo "error: notes file not found: ${NOTES_FILE:-<none>}" >&2; exit 1; }
+  }
+else
+  confirm "create ${NOTES_FILE} and edit it now?" || { echo "error: add ${NOTES_FILE} first" >&2; exit 1; }
   printf "## What's New\n\n- \n" > "$NOTES_FILE"
   "${VISUAL:-${EDITOR:-vi}}" "$NOTES_FILE"
   [ -s "$NOTES_FILE" ] || { echo "error: ${NOTES_FILE} is empty" >&2; exit 1; }
 fi
 
 # --- 4. commit to tag --------------------------------------------------------
+HEAD_SHA="$(git rev-parse --short HEAD)"
 echo "==> recent commits:"
 git log --oneline -n 10 --decorate=short | sed 's/^/    /'
-printf "tag which commit [HEAD]: "
-read -r REF
-REF="${REF:-HEAD}"
+REF="HEAD"
+confirm "tag HEAD (${HEAD_SHA})?" || {
+  printf "which commit (ref/sha) [HEAD]: "
+  read -r REF
+  REF="${REF:-HEAD}"
+}
 git rev-parse -q --verify "${REF}^{commit}" >/dev/null || { echo "error: unknown commit: ${REF}" >&2; exit 1; }
 REF_SHA="$(git rev-parse --short "${REF}^{commit}")"
 

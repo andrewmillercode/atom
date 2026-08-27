@@ -525,6 +525,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_spawn_accepts_single_string_task() {
+        let s = FakeSpawner::new();
+        let ctx = spawner_ctx(&s);
+        let out = execute_tool(
+            &ctx,
+            "dispatch",
+            r#"{"action":"spawn","thinking":"high","tasks":"just one task"}"#,
+        )
+        .await;
+        assert!(!out.text.starts_with("error"));
+        let spawned = s.spawned.lock().unwrap();
+        assert_eq!(spawned.len(), 1);
+        assert_eq!(spawned[0].prompt, "just one task");
+    }
+
+    #[tokio::test]
     async fn dispatch_inspect_without_target_lists_all() {
         let s = FakeSpawner::new();
         let ctx = spawner_ctx(&s);

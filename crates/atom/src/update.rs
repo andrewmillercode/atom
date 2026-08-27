@@ -109,8 +109,8 @@ pub async fn run() {
 
 /// Gates that skip the updater entirely (silently, no network).
 fn gates_pass() -> bool {
-    // Dev builds never self-update: they run from target/ or the
-    // atomdev symlink and are refreshed by `make install-dev`.
+    // Dev builds never self-update: they run from target/ (or the
+    // atomdev install link) and are refreshed by `make install-dev`.
     if cfg!(debug_assertions) {
         return false;
     }

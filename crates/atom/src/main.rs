@@ -62,7 +62,7 @@ fn help_text() -> String {
     format!(
         "{USAGE}\n\nversion: {}\nbuild: {}",
         atom_core::build::version_label(),
-        env!("ATOM_BUILD")
+        atom_core::build::build_label()
     )
 }
 
@@ -327,7 +327,7 @@ mod tests {
     fn help_identifies_version_and_build() {
         let help = help_text();
         assert!(help.contains(env!("CARGO_PKG_VERSION")));
-        assert!(help.contains(env!("ATOM_BUILD")));
+        assert!(help.contains(atom_core::build::build_label()));
     }
 }
 

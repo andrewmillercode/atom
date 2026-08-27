@@ -20,7 +20,7 @@ validated with `cargo check` / `cargo test`, not a checked-in executable.
 To build the executable:
 
 ```sh
-cargo build --bin atom
+cargo build --bin atom --bin atoms --bin atomdev --bin atomsdev
 ```
 
 To make `atom` available on your PATH during development:
@@ -29,8 +29,9 @@ To make `atom` available on your PATH during development:
 make install-dev
 ```
 
-This symlinks the debug build into `~/.local/bin` as `atomdev` and
-`atomsdev` (release installs keep the `atom`/`atoms` names). Make sure
+This links the debug build into `~/.local/bin` as `atomdev` and
+`atomsdev` — `cargo build` emits real `atomdev`/`atomsdev` binaries
+(release installs keep the `atom`/`atoms` names). Make sure
 `~/.local/bin` is on your `PATH`. The client starts the `atomsdev`
 server automatically if it isn't already running.
 
@@ -82,15 +83,19 @@ Do not reformat unrelated files in the same commit; keep diffs minimal.
 
 ## Binary name
 
-There are two binaries in `crates/atom/Cargo.toml`:
+There are two binaries in `crates/atom/Cargo.toml`, plus dev aliases:
 
 - **`atom`** — the TUI client. Automatically starts `atoms` if no server is
   running.
 - **`atoms`** — the background session server. Cannot be launched directly;
   it requires a launch token set by `atom` (`_ATOM_LAUNCH=managed`).
+- **`atomdev` / `atomsdev`** — dev aliases built from the same sources as
+  `atom`/`atoms` (see `crates/atom/Cargo.toml`). Real binaries, not
+  symlinks; meaningful only in the debug profile.
 
-Both are built by `cargo build` and installed together by `make install-dev`
-(as `atomdev`/`atomsdev`) or `make install` (as `atom`/`atoms`).
+All four are built by `cargo build` and installed together by
+`make install-dev` (as `atomdev`/`atomsdev`) or `make install` (as
+`atom`/`atoms`).
 
 ## Bundled instructions
 

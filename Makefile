@@ -1,6 +1,7 @@
 # Makefile for the `atom` / `atoms` executables
 #
-# Dev install (symlinks to the debug build, named atomdev/atomsdev):
+# Dev install (debug build, emitted by cargo as real atomdev/atomsdev
+# binaries and linked into ~/.local/bin):
 #   make install-dev
 #   make install-dev PREFIX=~/.local   # default
 #
@@ -38,11 +39,7 @@ CARGO_BUILD_FLAGS ?=
 all: build
 
 build:
-	$(CARGO) build $(CARGO_BUILD_FLAGS) --bin atom --bin atoms
-	@# Dev aliases: a debug build looks for its server as `atomsdev` and
-	@# ps shows atomdev/atomsdev, matching the install-dev link names.
-	ln -sf atom $(CURDIR)/target/debug/atomdev
-	ln -sf atoms $(CURDIR)/target/debug/atomsdev
+	$(CARGO) build $(CARGO_BUILD_FLAGS) --bin atom --bin atoms --bin atomdev --bin atomsdev
 
 build-release:
 	$(CARGO) build --release --bin atom --bin atoms

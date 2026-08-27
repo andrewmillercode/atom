@@ -6,7 +6,7 @@
 use anyhow::{anyhow, Context, Result};
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
@@ -529,9 +529,11 @@ pub async fn respond_approval(session_id: &str, approval_id: &str, decision: &st
 // ---------------------------------------------------------------------------
 
 /// serverSupportsClient reports whether the live server exposes every API
-/// this client needs and was built from the same release. Older servers
+/// this client needs and was built from the same sources. Older servers
 /// 404 on /api/capabilities or omit newer flags (dispatch); a server from
-/// a different version is recycled so a stale binary can't serve a newer
+/// a different version — or a rebuild of the same version (dev edits, a
+/// re-install without a version bump) — reports a different or missing
+/// build id and is recycled, so a stale binary can't serve a newer
 /// client.
 pub async fn server_supports_client() -> bool {
     #[derive(serde::Deserialize)]
@@ -548,6 +550,8 @@ pub async fn server_supports_client() -> bool {
         keepalive: bool,
         #[serde(default)]
         version: Option<String>,
+        #[serde(default)]
+        build: Option<String>,
     }
     let caps: Caps = match get("/api/capabilities").await {
         Ok(v) => match serde_json::from_value(v) {
@@ -562,6 +566,7 @@ pub async fn server_supports_client() -> bool {
         && caps.skills
         && caps.keepalive
         && caps.version.as_deref() == Some(env!("CARGO_PKG_VERSION"))
+        && caps.build.as_deref() == Some(atom_core::build::build_id())
 }
 
 /// stopBackgroundServer SIGTERMs the pid from server.pid and waits for
@@ -590,15 +595,16 @@ fn data_dir_pid_path() -> PathBuf {
 
 /// Locate the `atoms` server binary (named `atomsdev` in dev builds —
 /// see atom_core::build). It lives next to the running `atom`
-/// executable (same directory), which works for both dev-symlink and
-/// release installs.
+/// executable (same directory), which works for both dev and release
+/// installs.
 fn find_server_binary() -> Result<PathBuf> {
     let exe = std::env::current_exe().context("find own executable")?;
     let dir = exe.parent().context("executable has no parent dir")?;
     let name = atom_core::build::server_name();
 
-    // 1. Next to the running executable: the release install dir, the
-    //    `atomsdev` install-dev symlink, or the target/debug alias.
+    // 1. Next to the running executable: the release install dir, or
+    //    the dev install dir — `make install-dev` links the real
+    //    cargo-built atomsdev binary into ~/.local/bin.
     let candidate = dir.join(name);
     if candidate.is_file() {
         return Ok(candidate);
@@ -626,7 +632,7 @@ fn find_server_binary() -> Result<PathBuf> {
         }
     }
     let hint = if atom_core::build::is_dev() {
-        " — dev builds expect the atomdev/atomsdev symlinks; run `make install-dev`"
+        " — dev builds expect the atomdev/atomsdev binaries; run `make install-dev`"
     } else {
         ""
     };
@@ -636,16 +642,82 @@ fn find_server_binary() -> Result<PathBuf> {
     ))
 }
 
+/// runningServerIsExpected reports whether the live server process (the
+/// pid in server.pid) is the exact server binary this client would
+/// spawn — find_server_binary(). ensure_server recycles on mismatch so
+/// a leftover `atoms` process cannot keep serving clients that expect
+/// `atomsdev` (same version, same data dir, wrong binary). Deliberately
+/// lenient: if the pid file, the process, or the expected binary cannot
+/// be resolved, the running server stays up.
+fn running_server_is_expected() -> bool {
+    let expected = match find_server_binary() {
+        Ok(p) => p,
+        Err(_) => return true,
+    };
+    let pid = match std::fs::read_to_string(data_dir_pid_path())
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+    {
+        Some(p) if p > 0 => p,
+        _ => return true,
+    };
+    match running_exe(pid) {
+        Some(actual) => same_server_binary(&expected, &actual),
+        None => true,
+    }
+}
+
+/// The executable path behind a pid: /proc/<pid>/exe on Linux; on macOS
+/// `ps -o comm` reports the argv[0] path the process was exec'd with
+/// (the client always spawns the server by full path, so that is the
+/// binary's path).
+fn running_exe(pid: i32) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let out = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "comm="])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if s.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(s))
+        }
+    }
+}
+
+/// Equality that survives different spellings of one binary (direct
+/// target/ path vs the ~/.local/bin install link): compare
+/// canonicalized, falling back to literal equality if that fails.
+fn same_server_binary(expected: &Path, actual: &Path) -> bool {
+    match (expected.canonicalize(), actual.canonicalize()) {
+        (Ok(e), Ok(a)) => e == a,
+        _ => expected == actual,
+    }
+}
+
 /// ensureServer checks whether the atom server is already running. If
 /// not, it starts one as a detached background process and polls until
 /// it accepts connections (a 5s deadline, not a 5s sleep).
 pub async fn ensure_server() -> Result<()> {
     if is_running().await {
-        if server_supports_client().await {
+        if server_supports_client().await && running_server_is_expected() {
             return Ok(());
         }
-        // An older server is still bound to the socket and is missing
-        // APIs this client needs (compaction, dispatch, …). Recycle it.
+        // Recycle when the running server either lacks APIs this client
+        // needs (an older build), or is not the binary this client would
+        // spawn — e.g. an `atoms` leftover from a plain `cargo run`
+        // still bound to the dev socket while this client expects
+        // `atomsdev`. Same version and data dir, wrong binary: replace
+        // it so client and server stay a matched pair.
         stop_background_server().await;
     }
 
@@ -728,5 +800,38 @@ pub async fn hold_server_alive() -> ! {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A temp dir with a real binary file, a symlink to it, and a
+    /// second distinct binary file.
+    fn scratch() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("atom-client-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("atomsdev");
+        std::fs::write(&real, b"server").unwrap();
+        std::os::unix::fs::symlink(&real, dir.join("install-link")).unwrap();
+        std::fs::write(dir.join("atoms"), b"server").unwrap();
+        dir
+    }
+
+    #[test]
+    fn same_server_binary_accepts_symlink_spellings() {
+        let dir = scratch();
+        let real = dir.join("atomsdev");
+        let link = dir.join("install-link");
+        let other = dir.join("atoms");
+        assert!(same_server_binary(&real, &real));
+        assert!(
+            same_server_binary(&link, &real),
+            "install symlink must match the real binary"
+        );
+        assert!(!same_server_binary(&real, &other), "atoms is not atomsdev");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

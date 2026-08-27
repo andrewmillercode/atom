@@ -54,6 +54,22 @@ pub fn version_label() -> String {
     }
 }
 
+/// Human-facing build string for `-help`, e.g. "e4321875670b-dirty
+/// (debug)" — set by atom-core's build script.
+pub fn build_label() -> &'static str {
+    env!("ATOM_BUILD")
+}
+
+/// Identity of this exact build: commit, profile, and the time the
+/// build script last ran (cargo reruns the script only when the sources
+/// change, so this tracks the code, not each cargo invocation). Clients
+/// and servers exchange it over /api/capabilities: a running server
+/// whose build_id differs from the client's was built from older code
+/// and is recycled, even when CARGO_PKG_VERSION is unchanged.
+pub fn build_id() -> &'static str {
+    env!("ATOM_BUILD_ID")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

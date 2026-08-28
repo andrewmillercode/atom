@@ -1,7 +1,7 @@
 //! Build-flavor helpers: dev builds and release builds coexist on one
 //! machine without touching each other.
 //!
-//! Dev builds (`cargo build`, `cargo run`, `make install-dev` — the
+//! Dev builds (`cargo build`, `cargo run`, `make dev` — the
 //! debug profile) run as `atomdev` / `atomsdev` and keep their state in
 //! `atom-dev` data/config directories. Release builds (`cargo build
 //! --release`, `make install`, install.sh) run as `atom` / `atoms` with

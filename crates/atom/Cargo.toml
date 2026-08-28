@@ -11,7 +11,7 @@ path = "src/main.rs"
 name = "atoms"
 path = "src/atoms.rs"
 
-# Dev installs (`make install-dev`) run under the names atomdev/atomsdev.
+# Dev installs (`make dev`) run under the names atomdev/atomsdev.
 # These are real cargo binaries built from the same sources — not
 # Makefile symlinks — so `cargo build` emits all four and `ps` shows the
 # dev names with no link tricks. Flavor is keyed on

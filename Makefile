@@ -2,8 +2,8 @@
 #
 # Dev install (debug build, emitted by cargo as real atomdev/atomsdev
 # binaries and linked into ~/.local/bin):
-#   make install-dev
-#   make install-dev PREFIX=~/.local   # default
+#   make dev
+#   make dev PREFIX=~/.local   # default
 #
 # Dev installs coexist with release installs: different binary names
 # (atomdev/atomsdev vs atom/atoms) and a separate atom-dev data/config
@@ -34,23 +34,22 @@ BIN_DIR_SED = $(subst /,\/,$(BIN_DIR))
 CARGO ?= cargo
 CARGO_BUILD_FLAGS ?=
 
-.PHONY: all dev build build-release install-dev install uninstall clean release
+.PHONY: all dev build build-release install uninstall clean release
 
 all: build
 
-# Dev build (debug profile; also emits the atomdev/atomsdev dev aliases).
+# Dev build (debug profile; also emits the atomdev/atomsdev dev aliases),
+# then link atomdev/atomsdev into $(BIN_DIR) so they're callable.
 dev: build
+	install -d $(BIN_DIR)
+	ln -sf $(CURDIR)/target/debug/atomdev $(BIN_DIR)/atomdev
+	ln -sf $(CURDIR)/target/debug/atomsdev $(BIN_DIR)/atomsdev
 
 build:
 	$(CARGO) build $(CARGO_BUILD_FLAGS) --bin atom --bin atoms --bin atomdev --bin atomsdev
 
 build-release:
 	$(CARGO) build --release --bin atom --bin atoms
-
-install-dev: build
-	install -d $(BIN_DIR)
-	ln -sf $(CURDIR)/target/debug/atomdev $(BIN_DIR)/atomdev
-	ln -sf $(CURDIR)/target/debug/atomsdev $(BIN_DIR)/atomsdev
 
 install: build-release
 	install -d $(BIN_DIR)

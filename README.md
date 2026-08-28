@@ -20,7 +20,7 @@ Atom runs agents in your terminal: they plan, edit code, run commands, and searc
 curl -fsSL https://raw.githubusercontent.com/andrewmillercode/atom/main/install.sh | bash
 ```
 
-That installs `atom` (the TUI) and `atoms` (the session server) into `~/.local/bin`, adds them to your PATH, and checks the runtime deps (`rg`, `uv`, `merman-cli`). Then just run `atom` in a repo — it starts the server for you. To build from source instead, use `make install` (or `make install-dev` for a separate `atomdev`/`atomsdev` setup).
+That installs `atom` (the TUI) and `atoms` (the session server) into `~/.local/bin`, adds them to your PATH, and checks the runtime deps (`rg`, `uv`, `merman-cli`). Then just run `atom` in a repo — it starts the server for you. To build from source instead, use `make install` (or `make dev` for a separate `atomdev`/`atomsdev` setup).
 
 ## Contributions
 

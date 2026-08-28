@@ -136,7 +136,9 @@ tar -czf "$ASSET" -C target/release atom atoms
 
 echo "==> tagging ${TAG} at ${REF_SHA}"
 git tag "$TAG" "$REF_SHA"
-git push origin "$TAG"
+# full refs/tags/ path: a branch with the same name as the tag makes the
+# short name ambiguous ("src refspec ... matches more than one")
+git push origin "refs/tags/${TAG}"
 
 echo "==> creating GitHub release ${TAG}"
 gh release create "$TAG" "$ASSET" \

@@ -1,0 +1,21 @@
+{
+  "name": "Gruvbox Dark",
+  "author": "Pavel Pertsev (github.com/morhetz/gruvbox)",
+  "border": "#3c3836",
+  "card_dark": "#1d2021",
+  "card_light": "#32302f",
+  "secondary": "#d3869b",
+  "primary": "#83a598",
+  "primary_dark": "#458588",
+  "select": "#504945",
+  "background": "#282828",
+  "foreground": "#ebdbb2",
+  "muted": "#928374",
+  "muted_extra": "#665c54",
+  "diff_add": "#26331c",
+  "diff_del": "#3c1f1c",
+  "diff_add_bg": "#2b3319",
+  "diff_del_bg": "#38211d",
+  "syntax_type": "#fe8019",
+  "syntax_string": "#b8bb26"
+}

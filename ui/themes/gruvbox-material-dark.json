@@ -1,0 +1,21 @@
+{
+  "name": "Gruvbox Material Dark",
+  "author": "Sainnhe Park (sainnhe)",
+  "border": "#3c3836",
+  "card_dark": "#1c1b19",
+  "card_light": "#32302f",
+  "secondary": "#d3869b",
+  "primary": "#7daea3",
+  "primary_dark": "#45707a",
+  "select": "#45403d",
+  "background": "#282828",
+  "foreground": "#d4be98",
+  "muted": "#928374",
+  "muted_extra": "#7c6f64",
+  "diff_add": "#a9b665",
+  "diff_del": "#ea6962",
+  "diff_add_bg": "#3c4737",
+  "diff_del_bg": "#48322f",
+  "syntax_type": "#e78a4e",
+  "syntax_string": "#a9b665"
+}

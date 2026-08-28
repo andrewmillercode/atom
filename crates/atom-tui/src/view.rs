@@ -6,7 +6,7 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block as RtBlock, Borders, Clear};
 
@@ -1010,6 +1010,7 @@ fn render_overlay(app: &mut App, kind: OverlayKind) -> Vec<Line<'static>> {
         OverlayKind::ProviderKey => render_provider_key_overlay(app),
         OverlayKind::Settings => render_settings_overlay(app),
         OverlayKind::WebSearch => render_web_search_overlay(app),
+        OverlayKind::Theme => render_theme_overlay(app),
     }
 }
 
@@ -1323,6 +1324,44 @@ fn render_settings_overlay(app: &App) -> Vec<Line<'static>> {
         for row in wrap_plain(&format!("{prefix}{label}"), width) {
             out.push(Line::from(Span::styled(row, style)));
         }
+    }
+    out
+}
+
+/// renderThemeOverlay lists selectable themes with color swatches.
+/// The active theme is marked; Enter applies and persists the selection.
+fn render_theme_overlay(app: &App) -> Vec<Line<'static>> {
+    let width = app.width.max(1) as usize;
+    let mut out = wrapped_header(&overlays::overlay_title(app, OverlayKind::Theme), width);
+    out.push(blank());
+    let active = atom_core::render::colors::active_theme_name();
+    for (index, entry) in overlays::theme_rows().into_iter().enumerate() {
+        let (prefix, style) = if index == app.overlay_sel {
+            ("▸ ", ansi::style_selected())
+        } else {
+            ("  ", ansi::style_inactive())
+        };
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        spans.push(Span::styled(prefix.to_string(), style));
+        let marker = if entry.id == active { "● " } else { "" };
+        spans.push(Span::styled(format!("{marker}{}", entry.name), style));
+        // Swatches: background, primary, secondary, foreground chips.
+        for role in [
+            entry.theme.background.as_str(),
+            entry.theme.primary.as_str(),
+            entry.theme.secondary.as_str(),
+            entry.theme.foreground.as_str(),
+        ] {
+            let (r, g, b) = atom_core::render::colors::hex_to_rgb(role);
+            spans.push(Span::styled(
+                "   ".to_string(),
+                Style::default().bg(Color::Rgb(r, g, b)),
+            ));
+            spans.push(Span::raw(" "));
+        }
+        let source = if entry.builtin { "built-in" } else { "custom" };
+        spans.push(Span::styled(source.to_string(), ansi::style_dim()));
+        out.push(Line::from(spans));
     }
     out
 }

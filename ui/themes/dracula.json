@@ -1,0 +1,21 @@
+{
+  "name": "Dracula",
+  "author": "Zeno Rocha (draculatheme.com)",
+  "border": "#44475a",
+  "card_dark": "#21222c",
+  "card_light": "#343746",
+  "secondary": "#ff79c6",
+  "primary": "#8be9fd",
+  "primary_dark": "#3a6a75",
+  "select": "#44475a",
+  "background": "#282a36",
+  "foreground": "#f8f8f2",
+  "muted": "#6272a4",
+  "muted_extra": "#44475a",
+  "diff_add": "#0e2f1c",
+  "diff_del": "#2f1216",
+  "diff_add_bg": "#1f3a29",
+  "diff_del_bg": "#3a2229",
+  "syntax_type": "#ffb86c",
+  "syntax_string": "#f1fa8c"
+}

@@ -1,0 +1,21 @@
+{
+  "name": "Kanagawa",
+  "author": "Tommaso Laurenzi (rebelot)",
+  "border": "#2a2a37",
+  "card_dark": "#16161d",
+  "card_light": "#1f1f28",
+  "secondary": "#957fb8",
+  "primary": "#7e9cd8",
+  "primary_dark": "#545c7e",
+  "select": "#223249",
+  "background": "#1f1f28",
+  "foreground": "#dcd7ba",
+  "muted": "#727169",
+  "muted_extra": "#54546d",
+  "diff_add": "#76946a",
+  "diff_del": "#c34043",
+  "diff_add_bg": "#2b3328",
+  "diff_del_bg": "#43242b",
+  "syntax_type": "#7aa89f",
+  "syntax_string": "#98bb6c"
+}

@@ -1,0 +1,21 @@
+{
+  "name": "Solarized Dark",
+  "author": "Ethan Schoonover",
+  "border": "#073642",
+  "card_dark": "#00212b",
+  "card_light": "#073642",
+  "secondary": "#d33682",
+  "primary": "#268bd2",
+  "primary_dark": "#1a5f91",
+  "select": "#0a4250",
+  "background": "#002b36",
+  "foreground": "#839496",
+  "muted": "#657b83",
+  "muted_extra": "#586e75",
+  "diff_add": "#719e00",
+  "diff_del": "#dc322f",
+  "diff_add_bg": "#0d3b26",
+  "diff_del_bg": "#3b1522",
+  "syntax_type": "#cb4b16",
+  "syntax_string": "#2aa198"
+}

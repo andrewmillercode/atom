@@ -1,0 +1,21 @@
+{
+  "name": "Loadbearing",
+  "author": "Ported from Claude Code dark theme (MarceloCajueiro/claude-terminal-theme terminal port)",
+  "border": "#2a2a28",
+  "card_dark": "#383734",
+  "card_light": "#33322e",
+  "secondary": "#9b7ea4",
+  "primary": "#d97757",
+  "primary_dark": "#b8512e",
+  "select": "#383734",
+  "background": "#141413",
+  "foreground": "#e8e6dc",
+  "muted": "#b0aea5",
+  "muted_extra": "#66645f",
+  "diff_add": "#92a87a",
+  "diff_del": "#e89a7e",
+  "diff_add_bg": "#14532d",
+  "diff_del_bg": "#7f1d1d",
+  "syntax_type": "#c9a96e",
+  "syntax_string": "#6aaa96"
+}

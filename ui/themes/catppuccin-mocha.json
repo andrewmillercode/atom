@@ -1,0 +1,20 @@
+{
+  "name": "Catppuccin Mocha",
+  "border": "#45475a",
+  "card_dark": "#181825",
+  "card_light": "#313244",
+  "secondary": "#cba6f7",
+  "primary": "#89b4fa",
+  "primary_dark": "#7287fd",
+  "select": "#414559",
+  "background": "#1e1e2e",
+  "foreground": "#cdd6f4",
+  "muted": "#a6adc8",
+  "muted_extra": "#6c7086",
+  "diff_add": "#a6e3a1",
+  "diff_del": "#f38ba8",
+  "diff_add_bg": "#2d3b2e",
+  "diff_del_bg": "#4a2a35",
+  "syntax_type": "#fab387",
+  "syntax_string": "#a6e3a1"
+}

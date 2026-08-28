@@ -328,6 +328,15 @@ impl App {
         };
         m.refresh_thinking_levels();
         m.apply_thinking(&m.session.thinking.clone());
+        // Apply the persisted theme after any dev hot-theme load so the
+        // user's selection wins in normal runs (hot reload only runs in
+        // --hot mode, which layers on top of this afterwards).
+        if let Some(theme) = m.atom_config.theme.clone() {
+            if let Err(error) = atom_core::render::colors::apply_theme(&theme) {
+                m.err_msg = format!("theme: {error}");
+                m.atom_config.theme = None;
+            }
+        }
         // If no model was found, auto-open the provider selector.
         if m.sel_model.is_empty() && m.session.id.is_empty() {
             m.overlay = Some(OverlayKind::Providers);
@@ -1379,6 +1388,16 @@ impl App {
                 self.overlay_sel = 0;
                 self.overlay_q.clear();
                 self.settings_onboarding = false;
+                Vec::new()
+            }
+            "/theme" => {
+                let rows = overlays::theme_rows();
+                self.overlay = Some(OverlayKind::Theme);
+                self.overlay_sel = rows
+                    .iter()
+                    .position(|entry| entry.id == atom_core::render::colors::active_theme_name())
+                    .unwrap_or(0);
+                self.overlay_q.clear();
                 Vec::new()
             }
             "/model" => {
@@ -3145,6 +3164,30 @@ impl App {
                 self.overlay = Some(OverlayKind::Settings);
                 self.overlay_sel = 1;
                 Vec::new()
+            }
+            OverlayKind::Theme => {
+                let rows = overlays::theme_rows();
+                let Some(entry) = rows.get(self.overlay_sel) else {
+                    return Vec::new();
+                };
+                let id = entry.id.clone();
+                let name = entry.name.clone();
+                if let Err(error) = atom_core::render::colors::apply_theme(&id) {
+                    self.err_msg = format!("theme: {error}");
+                    return Vec::new();
+                }
+                self.atom_config.theme = Some(id);
+                self.save_atom_config();
+                self.overlay = None;
+                self.copied_msg = format!("theme: {name}");
+                self.copied_at = Some(Instant::now());
+                // The palette changed behind every cached render: drop the
+                // block caches and repaint previews, mirroring what the
+                // hot theme reload path does. The next frame's
+                // refresh_viewport rebuilds against the new palette.
+                self.invalidate_all_blocks();
+                self.preview_dirty = true;
+                vec![Effect::PaintPreviews]
             }
         }
     }
@@ -5397,6 +5440,43 @@ mod tests {
             app.scroll_y > 0,
             "scrollbar click at width-1 should scroll: scroll_y = {}",
             app.scroll_y
+        );
+    }
+
+    #[test]
+    fn theme_switch_drops_cached_block_colors() {
+        let mut app = App::new_test(80, 20);
+        app.blocks.push(Block {
+            kind: BlockKind::Tool,
+            title: "Fetch".into(),
+            tool_name: "webfetch".into(),
+            text: "example".into(),
+            ..Default::default()
+        });
+        app.refresh_viewport();
+        assert!(app.blocks[0].lines.as_ref().is_some(), "block cache built");
+
+        // Re-select the active theme: the palette is unchanged, so this
+        // stays race-free for other tests that pin default-theme colors,
+        // while still exercising the switch path end to end. The cached
+        // lines must be dropped so the next frame re-renders against
+        // whatever palette is active.
+        let active = atom_core::render::colors::active_theme_name();
+        let target = overlays::theme_rows()
+            .iter()
+            .position(|entry| entry.id == active)
+            .expect("active theme is selectable");
+        app.overlay = Some(OverlayKind::Theme);
+        app.overlay_sel = target;
+
+        let effects = app.key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.overlay.is_none());
+        assert!(app.preview_dirty);
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(effects[0], Effect::PaintPreviews));
+        assert!(
+            app.blocks[0].lines.as_ref().is_none(),
+            "theme switch must drop cached block colors"
         );
     }
 }

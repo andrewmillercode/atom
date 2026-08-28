@@ -26,6 +26,7 @@ pub enum OverlayKind {
     ProviderKey,
     Settings,
     WebSearch,
+    Theme,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -59,7 +60,7 @@ pub struct Command {
     pub kind: &'static str,
 }
 
-pub const COMMANDS: [Command; 14] = [
+pub const COMMANDS: [Command; 15] = [
     Command {
         name: "/new",
         desc: "start a new session",
@@ -118,6 +119,11 @@ pub const COMMANDS: [Command; 14] = [
     Command {
         name: "/reasoning",
         desc: "select reasoning level",
+        kind: "",
+    },
+    Command {
+        name: "/theme",
+        desc: "select color theme",
         kind: "",
     },
     Command {
@@ -379,6 +385,7 @@ pub fn overlay_count(app: &App) -> usize {
         Some(OverlayKind::ProviderMethod) => 2,
         Some(OverlayKind::Settings) => 3,
         Some(OverlayKind::WebSearch) => web_search_rows(app).len(),
+        Some(OverlayKind::Theme) => atom_core::render::colors::available_themes().len(),
         _ => 0,
     }
 }
@@ -398,6 +405,11 @@ pub fn settings_labels(app: &App) -> Vec<String> {
             "Done".into()
         },
     ]
+}
+
+/// themeRows lists selectable themes with their id and source label.
+pub fn theme_rows() -> Vec<atom_core::render::colors::ThemeEntry> {
+    atom_core::render::colors::available_themes()
 }
 
 pub fn web_search_rows(app: &App) -> Vec<(String, String, String)> {
@@ -1130,6 +1142,8 @@ pub fn overlay_title(app: &App, kind: OverlayKind) -> String {
             "Settings — ↑↓ to navigate, Enter to change, Esc to close".to_string(),
         OverlayKind::WebSearch =>
             "Web search provider — ↑↓ to navigate, Enter to select, Esc to settings".to_string(),
+        OverlayKind::Theme =>
+            "Theme — ↑↓ to navigate, Enter to apply, Esc to cancel".to_string(),
     }
 }
 
@@ -1148,9 +1162,10 @@ pub fn overlay_header_rows(app: &App) -> usize {
             };
             title_rows + wrap_plain(&query, width).len().max(1) + 2
         }
-        OverlayKind::ProviderMethod | OverlayKind::Settings | OverlayKind::WebSearch => {
-            title_rows + 1
-        }
+        OverlayKind::ProviderMethod
+        | OverlayKind::Settings
+        | OverlayKind::WebSearch
+        | OverlayKind::Theme => title_rows + 1,
         _ => 0,
     }
 }

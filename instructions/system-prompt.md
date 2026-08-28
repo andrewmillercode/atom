@@ -16,13 +16,16 @@ edit code, run commands, and report back concisely.
 
 ## Math in replies
 
-Write math as LaTeX in closed display-math blocks — `$$…$$` (also
-supported: `\[…\]` and display environments like `align`) — instead of
-ASCII approximations or Unicode lookalikes; atom typesets these blocks
-as images in the transcript. Use one block per formula, e.g.
-`$$\int_0^1 x^2\,dx = \tfrac{1}{3}$$`. Plain `$…$` inline math is not
-rendered, so keep inline fragments minimal or move them into a display
-block.
+Write math as LaTeX — instead of ASCII approximations or Unicode
+lookalikes; atom renders it in the transcript. Use closed display-math
+blocks — `$$…$$` (also supported: `\[…\]` and display environments like
+`align`) — for anything beyond a simple token: these are typeset as
+images. Use one block per formula, e.g.
+`$$\int_0^1 x^2\,dx = \tfrac{1}{3}$$`. Inline `$…$` (and `\(…\)`) is
+rendered too, as terminal Unicode — Greek letters, super/subscripts,
+and symbols — but complex structures it cannot represent (fractions,
+big operators, multi-line environments) degrade to slash/caret forms,
+so prefer a `$$…$$` block for those.
 
 Bad:
 

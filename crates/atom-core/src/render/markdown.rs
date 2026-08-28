@@ -12,6 +12,7 @@
 use super::colors::{ansi_fg, COLOR_FOREGROUND, COLOR_MUTED, COLOR_SECONDARY, COLOR_SYNTAX_STRING};
 use super::highlight::highlight_code;
 use super::links::{ansi_wrap, osc8_close, osc8_open};
+use super::math_inline;
 
 const BOLD: &str = "\x1b[1m";
 const ITALIC: &str = "\x1b[3m";
@@ -502,8 +503,20 @@ pub fn render_inlines(src: &str) -> String {
         let c = chars[i];
         match c {
             '\\' if i + 1 < chars.len() => {
-                out.push(chars[i + 1]);
-                i += 2;
+                // `\(…\)` is inline math, same treatment as `$…$`.
+                let close = if chars[i + 1] == '(' {
+                    find_sub(&chars, i + 2, &['\\', ')'])
+                } else {
+                    None
+                };
+                if let Some(close) = close {
+                    let src: String = chars[i + 2..close].iter().collect();
+                    out.push_str(&math_inline::styled(&src));
+                    i = close + 2;
+                } else {
+                    out.push(chars[i + 1]);
+                    i += 2;
+                }
             }
             '`' => {
                 let n = run_len(&chars, i, '`');
@@ -608,6 +621,17 @@ pub fn render_inlines(src: &str) -> String {
                     i += 1;
                 }
             }
+            '$' => match math_inline::inline_math_span(&chars, i) {
+                Some((end, rendered)) => {
+                    out.push_str(&rendered);
+                    i = end;
+                }
+                None => {
+                    // Not math (currency, stray dollar): pass through.
+                    out.push('$');
+                    i += 1;
+                }
+            },
             '\n' => {
                 out.push('\n');
                 i += 1;

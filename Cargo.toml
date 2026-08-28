@@ -62,3 +62,11 @@ codegen-units = 1
 lto = "thin"
 panic = "abort"
 strip = true
+
+[profile.dev]
+# Line tables only: keeps backtraces' file/line info but skips variable
+# DWARF, which materially cuts compile and (mostly) link time across the
+# 398-crate graph — and keeps target/debug from ballooning into tens of
+# GB of debuginfo. Tradeoff: no variable inspection when debugging
+# atomdev under lldb (tests are the debugging path for logic).
+debug = "line-tables-only"

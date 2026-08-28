@@ -54,20 +54,21 @@ impl Layout {
 
     pub fn compute(app: &App) -> Self {
         let status_rows = crate::statusbar::status_bar_rows(app);
-        let input_h = app.input_height();
-        let preview_rows = preview::preview_row_count(app);
-        let reserved = status_rows
-            + crate::app::STATUS_FOOTER_ROWS
-            + 2 * crate::app::PROMPT_PAD
-            + input_h
-            + preview_rows;
+        // Read-only subagent views hide the prompt entirely; the
+        // viewport claims its rows.
+        let prompt_h = app.prompt_height();
+        let reserved = status_rows + crate::app::STATUS_FOOTER_ROWS + prompt_h;
         let viewport_h = (app.height as usize).saturating_sub(reserved).max(1);
         // The prompt's top border sits directly below the viewport; the
         // former working row now shares the status bar (see statusbar.rs),
         // so no chrome is reserved above the prompt.
         let prompt_top_y = viewport_h;
-        let preview_y = prompt_top_y + crate::app::PROMPT_PAD + input_h;
-        let status_y = preview_y + preview_rows + crate::app::PROMPT_PAD;
+        let preview_y = if prompt_h == 0 {
+            viewport_h
+        } else {
+            prompt_top_y + crate::app::PROMPT_PAD + app.input_height()
+        };
+        let status_y = prompt_top_y + prompt_h;
         let cwd_y = status_y + status_rows;
         Layout {
             viewport_h,
@@ -148,55 +149,62 @@ pub fn draw(app: &mut App, area: Rect, buf: &mut Buffer) -> Option<(u16, u16)> {
     );
 
     // --- prompt input ------------------------------------------------------
-    let in_h = app.input_height();
-    let input_w = app.input_width().min(inner_w).max(1);
-    let (rows, cur) = app.input.view(input_w, in_h);
-    let pad = card_line(Line::from(""), inner_w, 0);
-    // Shell mode replaces the blank padding above the input with a mode
-    // label so the prompt reads as a shell, not a chat box.
-    let top_line = if app.shell_mode {
-        card_line(
-            Line::from(Span::styled(
-                "shell mode · enter runs a command · ctrl+c exits",
-                ansi::style_dim(),
-            )),
-            inner_w,
-            crate::app::PROMPT_PAD,
-        )
-    } else {
-        pad.clone()
-    };
-    write_line(
-        buf,
-        area.x + 1,
-        area.y + geo.prompt_top_y as u16,
-        inner_w,
-        &top_line,
-    );
-    for (i, row) in rows.iter().enumerate() {
-        let y = area.y + (geo.prompt_top_y + crate::app::PROMPT_PAD + i) as u16;
-        let chipped = card_line(
-            line_with_chips_styled(row, app),
-            inner_w,
-            crate::app::PROMPT_PAD,
-        );
-        write_line(buf, area.x + 1, y, inner_w, &chipped);
-    }
-
-    // --- preview placeholders inside the input box -------------------------
-    let preview_lines = render_previews(app);
-    for (i, line) in preview_lines.iter().enumerate() {
-        let y = area.y + (geo.preview_y + i) as u16;
+    // Read-only subagent views draw no prompt: the transcript owns the
+    // rows down to the status bar.
+    let prompt_cur = if !app.read_only_view() {
+        let in_h = app.input_height();
+        let input_w = app.input_width().min(inner_w).max(1);
+        let (rows, cur) = app.input.view(input_w, in_h);
+        let pad = card_line(Line::from(""), inner_w, 0);
+        // Shell mode replaces the blank padding above the input with a mode
+        // label so the prompt reads as a shell, not a chat box.
+        let top_line = if app.shell_mode {
+            card_line(
+                Line::from(Span::styled(
+                    "shell mode · enter runs a command · ctrl+c exits",
+                    ansi::style_dim(),
+                )),
+                inner_w,
+                crate::app::PROMPT_PAD,
+            )
+        } else {
+            pad.clone()
+        };
         write_line(
             buf,
             area.x + 1,
-            y,
+            area.y + geo.prompt_top_y as u16,
             inner_w,
-            &card_line(line.clone(), inner_w, crate::app::PROMPT_PAD),
+            &top_line,
         );
-    }
-    let bottom_y = geo.status_y.saturating_sub(crate::app::PROMPT_PAD);
-    write_line(buf, area.x + 1, area.y + bottom_y as u16, inner_w, &pad);
+        for (i, row) in rows.iter().enumerate() {
+            let y = area.y + (geo.prompt_top_y + crate::app::PROMPT_PAD + i) as u16;
+            let chipped = card_line(
+                line_with_chips_styled(row, app),
+                inner_w,
+                crate::app::PROMPT_PAD,
+            );
+            write_line(buf, area.x + 1, y, inner_w, &chipped);
+        }
+
+        // --- preview placeholders inside the input box -------------------
+        let preview_lines = render_previews(app);
+        for (i, line) in preview_lines.iter().enumerate() {
+            let y = area.y + (geo.preview_y + i) as u16;
+            write_line(
+                buf,
+                area.x + 1,
+                y,
+                inner_w,
+                &card_line(line.clone(), inner_w, crate::app::PROMPT_PAD),
+            );
+        }
+        let bottom_y = geo.status_y.saturating_sub(crate::app::PROMPT_PAD);
+        write_line(buf, area.x + 1, area.y + bottom_y as u16, inner_w, &pad);
+        cur
+    } else {
+        None
+    };
 
     // --- status bar ----------------------------------------------------------
     for (i, line) in crate::statusbar::status_bar_lines(app).iter().enumerate() {
@@ -218,7 +226,7 @@ pub fn draw(app: &mut App, area: Rect, buf: &mut Buffer) -> Option<(u16, u16)> {
     if app.approval.is_some() {
         return None;
     }
-    cur.map(|(cx, cy)| {
+    prompt_cur.map(|(cx, cy)| {
         let x = area.x + 1 + crate::app::PROMPT_PAD as u16 + cx as u16;
         let y = area.y + (geo.prompt_top_y + crate::app::PROMPT_PAD + cy) as u16;
         (
@@ -565,6 +573,9 @@ fn render_manage_menu(app: &App) -> Vec<Line<'static>> {
             }
             atom_core::session::store::DelegateStatus::Cancelled => {
                 ("Cancelled", false, ansi::style_error())
+            }
+            atom_core::session::store::DelegateStatus::Stopped => {
+                ("Stopped", false, ansi::style_dim())
             }
         };
         let mut status_text = String::new();

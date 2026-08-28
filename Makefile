@@ -34,19 +34,27 @@ BIN_DIR_SED = $(subst /,\/,$(BIN_DIR))
 CARGO ?= cargo
 CARGO_BUILD_FLAGS ?=
 
-.PHONY: all dev build build-release install uninstall clean release
+.PHONY: all dev dev-build build build-release install uninstall clean release
 
 all: build
 
 # Dev build (debug profile; also emits the atomdev/atomsdev dev aliases),
 # then link atomdev/atomsdev into $(BIN_DIR) so they're callable.
-dev: build
+# The dev install only needs the dev-named binaries: atomdev/atomsdev and
+# atom/atoms are built from the same sources and differ in debug-flavor
+# behavior by cfg!(debug_assertions), not by name, so compiling and
+# linking the release-named pair too doubles the final stage for nothing.
+# `make build` still emits all four.
+dev: dev-build
 	install -d $(BIN_DIR)
 	ln -sf $(CURDIR)/target/debug/atomdev $(BIN_DIR)/atomdev
 	ln -sf $(CURDIR)/target/debug/atomsdev $(BIN_DIR)/atomsdev
 
 build:
 	$(CARGO) build $(CARGO_BUILD_FLAGS) --bin atom --bin atoms --bin atomdev --bin atomsdev
+
+dev-build:
+	$(CARGO) build $(CARGO_BUILD_FLAGS) --bin atomdev --bin atomsdev
 
 build-release:
 	$(CARGO) build --release --bin atom --bin atoms

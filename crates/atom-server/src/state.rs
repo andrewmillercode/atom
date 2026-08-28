@@ -8,6 +8,7 @@ use atom_sandbox::approvals::{ApprovalRequest, Decision};
 use atom_sandbox::policy::SandboxConfig;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -549,6 +550,11 @@ pub struct AppState {
     /// Per-session seen-file caches handed to ToolCtx (Go keeps fileSeen
     /// on the shared Session struct).
     pub files: Mutex<HashMap<String, Arc<atom_tools::FileSeen>>>,
+    /// User-initiated stops: sessions whose live turn was paused through
+    /// the HTTP /pause route (Esc in the TUI). Only external clients use
+    /// that route — dispatch pauses are in-process — so it classifies the
+    /// stop as user-initiated. Consumed by the turn loop at turn end.
+    user_stops: Mutex<HashSet<String>>,
 }
 
 impl AppState {
@@ -563,6 +569,7 @@ impl AppState {
             cfg,
             tracker,
             files: Mutex::new(HashMap::new()),
+            user_stops: Mutex::new(HashSet::new()),
         }
     }
 
@@ -602,6 +609,23 @@ impl AppState {
     /// Remove the seen-file cache when its session is deleted.
     pub fn remove_file_seen(&self, session_id: &str) {
         self.files.lock().unwrap().remove(session_id);
+    }
+
+    /// Marks a user-initiated stop for a session (HTTP /pause on a live
+    /// subagent turn). Consumed by the turn loop at turn end.
+    pub fn mark_user_stop(&self, session_id: &str) {
+        self.user_stops
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string());
+    }
+
+    /// Takes (checks and clears) the user-stop mark for a session.
+    pub fn take_user_stop(&self, session_id: &str) -> bool {
+        self.user_stops
+            .lock()
+            .unwrap()
+            .remove(session_id)
     }
 }
 

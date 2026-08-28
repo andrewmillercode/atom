@@ -36,6 +36,11 @@ fn child_result(child: &Session, include_result: bool) -> serde_json::Value {
             tail = m.content.clone();
             break;
         }
+        // User-initiated stop (Esc in the TUI): bookkeeping, not an error.
+        if m.role == "stopped" && !m.content.trim().is_empty() {
+            tail = m.content.clone();
+            break;
+        }
         if m.role == "error" && !m.content.trim().is_empty() {
             tail = format!("error: {}", m.content);
             break;
@@ -952,6 +957,29 @@ mod tests {
         child.status = DelegateStatus::Error;
         let result = child_result(&child, true);
         assert_eq!(result["result"], "error: provider returned 400");
+    }
+
+    #[test]
+    fn format_result_reports_user_stop_without_error_prefix() {
+        let mut child = atom_core::session::store::Session {
+            id: "0123456789abcdef".into(),
+            ..Default::default()
+        };
+        child.messages.push(atom_core::types::Message {
+            role: "assistant".into(),
+            content: "partial work".into(),
+            ..Default::default()
+        });
+        child.messages.push(atom_core::types::Message {
+            role: "stopped".into(),
+            content: "stopped by the user".into(),
+            ..Default::default()
+        });
+
+        child.status = DelegateStatus::Stopped;
+        let result = child_result(&child, true);
+        assert_eq!(result["result"], "stopped by the user");
+        assert_eq!(result["status"], "stopped");
     }
 
     #[tokio::test]

@@ -19,6 +19,9 @@ pub enum DelegateStatus {
     #[default]
     Done,
     Cancelled,
+    /// StoppedByUser: the user pressed Esc on the subagent's live turn.
+    /// Not an error; the parent is told the user stopped it.
+    Stopped,
 }
 
 impl DelegateStatus {
@@ -34,6 +37,7 @@ impl DelegateStatus {
             Self::Error => "error",
             Self::Done => "done",
             Self::Cancelled => "cancelled",
+            Self::Stopped => "stopped",
         }
     }
 }

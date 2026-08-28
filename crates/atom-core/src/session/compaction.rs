@@ -172,7 +172,7 @@ pub fn compact_span(sess: &Session) -> Option<(usize, usize)> {
             end -= 1;
             continue;
         }
-        if role == "user" || role == "nudge" {
+        if role == "user" || role == "nudge" || role == "stopped" {
             end -= 1;
         }
         break;
@@ -204,7 +204,7 @@ pub fn llm_messages(sess: &Session) -> Vec<Message> {
         if m.role == "compaction" {
             continue;
         }
-        if m.role == "nudge" {
+        if m.role == "nudge" || m.role == "stopped" {
             msgs.push(Message {
                 role: "user".into(),
                 content: m.content.clone(),

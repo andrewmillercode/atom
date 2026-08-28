@@ -398,6 +398,21 @@ impl App {
         crate::preview::preview_row_count(self)
     }
 
+    /// Read-only transcript view: subagent sessions accept no user input.
+    pub fn read_only_view(&self) -> bool {
+        !self.session.parent_id.is_empty()
+    }
+
+    /// Rows the prompt card occupies (padding + input + previews). Zero
+    /// in read-only subagent views, where the prompt is hidden entirely.
+    pub fn prompt_height(&self) -> usize {
+        if self.read_only_view() {
+            0
+        } else {
+            2 * PROMPT_PAD + self.input_height() + self.preview_row_count()
+        }
+    }
+
     /// inputHeight: wrapped prompt rows clamped to INPUT_MAX_HEIGHT or
     /// what fits under the terminal chrome.
     pub fn input_height(&self) -> usize {
@@ -689,11 +704,7 @@ impl App {
     /// Conversation rows available before a footer menu is accounted for.
     pub fn base_viewport_height(&self) -> usize {
         let vp = (self.height as usize).saturating_sub(
-            crate::statusbar::status_bar_rows(self)
-                + STATUS_FOOTER_ROWS
-                + 2 * PROMPT_PAD
-                + self.input_height()
-                + self.preview_row_count(),
+            crate::statusbar::status_bar_rows(self) + STATUS_FOOTER_ROWS + self.prompt_height(),
         );
         // Reserve only the top viewport padding: the prompt card sits
         // directly below the scrolling region with no empty row in
@@ -1347,6 +1358,10 @@ impl App {
                 self.err_msg = "no session to compact".into();
                 return Vec::new();
             }
+            if self.read_only_view() {
+                self.err_msg = "subagent sessions are managed by their parent".into();
+                return Vec::new();
+            }
             let extra = text
                 .strip_prefix("/compact")
                 .unwrap_or("")
@@ -1733,7 +1748,7 @@ impl App {
                     }
                     return Vec::new();
                 }
-                if !text.is_empty() {
+                if !text.is_empty() && !self.read_only_view() {
                     self.input.insert_str(&text);
                     return self.after_input_change();
                 }
@@ -2222,6 +2237,9 @@ impl App {
         if !files.is_empty() {
             return preview::paste_local_images(self, files);
         }
+        if self.read_only_view() {
+            return Vec::new();
+        }
         self.input.insert_str(&content);
         self.after_input_change()
     }
@@ -2367,6 +2385,24 @@ impl App {
 
         if self.overlay.is_some() {
             return self.update_overlay_key(k);
+        }
+
+        // Read-only subagent views accept no user input: swallow the
+        // editing/sending keys and let everything else (Esc, arrows,
+        // Ctrl+C, Ctrl+P, Shift+Up) fall through to the global bindings.
+        if self.read_only_view() {
+            match k.code {
+                KeyCode::Char(_) => {
+                    let global = k.modifiers.contains(KeyModifiers::CONTROL)
+                        || k.modifiers.contains(KeyModifiers::ALT)
+                        || k.modifiers.contains(KeyModifiers::SUPER);
+                    if !global {
+                        return Vec::new();
+                    }
+                }
+                KeyCode::Enter | KeyCode::Backspace | KeyCode::Delete => return Vec::new(),
+                _ => {}
+            }
         }
 
         let mods = k.modifiers;
@@ -3773,6 +3809,9 @@ impl App {
     }
 
     pub fn mouse_in_prompt(&self, y: usize) -> bool {
+        if self.read_only_view() {
+            return false;
+        }
         let geo = crate::view::Layout::compute(self);
         y >= geo.prompt_top_y
             && y < geo.prompt_top_y
@@ -4276,6 +4315,87 @@ mod tests {
             other => panic!("unexpected effects {other:?}"),
         }
         assert!(app.shell_mode, "! prefix leaves shell mode enabled");
+    }
+
+    // -- subagent read-only views --------------------------------------------
+
+    #[test]
+    fn subagent_view_hides_prompt_and_reclaims_rows() {
+        let mut parent = App::new_test(90, 30);
+        let mut child = App::new_test(90, 30);
+        child.session.parent_id = "parent".into();
+        assert!(child.read_only_view());
+        assert_eq!(child.prompt_height(), 0);
+        let pgeo = crate::view::Layout::compute(&parent);
+        let cgeo = crate::view::Layout::compute(&child);
+        assert!(
+            cgeo.viewport_h > pgeo.viewport_h,
+            "subagent viewport reclaims the prompt rows: {} vs {}",
+            cgeo.viewport_h,
+            pgeo.viewport_h
+        );
+        // The status bar stays bottom-anchored; only the viewport grows.
+        assert_eq!(cgeo.status_y, pgeo.status_y);
+    }
+
+    #[test]
+    fn subagent_view_swallows_input_keys() {
+        let mut app = App::new_test(90, 30);
+        app.session.parent_id = "parent".into();
+        // Typing does nothing — no shell mode either.
+        assert!(app.key(key(KeyCode::Char('x'), KeyModifiers::NONE)).is_empty());
+        assert!(app.key(key(KeyCode::Char('!'), KeyModifiers::NONE)).is_empty());
+        assert!(!app.shell_mode);
+        assert!(app.input.value.is_empty());
+        // Enter sends nothing: no SendTurn, no RunShell.
+        app.input.set_value("stale draft");
+        let fx = app.key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            fx.is_empty(),
+            "subagent views send nothing on Enter: {fx:?}"
+        );
+        // Backspace/Delete are swallowed too.
+        assert!(app.key(key(KeyCode::Backspace, KeyModifiers::NONE)).is_empty());
+    }
+
+    #[test]
+    fn subagent_view_esc_pauses_the_running_turn() {
+        let mut app = App::new_test(90, 30);
+        app.session.parent_id = "parent".into();
+        app.streaming = true;
+        let fx = app.key(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            matches!(fx.as_slice(), [Effect::PauseTurn]),
+            "Esc stops the running child turn: {fx:?}"
+        );
+        // Esc with no live turn just clears selection.
+        app.streaming = false;
+        assert!(app.key(key(KeyCode::Esc, KeyModifiers::NONE)).is_empty());
+    }
+
+    #[test]
+    fn subagent_view_keeps_global_bindings() {
+        let mut app = App::new_test(90, 30);
+        app.session.parent_id = "parent".into();
+        // Shift+Up returns to the parent.
+        let fx = app.key(key(KeyCode::Up, KeyModifiers::SHIFT));
+        assert!(matches!(
+            fx.as_slice(),
+            [Effect::LoadSession { id }] if id == "parent"
+        ));
+        // Ctrl+P still opens the slash menu.
+        app.key(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert!(app.menu_visible);
+    }
+
+    #[test]
+    fn subagent_view_refuses_compact() {
+        let mut app = App::new_test(90, 30);
+        app.session.parent_id = "parent".into();
+        app.session.id = "sess1".into();
+        let fx = app.handle_input("/compact");
+        assert!(fx.is_empty());
+        assert!(app.err_msg.contains("managed by their parent"));
     }
 
     #[test]

@@ -1420,8 +1420,30 @@ async fn end_of_turn(
     parent_id: &str,
 ) {
     state.turns.end_turn(id, handle);
+    // A user-initiated stop (Esc via the pause route) ends the child's
+    // turn: record a non-error transcript marker so the parent's dispatch
+    // learns "stopped by the user", and a Stopped status instead of
+    // deriving Done/Error from the last assistant/error message.
+    let user_stopped = state.take_user_stop(id);
+    if user_stopped && !parent_id.is_empty() {
+        let stored_id = id.to_string();
+        state
+            .store_call(move |store| {
+                if let Some(mut stored) = store.get(&stored_id) {
+                    stored.messages.push(Message {
+                        role: "stopped".into(),
+                        content: "stopped by the user".into(),
+                        ..Default::default()
+                    });
+                    store.update_turn_snapshot(&stored_id, &stored, "");
+                }
+            })
+            .await;
+    }
     if !parent_id.is_empty() {
-        let status = if sess.cancelled {
+        let status = if user_stopped {
+            atom_core::session::store::DelegateStatus::Stopped
+        } else if sess.cancelled {
             atom_core::session::store::DelegateStatus::Cancelled
         } else if sess
             .messages
@@ -1980,5 +2002,61 @@ mod tests {
         .await
         .expect("provider handshake ignored cancellation");
         assert!(result.is_none());
+    }
+
+    /// Esc on a live subagent turn: the user stop records a non-error
+    /// "stopped" marker and Stopped status — never "done", never an error.
+    #[tokio::test]
+    async fn user_stop_marks_child_stopped_with_marker() {
+        use crate::state::ConnTracker;
+        use atom_sandbox::policy::{SandboxConfig, SandboxMode};
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(atom_core::session::store::SessionStore::open_in_dir(dir.path()).unwrap());
+        let state = Arc::new(AppState::new(
+            store.clone(),
+            SandboxConfig {
+                mode: SandboxMode::Off,
+                ..Default::default()
+            },
+            Arc::new(ConnTracker::new()),
+        ));
+        let parent = store.create("m", "/tmp", vec![]);
+        let child = store.create_child(&parent.id, "m", "/tmp", "low", "child", vec![]);
+        // The pause path persisted the partial reply before the turn ended.
+        let mut partial = store.get(&child.id).unwrap();
+        partial.messages.push(Message {
+            role: "assistant".into(),
+            content: "partial work".into(),
+            model: "m".into(),
+            ..Default::default()
+        });
+        store.update_turn_snapshot(&child.id, &partial, "");
+
+        let handle = state.turns.start_turn(&child.id, "t1");
+        state.mark_user_stop(&child.id);
+        let sess = store.get(&child.id).unwrap();
+        end_of_turn(&state, &sess, &child.id, &handle, &parent.id).await;
+
+        let stored = store.get(&child.id).unwrap();
+        let last = stored.messages.last().unwrap();
+        assert_eq!(last.role, "stopped");
+        assert_eq!(last.content, "stopped by the user");
+        assert!(!stored.messages.iter().any(|m| m.role == "error"));
+        assert_eq!(
+            store.get_info(&child.id).unwrap().status,
+            atom_core::session::store::DelegateStatus::Stopped
+        );
+        assert!(!state.take_user_stop(&child.id), "flag consumed");
+
+        // Without a stop flag the same end derives its usual status.
+        let sibling = store.create_child(&parent.id, "m", "/tmp", "low", "sibling", vec![]);
+        let handle2 = state.turns.start_turn(&sibling.id, "t2");
+        let sess2 = store.get(&sibling.id).unwrap();
+        end_of_turn(&state, &sess2, &sibling.id, &handle2, &parent.id).await;
+        assert_eq!(
+            store.get_info(&sibling.id).unwrap().status,
+            atom_core::session::store::DelegateStatus::Done
+        );
     }
 }

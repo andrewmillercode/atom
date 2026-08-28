@@ -435,6 +435,20 @@ async fn session_item(
 /// POST /api/sessions/{id}/pause.
 async fn handle_pause(state: &Arc<AppState>, req: &mut Request<Incoming>, id: &str) -> Resp {
     let body: PauseBody = decode(req).await.unwrap_or_default();
+    // External pause routes (the TUI's Esc) are user-initiated by
+    // construction: dispatch pauses run in-process and never use them.
+    // Mark live child turns so the turn loop records a user stop, not an
+    // error or a silent "done". No active turn means the mark is withheld
+    // so a stale flag cannot misclassify a later dispatch turn.
+    if !state
+        .store
+        .get_info(id)
+        .map(|info| info.parent_id.is_empty())
+        .unwrap_or(true)
+        && state.turns.session_has_active_turn(id)
+    {
+        state.mark_user_stop(id);
+    }
     state.turns.pause_session(id, &body.turn_id);
     state.subs.broadcast(id, &json!({"type": "paused"}));
     if state.turns.wait_idle(id, PAUSE_WAIT_TIMEOUT).await {
@@ -616,7 +630,12 @@ async fn handle_send(
     let Some(mut sess) = state.store_call(move |store| store.get(&load_id)).await else {
         return error_resp(StatusCode::NOT_FOUND, "session not found");
     };
-
+    if !sess.parent_id.is_empty() {
+        return error_resp(
+            StatusCode::CONFLICT,
+            "subagent sessions are managed by their parent",
+        );
+    }
     let body: SendBody = match decode(req).await {
         Ok(b) => b,
         Err(e) => return error_resp(StatusCode::BAD_REQUEST, &format!("invalid body: {e}")),
@@ -720,6 +739,12 @@ async fn handle_compact(state: &Arc<AppState>, req: &mut Request<Incoming>, id: 
     let Some(mut sess) = state.store_call(move |store| store.get(&load_id)).await else {
         return error_resp(StatusCode::NOT_FOUND, "session not found");
     };
+    if !sess.parent_id.is_empty() {
+        return error_resp(
+            StatusCode::CONFLICT,
+            "subagent sessions are managed by their parent",
+        );
+    }
     let body: CompactBody = decode(req).await.unwrap_or_default();
 
     // Mid-turn: interrupt the current model request so handleSend can

@@ -7,4 +7,5 @@ pub mod diff;
 pub mod highlight;
 pub mod links;
 pub mod markdown;
+pub mod math_inline;
 pub mod mermaid;

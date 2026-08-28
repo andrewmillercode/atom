@@ -1468,7 +1468,7 @@ mod tests {
         app.refresh_viewport();
         let term = frame(&mut app, 80, 24);
         let s = text(&term);
-        assert!(s.contains("test-model (none)"), "status bar head");
+        assert!(s.contains("test-model none"), "status bar head");
         assert!(s.contains("hello"), "conversation content");
         assert!(!s.contains("you:"), "user label removed");
         assert_eq!(cell(&term, 1, 21).bg, ansi::c_card_light());
@@ -2062,12 +2062,12 @@ mod tests {
             assert!(!row_text(&term, y).contains('─'));
         }
 
-        // Status bar head is dim-styled, not frame-colored.
+        // Status bar head is foreground-styled, not dim.
         let sx = first_char_x(&term, 28).expect("status bar drawn");
         assert_eq!(
             cell(&term, sx, 28).fg,
-            ansi::c_muted(),
-            "status bar must not fall back to the frame fg"
+            ansi::c_foreground(),
+            "status bar head must use the foreground color"
         );
     }
 

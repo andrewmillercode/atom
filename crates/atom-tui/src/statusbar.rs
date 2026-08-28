@@ -112,23 +112,57 @@ pub(crate) fn truncate_width(text: &str, width: usize) -> String {
     out
 }
 
-fn status_head(app: &App) -> String {
+/// The model head: plain text for width math plus its styled spans
+/// (dim model name, then the thinking level in the primary color).
+#[derive(Clone)]
+struct Head {
+    text: String,
+    spans: Vec<Span<'static>>,
+}
+
+fn head_from_spans(text: String, spans: Vec<Span<'static>>) -> Head {
+    debug_assert_eq!(
+        text_width(&text),
+        spans.iter().map(|s| text_width(&s.content)).sum::<usize>()
+    );
+    Head { text, spans }
+}
+
+fn status_head(app: &App) -> Head {
     let lvl = app.thinking_level();
     if lvl.is_empty() {
-        app.sel_model.clone()
+        head_from_spans(
+            app.sel_model.clone(),
+            vec![Span::styled(
+                app.sel_model.clone(),
+                ansi::style_foreground(),
+            )],
+        )
     } else {
-        format!("{} ({})", app.sel_model, lvl)
+        head_from_spans(
+            format!("{} {}", app.sel_model, lvl),
+            vec![
+                Span::styled(app.sel_model.clone(), ansi::style_foreground()),
+                Span::styled(" ", ansi::style_dim()),
+                Span::styled(lvl, ansi::style_primary()),
+            ],
+        )
     }
 }
 
-fn fitted_status_head(app: &App, width: usize, head: &str) -> String {
-    if text_width(head) <= width {
-        return head.to_string();
+fn fitted_status_head(app: &App, width: usize, head: &Head) -> Head {
+    if text_width(&head.text) <= width {
+        return head.clone();
     }
-    if !app.sel_model.is_empty() {
-        return truncate_width(&app.sel_model, width);
-    }
-    truncate_width(head, width)
+    let text = if !app.sel_model.is_empty() {
+        truncate_width(&app.sel_model, width)
+    } else {
+        truncate_width(&head.text, width)
+    };
+    head_from_spans(
+        text.clone(),
+        vec![Span::styled(text, ansi::style_foreground())],
+    )
 }
 
 fn usage_variants(app: &App, width: usize) -> Vec<String> {
@@ -337,8 +371,8 @@ fn append_suffix(lines: &mut Vec<Line<'static>>, text: &str, style: Style, width
     lines.push(Line::from(Span::styled(truncate_width(text, width), style)));
 }
 
-fn one_line(head: String, usage: Option<String>, suffix: Option<(String, Style)>) -> Line<'static> {
-    let mut spans = vec![Span::styled(head, ansi::style_dim())];
+fn one_line(head: Head, usage: Option<String>, suffix: Option<(String, Style)>) -> Line<'static> {
+    let mut spans = head.spans;
     if let Some(usage) = usage {
         spans.push(Span::styled(format!("  {usage}"), ansi::style_dim()));
     }
@@ -400,12 +434,12 @@ fn secondary_line(
 /// context meter, nav hints, transient suffix), joined by dim gaps. The
 /// nav hints already carry their own internal " / " styling.
 fn one_line_full(
-    head: String,
+    head: Head,
     usage: Option<String>,
     nav: Option<Vec<Span<'static>>>,
     suffix: Option<(String, Style)>,
 ) -> Line<'static> {
-    let mut spans = vec![Span::styled(head, ansi::style_dim())];
+    let mut spans = head.spans;
     if let Some(usage) = usage {
         spans.push(Span::styled(format!("  {usage}"), ansi::style_dim()));
     }
@@ -422,7 +456,7 @@ fn one_line_full(
 /// Returns a single-line status bar when every segment fits in `width`.
 fn try_one_line(
     width: usize,
-    head: &str,
+    head: &Head,
     usage_variants: &[String],
     nav: &[Vec<Span<'static>>],
     suffix: Option<&(String, Style)>,
@@ -433,7 +467,7 @@ fn try_one_line(
         2 + nav_width(nav)
     };
     let suffixw = suffix.map(|(text, _)| 2 + text_width(text)).unwrap_or(0);
-    let headw = text_width(head);
+    let headw = text_width(&head.text);
     let nav_spans_opt = if nav.is_empty() {
         None
     } else {
@@ -442,7 +476,7 @@ fn try_one_line(
     if usage_variants.is_empty() {
         if headw + navw + suffixw <= width {
             return Some(one_line_full(
-                head.to_string(),
+                head.clone(),
                 None,
                 nav_spans_opt,
                 suffix.cloned(),
@@ -452,7 +486,7 @@ fn try_one_line(
         let usage = &usage_variants[0];
         if headw + 2 + text_width(usage) + navw + suffixw <= width {
             return Some(one_line_full(
-                head.to_string(),
+                head.clone(),
                 Some(usage.clone()),
                 nav_spans_opt,
                 suffix.cloned(),
@@ -516,7 +550,7 @@ fn status_bar_layout(app: &App) -> Vec<Line<'static>> {
     let tail_empty = tail
         .iter()
         .all(|line| ansi::line_plain(line).trim().is_empty());
-    if fitted_head.is_empty() {
+    if fitted_head.text.is_empty() {
         if tail_empty {
             vec![one_line(fitted_head, None, None)]
         } else {
@@ -682,7 +716,14 @@ mod tests {
         app.thinking_idx = 1;
         let line = &status_bar_lines(&app)[0];
         let txt = ansi::line_plain(line);
-        assert_eq!(txt, "deepseek-v4 (high)");
+        assert_eq!(txt, "deepseek-v4 high");
+        // model foreground(ish), level primary
+        assert_eq!(line.spans[0].style, ansi::style_foreground());
+        assert_eq!(line.spans[0].content, "deepseek-v4");
+        assert_eq!(line.spans[1].style, ansi::style_dim());
+        assert_eq!(line.spans[1].content, " ");
+        assert_eq!(line.spans[2].style, ansi::style_primary());
+        assert_eq!(line.spans[2].content, "high");
     }
 
     #[test]

@@ -65,6 +65,11 @@ fn theme_color(role: atom_core::render::colors::ThemeColor) -> Color {
 pub fn style_user() -> Style {
     Style::new().fg(c_foreground()).bg(c_card_light())
 }
+/// Default terminal foreground (no fg set), for text that should stand
+/// out from dim chrome like the status bar.
+pub fn style_foreground() -> Style {
+    Style::new()
+}
 pub fn style_primary() -> Style {
     Style::new().fg(c_primary())
 }

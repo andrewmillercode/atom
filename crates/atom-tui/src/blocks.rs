@@ -1021,14 +1021,28 @@ pub fn render_block_linked(
                 out.links.extend(parsed.links);
             }
             if !b.model.is_empty() {
-                let footer = match b.turn_duration {
-                    Some(duration) => {
-                        format!("{} | {}", b.model, format_turn_duration(duration))
-                    }
+                let dur = b.turn_duration.map(format_turn_duration);
+                let plain = match &dur {
+                    Some(dur) => format!("{} {dur}", b.model),
                     None => b.model.clone(),
                 };
-                for row in crate::prompt::wrap_plain(&footer, width.max(1)) {
-                    out.push_blank(Line::from(Span::styled(row, ansi::style_reasoning())));
+                for row in crate::prompt::wrap_plain(&plain, width.max(1)) {
+                    // The duration is extra-muted so it recedes behind the
+                    // model id; wrap_plain may put it on its own row.
+                    let spans = match &dur {
+                        Some(dur) if row.ends_with(dur.as_str()) => {
+                            let head = row[..row.len() - dur.len()].trim_end();
+                            vec![
+                                Span::styled(head.to_string(), ansi::style_reasoning()),
+                                Span::styled(
+                                    format!(" {dur}"),
+                                    ansi::style_reasoning().fg(ansi::c_muted_extra()),
+                                ),
+                            ]
+                        }
+                        _ => vec![Span::styled(row, ansi::style_reasoning())],
+                    };
+                    out.push_blank(Line::from(spans));
                 }
             }
         }
@@ -2564,10 +2578,14 @@ mod render_tests {
 
         let lines = render_block(&mut block, 60, true, "*");
 
-        assert_eq!(ansi::line_plain(lines.last().unwrap()), "model-b | 2m 15s");
+        assert_eq!(ansi::line_plain(lines.last().unwrap()), "model-b 2m 15s");
         assert_eq!(
             lines.last().unwrap().spans[0].style,
             ansi::style_reasoning()
+        );
+        assert_eq!(
+            lines.last().unwrap().spans[1].style,
+            ansi::style_reasoning().fg(ansi::c_muted_extra())
         );
     }
 

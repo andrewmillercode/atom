@@ -72,7 +72,15 @@ fn child_result(child: &Session, include_result: bool) -> serde_json::Value {
 
 fn status_snapshot(batch_id: &str, children: &[Session], include_results: bool) -> String {
     let mut counts = serde_json::Map::new();
-    for name in ["queued", "working", "sandbox", "error", "done", "cancelled"] {
+    for name in [
+        "queued",
+        "working",
+        "sandbox",
+        "error",
+        "done",
+        "cancelled",
+        "stopped",
+    ] {
         counts.insert(
             name.into(),
             json!(children
@@ -91,7 +99,15 @@ fn status_snapshot(batch_id: &str, children: &[Session], include_results: bool) 
 
 fn status_snapshot_info(batch_id: &str, children: &[SessionInfo]) -> String {
     let mut counts = serde_json::Map::new();
-    for name in ["queued", "working", "sandbox", "error", "done", "cancelled"] {
+    for name in [
+        "queued",
+        "working",
+        "sandbox",
+        "error",
+        "done",
+        "cancelled",
+        "stopped",
+    ] {
         counts.insert(
             name.into(),
             json!(children
@@ -822,10 +838,16 @@ async fn maybe_auto_continue_parent(
         .iter()
         .filter(|c| c.status == DelegateStatus::Error)
         .count();
+    let stopped_count = children
+        .iter()
+        .filter(|c| c.status == DelegateStatus::Stopped)
+        .count();
     let total = children.len();
 
     let status_summary = if error_count > 0 {
         format!("{done_count} done, {error_count} errored (out of {total})")
+    } else if stopped_count > 0 {
+        format!("{done_count} done, {stopped_count} stopped by user (out of {total})")
     } else {
         format!("all {total} done")
     };
@@ -843,12 +865,44 @@ async fn maybe_auto_continue_parent(
 
     let parent_thinking = parent_sess.thinking.clone();
     let parent_id_owned = parent_id.to_string();
+    // The child's turn ran with the model plumbing the parent handed to
+    // dispatch — the caller's provider at spawn time. The parent's own
+    // turn must pair its stored model with its own provider: mixing the
+    // child's plumbing with a provider the parent has since switched to
+    // (e.g. the parent dispatched on amazon-bedrock but itself runs on
+    // ollama) sends an invalid model id to the wrong endpoint
+    // ("The provided model identifier is invalid.").
+    let parent_provider = parent_sess.provider.trim().to_string();
+    let (continue_key, continue_base_url, continue_reasoning_field) = if parent_provider.is_empty()
+    {
+        (
+            key.to_string(),
+            base_url.to_string(),
+            reasoning_field.to_string(),
+        )
+    } else {
+        atom_core::providers::modelsdev::ensure_models_dev_catalog().await;
+        match atom_core::providers::providers::build_providers()
+            .await
+            .into_iter()
+            .find(|p| p.name == parent_provider || p.id == parent_provider)
+        {
+            Some(p) => (p.key, p.base_url, p.reasoning_field),
+            // Not a resolvable provider (custom/local): the dispatch
+            // plumbing was the caller's own and is the best guess.
+            None => (
+                key.to_string(),
+                base_url.to_string(),
+                reasoning_field.to_string(),
+            ),
+        }
+    };
     let opts = crate::turn::TurnOpts {
         message: notification,
         thinking: parent_thinking,
-        key: key.to_string(),
-        base_url: base_url.to_string(),
-        reasoning_field: reasoning_field.to_string(),
+        key: continue_key,
+        base_url: continue_base_url,
+        reasoning_field: continue_reasoning_field,
         turn_id: format!("auto-continue-{parent_id_owned}"),
         images: Vec::new(),
         compact: false,

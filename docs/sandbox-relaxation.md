@@ -1,5 +1,8 @@
 # Sandbox Relaxation Design
 
+Note: at the time of writing, sandbox approval from user still gets blocked by seatbelt. Sandbox v2 should fix this.
+
+
 ## Problem
 
 The current sandbox is conservative:

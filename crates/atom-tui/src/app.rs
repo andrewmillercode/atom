@@ -1984,6 +1984,11 @@ impl App {
             self.following = true;
             self.streaming = false;
             self.interrupting = false;
+            // The turn id belongs to the session it was generated for: a
+            // stale id from the previous view would make a pause target a
+            // turn that never exists (e.g. a subagent's "dispatch-<id>"
+            // turn) instead of the session's live turns.
+            self.turn_id = String::new();
             self.manage_restore_from = self.session.id.clone();
             self.hide_manage_menu();
             self.manage_agents.clear();
@@ -2548,6 +2553,17 @@ impl App {
                 self.input.clear_selection();
                 if self.streaming {
                     self.paused = true;
+                    return vec![Effect::PauseTurn];
+                }
+                // A detached subagent turn (dispatch) runs without a TUI
+                // /send stream, so `streaming` stays false while the child
+                // works. Esc in a subagent view must still stop it, with an
+                // empty turn_id: the server registers the child turn as
+                // "dispatch-<child id>", so a stale turn id from a previous
+                // send would only record a pending pause that never fires.
+                if !self.session.parent_id.is_empty() && self.remote_working {
+                    self.paused = true;
+                    self.turn_id = String::new();
                     return vec![Effect::PauseTurn];
                 }
             }
@@ -4343,8 +4359,12 @@ mod tests {
         let mut app = App::new_test(90, 30);
         app.session.parent_id = "parent".into();
         // Typing does nothing — no shell mode either.
-        assert!(app.key(key(KeyCode::Char('x'), KeyModifiers::NONE)).is_empty());
-        assert!(app.key(key(KeyCode::Char('!'), KeyModifiers::NONE)).is_empty());
+        assert!(app
+            .key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+            .is_empty());
+        assert!(app
+            .key(key(KeyCode::Char('!'), KeyModifiers::NONE))
+            .is_empty());
         assert!(!app.shell_mode);
         assert!(app.input.value.is_empty());
         // Enter sends nothing: no SendTurn, no RunShell.
@@ -4355,7 +4375,9 @@ mod tests {
             "subagent views send nothing on Enter: {fx:?}"
         );
         // Backspace/Delete are swallowed too.
-        assert!(app.key(key(KeyCode::Backspace, KeyModifiers::NONE)).is_empty());
+        assert!(app
+            .key(key(KeyCode::Backspace, KeyModifiers::NONE))
+            .is_empty());
     }
 
     #[test]
@@ -4370,6 +4392,33 @@ mod tests {
         );
         // Esc with no live turn just clears selection.
         app.streaming = false;
+        assert!(app.key(key(KeyCode::Esc, KeyModifiers::NONE)).is_empty());
+    }
+
+    #[test]
+    fn subagent_view_esc_pauses_a_detached_turn() {
+        let mut app = App::new_test(90, 30);
+        app.session.parent_id = "parent".into();
+        // A dispatch child never opens a TUI /send stream: streaming stays
+        // false while its turn runs; only remote events mark it working.
+        app.streaming = false;
+        app.remote_working = true;
+        // A turn id left over from a previous send must not leak into the
+        // pause: a non-matching id would only record a pending pause that
+        // never matches the child's "dispatch-<id>" turn.
+        app.turn_id = "stale-turn".into();
+        let fx = app.key(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            matches!(fx.as_slice(), [Effect::PauseTurn]),
+            "Esc stops a detached subagent turn: {fx:?}"
+        );
+        assert!(
+            app.turn_id.is_empty(),
+            "Esc must pause with an empty turn_id, got {:?}",
+            app.turn_id
+        );
+        // No live remote activity: Esc does nothing.
+        app.remote_working = false;
         assert!(app.key(key(KeyCode::Esc, KeyModifiers::NONE)).is_empty());
     }
 

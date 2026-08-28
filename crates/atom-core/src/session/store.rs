@@ -1028,6 +1028,10 @@ fn status_from_str(value: &str) -> rusqlite::Result<DelegateStatus> {
         "error" => Ok(DelegateStatus::Error),
         "done" => Ok(DelegateStatus::Done),
         "cancelled" => Ok(DelegateStatus::Cancelled),
+        // StoppedByUser rows must load: an Esc-stopped dispatch child keeps
+        // its record, and a missing read arm here makes every later load()
+        // fail — the session vanishes from inspect and the TUI 404s on it.
+        "stopped" => Ok(DelegateStatus::Stopped),
         _ => Err(rusqlite::Error::FromSqlConversionFailure(
             0,
             rusqlite::types::Type::Text,
@@ -1298,6 +1302,48 @@ mod tests {
             !store.set_cancelled("missing-session", true),
             "unknown sessions are a no-op"
         );
+    }
+
+    #[test]
+    fn stopped_status_round_trips_through_the_store() {
+        // An Esc-stopped dispatch child keeps its DB row with status
+        // "stopped". Every read path (info, get, children_info) must load
+        // it: a missing arm made load() fail, so the subagent vanished
+        // from dispatch inspect and the TUI 404'd on its session view.
+        let dir = temp_dir("stopped-status");
+        let child = {
+            let store = SessionStore::open_in_dir(&dir).unwrap();
+            let parent = store.create("m", "/tmp", vec![]);
+            let child = store.create_child(
+                &parent.id,
+                "child-a",
+                "/tmp",
+                "high",
+                "",
+                vec![user_msg("First child prompt")],
+            );
+            store.update_delegate_status(&child.id, DelegateStatus::Stopped);
+            assert!(
+                store.get_info(&child.id).is_some(),
+                "index holds the stopped child"
+            );
+            let loaded = store
+                .get(&child.id)
+                .expect("a stopped child must load like any other status");
+            assert_eq!(loaded.status, DelegateStatus::Stopped);
+            assert_eq!(loaded.info().status.as_str(), "stopped");
+            let infos = store.children_info(&parent.id);
+            assert_eq!(infos.len(), 1);
+            assert_eq!(infos[0].status, DelegateStatus::Stopped);
+            child.id
+        };
+        // Reopening the store must not lose it either (startup load_all).
+        let reopened = SessionStore::open_in_dir(&dir).unwrap();
+        let reopened_child = reopened
+            .get(&child)
+            .expect("stopped child survives a store reopen");
+        assert_eq!(reopened_child.status, DelegateStatus::Stopped);
+        let _cleanup = Cleanup(dir);
     }
 
     #[test]

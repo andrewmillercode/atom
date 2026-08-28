@@ -17,8 +17,8 @@ BASE="https://github.com/${REPO}/releases/download"
 OS="$(uname -s)"
 ARCH="$(uname -m)"
 case "$OS" in
-  Darwin|Linux) ;;
-  *) echo "error: unsupported OS: $OS" >&2; exit 1 ;;
+  Darwin) ;;
+  *) echo "error: prebuilt releases are macOS-only (got $OS); build from source with 'make install'" >&2; exit 1 ;;
 esac
 case "$ARCH" in
   arm64|aarch64) ARCH="arm64" ;;

@@ -152,12 +152,26 @@ pub fn draw(app: &mut App, area: Rect, buf: &mut Buffer) -> Option<(u16, u16)> {
     let input_w = app.input_width().min(inner_w).max(1);
     let (rows, cur) = app.input.view(input_w, in_h);
     let pad = card_line(Line::from(""), inner_w, 0);
+    // Shell mode replaces the blank padding above the input with a mode
+    // label so the prompt reads as a shell, not a chat box.
+    let top_line = if app.shell_mode {
+        card_line(
+            Line::from(Span::styled(
+                "shell mode · enter runs a command · ctrl+c exits",
+                ansi::style_dim(),
+            )),
+            inner_w,
+            crate::app::PROMPT_PAD,
+        )
+    } else {
+        pad.clone()
+    };
     write_line(
         buf,
         area.x + 1,
         area.y + geo.prompt_top_y as u16,
         inner_w,
-        &pad,
+        &top_line,
     );
     for (i, row) in rows.iter().enumerate() {
         let y = area.y + (geo.prompt_top_y + crate::app::PROMPT_PAD + i) as u16;
@@ -664,7 +678,7 @@ pub fn working_status_line(app: &App) -> Line<'static> {
     }
     let sep = vec![Span::styled(" / ", ansi::style_prompt_border())];
     let mut spans: Vec<Span> = Vec::new();
-    for (i, s) in segs.into_iter().enumerate() {
+    for (i, (_, s)) in segs.into_iter().enumerate() {
         if i > 0 {
             spans.extend(sep.clone());
         }

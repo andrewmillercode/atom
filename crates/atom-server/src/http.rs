@@ -128,6 +128,8 @@ struct PatchBody {
     provider: String,
     #[serde(default)]
     thinking: Option<String>,
+    #[serde(default)]
+    cwd: String,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -379,14 +381,22 @@ async fn session_item(
             full_body(serde_json::to_value(&sess).unwrap_or(Value::Null))
         }
         "PATCH" => {
-            // Change the model and/or thinking level the session uses.
-            // The conversation history stays; only future turns change.
+            // Change the model, thinking level, or working directory the
+            // session uses. The conversation history stays; only future
+            // turns change.
             let body: PatchBody = decode(req).await.unwrap_or_default();
-            if body.model.is_empty() && body.provider.is_empty() && body.thinking.is_none() {
+            if body.model.is_empty()
+                && body.provider.is_empty()
+                && body.thinking.is_none()
+                && body.cwd.is_empty()
+            {
                 return error_resp(
                     StatusCode::BAD_REQUEST,
-                    "model, provider, or thinking is required",
+                    "model, provider, thinking, or cwd is required",
                 );
+            }
+            if !body.cwd.is_empty() && !std::path::Path::new(&body.cwd).is_absolute() {
+                return error_resp(StatusCode::BAD_REQUEST, "cwd must be an absolute path");
             }
             let patch_id = id.to_string();
             state
@@ -399,6 +409,9 @@ async fn session_item(
                     }
                     if let Some(t) = &body.thinking {
                         store.update_thinking(&patch_id, t);
+                    }
+                    if !body.cwd.is_empty() {
+                        store.update_cwd(&patch_id, &body.cwd);
                     }
                 })
                 .await;

@@ -626,6 +626,32 @@ impl SessionStore {
         }
     }
 
+    /// UpdateCwd moves the session's working directory (shell mode `cd`):
+    /// future turns run the agent's tools from the new directory.
+    pub fn update_cwd(&self, id: &str, cwd: &str) {
+        let _mutation = self.mutation.lock().unwrap();
+        if !self.index.read().unwrap().contains_key(id) {
+            return;
+        }
+        let now = Utc::now();
+        if self
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET cwd = ?1, updated_at = ?2 WHERE id = ?3",
+                params![cwd, now.to_rfc3339(), id],
+            )
+            .is_ok()
+        {
+            // SessionInfo doesn't carry cwd; sessions re-read it from the
+            // store (turn.rs reads sess.cwd per turn).
+            if let Some(info) = self.index.write().unwrap().get_mut(id) {
+                info.updated_at = now;
+            }
+        }
+    }
+
     /// SetCancelled records whether a dispatched subagent was explicitly
     /// killed by its parent (true) or revived by a follow-up (false).
     pub fn set_cancelled(&self, id: &str, cancelled: bool) -> bool {

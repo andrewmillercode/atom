@@ -63,6 +63,12 @@ pub async fn patch_session_thinking(id: &str, thinking: &str) -> Result<Value> {
     atom_server::client::patch(&format!("/api/sessions/{id}"), &body).await
 }
 
+/// patchSessionCwd moves the session's working directory (shell mode `cd`).
+pub async fn patch_session_cwd(id: &str, cwd: &str) -> Result<Value> {
+    let body = json!({"cwd": cwd});
+    atom_server::client::patch(&format!("/api/sessions/{id}"), &body).await
+}
+
 /// deleteSession removes a session permanently.
 pub async fn delete_session(id: &str) -> Result<Value> {
     atom_server::client::delete(&format!("/api/sessions/{id}")).await

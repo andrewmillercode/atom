@@ -229,6 +229,14 @@ pub struct App {
     pub input: Prompt,
 
     pub cwd: String,
+
+    // shell mode (! prefix): typed input runs in the shell instead of
+    // going to the model; `cd` moves the app (and the session) with it.
+    pub shell_mode: bool,
+    pub shell_running: bool,
+    /// Kill switch for the running shell command, armed by the spawned
+    /// task; Ctrl+C sends on it to abort the child process.
+    pub shell_kill: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl App {
@@ -325,6 +333,9 @@ impl App {
             test_scene: -1,
             input: Prompt::new(),
             cwd,
+            shell_mode: false,
+            shell_running: false,
+            shell_kill: None,
         };
         m.refresh_thinking_levels();
         m.apply_thinking(&m.session.thinking.clone());
@@ -1806,7 +1817,7 @@ impl App {
             }
             AppMsg::TickSpinner => {
                 self.spinner_frame = self.spinner_frame.wrapping_add(1);
-                if self.streaming || self.remote_working || self.test_mode {
+                if self.streaming || self.remote_working || self.test_mode || self.shell_running {
                     self.invalidate_live_blocks();
                 }
                 Vec::new()
@@ -1825,6 +1836,19 @@ impl App {
                 crate::outputtest::advance_output_test_scene(self)
             }
             AppMsg::OAuthDone(result) => self.oauth_done(result),
+            AppMsg::ShellKillArmed(tx) => {
+                // Stale senders from an already-finished command are
+                // dropped by the next ShellDone.
+                self.shell_kill = Some(tx);
+                Vec::new()
+            }
+            AppMsg::ShellDone {
+                cmd,
+                output,
+                code,
+                new_cwd,
+                ..
+            } => self.shell_done(cmd, output, code, new_cwd),
             // Handled by the loop before reaching the state machine.
             AppMsg::SubscribeNow(_)
             | AppMsg::HotRebuilt(_)
@@ -2205,6 +2229,13 @@ impl App {
     /// afterInputChange syncs menus/previews after prompt edits.
     pub fn after_input_change(&mut self) -> Vec<Effect> {
         let mut effects = Vec::new();
+        if self.shell_mode {
+            // Shell mode has no slash/@ menus; keep image chips in sync.
+            if preview::sync_pending_from_input(self) {
+                effects.push(Effect::PaintPreviews);
+            }
+            return effects;
+        }
         if (!matches!(self.picker_kind, PickerKind::None)
             || self.context_visible
             || self.reasoning_visible)
@@ -2241,6 +2272,85 @@ impl App {
         effects
     }
 
+    // -- shell mode ----------------------------------------------------------
+
+    /// Submits a shell-mode command: append a running tool block and
+    /// spawn the shell. The result arrives as AppMsg::ShellDone.
+    fn run_shell_command(&mut self, cmd: &str) -> Vec<Effect> {
+        self.shell_running = true;
+        self.err_msg.clear();
+        let mut block = Block::new(BlockKind::Tool);
+        block.title = format!("! {cmd}");
+        block.tool_name = "shell".into();
+        block.tool_done = false;
+        self.blocks.push(block);
+        self.following = true;
+        self.refresh_viewport();
+        vec![Effect::RunShell {
+            cmd: cmd.to_string(),
+            cwd: self.cwd.clone(),
+        }]
+    }
+
+    /// Leaves shell mode, aborting any running command (Ctrl+C, or
+    /// backspacing out of an empty prompt).
+    pub fn exit_shell_mode(&mut self) {
+        self.shell_mode = false;
+        self.shell_running = false;
+        self.input.clear();
+        if let Some(tx) = self.shell_kill.take() {
+            let _ = tx.send(());
+        }
+    }
+
+    /// ShellDone: fill in the running block, then follow a `cd` by moving
+    /// the app's cwd (footer, @-completion, skill discovery) and patching
+    /// the session on the server so the agent's tools move too.
+    fn shell_done(
+        &mut self,
+        cmd: String,
+        output: String,
+        code: Option<i32>,
+        new_cwd: String,
+    ) -> Vec<Effect> {
+        self.shell_running = false;
+        self.shell_kill = None;
+
+        let mut result = output;
+        match code {
+            Some(0) | None => {}
+            Some(exit) => result.push_str(&format!("\nexit code {exit}")),
+        }
+        // Killed commands report code None; say so unless output already
+        // explains itself (spawn errors carry their own message).
+        if code.is_none() && !result.starts_with("error:") {
+            result.push_str("\nkilled");
+        }
+
+        let title = format!("! {cmd}");
+        if let Some(block) = self.blocks.iter_mut().rev().find(|b| {
+            b.kind == BlockKind::Tool && b.tool_name == "shell" && !b.tool_done && b.title == title
+        }) {
+            block.tool_done = true;
+            block.result = result;
+            block.lines = None;
+            self.viewport_dirty = true;
+        }
+
+        let mut effects = Vec::new();
+        if !new_cwd.is_empty() && new_cwd != self.cwd {
+            self.cwd = new_cwd.clone();
+            self.slash_commands = overlays::discover_commands(&self.cwd);
+            if !self.session.id.is_empty() {
+                effects.push(Effect::PatchSessionCwd {
+                    id: self.session.id.clone(),
+                    cwd: new_cwd,
+                });
+            }
+        }
+        effects
+    }
+
     // -- keys ----------------------------------------------------------------
 
     pub fn key(&mut self, k: KeyEvent) -> Vec<Effect> {
@@ -2263,6 +2373,13 @@ impl App {
         let shift = mods.contains(KeyModifiers::SHIFT);
         let ctrl = mods.contains(KeyModifiers::CONTROL);
         let alt = mods.contains(KeyModifiers::ALT);
+
+        // Shell mode: Ctrl+C leaves (aborting a running command) instead
+        // of clearing the prompt / quitting the app.
+        if self.shell_mode && ctrl && matches!(k.code, KeyCode::Char('c')) {
+            self.exit_shell_mode();
+            return Vec::new();
+        }
 
         // Alt/Shift+Enter insert a newline instead of sending; Ctrl+J too.
         if let KeyCode::Enter = k.code {
@@ -2404,6 +2521,25 @@ impl App {
                     return Vec::new();
                 }
                 self.set_menu_visible(false);
+                if self.shell_running {
+                    // One command at a time; the running block's spinner
+                    // shows why the submit is a no-op.
+                    return Vec::new();
+                }
+                if self.shell_mode {
+                    self.input.clear();
+                    return self.run_shell_command(&text);
+                }
+                // `!` prefix enters shell mode; `!cmd` runs right away.
+                if let Some(rest) = text.strip_prefix('!') {
+                    self.shell_mode = true;
+                    let cmd = rest.trim();
+                    if cmd.is_empty() {
+                        return Vec::new();
+                    }
+                    self.input.clear();
+                    return self.run_shell_command(cmd);
+                }
                 return self.handle_input(&text);
             }
             KeyCode::Tab => {
@@ -2445,6 +2581,12 @@ impl App {
                 self.refresh_viewport();
             }
             KeyCode::Backspace => {
+                // Deleting backwards past the start of an empty shell-mode
+                // prompt leaves shell mode.
+                if self.shell_mode && self.input.value.is_empty() {
+                    self.exit_shell_mode();
+                    return Vec::new();
+                }
                 self.input.backspace();
                 return self.after_input_change();
             }
@@ -2456,6 +2598,12 @@ impl App {
             KeyCode::Right => self.input.right(),
             KeyCode::Char(ch) => {
                 if ctrl || alt {
+                    return Vec::new();
+                }
+                // `!` on an empty prompt enters shell mode; the bang
+                // itself is not inserted.
+                if ch == '!' && self.input.value.is_empty() {
+                    self.shell_mode = true;
                     return Vec::new();
                 }
                 self.input.insert_str(&ch.to_string());
@@ -3330,6 +3478,15 @@ impl App {
                     overlays::hover_overlay_row(self, y);
                     Vec::new()
                 }
+                // Wheel scrolls modal overlays by moving the selection the
+                // same way the arrow keys do (scroll follows via the
+                // sticky keep-visible logic).
+                MouseEventKind::ScrollUp => {
+                    self.update_overlay_key(KeyEvent::new(KeyCode::Up, KeyModifiers::empty()))
+                }
+                MouseEventKind::ScrollDown => {
+                    self.update_overlay_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()))
+                }
                 _ => Vec::new(),
             };
         }
@@ -3345,6 +3502,12 @@ impl App {
 
     fn click(&mut self, x: usize, y: usize) -> Vec<Effect> {
         self.link_pending = None;
+        // Status-bar hints are clickable: the subagent indicator opens the
+        // subagent menu (Shift+↓), "Shift ↑ to return" goes to the parent
+        // session, and "esc to close" dismisses an open footer menu.
+        if let Some(action) = self.status_nav_hit(x, y) {
+            return self.run_status_nav_action(action);
+        }
         // Scrollbar click: the rightmost SCROLLBAR_WIDTH columns within the
         // viewport region. The wider target also helps in terminal
         // multiplexer splits where the absolute last column's mouse events
@@ -3585,6 +3748,11 @@ impl App {
     }
 
     fn wheel(&mut self, down: bool, y: usize) -> Vec<Effect> {
+        // An open footer menu owns the wheel: scroll its selection the
+        // same way the arrow keys do (the menu window follows).
+        if self.footer_menu_wheel(down) {
+            return Vec::new();
+        }
         if self.prompt_navigable() && self.mouse_in_prompt(y) {
             let h = self.input_height();
             let total = self.input.content_lines(self.input_width());
@@ -3611,6 +3779,72 @@ impl App {
                 + 2 * PROMPT_PAD
                 + self.input_height()
                 + self.preview_row_count()
+    }
+
+    /// The clickable status-bar hint under a screen position, if any.
+    fn status_nav_hit(&self, x: usize, y: usize) -> Option<crate::statusbar::NavAction> {
+        let geo = crate::view::Layout::compute(self);
+        let row = y.checked_sub(geo.status_y)?;
+        let col = x.saturating_sub(TUI_HPAD);
+        crate::statusbar::nav_hit_regions(self)
+            .into_iter()
+            .find(|(r, c0, c1, _)| *r == row && col >= *c0 && col < *c1)
+            .map(|(_, _, _, action)| action)
+    }
+
+    /// Routes a wheel event to the open footer menu's arrow-key handler.
+    /// Returns false when no menu is open (the wheel then scrolls the
+    /// viewport or prompt as usual).
+    fn footer_menu_wheel(&mut self, down: bool) -> bool {
+        let code = if down { KeyCode::Down } else { KeyCode::Up };
+        if self.context_visible {
+            self.context_key(code).is_some()
+        } else if self.reasoning_visible {
+            self.reasoning_key(code).is_some()
+        } else if !matches!(self.picker_kind, PickerKind::None) {
+            self.picker_key(code).is_some()
+        } else if self.manage_visible {
+            self.manage_key(code).is_some()
+        } else if self.menu_visible {
+            self.menu_key(code).is_some()
+        } else if self.at_menu_visible {
+            self.at_menu_key(code).is_some()
+        } else {
+            false
+        }
+    }
+
+    /// Runs the action bound to a clicked status-bar hint.
+    fn run_status_nav_action(&mut self, action: crate::statusbar::NavAction) -> Vec<Effect> {
+        use crate::statusbar::NavAction;
+        match action {
+            NavAction::OpenSubagents => self.open_manage_menu(),
+            NavAction::ReturnToParent => {
+                if !self.session.parent_id.is_empty() {
+                    vec![Effect::LoadSession {
+                        id: self.session.parent_id.clone(),
+                    }]
+                } else {
+                    Vec::new()
+                }
+            }
+            NavAction::CloseMenu => {
+                if self.context_visible {
+                    self.close_context_menu();
+                } else if self.reasoning_visible {
+                    self.close_reasoning_menu();
+                } else if !matches!(self.picker_kind, PickerKind::None) {
+                    self.close_picker();
+                } else if self.manage_visible {
+                    self.dismiss_manage_menu();
+                } else if self.menu_visible {
+                    self.set_menu_visible(false);
+                } else if self.at_menu_visible {
+                    self.close_at_menu();
+                }
+                Vec::new()
+            }
+        }
     }
 
     pub fn content_pos_at(&self, x: usize, y: usize) -> Option<(usize, usize)> {
@@ -3886,6 +4120,162 @@ mod tests {
         // Ctrl+C still quits.
         let fx = app.key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(matches!(fx.last(), Some(Effect::Quit)));
+    }
+
+    // -- shell mode ----------------------------------------------------------
+
+    #[test]
+    fn bang_enters_shell_mode_and_ctrl_c_exits_without_quitting() {
+        let mut app = App::new_test(90, 30);
+        // `!` on an empty prompt enters shell mode; the bang is not inserted.
+        assert!(app
+            .key(key(KeyCode::Char('!'), KeyModifiers::NONE))
+            .is_empty());
+        assert!(app.shell_mode);
+        assert!(app.input.value.is_empty());
+        // Ctrl+C clears shell mode instead of quitting the app.
+        let fx = app.key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(!app.shell_mode);
+        assert!(!matches!(fx.last(), Some(Effect::Quit)));
+        // `!` mid-text in normal mode is an ordinary character.
+        let mut app = App::new_test(90, 30);
+        app.input.set_value("hi");
+        app.key(key(KeyCode::Char('!'), KeyModifiers::NONE));
+        assert_eq!(app.input.value, "hi!");
+        assert!(!app.shell_mode);
+    }
+
+    #[test]
+    fn backspace_out_of_empty_prompt_exits_shell_mode() {
+        let mut app = App::new_test(90, 30);
+        app.key(key(KeyCode::Char('!'), KeyModifiers::NONE));
+        assert!(app.shell_mode);
+        app.key(key(KeyCode::Backspace, KeyModifiers::NONE));
+        assert!(!app.shell_mode);
+    }
+
+    #[test]
+    fn shell_mode_enter_spawns_command_block() {
+        let mut app = App::new_test(90, 30);
+        app.session.id = "sess1".into();
+        app.key(key(KeyCode::Char('!'), KeyModifiers::NONE));
+        app.input.set_value("echo hi");
+        let fx = app.key(key(KeyCode::Enter, KeyModifiers::NONE));
+        match &fx[..] {
+            [Effect::RunShell { cmd, cwd }] => {
+                assert_eq!(cmd, "echo hi");
+                assert_eq!(cwd, &app.cwd);
+            }
+            other => panic!("unexpected effects {other:?}"),
+        }
+        assert!(app.shell_mode, "mode persists after a command");
+        assert!(app.shell_running);
+        assert!(app.input.value.is_empty());
+        let block = app.blocks.last().unwrap();
+        assert_eq!(block.kind, BlockKind::Tool);
+        assert_eq!(block.tool_name, "shell");
+        assert_eq!(block.title, "! echo hi");
+        assert!(!block.tool_done);
+        // Enter while a command runs is a no-op.
+        app.input.set_value("echo again");
+        assert!(app.key(key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
+    }
+
+    #[test]
+    fn shell_done_fills_block_and_cd_moves_the_app() {
+        let mut app = App::new_test(90, 30);
+        app.session.id = "sess1".into();
+        app.cwd = "/work".into();
+        app.key(key(KeyCode::Char('!'), KeyModifiers::NONE));
+        app.input.set_value("cd /tmp && echo hi");
+        let fx = app.key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(fx[0], Effect::RunShell { .. }));
+
+        let fx = app.handle_msg(AppMsg::ShellDone {
+            cmd: "cd /tmp && echo hi".into(),
+            cwd: "/work".into(),
+            output: "hi\n".into(),
+            code: Some(0),
+            new_cwd: "/tmp".into(),
+        });
+        let block = app.blocks.last().unwrap();
+        assert!(block.tool_done);
+        assert_eq!(block.result, "hi\n");
+        assert!(!app.shell_running);
+        assert_eq!(app.cwd, "/tmp", "app follows the shell's cd");
+        match &fx[..] {
+            [Effect::PatchSessionCwd { id, cwd }] => {
+                assert_eq!(id, "sess1");
+                assert_eq!(cwd, "/tmp");
+            }
+            other => panic!("unexpected effects {other:?}"),
+        }
+        // Unchanged cwd patches nothing, even though no block matches.
+        let fx = app.handle_msg(AppMsg::ShellDone {
+            cmd: "echo again".into(),
+            cwd: "/tmp".into(),
+            output: String::new(),
+            code: Some(0),
+            new_cwd: "/tmp".into(),
+        });
+        assert!(fx.is_empty());
+        assert_eq!(app.cwd, "/tmp");
+    }
+
+    #[test]
+    fn shell_done_reports_nonzero_exit_and_kill() {
+        let mut app = App::new_test(90, 30);
+        app.session.id = "sess1".into();
+        app.key(key(KeyCode::Char('!'), KeyModifiers::NONE));
+        app.input.set_value("false");
+        app.key(key(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_msg(AppMsg::ShellDone {
+            cmd: "false".into(),
+            cwd: app.cwd.clone(),
+            output: String::new(),
+            code: Some(1),
+            new_cwd: String::new(),
+        });
+        assert!(app.blocks.last().unwrap().result.contains("exit code 1"));
+
+        // A killed command (Ctrl+C during a run) marks the block killed.
+        app.key(key(KeyCode::Char('!'), KeyModifiers::NONE));
+        app.input.set_value("sleep 100");
+        app.key(key(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_msg(AppMsg::ShellDone {
+            cmd: "sleep 100".into(),
+            cwd: app.cwd.clone(),
+            output: String::new(),
+            code: None,
+            new_cwd: String::new(),
+        });
+        assert!(app.blocks.last().unwrap().result.contains("killed"));
+    }
+
+    #[test]
+    fn shell_ctrl_c_kills_the_running_command() {
+        let mut app = App::new_test(90, 30);
+        app.key(key(KeyCode::Char('!'), KeyModifiers::NONE));
+        app.input.set_value("sleep 100");
+        app.key(key(KeyCode::Enter, KeyModifiers::NONE));
+        let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+        app.handle_msg(AppMsg::ShellKillArmed(tx));
+        let fx = app.key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(!app.shell_mode);
+        assert!(!matches!(fx.last(), Some(Effect::Quit)));
+        assert!(rx.try_recv().is_ok(), "kill switch fired");
+    }
+
+    #[test]
+    fn bang_prefix_one_shots_into_shell_mode() {
+        let mut app = App::new_test(90, 30);
+        app.input.set_value("!echo hi");
+        let fx = app.key(key(KeyCode::Enter, KeyModifiers::NONE));
+        match &fx[..] {
+            [Effect::RunShell { cmd, .. }] => assert_eq!(cmd, "echo hi"),
+            other => panic!("unexpected effects {other:?}"),
+        }
+        assert!(app.shell_mode, "! prefix leaves shell mode enabled");
     }
 
     #[test]
@@ -4283,6 +4673,137 @@ mod tests {
         };
         let _ = app.mouse(ev);
         assert!(!app.blocks[1].expanded, "second click collapsed the block");
+    }
+
+    #[test]
+    fn click_on_subagent_indicator_opens_manage_menu() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = App::new_test(100, 40);
+        app.session.id = "sess-1".into();
+        app.manage_agents = vec![empty_session_info()];
+        app.refresh_viewport();
+        let geo = crate::view::Layout::compute(&app);
+        let regions = crate::statusbar::nav_hit_regions(&app);
+        assert_eq!(regions.len(), 1, "subagent indicator is clickable");
+        let (row, c0, _, action) = regions[0];
+        assert_eq!(action, crate::statusbar::NavAction::OpenSubagents);
+        let ev = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: (TUI_HPAD + c0) as u16,
+            row: (geo.status_y + row) as u16,
+            modifiers: KeyModifiers::empty(),
+        };
+        let effects = app.mouse(ev);
+        assert!(app.manage_visible, "click opened the subagent menu");
+        assert!(
+            matches!(effects.first(), Some(Effect::ListChildren { .. })),
+            "click listed children: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn click_on_return_hint_loads_parent_session() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = App::new_test(100, 40);
+        app.session.parent_id = "parent-1".into();
+        app.refresh_viewport();
+        let geo = crate::view::Layout::compute(&app);
+        let regions = crate::statusbar::nav_hit_regions(&app);
+        let (row, c0, _, action) = regions[0];
+        assert_eq!(action, crate::statusbar::NavAction::ReturnToParent);
+        let ev = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: (TUI_HPAD + c0) as u16,
+            row: (geo.status_y + row) as u16,
+            modifiers: KeyModifiers::empty(),
+        };
+        let effects = app.mouse(ev);
+        assert!(
+            matches!(
+                effects.first(),
+                Some(Effect::LoadSession { id }) if id == "parent-1"
+            ),
+            "click returned to the parent: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn click_on_esc_hint_closes_open_menu() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = App::new_test(100, 40);
+        app.context_visible = true;
+        app.refresh_viewport();
+        let geo = crate::view::Layout::compute(&app);
+        let regions = crate::statusbar::nav_hit_regions(&app);
+        let (row, c0, _, action) = regions[0];
+        assert_eq!(action, crate::statusbar::NavAction::CloseMenu);
+        let ev = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: (TUI_HPAD + c0) as u16,
+            row: (geo.status_y + row) as u16,
+            modifiers: KeyModifiers::empty(),
+        };
+        let _ = app.mouse(ev);
+        assert!(!app.context_visible, "click closed the open menu");
+    }
+
+    #[test]
+    fn wheel_scrolls_footer_menu_selection() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = App::new_test(100, 40);
+        app.session.id = "sess-1".into();
+        app.manage_agents = (0..5).map(|_| empty_session_info()).collect();
+        let _ = app.open_manage_menu();
+        assert_eq!(app.manage_sel, 0);
+        let ev = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 4,
+            row: 1,
+            modifiers: KeyModifiers::empty(),
+        };
+        let _ = app.mouse(ev);
+        assert_eq!(app.manage_sel, 1, "wheel down moved the menu selection");
+        let ev = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 4,
+            row: 1,
+            modifiers: KeyModifiers::empty(),
+        };
+        let _ = app.mouse(ev);
+        assert_eq!(app.manage_sel, 0, "wheel up moved back");
+        // With the menu closed the wheel no longer touches the selection.
+        app.dismiss_manage_menu();
+        let ev = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 4,
+            row: 1,
+            modifiers: KeyModifiers::empty(),
+        };
+        let _ = app.mouse(ev);
+        assert_eq!(app.manage_sel, 0);
+    }
+
+    #[test]
+    fn wheel_scrolls_modal_overlay_selection() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = App::new_test(100, 40);
+        app.overlay = Some(OverlayKind::Settings);
+        let ev = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 4,
+            row: 2,
+            modifiers: KeyModifiers::empty(),
+        };
+        let _ = app.mouse(ev);
+        assert_eq!(app.overlay_sel, 1, "wheel down moved the overlay selection");
+        let ev = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 4,
+            row: 2,
+            modifiers: KeyModifiers::empty(),
+        };
+        let _ = app.mouse(ev);
+        assert_eq!(app.overlay_sel, 0, "wheel up moved back");
     }
 
     #[test]

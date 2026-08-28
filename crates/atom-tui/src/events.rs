@@ -203,6 +203,18 @@ pub enum Effect {
     OpenLink {
         uri: String,
     },
+    /// Shell mode: run a user-typed command from the session cwd. The
+    /// result comes back as AppMsg::ShellDone.
+    RunShell {
+        cmd: String,
+        cwd: String,
+    },
+    /// Shell mode `cd`: persist the new working directory on the session
+    /// so the agent's tools follow the shell.
+    PatchSessionCwd {
+        id: String,
+        cwd: String,
+    },
     PaintPreviews,
 }
 
@@ -275,6 +287,19 @@ pub enum AppMsg {
     OAuthDone(Result<AuthEntry, String>),
     HotRebuilt(Result<crate::hot::HotBuild, String>),
     ThemeReloaded(Result<std::time::Duration, String>),
+    /// Internal: the spawned shell command armed its kill switch. The App
+    /// stores the sender so Ctrl+C can abort the running command.
+    ShellKillArmed(tokio::sync::oneshot::Sender<()>),
+    /// Shell mode command finished. `code` is None when the command was
+    /// killed; `new_cwd` is the shell's $PWD afterwards ("" when the
+    /// platform wrapper can't report it), letting `cd` move the app.
+    ShellDone {
+        cmd: String,
+        cwd: String,
+        output: String,
+        code: Option<i32>,
+        new_cwd: String,
+    },
 }
 
 impl std::fmt::Debug for AppMsg {
@@ -319,6 +344,10 @@ impl std::fmt::Debug for AppMsg {
             AppMsg::OAuthDone(r) => write!(f, "OAuthDone({r:?})"),
             AppMsg::HotRebuilt(r) => write!(f, "HotRebuilt({r:?})"),
             AppMsg::ThemeReloaded(r) => write!(f, "ThemeReloaded({r:?})"),
+            AppMsg::ShellKillArmed(_) => write!(f, "ShellKillArmed"),
+            AppMsg::ShellDone { cmd, code, .. } => {
+                write!(f, "ShellDone({cmd:?}, code={code:?})")
+            }
         }
     }
 }

@@ -1,272 +1,266 @@
 # Sandbox v2
 
-Rewrite of the bash-command gating system. Replaces the v1
-allow/ask/deny rule ladder + Seatbelt confinement with a three-tier
-escalation model: safe commands run silently, unknown commands get a
-cheap LLM review, and only commands that fail review (or hit a
-guardrail) interrupt the user. LLM reviews fail gracefully and escalate to sandbox if failing.
+Rewrite of bash-command gating. Two stages: a wide static Allow list
+runs commands silently, and anything not on the list prompts the user
+with a clear, terminal-native block. A hardcoded floor of dangerous
+shapes (rm-rf /, dd to devices, sudo, keychain, curl|sh, …) blocks
+even approved commands. No LLM step.
 
 Status: spec. Not implemented.
 
 ## Problem
 
-The v1 sandbox is conservative and interrupts constantly:
-
-- Unknown commands → prompt (blocks the session)
-- Network denied by default — even `curl` to a test server needs approval
-- All builds/installs (`cargo build`, `npm install`) prompt
-- The approval flow is fragile: a kernel-sandbox (Seatbelt) bug can
-  block a command the user already approved
-- File-boundary violations and path escapes each have their own prompt
-  path, producing a patchwork of rules the user can't reason about
-
-The v1 answer to every gray area was "ask." v2's answer is "escalate up
-the chain, and only land on the user as a last resort."
+v1 is conservative and interrupts constantly. Network tools and
+installs always ask, even `cargo build` and `npm install`; the Seatbelt
+confinement can block a command the user already approved; the
+prompt is fine but tiny compared to the noise it produces. v2's answer
+is "be generous about what runs, make the prompt clean when it fires,
+and keep a hard floor that no path can lower."
 
 ## Design
 
-Every bash command is classified into one of three tiers. Failures
-escalate strictly upward: 1 → 2 → 3. Nothing escalates sideways or down.
-
 ```
-Tier 1 — run            known-safe, additive, or user-approved commands
-Tier 2 — auto-review    unknown commands go to a cheap LLM reviewer
-Tier 3 — prompt         the user decides (accept/deny, once/global)
+Static table — Allow  verdict   → run
+Guardrail     — Deny   verdict   → blocked (terminal)
+Static table  — Ask    verdict   → user prompt
+User prompt   — once / all / deny once / deny all
 ```
 
-### Tier 1 — run, no prompt
+No Tier 2 LLM review. The classifier is the rule table plus arg/path
+analysis; the only humans involved are the agent and the user. That
+removes a costly round trip and the largest prompt-injection surface
+in the old design (reviewer input would have been attacker-controlled
+text), at the cost of more prompts for commands the table doesn't
+recognize. The wide table below is what makes the tradeoff pay off.
 
-Commands the static rule table recognizes as additive or read-only.
-Includes, non-exclusively:
+## Tier 1 — wide static allowlist
 
-- Pure reads: `cat`, `head`, `tail`, `ls`, `stat`, `find`, `grep`, `wc`
-- Git reads: `git status|log|diff|show|branch`
-- Builds and checks: `cargo build|check|test|clippy|fmt`, `make`,
-  `npm run`, `gofmt`, `prettier`, `black`
-- Package **installs**: `cargo update|add`, `npm install`, `pip install`
-- **Network**: `curl`, `wget`, `ping` — unconfined, any destination
+A command is Tier 1 only when every token is statically resolvable
+(no `$(…)`, backticks, `<(…)`, `$FOO`, or unexpanded glob-into-flag),
+argv is NFKC-normalized with zero-width chars stripped, and every
+argument that looks like a write target is canonicalized before
+matching (so `/Users/./me` and `..` chains resolve). Flag-vetoed
+shapes — `find -delete/-exec`, `file -f`, `sort -o`, `sed -i`,
+`tar -x`, etc. — drop to the prompt tier even when their bare form
+is Tier 1.
 
-The tier intentionally includes network and installs. This is a posture
-decision, not an oversight: footgunning the agent into a review prompt
-every time it researches or fetches a dependency costs more than the
-occasional bad package, which is reviewable after the fact and cannot
-self-propagate (no confinement, no second tier it can hide in).
+Categories, with the safety argument for each:
 
-A matching **user rule** in `sandbox.json` (`rules.allow`, written by a
-previous "accept all") also lands here.
+**A. Pure reads** — no writes, no network, no side effects.
+`cat head tail less more nl`, `ls tree eza exa lsd`, `find` (no
+`-delete/-exec/-ok`), `stat file du df`, `wc sort uniq cut paste tr
+column fold fmt nl tac rev join comm`, `diff cmp colordiff patch
+--dry-run`, `grep egrep fgrep zgrep rg ag ack fd fdfind`, `awk sed`
+(no `-i`), `jq yq xmllint`, `xxd od hexdump strings`, `md5 md5sum
+shasum sha1sum sha256sum sha512sum cksum`, `base64 -d` (decode only),
+`bc expr`, `which whereis type whence command hash`, `whoami id
+groups hostname uname arch sw_vers date pwd locale true false test
+sleep env printenv` (filtered in prompt — see Environment
+scrubbing).
 
-**Resolvability requirement**: a command is only Tier 1 if every token
-is statically resolvable. Command substitution (`$(…)`), backticks,
-process substitution (`<(...)`), variable references (`$FOO`), or
-unexpanded glob-into-flag shapes mean the table cannot actually see
-what will run — those commands are Tier 2 at best, never Tier 1. This
-closes env-var indirection as a Tier 1 evasion for the guardrail shapes
-above.
+**B. Builds, tests, formatters** — write artifacts to cwd/build dirs.
+`make ninja meson cmake --build`, `cargo build|check|test|clippy|fmt
+|doc|run|bench|clean`, `go build|test|run|vet|mod tidy|mod
+download`, `python -m pytest|unittest`, `pytest ruff mypy pyright
+black isort`, `node tsc ts-node tsx deno test|check|cache`, `bun
+test|run|build`, `npx pnpm run|test|build|exec` (not `pnpm
+publish`), `yarn run|test|build`, `ruby bundle exec rake rspec`,
+`swift build|test|run|package xcodebuild`, `mix compile|test|run
+|docs elixir`, `dotnet build|test|run|restore`, `mvn gradle`, `gofmt
+prettier shellcheck shfmt`.
 
-**Arg verification**: Tier 1 matches the *whole argv*, not just the
-head. Read tools carry execution/write-capable flags that turn them
-into command primitives: `find -exec/-execdir/-delete`, `file
--f/-m`, `sort -o` (writes), an unrecognized flag on any Tier 1 tool.
-Shape-matched but flag-vetoed ⇒ at least Tier 2. A command whose
-analysis cannot be completed (over-long, weird quoting, parse failure)
-prompts — the analyzer must not give up to Tier 1 by default.
+**C. Package installs** — fetches and runs install scripts; the
+postinstall risk is accepted (see Residual risks). `cargo add|update
+|install`, `npm i|install|add|update|ci` (not `npm publish`),
+`pnpm i|install|add|update`, `yarn install|add`, `bun install|add`,
+`pip pip3 pipx`, `uv pip|add|sync|run`, `poetry install|add|update
+|run`, `gem install`, `bundle install`, `go get|install`, `mix
+archive.install`, `dotnet add package|tool install`, `brew
+install|upgrade|reinstall|tap` (mac), `apt apt-get aptitude
+install|update|upgrade` (Linux), `yum dnf zypper pacman apk add`,
+`asdf install`, `nix profile install`. `cargo publish`, `npm
+publish`, `dotnet nuget push` stay at the prompt tier.
 
-**Normalization before matching**: argv is NFKC-normalized with
-zero-width characters stripped before any table or guardrail matching
-(`rm -rf ∼` with U+223C ≠ `~/`); guardrail path shapes match
-**canonicalized absolute paths**, so `/Users/./me`, `..` chains, and
-symlink indirection resolve before comparison.
+**D. Network fetches** — bytes in, no execution. `curl wget http
+httpie`, `gh api glab api`, `ping traceroute mtr`, `dig host
+nslookup whois`, `ssh-keyscan`, `git fetch` (updates
+remote-tracking branches only).
 
-**Generality**: the table intentionally covers only the universal core
-(reads, git reads, cwd ops, the few cross-language tools). It does not
-try to enumerate every language or domain — `mix test`, `dotnet
-publish`, `sips`, `ffmpeg` have no entries and fall to Tier 2, where
-the reviewer generalizes without per-ecosystem rules. Coverage grows
-organically: reviewer allow-verdicts persist as learned rules, and user
-"accept all" decisions persist as allow rules. atom is usable in any
-language (or no language) from first run; Tier 1 just gets sharper the
-longer it runs on your machine.
+**E. Local VCS — additive / reversible** — no force pushes, no
+hard resets, no clean of untracked. `git status|log|diff|show|blame
+|branch|tag|remote|config --get|reflog|ls-files|shortlog|rev-parse
+|describe|worktree|help|version`, `git add`, `git rm --cached`,
+`git mv`, `git commit` (no `--amend`), `git checkout -b`, `git
+switch -c`, `git fetch`, `git worktree add`, `git stash|apply|pop`,
+`git tag`, `git init`, `git revert`, `git merge` (no `-ff-only`
+overrides), `git rebase` (no force). `git push`, `git reset --hard`,
+`git clean -fd`, `git branch -D` stay at the prompt tier.
 
-### Tier 2 — auto-review
+**F. Filesystem additions** — within cwd only; writes outside cwd
+drop to the prompt tier. `mkdir -p`, `touch`, `cp ln mv install
+rsync truncate` (target must not preexist for `cp`/`install`), `tee`,
+`tar -c zip -r gzip bzip2 xz zstd` (creation only), `git init`.
 
-Anything the rule table does not recognize. The command is sent to a
-small, cheap LLM reviewer that decides: run it, or escalate.
+**G. Process / system read-only** — `ps top -l pgrep -l`, `lsof
+netstat ss ifconfig ip`, `mount` (no args), `diskutil list|info|apfs
+list`, `dtrace` read probes, `iostat vm_stat sysctl -n`, `uptime
+launchctl list` (read-only list mode).
 
-The reviewer is a **reviewer swap, not a permission system** — it exists
-to classify the unknown, not to police Tier 1 (see Guardrails for its
-limits). Cursor's Auto-review and Codex's auto-review are the prior art
-to steal from; both use exactly this shape.
+**H. Dev workflow helpers** — `docker ps|images|logs|inspect
+|version|info`, `docker compose build|up|down|ps|logs|config`, `kubectl
+get|describe|logs|version|config view`, `nix build|develop|run|flake
+update`, `make -n` (dry-run).
 
-- **Model**: smallest model with enough reasoning to judge a shell
-  command. Undecided — research Cursor Auto-review (Haiku-class managed
-  model) and Codex auto-review before picking. Runs on the existing
-  provider infra from `atoms`.
-- **Input (v1, single-shot)**: full command line, cwd, workspace root,
-  and the user's current request. Deliberately **not** pasted tool
-  outputs, web pages, or file contents — the reviewer's context is a
-  prompt-injection surface, and the cheapest hardening is to keep
-  attacker-controlled text out of it.
-- **Steering**: plain-English `allow_instructions` /
-  `block_instructions` from config, Cursor-`permissions.json` style.
-- **Verdict**: allow → run. Fishy → escalate to Tier 3. The escalation
-  goes straight to the user prompt (no agent-feedback retry loop in v1).
-- **Learning**: an allow verdict persists a prefix rule (`cargo test
-  *`) to `rules.learned` in `sandbox.json` — prior yes ⇒ yes forever.
-  Constraints, because a poisoned learned rule is silent forever:
-  prefixes are capped at head + one subcommand or flag group
-  (`cargo test *`, never `cargo *`); commands containing unresolvable
-  constructs or protected-path targets are never learned; guardrail
-  families are never learned; and a small **never-learn veto list**
-  excludes verbs whose blast radius outruns any prefix — `git push`,
-  `git remote`, `scp`, `rsync`, `ssh`, cloud/deploy CLIs. Those always
-  re-review or prompt. Learned rules are human-editable/prunable
-  and never override guardrails, user deny rules, or protected paths.
+Commands outside the table are Tier 2 — prompt the user. Same
+shape, same chrome, same prefix-rule growth. The table is the
+default; users widen it through accept-all decisions, never the
+other way.
 
-### Tier 3 — prompt
+## Tier 2 — prompt
 
-The existing approval flow, unchanged mechanically: the client shows the
-command inline as a tool block and blocks indefinitely (no timeout —
-already fixed in v1.5). New decision set:
+The user prompt is the only interruption Tier 1 cannot absorb.
+Existing chrome stays, with refinements listed below.
+
+Decisions:
 
 ```
-[y] accept once   [a] accept all
-[n] deny once     [d] deny all
+[y] accept once    run, no memory
+[a] accept all     run + persist prefix rule
+[n] deny once      error back to the model
+[d] deny all       error now + persist deny rule
+[esc] cancel       error back, nothing persisted
 ```
 
-**Trust chrome.** Prompt text is invariant scaffolding rendered by the
-client: the full command, the cwd, and the decision origin (guardrail /
-Tier 2 review / rule name). Tool output is rendered with terminal
-escape sequences neutralized, so session output can never draw a fake
-approval block, and key presses always belong to the real chrome —
-an injected session cannot phish you into approving B by drawing A.
+Session-scoped grants are gone. Once/all only — the prompt either
+remembers or doesn't, never in between. `[a]` writes a **prefix
+rule** to `sandbox.json` so the command family lands in Tier 1
+forever (e.g. approving `cargo test --release` stores `cargo test
+*`); `[d]` writes a deny rule so the family prompts never again.
 
-- **Accept once** — runs; nothing remembered.
-- **Accept all** — runs, and writes a **prefix rule** to
-  `sandbox.json` so the command family lands in Tier 1 forever
-  (e.g. approving `cargo test --release` stores `cargo test *`).
-  Prefixes generalize at word boundaries only; the prefix is capped so
-  dangerous heads never generalize silently (see Guardrails).
-- **Deny once** — error to the model, it continues with another approach.
-- **Deny all** — error now, and a persistent deny rule: this command
-  family prompts **never** again; the model is told it is blocked.
-- No session-scoped grants anywhere. Once/all only.
+**Trust chrome.** Prompt text is invariant scaffolding rendered by
+the client: full command, cwd, matched rule id, reason, and the
+decision origin (guardrail / arg-veto / unknown-command / rule
+name). Tool output in the prompt block has terminal escapes
+neutralized, so session output can never draw a fake approval row,
+and key presses always belong to the real chrome — an injected
+session cannot phish you into approving B by drawing A.
 
-Replaces the current `[a]/[s]/[g]/[d]` buttons and the `allow_session`
-decision.
+**Subagent provenance.** When the prompt is from a dispatched
+subagent, the parent view surfaces it without navigating into the
+child (carries `from_subagent` + `child_title` on the event); the
+child waits indefinitely; cancel propagates up.
 
-### Guardrails (static escalation floor)
+**Editable prefix on accept-all.** `[a]` shows the resulting
+prefix before persisting ("this would let all `cargo test`
+invocations run unprompted"); the user can adjust or back out.
+Dangerous heads (`rm`, `git push`, `sudo`, `chmod -R`,
+`network-to-interpreter` shapes) are flagged but not blocked —
+accepting still works, the warning is informational.
 
-A hardcoded pattern list that **overrides every other decision except
-the user's**: a match is forced up to Tier 3, no matter what the
-reviewer says. This is the reviewer's guardrail — it saves the reviewer
-from having to reason about catastrophic shapes, saves tokens, and
-means the reviewer can never talk a destructive command down to Tier 1
-or 2.
+**Help line.** A single dim line under the buttons lists every key
+binding, the prefix-rule preview, and a one-line "press ? for
+details" hint that expands each decision into its long form in a
+modal overlay.
 
-Guardrail match ⇒ Tier 3 prompt (not a hard deny — the user still
-decides, and can deny-all it permanently).
+**Audit.** Every prompt and decision is written to `sandbox-audit.log`
+alongside the existing verdict record — `[a]` and `[d]` lines
+include the rule added, so denials and grants can be reviewed.
 
-Initial list:
+## Guardrails (Deny floor)
 
-- Recursive/forced deletes targeting `$HOME`, system roots, or outside
-  the workspace (`rm -rf /...`, `rm -rf ~`)
-- Disk-level tools: `dd`, `mkfs`, `diskutil erase*`, `mount`
-- Privilege/permission escalation: `sudo`, `chmod`, `chown`
-- Process-kill tools: `kill`, `killall`, `pkill` — any variant, any
-  target. A wrong process name can take down the session or system
-  daemons, so there is no safe subset.
-- Credential exfil shapes: file-bearing network payloads — `curl|nc -d @…`,
-  `-T`, `--data-binary`, `<` redirections — referencing `$HOME`,
-  protected paths, or dotfiles, and piping `~/.ssh/*`, `.env`,
-  keychains, or token-shaped args into network tools.
-- Keychain access: `security find-*`, `security dump-keychain` —
-  one command exports every stored secret.
-- Network-to-interpreter pipes: `curl … | sh|bash|zsh|python`,
-  `wget -O - … | sh` — remote-download-then-execute in one line.
-- System services and automation: `osascript`, `launchctl`,
-  `crontab`, `defaults write` outside the workspace.
+A hardcoded pattern list that overrides every other decision: a
+match is blocked outright, no prompt, even for a user who has
+accepted the command before. The floor is what makes "wide Tier 1"
+safe — the table can be generous because the floor catches the
+shapes that matter.
 
-The reviewer may still escalate *additional* commands to Tier 3 on
-its own judgment — guardrails only set a floor.
+- Recursive/forced deletes targeting `$HOME`, system roots, or
+  outside the workspace: `rm -rf /`, `rm -rf ~`, `rm -rf $HOME`,
+  fork-bomb `:(){ :|:& };:`
+- Disk-level: `dd of=/dev/*`, `mkfs*`, `diskutil erase*|apfs|hfs`,
+  `mount` with device
+- Privilege escalation: `sudo`, `su`, `doas`, `pfexec`, `dzdo`,
+  `csrutil`, `nvram`, `pmset`, `kextload/unload/util`, `spctl`,
+  `installer`, `dscl`
+- Process kill: `kill`, `killall`, `pkill` — any variant, any
+  target. A wrong name takes down the session or system daemons;
+  there is no safe subset.
+- System services and automation: `osascript`, `launchctl`
+  (mutating forms), `crontab`, `defaults write` outside the
+  workspace, `shutdown`, `reboot`, `halt`, `poweroff`, `init`,
+  `telinit`
+- Credential exfil shapes: network tools with file-bearing
+  payloads — `curl|nc -d @…`, `-T`, `--data-binary`, `<` redirections
+  — referencing `$HOME`, protected paths, or dotfiles, and piping
+  `~/.ssh/*`, `.env`, keychains, or token-shaped args into network
+  tools
+- Keychain: `security dump-keychain`, `security find-*` (any)
+- Network-to-interpreter: `curl … | sh|bash|zsh|python`,
+  `wget -O - … | sh`
+- Path escape write: any write-prog (`touch mkdir cp mv rm ln tee
+  truncate install rsync dd`) targeting `/System`, `/bin`,
+  `/sbin`, `/usr`, `/etc`, `/private/etc`, `/boot`, or any
+  symlink whose target resolves there
 
-### Protected paths (write floor, all tools)
+Guardrail matches are logged but never reduced by `[a]` or any
+prefix rule — a deny rule written by `[d]` is the only way to
+silence a guardrail, and only when the user does so deliberately.
 
-A small set of paths no tier may write and **no tool** — bash or file
-tools — may modify without a prompt. This is the anti-self-escalation
-floor: an agent that could edit its own gate owns the gate.
+## Protected paths (Tier 1 floor, all tools)
 
-- atom's own state: `dataDir()` (`sandbox.json`, approval/learned-rule
-  stores) and the atom config dir
+No tier may write these without a prompt. This is the
+anti-self-escalation floor — an agent that could edit its own gate
+owns the gate.
+
+- atom's own state: `dataDir()` (`sandbox.json`, `approvals.json`,
+  audit log) and the atom config dir
 - Shell startup files: `~/.zshrc`, `~/.zshenv`, `~/.zprofile`,
-  `~/.bashrc`, `~/.bash_profile`, fish config — a tier-1 `echo >>` or
-  file-tool edit here persists attacker code into every future shell
+  `~/.bashrc`, `~/.bash_profile`, fish config — a Tier 1
+  `echo >>` or file-tool edit here persists attacker code into
+  every future shell
 - Anything on `$PATH`: `~/.local/bin`, `/usr/local/bin`,
-  `/opt/homebrew/bin` — a tier-1 `cp` of a shim over a trusted binary
-  turns later tier-1 runs into attacker code
+  `/opt/homebrew/bin`, any other `PATH` entry — a Tier 1 `cp` of a
+  shim over a trusted binary turns later Tier 1 runs into attacker
+  code
 - `~/.ssh` (writes; reads remain per the open posture)
-- `.git/hooks/` in any repository the agent touches — a planted hook
-  turns every later `git commit` into host-level code execution
+- `.git/hooks/` in any repository the agent touches — a planted
+  hook turns every later `git commit` into host-level code
+  execution
 
-Protected-path matching also checks **symlink targets**: a write whose
-destination or any path component resolves into a protected tree is
-protected, wherever the link lives.
+Protected-path matching checks symlink targets too: a write whose
+destination or any path component resolves into a protected tree
+is protected, wherever the link lives. Bash-side writes to
+protected paths escalate to the prompt tier regardless of the
+static rule; the file tools enforce the same floor (writes to
+`sandbox.json` from `edit_file` would otherwise bypass the gate).
 
-Protected-path writes are **Tier 3, always** — they cannot be
-pre-allowed by `rules.allow` or `learned` entries, only accepted
-per-operation (or silenced via deny-all).
+## Environment scrubbing
 
-### Environment scrubbing
-
-Bash subprocesses run with a **scrubbed environment**: provider
+Bash subprocesses run with a scrubbed environment: provider
 credentials (`ANTHROPIC_*`, `OPENAI_*`, `GITHUB_TOKEN`, and
-token-shaped variables such as `*_TOKEN`, `*_KEY`, `*_SECRET`, `*_PASSWORD`)
-are unset before every command runs. The shell inheritance path —
-`printenv`, `env`, `$ENV_VAR` indirection — is otherwise the cheapest
-credential-exfiltration channel in the whole design, and it needs no
-static evasion at all. Scrubbing is deterministic, zero-prompt, and
-composes with the exfil guardrails instead of relying on them.
+token-shaped `*_TOKEN`, `*_KEY`, `*_SECRET`, `*_PASSWORD`) are
+unset before every command runs. `printenv` and `env` output is
+filtered so the agent can't read what was scrubbed. The shell
+inheritance path is otherwise the cheapest credential-
+exfiltration channel in the whole design and needs no static
+evasion; scrubbing is deterministic, zero-prompt, and composes
+with the exfil guardrails instead of relying on them.
 
-### Compound commands
+## Compound commands
 
-Segment on top-level `&&`, `||`, `;`, `|` (existing tokenizer). Each
-segment is classified independently; the command runs only if every
-segment clears, and the highest tier among segments wins. A Tier 1 +
-Tier 3 mixture prompts once for the whole command line.
+Segment on top-level `&&`, `||`, `;`, `|` (existing tokenizer).
+Each segment is classified independently; the command runs only if
+every segment clears, and the highest tier among segments wins. A
+Tier 1 + Tier 2 mixture prompts once for the whole command line.
 
-**Wrapper unwrapping**: interpreters and exec wrappers — `bash`,
-`sh`, `zsh -c`, `env`, `nice`, `timeout`, `nohup`, bare `xargs` — are
-unwrapped recursively before classification: the real command (for
-`-c`-style shells, the parsed string) is what gets tiered. `bash
-killall Dock` is a `killall`, never a Tier 1 "shell". A wrapper the
-unwrapper cannot see through is Tier 2 by default. Without this,
-`bash <anything>` is an unclimbable blind spot in the table and an
-ambiguous input to the reviewer.
-
-## What is removed
-
-- **Seatbelt / kernel confinement entirely.** No `sandbox-exec`
-  profiles, no confinement matrix, no `network` policy knob. Tiers +
-  review + user decisions are the whole system. This also kills the
-  "approved command still blocked by seatbelt" defect class. If a
-  kernel backstop is ever wanted again, it can be reintroduced around
-  Tier 2 only (the softest decision in the chain) — noted, not designed.
-- **Session-scoped approvals** (`allow_session`, `ApprovalStore`
-  sessions, `[s]` button).
-- **Trust-tier permission matrix, confinement profiles, sticky mode,
-  batch mode, audit log, directory-trust config** — all v1 spec ideas
-  that the escalation model supersedes.
-- **Gate on file tools — except protected paths.**
-  `read_file`/`write_file`/`edit_file` stay ungated for ordinary files;
-  v2 guards bash. But writes to **protected paths** (atom's own
-  `sandbox.json`, shell rc files, `$PATH` dirs, `~/.ssh`) go through
-  the gate regardless of which tool performs them — otherwise the agent
-  edits its own config with `edit_file` and self-escalates. Bash-side
-  writes outside the workspace are handled by classification: additive
-  writes (`mkdir -p`, `cp` to a new path) are Tier 1; destructive
-  shapes (`rm`, `mv` over existing targets) are reviewer/prompt
-  territory.
-- **`sandbox.json` v1 fields**: `mode` (off/workspace/strict), `network`,
-  `extra_writable`, `extra_readonly`. One behavior for everyone.
+**Wrapper unwrapping.** Interpreters and exec wrappers —
+`bash`, `sh`, `zsh -c`, `env`, `nice`, `timeout`, `nohup`, bare
+`xargs` — are unwrapped recursively before classification: the
+real command (for `-c`-style shells, the parsed string) is what
+gets tiered. `bash killall Dock` is a `killall`, never a Tier 1
+"shell". A wrapper the unwrapper cannot see through drops to the
+prompt tier. Without this, `bash <anything>` is an unclimbable
+blind spot in the table.
 
 ## Configuration
 
@@ -275,88 +269,106 @@ ambiguous input to the reviewer.
 ```json
 {
   "version": 2,
-  "auto_review": {
-    "enabled": true,
-    "model": null,
-    "allow_instructions": [],
-    "block_instructions": []
-  },
   "rules": {
-    "allow": ["cargo test *", "git push *"],
-    "learned": ["mix test *"],
+    "allow": ["cargo test *", "git push origin *"],
     "deny":   ["rm * ~"]
   }
 }
 ```
 
-- `model`: reviewer override; `null` = built-in default (TBD).
-- `allow` / `deny` rules: command-prefix globs, human-editable. `allow`
-  → Tier 1, `deny` → Tier 3 prompt with the rule name given as reason.
-- `learned`: prefix rules written automatically by Tier 2 reviewer
-  allow-verdicts. Treated as `allow` with lower provenance: guardrails
-  and `deny` rules always win over `learned` entries.
-- `allow_instructions` / `block_instructions`: plain-English steering
-  for the reviewer.
-- Guardrails are hardcoded, not config: they are the floor the config
+- `allow` → Tier 1; `deny` → prompt with rule name given as reason.
+- Allow/deny rules are command-prefix globs, human-editable, and
+  carry higher provenance than the table: a deny beats both, an
+  allow beats a Tier 2 verdict, neither beats a guardrail.
+- Guardrails are hardcoded, not config — the floor the config
   cannot lower.
-- **Migration**: one-time load of v1 `sandbox.json` + `approvals.json`;
-  existing global grants become `allow` prefix rules; v1 fields are
+- Migration: load v1 `sandbox.json` + `approvals.json` once;
+  existing global grants become `allow` prefix rules; v1 fields
+  (`mode`, `network`, `extra_writable`, `extra_readonly`) are
   dropped. Missing file = defaults.
-- **Concurrency**: many atom clients/servers run against one
-  `sandbox.json`. All rule writes go through a single-writer lock and
-  atomic temp-file + rename, and writers re-read before append so
-  concurrent sessions never drop each other's rules.
+- Concurrency: many atom clients/servers share one `sandbox.json`.
+  Rule writes go through a single-writer lock and atomic
+  temp-file + rename; writers re-read before append so concurrent
+  sessions never drop each other's rules.
 
 ## Implementation map
 
-- `atom-sandbox`: delete `seatbelt.rs`; drop confinement from `exec.rs`;
-  `rules.rs` verdicts become tier classification (Allow→1, Ask→2,
-  fallback→2, guardrail match→3); `approvals.rs` loses session grants.
-- New: reviewer module (`atom-sandbox` or `atom-server`) — provider call,
-  steering instructions, timeout → escalate.
-- `atom-tui`: `approval_buttons()` → the new four-button set; verdict
-  display notes which tier/rule fired.
-- `atom-server/http.rs`: decision decoding loses `allow_session`.
+- `atom-sandbox`: delete `seatbelt.rs` and the `confined` field
+  from `ExecOutcome`; `policy.rs` collapses to
+  `SandboxConfig { rules: { allow, deny } }`; `rules.rs` widens
+  the Allow table to categories A–H; arg-veto lists drop
+  matched-flag commands to the prompt tier.
+- `atom-sandbox/exec.rs`: the pipeline becomes
+  `analyze → guardrail floor → approval gate → spawn`; Seatbelt
+  paths deleted; environment scrubbing happens in `spawn_*`
+  helpers.
+- `atom-sandbox/approvals.rs`: `Decision` loses `AllowSession`;
+  `AllowOnce`/`AllowAll`/`DenyOnce`/`DenyAll`; global grants are
+  the only persisted ones, written through the same lock as
+  config rules.
+- `atom-tui`: `approval_buttons()` switches to `[y]/[a]/[n]/[d]`
+  + Esc; the prefix-rule preview pane and help line are new
+  blocks in the approval render path; verdict display notes the
+  matched rule id and tier origin (guardrail / arg-veto /
+  unknown-command / rule-name).
+- `atom-server`: `approval_request_event` carries an `origin`
+  field so the chrome can attribute the prompt; the decision
+  router accepts the four-button decision set.
 
 ## Open questions (pre-implementation)
 
-1. Reviewer model choice; latency budget (should be ≲ 2s end to end).
-2. Prefix-rule generalization rules for "accept all" — exact
-   algorithm for where the wildcard lands (two-word default, flag-token
-   exceptions, cap for dangerous heads like `rm`).
-3. Whether the reviewer verdict is displayed inline (a small
-   `reviewed: ok` line in the tool block) or only on escalation.
+1. Exact command lists per category — the above is the spec
+   outline; the implementation table will pin the entries and
+   their arg-any / arg-all constraints.
+2. Prefix-rule generalization algorithm on accept-all: where the
+   wildcard lands (two-word default, flag-token exceptions, cap
+   for dangerous heads).
+3. Whether the prefix-rule preview is inline in the prompt block
+   or a sub-step the user navigates into.
+4. Audit-log retention and rotation policy.
+5. Whether `osascript` / `launchctl` mutating forms deserve a
+   separate "automation" category with a softer floor (prompt
+   instead of deny), since power users routinely call these.
 
 ## Residual risks (accepted, by posture decision)
 
-v2 removes the kernel backstop and keeps network + installs unconfined.
+v2 removes Seatbelt and keeps network + installs unconfined.
 These follow from that and are documented, not unknown:
 
-1. **Creative exfiltration via Tier 1.** Reads are Tier 1, network is
-   Tier 1, and static shape matching cannot enumerate encodings. An
-   injected agent that reads a secret and sends it out through a shape
-   the exfil guardrail doesn't list (base64 indirection, heredoc into
-   an unlisted tool, a Tier 1 interpreter the table trusts) can
-   exfiltrate data. The two big cheap channels are closed anyway —
-   subprocess environments are scrubbed and keychain access is
-   guardrailed — so what's left is file content the user can already
-   read, and the guardrail list is expected to grow with real cases.
-2. **Install-script code execution.** `npm install`/postinstall runs
-   arbitrary code at Tier 1, and without confinement it can do
-   anything that code wants on first run. Accepted: malicious packages
-   are post-hoc reviewable and cannot pre-stage broad persistence
-   (rc/PATH/atom-config/.git-hook writes are protected paths;
-   kill/automation/keychain tooling is guardrailed). Same posture
-   covers executing downloaded scripts: never Tier 1, reviewer cannot
-   read the script's contents, so expect escalation to a prompt — if
-   the reviewer must ever inspect a script, that is a deliberate
-   extension with its own injection analysis.
-3. **Reviewer misclassification.** The reviewer is an LLM; both false
-   allows and false escalations happen, and its input could still carry
-   injection through the command string itself. It is best-effort
-   convenience over the hard floors, never the boundary.
-4. **Denial-of-work via guardrails.** The floor prompts on broad
-   classes (`kill`, `osascript`); a task legitimately needing them
-   costs one prompt and prefix-rule each in early sessions. Friction
-   is the price of the floor, not a defect — the relief valves are
-   prefix rules (accept all) and pruning deny rules.
+1. **Creative exfiltration via Tier 1.** Reads are Tier 1,
+   network is Tier 1, and static shape matching cannot enumerate
+   encodings. An injected agent that reads a secret and sends it
+   out through a shape the exfil guardrail doesn't list (base64
+   indirection, heredoc into an unlisted tool, a Tier 1
+   interpreter the table trusts) can exfiltrate data. The two big
+   cheap channels are closed — subprocess environments are
+   scrubbed and keychain access is guarded — so what's left is
+   file content the user can already read, and the guardrail list
+   is expected to grow with real cases.
+2. **Install-script code execution.** `npm install`/postinstall
+   runs arbitrary code at Tier 1, and without confinement it can
+   do anything that code wants on first run. Accepted: malicious
+   packages are post-hoc reviewable and cannot pre-stage broad
+   persistence (rc/PATH/atom-config/.git-hook writes are
+   protected paths; kill/automation/keychain tooling is
+   guarded).
+3. **Prompt fatigue.** The wide table reduces prompts but does
+   not eliminate them. Users who reflexively `[a]` on every
+   prompt widen Tier 1 toward unsafe shapes. The danger is
+   visible in the chrome (prefix preview, dangerous-head flag)
+   but not enforced — accept-all is a user choice, not a
+   recommendation.
+4. **Under-classification of niche ecosystems.** Languages and
+   tools the table doesn't list fall to the prompt tier; a
+   workflow heavy on, say, `zig build` or `terraform plan` will
+   prompt on every invocation. The wide Tier 1 grows with the
+   ecosystem over time as users accept-all their common shapes;
+   the spec starts with the universal core.
+5. **Guardrail miscategorization.** Putting a verb in the
+   guardrail list is a one-way door in practice — even deny
+   rules written by `[d]` cannot silence it. Decisions like
+   `kill` (which has safe subsets — `kill $!` after a forked
+   subprocess) and `defaults write` (which is innocuous inside
+   the workspace) are honest tradeoffs; the floor costs one
+   prompt per legitimate use. Acceptance: friction is the price
+   of the floor.

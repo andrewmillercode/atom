@@ -2309,9 +2309,16 @@ impl App {
         self.blocks.push(block);
         self.following = true;
         self.refresh_viewport();
+        // The PTY's winsize lets paginators (`git log`, `man`, `ls -l`)
+        // pick the same width the user is reading, so wrapping matches
+        // the viewport rather than a hardcoded 80.
+        let rows = self.height.max(1);
+        let cols = self.width.max(1);
         vec![Effect::RunShell {
             cmd: cmd.to_string(),
             cwd: self.cwd.clone(),
+            cols,
+            rows,
         }]
     }
 
@@ -4217,9 +4224,16 @@ mod tests {
         app.input.set_value("echo hi");
         let fx = app.key(key(KeyCode::Enter, KeyModifiers::NONE));
         match &fx[..] {
-            [Effect::RunShell { cmd, cwd }] => {
+            [Effect::RunShell {
+                cmd,
+                cwd,
+                cols,
+                rows,
+            }] => {
                 assert_eq!(cmd, "echo hi");
                 assert_eq!(cwd, &app.cwd);
+                assert_eq!(*cols, app.width);
+                assert_eq!(*rows, app.height);
             }
             other => panic!("unexpected effects {other:?}"),
         }

@@ -5,7 +5,9 @@
 use crate::dispatch::{self, DispatchPlan};
 use crate::file_edit::FileSeen;
 use crate::mcp;
-use crate::{file_edit, read_file, search, skills, vector_search, visualize, web_search};
+use crate::{
+    file_edit, read_file, search, skills, vector_search, visualize, web_fetch, web_search,
+};
 use atom_core::types::ImageData;
 use atom_sandbox::approvals::Approver;
 use atom_sandbox::policy::SandboxConfig;
@@ -112,6 +114,7 @@ pub async fn execute_tool(ctx: &ToolCtx<'_>, name: &str, args_json: &str) -> Too
             };
             ToolOutcome::from_text(web_search::web_search(&args.query, &ctx.cwd).await)
         }
+        "webfetch" => web_fetch::web_fetch(args_json, ctx).await,
         "vector_search" => {
             ToolOutcome::from_text(vector_search::vector_search(args_json, &ctx.cwd).await)
         }

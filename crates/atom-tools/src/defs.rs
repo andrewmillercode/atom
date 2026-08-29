@@ -23,6 +23,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDef> {
             "Search web for current info. Returns titles, URLs, snippets. Use when user asks about current events or info not in training data. Keep query concise, then answer from results.",
             r#"{"type":"object","properties":{"query":{"type":"string","description":"Search query"}},"required":["query"]}"#,
         ),
+        webfetch_def(),
         def(
             "read_file",
             "Read file, returns window of lines (offset default 0, limit default 1000). After this, edit_file and write_file may be used on path. If file changes on disk later, those tools return short diff — do not re-read whole file. Images (png, jpg, gif, webp, bmp) return as image for vision models.",
@@ -50,6 +51,14 @@ pub fn builtin_tool_definitions() -> Vec<ToolDef> {
         dispatch_def(),
         skill_def(),
     ]
+}
+
+pub fn webfetch_def() -> ToolDef {
+    def(
+        "webfetch",
+        "Fetch a single URL and return its content. Format: markdown (default), text, or html. Use when you already have the URL and want its content; use web_search to find URLs first. Read-only. 5MB max, 30s default timeout (max 120s). Bot-challenged sites (Cloudflare, Anubis) may still block.",
+        r#"{"type":"object","properties":{"url":{"type":"string","description":"The URL to fetch (http or https)"},"format":{"type":"string","enum":["markdown","text","html"],"description":"Output format. Default markdown."},"timeout":{"type":"integer","description":"Timeout in seconds, max 120. Default 30."}},"required":["url"]}"#,
+    )
 }
 
 pub fn vector_search_def() -> ToolDef {
@@ -144,6 +153,7 @@ mod tests {
             names,
             vec![
                 "web_search",
+                "webfetch",
                 "read_file",
                 "write_file",
                 "edit_file",
@@ -156,7 +166,7 @@ mod tests {
                 "skill",
             ]
         );
-        assert_eq!(crate::tool_definitions().len(), 11);
+        assert_eq!(crate::tool_definitions().len(), 12);
     }
 
     #[test]
@@ -182,7 +192,7 @@ mod tests {
         assert_eq!(without_tool(&tools, "dispatch").len(), tools.len());
         // Stripping everything but keeping order otherwise.
         let no_bash = without_tool(&crate::tool_definitions(), "bash");
-        assert_eq!(no_bash.len(), 10);
-        assert_eq!(no_bash[4].function.name, "vector_search");
+        assert_eq!(no_bash.len(), 11);
+        assert_eq!(no_bash[4].function.name, "edit_file");
     }
 }

@@ -10,9 +10,9 @@ use atom_core::providers::codex::{
     do_openai_codex_round, marshal_openai_codex_request, openai_codex_auth_for_key,
 };
 use atom_core::providers::{
-    anthropic_style_for_url, bedrock_style_for_url, context_window_tokens,
+    anthropic_style_for_url, api_protocol_for, bedrock_style_for_url, context_window_tokens,
     model_supports_image_input, provider_name_for_url, reasoning_field_for_url, stream_anthropic,
-    stream_bedrock, stream_chat,
+    stream_bedrock, stream_chat, stream_responses, APIProtocol,
 };
 use atom_core::session::compaction::{
     compact_session, compact_span, compaction_prompt_text, compaction_target, compaction_threshold,
@@ -24,7 +24,7 @@ use atom_core::types::{
     ChatRequest, Message, StreamOptions, StreamResult, StreamToolCallDelta, ToolCall,
 };
 use atom_tools::defs::without_tool;
-use chrono::Local;
+use chrono::{Local, Utc};
 use futures::{FutureExt, Stream, StreamExt};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -144,6 +144,10 @@ impl ToolCallAccumulator {
     /// that can't be appended to the accumulated string.
     pub fn add(&mut self, d: &StreamToolCallDelta) {
         let mut existing = self.by_index.get(&d.index).copied();
+        // Some routers stream an empty arguments object as a placeholder
+        // and send the real object in a later delta; the placeholder must
+        // be overwritten, not treated as a second call.
+        let mut replace_args = false;
         if let Some(i) = existing {
             let e = &self.calls[i];
             // A delta naming a different call ID than the one at this index
@@ -157,8 +161,13 @@ impl ToolCallAccumulator {
                 && !json_valid(&format!("{}{}", e.function.arguments, d.function.arguments))
             {
                 // Two complete JSON objects can't form one argument string:
-                // the delta is a second call reusing this index.
-                existing = None;
+                // the delta is a second call reusing this index — unless the
+                // first is just an empty placeholder object.
+                if e.function.arguments == "{}" {
+                    replace_args = true;
+                } else {
+                    existing = None;
+                }
             }
         }
         let Some(i) = existing else {
@@ -184,7 +193,11 @@ impl ToolCallAccumulator {
         if e.function.name.is_empty() && !d.function.name.is_empty() {
             e.function.name = d.function.name.clone();
         }
-        e.function.arguments += &d.function.arguments;
+        if replace_args {
+            e.function.arguments = d.function.arguments.clone();
+        } else {
+            e.function.arguments += &d.function.arguments;
+        }
     }
 
     /// list returns the accumulated tool calls in the order their first
@@ -655,6 +668,7 @@ pub async fn run_session_turn(
             role: "user".into(),
             content: opts.message.clone(),
             images: opts.images.clone(),
+            created_at: Some(Utc::now()),
             ..Default::default()
         });
         // Persist the session log now so the user message is on the
@@ -691,6 +705,11 @@ pub async fn run_session_turn(
 
     let cwd = PathBuf::from(sess.cwd.clone());
     let mut tools = atom_tools::tool_definitions_with_mcp(&cwd).await;
+    // Deferred MCP catalogs surface a single search entry point instead
+    // of flooding the context with every server tool.
+    if atom_tools::has_deferred_tools(&cwd).await {
+        tools.push(atom_tools::defs::find_tool_def());
+    }
     if !parent_id.is_empty() {
         tools = without_tool(&tools, "dispatch");
     }
@@ -985,6 +1004,107 @@ pub async fn run_session_turn(
                     return;
                 }
             }
+        } else if api_protocol_for(&provider, &sess.model) == APIProtocol::OpenAIResponses {
+            // OpenAI Responses API: POST {base}/responses. Picked for
+            // opencode-hosted models with models.dev npm =
+            // "@ai-sdk/openai" — most visibly
+            // muse-spark-1.2-contributor-free on OpenCode's Zen tier
+            // (https://opencode.ai/zen/v1). Chat Completions on the
+            // same base URL answers with a generic Internal server
+            // error and drops the request, so the protocol routing
+            // here is what makes those models reachable from atom at
+            // all. Driven entirely by models.dev metadata
+            // (api_protocol_for) — no provider hardcoding.
+            let opened = await_round(
+                stream_responses(&base_url, &key, &sess.model, &msgs, &tools, &opts.thinking),
+                &turn_cancel,
+                &ctx.parent,
+                &round_cancel,
+            )
+            .await;
+            let chunks = match opened {
+                None => {
+                    ctx.handle.set_round_cancel(None);
+                    if ctx.err() {
+                        finish_paused_turn(state, sess, &out, id).await;
+                        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                        return;
+                    }
+                    if let Some(extra) = ctx.handle.take_compact() {
+                        if let Err(ferr) = fold_session(state, sess, &out, id, &extra).await {
+                            emit(state, &out, id, &fold_error_event(&ferr)).await;
+                        }
+                    }
+                    continue 'rounds;
+                }
+                Some(result) => match result {
+                    Ok(c) => c,
+                    Err(err) => {
+                        ctx.handle.set_round_cancel(None);
+                        if ctx.err() {
+                            finish_paused_turn(state, sess, &out, id).await;
+                            end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                            return;
+                        }
+                        if let Some(extra) = ctx.handle.take_compact() {
+                            if let Err(ferr) = fold_session(state, sess, &out, id, &extra).await {
+                                emit(state, &out, id, &fold_error_event(&ferr)).await;
+                            }
+                            continue 'rounds;
+                        }
+                        let msg = provider_error_message(&err, &base_url);
+                        let ev = event(vec![
+                            ("type", json!("error")),
+                            ("message", json!(msg.clone())),
+                        ]);
+                        emit(state, &out, id, &ev).await;
+                        sess.messages.push(Message {
+                            role: "error".into(),
+                            content: msg,
+                            ..Default::default()
+                        });
+                        persist_session(state, sess, id).await;
+                        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                        return;
+                    }
+                },
+            };
+            let r = stream_model_to_client(
+                state,
+                &out,
+                id,
+                chunks,
+                &turn_cancel,
+                &ctx.parent,
+                &round_cancel,
+                &reasoning_field,
+            )
+            .await;
+            ctx.handle.set_round_cancel(None);
+            match r {
+                Ok(result) => result,
+                Err(err) => {
+                    if ctx.err() {
+                        finish_paused_turn(state, sess, &out, id).await;
+                        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                        return;
+                    }
+                    let msg = provider_error_message(&err, &base_url);
+                    let ev = event(vec![
+                        ("type", json!("error")),
+                        ("message", json!(msg.clone())),
+                    ]);
+                    emit(state, &out, id, &ev).await;
+                    sess.messages.push(Message {
+                        role: "error".into(),
+                        content: msg,
+                        ..Default::default()
+                    });
+                    persist_session(state, sess, id).await;
+                    end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                    return;
+                }
+            }
         } else if openai_codex_auth_for_key(&key).is_some() {
             let codex_body =
                 match marshal_openai_codex_request(&sess.model, &msgs, &tools, &opts.thinking) {
@@ -1172,7 +1292,7 @@ pub async fn run_session_turn(
 
         if empty_response(&result) {
             if empty_response_attempt < atom_core::providers::MAX_EMPTY_RESPONSE_RETRIES {
-                let delays = atom_core::providers::retry::provider_retry_delays();
+                let delays = atom_core::providers::retry::empty_response_retry_delays();
                 let delay = delays
                     .get(empty_response_attempt)
                     .copied()
@@ -1192,7 +1312,9 @@ pub async fn run_session_turn(
                 continue 'rounds;
             }
             let msg = format!(
-                "provider returned an empty response after {} attempts",
+                "provider returned an empty response after {} attempts \
+                 (some free tiers, like OpenCode Zen, rate-limit by silently \
+                 returning empty streams; wait a moment and retry)",
                 empty_response_attempt + 1
             );
             let ev = event(vec![
@@ -1420,8 +1542,30 @@ async fn end_of_turn(
     parent_id: &str,
 ) {
     state.turns.end_turn(id, handle);
+    // A user-initiated stop (Esc via the pause route) ends the child's
+    // turn: record a non-error transcript marker so the parent's dispatch
+    // learns "stopped by the user", and a Stopped status instead of
+    // deriving Done/Error from the last assistant/error message.
+    let user_stopped = state.take_user_stop(id);
+    if user_stopped && !parent_id.is_empty() {
+        let stored_id = id.to_string();
+        state
+            .store_call(move |store| {
+                if let Some(mut stored) = store.get(&stored_id) {
+                    stored.messages.push(Message {
+                        role: "stopped".into(),
+                        content: "stopped by the user".into(),
+                        ..Default::default()
+                    });
+                    store.update_turn_snapshot(&stored_id, &stored, "");
+                }
+            })
+            .await;
+    }
     if !parent_id.is_empty() {
-        let status = if sess.cancelled {
+        let status = if user_stopped {
+            atom_core::session::store::DelegateStatus::Stopped
+        } else if sess.cancelled {
             atom_core::session::store::DelegateStatus::Cancelled
         } else if sess
             .messages
@@ -1537,6 +1681,22 @@ mod tests {
             r#"{"command":"git log --oneline -20"}"#
         );
         assert_eq!(calls[1].function.arguments, r#"{"command":"ls"}"#);
+    }
+
+    /// A router that streams object-form arguments may send an empty
+    /// placeholder object first and the real object in a later delta
+    /// reusing the index. The placeholder must be overwritten, keeping
+    /// one call, instead of opening a bogus second call.
+    #[test]
+    fn accumulator_empty_object_placeholder() {
+        let mut acc = ToolCallAccumulator::new();
+        acc.add(&delta(0, "call_a", "grep", "{}"));
+        acc.add(&delta(0, "", "", r#"{"pattern":"version"}"#));
+        let calls = acc.list();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_a");
+        assert_eq!(calls[0].function.name, "grep");
+        assert_eq!(calls[0].function.arguments, r#"{"pattern":"version"}"#);
     }
 
     /// The same reuse of index 0 with distinct call IDs must also split,
@@ -1823,7 +1983,6 @@ mod tests {
         let state = Arc::new(AppState::new(
             store,
             SandboxConfig {
-                mode: atom_sandbox::policy::SandboxMode::Off,
                 ..Default::default()
             },
             Arc::new(ConnTracker::new()),
@@ -1882,7 +2041,6 @@ mod tests {
         let state = Arc::new(AppState::new(
             store,
             SandboxConfig {
-                mode: atom_sandbox::policy::SandboxMode::Off,
                 ..Default::default()
             },
             Arc::new(ConnTracker::new()),
@@ -1938,7 +2096,6 @@ mod tests {
         let state = AppState::new(
             store,
             SandboxConfig {
-                mode: atom_sandbox::policy::SandboxMode::Off,
                 ..Default::default()
             },
             Arc::new(ConnTracker::new()),
@@ -1980,5 +2137,60 @@ mod tests {
         .await
         .expect("provider handshake ignored cancellation");
         assert!(result.is_none());
+    }
+
+    /// Esc on a live subagent turn: the user stop records a non-error
+    /// "stopped" marker and Stopped status — never "done", never an error.
+    #[tokio::test]
+    async fn user_stop_marks_child_stopped_with_marker() {
+        use crate::state::ConnTracker;
+        use atom_sandbox::policy::SandboxConfig;
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(atom_core::session::store::SessionStore::open_in_dir(dir.path()).unwrap());
+        let state = Arc::new(AppState::new(
+            store.clone(),
+            SandboxConfig {
+                ..Default::default()
+            },
+            Arc::new(ConnTracker::new()),
+        ));
+        let parent = store.create("m", "/tmp", vec![]);
+        let child = store.create_child(&parent.id, "m", "/tmp", "low", "child", vec![]);
+        // The pause path persisted the partial reply before the turn ended.
+        let mut partial = store.get(&child.id).unwrap();
+        partial.messages.push(Message {
+            role: "assistant".into(),
+            content: "partial work".into(),
+            model: "m".into(),
+            ..Default::default()
+        });
+        store.update_turn_snapshot(&child.id, &partial, "");
+
+        let handle = state.turns.start_turn(&child.id, "t1");
+        state.mark_user_stop(&child.id);
+        let sess = store.get(&child.id).unwrap();
+        end_of_turn(&state, &sess, &child.id, &handle, &parent.id).await;
+
+        let stored = store.get(&child.id).unwrap();
+        let last = stored.messages.last().unwrap();
+        assert_eq!(last.role, "stopped");
+        assert_eq!(last.content, "stopped by the user");
+        assert!(!stored.messages.iter().any(|m| m.role == "error"));
+        assert_eq!(
+            store.get_info(&child.id).unwrap().status,
+            atom_core::session::store::DelegateStatus::Stopped
+        );
+        assert!(!state.take_user_stop(&child.id), "flag consumed");
+
+        // Without a stop flag the same end derives its usual status.
+        let sibling = store.create_child(&parent.id, "m", "/tmp", "low", "sibling", vec![]);
+        let handle2 = state.turns.start_turn(&sibling.id, "t2");
+        let sess2 = store.get(&sibling.id).unwrap();
+        end_of_turn(&state, &sess2, &sibling.id, &handle2, &parent.id).await;
+        assert_eq!(
+            store.get_info(&sibling.id).unwrap().status,
+            atom_core::session::store::DelegateStatus::Done
+        );
     }
 }

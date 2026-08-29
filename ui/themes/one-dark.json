@@ -1,0 +1,20 @@
+{
+  "name": "One Dark",
+  "border": "#3e4451",
+  "card_dark": "#21252b",
+  "card_light": "#333842",
+  "secondary": "#c678dd",
+  "primary": "#61afef",
+  "primary_dark": "#528bff",
+  "select": "#3a3f4b",
+  "background": "#282c34",
+  "foreground": "#abb2bf",
+  "muted": "#828997",
+  "muted_extra": "#4f545d",
+  "diff_add": "#98c379",
+  "diff_del": "#e06c75",
+  "diff_add_bg": "#2e3532",
+  "diff_del_bg": "#3e2f31",
+  "syntax_type": "#d19a66",
+  "syntax_string": "#98c379"
+}

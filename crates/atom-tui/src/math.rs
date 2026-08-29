@@ -150,7 +150,7 @@ fn render_assistant_markdown_with(
         match segment {
             MarkdownSegment::Text(prose) => {
                 let parsed = ansi::ansi_to_lines_linked(
-                    &atom_core::render::markdown::render_markdown(prose, width),
+                    &atom_core::render::markdown::render_markdown(prose, width, ""),
                 );
                 lines.extend(parsed.lines);
                 links.extend(parsed.links);
@@ -202,8 +202,9 @@ fn render_math_fallback(
     lines: &mut Vec<Line<'static>>,
     links: &mut Vec<Vec<ansi::LinkRegion>>,
 ) {
-    let parsed =
-        ansi::ansi_to_lines_linked(&atom_core::render::markdown::render_markdown(source, width));
+    let parsed = ansi::ansi_to_lines_linked(&atom_core::render::markdown::render_markdown(
+        source, width, "",
+    ));
     lines.extend(parsed.lines);
     links.extend(parsed.links);
 }

@@ -65,6 +65,15 @@ fn theme_color(role: atom_core::render::colors::ThemeColor) -> Color {
 pub fn style_user() -> Style {
     Style::new().fg(c_foreground()).bg(c_card_light())
 }
+/// Default terminal foreground (no fg set), for text that should stand
+/// out from dim chrome like the status bar.
+pub fn style_foreground() -> Style {
+    Style::new()
+}
+/// Bold title style for fullscreen overlay headers.
+pub fn style_title() -> Style {
+    Style::new().fg(c_foreground()).add_modifier(Modifier::BOLD)
+}
 pub fn style_primary() -> Style {
     Style::new().fg(c_primary())
 }
@@ -662,6 +671,7 @@ mod tests {
         let body = wrap_linked(
             "prose before and then https://example.com/very/long/url and some prose after",
             24,
+            "",
             "",
             "",
         );

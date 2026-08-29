@@ -46,6 +46,10 @@ pub struct AtomConfig {
     /// to disable the startup auto-updater.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_update: Option<bool>,
+    /// Selected theme id (file stem of a `ui/themes/*.json` built-in or
+    /// a user theme in the config `themes/` directory).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme: Option<String>,
 }
 
 const fn config_version() -> u32 {
@@ -59,6 +63,7 @@ impl Default for AtomConfig {
             compaction: None,
             web_search: None,
             auto_update: None,
+            theme: None,
         }
     }
 }

@@ -5,11 +5,28 @@
 use crate::dispatch::{self, DispatchPlan};
 use crate::file_edit::FileSeen;
 use crate::mcp;
-use crate::{file_edit, read_file, search, skills, vector_search, visualize, web_search};
+use crate::{
+    file_edit, read_file, search, skills, vector_search, visualize, web_fetch, web_search,
+};
 use atom_core::types::ImageData;
 use atom_sandbox::approvals::Approver;
 use atom_sandbox::policy::SandboxConfig;
 use std::path::PathBuf;
+
+/// empty_arguments_msg is the standard diagnostic when a tool call
+/// arrives with no JSON arguments at all (an empty or whitespace-only
+/// string). serde's own error in that case — "EOF while parsing a value
+/// at line 1 column 0" — is technically correct but confuses models
+/// into thinking the stream/network closed early, and they end up
+/// retrying with the same broken call. This message keeps the
+/// "error parsing arguments:" prefix so callers that grep on it keep
+/// working, but spells out the cause and the fix so the next model turn
+/// can recover.
+pub(crate) fn empty_arguments_msg(tool: &str) -> String {
+    format!(
+        "error parsing arguments: model emitted no arguments for tool \"{tool}\" (empty arguments string); pass a JSON object like {{\"arg\": \"value\"}}"
+    )
+}
 
 /// Everything a tool call needs: session identity, provider plumbing for
 /// dispatch turns, sandbox policy, the approval gate, the subagent
@@ -88,18 +105,23 @@ pub async fn execute_tool(ctx: &ToolCtx<'_>, name: &str, args_json: &str) -> Too
                 #[serde(default)]
                 query: String,
             }
+            if args_json.trim().is_empty() {
+                return ToolOutcome::from_text(empty_arguments_msg("web_search"));
+            }
             let args: Args = match serde_json::from_str(args_json) {
                 Ok(a) => a,
                 Err(e) => return ToolOutcome::from_text(format!("error parsing arguments: {e}")),
             };
             ToolOutcome::from_text(web_search::web_search(&args.query, &ctx.cwd).await)
         }
+        "webfetch" => web_fetch::web_fetch(args_json, ctx).await,
         "vector_search" => {
             ToolOutcome::from_text(vector_search::vector_search(args_json, &ctx.cwd).await)
         }
         "grep" => ToolOutcome::from_text(search::grep_search(args_json, &ctx.cwd).await),
         "glob" => ToolOutcome::from_text(search::glob_search(args_json, &ctx.cwd).await),
         "read_file" => read_file::execute_read_file(args_json, ctx),
+        "find_tool" => ToolOutcome::from_text(mcp::execute_find_tool(args_json, &ctx.cwd).await),
         "visualize" => visualize::execute_visualize(args_json, ctx).await,
         "write_file" => file_edit::execute_write_file(args_json, ctx).await,
         "edit_file" => file_edit::execute_edit_file(args_json, ctx).await,
@@ -131,6 +153,9 @@ async fn execute_bash(args_json: &str, ctx: &ToolCtx<'_>) -> ToolOutcome {
     struct Args {
         #[serde(default)]
         command: String,
+    }
+    if args_json.trim().is_empty() {
+        return ToolOutcome::from_text(empty_arguments_msg("bash"));
     }
     let args: Args = match serde_json::from_str(args_json) {
         Ok(a) => a,
@@ -173,10 +198,7 @@ pub(crate) mod test_support {
     static ALLOW_ONCE: Lazy<AutoApprover> = Lazy::new(|| AutoApprover(Decision::AllowOnce));
 
     pub fn off_cfg() -> SandboxConfig {
-        SandboxConfig {
-            mode: atom_sandbox::policy::SandboxMode::Off,
-            ..Default::default()
-        }
+        SandboxConfig::default()
     }
 
     /// A ctx with no seen-file cache, Off sandbox, auto-approving.
@@ -282,6 +304,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bash_empty_arguments_friendly_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+        let out = execute_tool(&ctx, "bash", "").await;
+        assert!(
+            out.text.starts_with("error parsing arguments:"),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text.contains("\"bash\""),
+            "tool name should appear in the message: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("empty arguments string"),
+            "reason should be explained: {}",
+            out.text
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_empty_arguments_friendly_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+        let out = execute_tool(&ctx, "read_file", "   ").await;
+        assert!(
+            out.text.starts_with("error parsing arguments:"),
+            "{}",
+            out.text
+        );
+        assert!(out.text.contains("\"read_file\""), "{}", out.text);
+    }
+
+    #[test]
+    fn empty_arguments_msg_format() {
+        let m = empty_arguments_msg("grep");
+        assert!(m.starts_with("error parsing arguments:"));
+        assert!(m.contains("\"grep\""));
+        assert!(m.contains("empty arguments string"));
+        assert!(m.contains("JSON object"));
+    }
+
+    #[tokio::test]
     async fn unknown_tool_message() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = test_ctx(dir.path());
@@ -296,7 +362,7 @@ mod tests {
         let pjson = serde_json::json!({"path": path.display().to_string()});
 
         let ctx = env.ctx_with(&atom_sandbox::approvals::AutoApprover(
-            atom_sandbox::approvals::Decision::AllowSession,
+            atom_sandbox::approvals::Decision::AllowOnce,
         ));
         // Write to a not-yet-seen existing file errors first.
         std::fs::write(&path, "old\n").unwrap();
@@ -336,7 +402,7 @@ mod tests {
         let path = env.ws.path().join("relative.txt");
         std::fs::write(&path, "old\n").unwrap();
         let ctx = env.ctx_with(&atom_sandbox::approvals::AutoApprover(
-            atom_sandbox::approvals::Decision::AllowSession,
+            atom_sandbox::approvals::Decision::AllowOnce,
         ));
 
         let read = execute_tool(&ctx, "read_file", r#"{"path":"relative.txt"}"#).await;
@@ -357,10 +423,17 @@ mod tests {
 
     #[tokio::test]
     async fn skill_unknown_lists_nothing_without_catalog() {
-        let dir = tempfile::tempdir().unwrap(); // empty cwd → no skills
+        let dir = tempfile::tempdir().unwrap(); // empty cwd → no project skills
         let ctx = test_ctx(dir.path());
         let out = execute_tool(&ctx, "skill", r#"{"name":"nope"}"#).await;
-        assert_eq!(out.text, "error: unknown skill \"nope\"");
+        // Prefix check: user-level skill catalogs (~/.agents/skills etc.)
+        // legitimately exist on dev machines, so the "(known: …)" suffix
+        // may be non-empty — but the unknown-name error must always lead.
+        assert!(
+            out.text.starts_with("error: unknown skill \"nope\""),
+            "{}",
+            out.text
+        );
     }
 
     #[tokio::test]

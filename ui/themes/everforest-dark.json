@@ -1,0 +1,20 @@
+{
+  "name": "Everforest Dark",
+  "border": "#414b50",
+  "card_dark": "#232a2e",
+  "card_light": "#374145",
+  "secondary": "#d699b6",
+  "primary": "#7fbbb3",
+  "primary_dark": "#3a515d",
+  "select": "#414b50",
+  "background": "#2d353b",
+  "foreground": "#d3c6aa",
+  "muted": "#9da9a0",
+  "muted_extra": "#616863",
+  "diff_add": "#a7c080",
+  "diff_del": "#e67e80",
+  "diff_add_bg": "#425047",
+  "diff_del_bg": "#514045",
+  "syntax_type": "#e69875",
+  "syntax_string": "#dbbc7f"
+}

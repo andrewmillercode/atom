@@ -56,6 +56,11 @@ pub struct Analysis {
     pub uses_network: bool,
     /// Some argument resolves outside workspace_root.
     pub paths_outside_workspace: bool,
+    /// Short human-readable explanation of which tier produced the
+    /// verdict (e.g. "static allowlist", "arg veto", "guardrail",
+    /// "unknown command"). Surfaced in the approval prompt so the user
+    /// knows why the table landed where it did.
+    pub tier_origin: String,
 }
 
 /// One built-in permission rule. Matchers are globs evaluated against
@@ -147,6 +152,19 @@ macro_rules! rule {
             network: false,
         }
     };
+    ($id:expr, $reason:expr, $verdict:expr, $prog:expr, any: [$($a:expr),*], all: [$($b:expr),*]) => {
+        Rule {
+            id: $id,
+            reason: $reason,
+            verdict: $verdict,
+            prog: $prog,
+            arg_any: &[$($a),*],
+            arg_all: &[$($b),*],
+            min_args: 0,
+            max_args: usize::MAX,
+            network: false,
+        }
+    };
     ($id:expr, $reason:expr, $verdict:expr, $prog:expr, min: $min:expr) => {
         Rule {
             id: $id,
@@ -197,10 +215,13 @@ pub static RULES: &[Rule] = &[
         "{sudo,su,doas,pfexec,dzdo}"
     ),
     rule!(
-        "launchctl",
+        "launchctl-mutate",
         "manages launchd services",
         Verdict::Deny,
-        "launchctl"
+        "launchctl",
+        any: ["load", "unload", "bootstrap", "bootout", "enable", "disable",
+              "kickstart", "reboot", "start", "stop", "kill", "bless",
+              "remove", "submit", "override", "print-cache"]
     ),
     rule!(
         "csrutil",
@@ -234,8 +255,41 @@ pub static RULES: &[Rule] = &[
         Verdict::Deny,
         "spctl"
     ),
-    rule!("disk-erase", "erases or reformats disks/volumes", Verdict::Deny, "diskutil",
-          any: ["erase*", "apfs", "hfs"]),
+    rule!("disk-erase", "erases or reformats disks/volumes", Verdict::Deny,
+          "diskutil", any: ["erase*", "apfs*create*", "apfs*delete*",
+                            "apfs*resize*", "apfs*add*", "apfs*erase*",
+                            "hfs*create*"]),
+    rule!(
+        "mount-device",
+        "mounts/unmounts filesystems",
+        Verdict::Ask,
+        "{mount,umount}"
+    ),
+    rule!(
+        "osascript",
+        "runs AppleScript automation",
+        Verdict::Deny,
+        "osascript"
+    ),
+    rule!(
+        "crontab",
+        "edits the system crontab",
+        Verdict::Deny,
+        "crontab"
+    ),
+    rule!(
+        "kill",
+        "signals arbitrary processes (no safe subset)",
+        Verdict::Deny,
+        "{kill,killall,pkill}"
+    ),
+    rule!(
+        "security-keychain",
+        "inspects the system keychain",
+        Verdict::Deny,
+        "security",
+        any: ["dump-keychain", "find-*", "add-*", "delete-*", "set-*"]
+    ),
     rule!("system-path-write", "writes into system directories", Verdict::Deny,
           "{rm,mv,cp,chmod,chown,chgrp,ln,mkdir,touch,tee,truncate,install,rsync,dd}",
           any: ["/System/*", "/bin/*", "/sbin/*", "/usr/*", "/etc/*",
@@ -313,12 +367,6 @@ pub static RULES: &[Rule] = &[
           any: ["-delete", "-exec", "-execdir", "-ok", "-okdir"]),
     rule!("sed-inplace", "sed -i rewrites files in place", Verdict::Ask, "sed",
           any: ["-i", "-i*"]),
-    rule!(
-        "process-kill",
-        "signals arbitrary processes",
-        Verdict::Ask,
-        "{kill,killall,pkill}"
-    ),
     rule!("archive-extract", "extracts archives onto disk", Verdict::Ask,
           "{tar,gtar}", any: ["-x", "--extract", "-x*", "--extract*"]),
     rule!(
@@ -459,6 +507,139 @@ pub static RULES: &[Rule] = &[
           min: 2),
     rule!("install-files", "copies files into place", Verdict::Allow, "install",
           min: 2),
+    // --- v2 allowlist: builds & test runners (Category 2) ---
+    rule!("cargo-test-bench", "runs cargo benchmarks", Verdict::Allow, "cargo",
+          any: ["bench"]),
+    rule!("go-test-run", "runs Go programs", Verdict::Allow, "go",
+          any: ["test", "run", "vet", "mod", "download", "env"]),
+    rule!("pytest", "runs Python tests", Verdict::Allow, "pytest"),
+    rule!(
+        "py-formatters",
+        "formats Python source",
+        Verdict::Allow,
+        "{ruff,black,isort,mypy,pyright,flake8}"
+    ),
+    rule!(
+        "js-ts-tools",
+        "runs JS/TS toolchain",
+        Verdict::Allow,
+        "{tsc,ts-node,tsx,node}"
+    ),
+    rule!("bun-test", "runs bun tests/build", Verdict::Allow, "bun",
+          any: ["test", "run", "build"]),
+    rule!("pnpm-run", "runs pnpm scripts", Verdict::Allow, "pnpm",
+          any: ["run", "test", "build", "exec", "dlx"]),
+    rule!("yarn-run", "runs yarn scripts", Verdict::Allow, "yarn",
+          any: ["run", "test", "build"]),
+    rule!("bundle-exec", "runs bundle exec wrappers", Verdict::Allow, "bundle",
+          any: ["exec"]),
+    rule!(
+        "rake-rspec",
+        "runs rake/rspec",
+        Verdict::Allow,
+        "{rake,rspec}"
+    ),
+    rule!("swift-tooling", "builds Swift packages", Verdict::Allow,
+          "{swift,xcodebuild}", any: ["build", "test", "run", "package"]),
+    rule!("elixir-mix", "runs mix tasks", Verdict::Allow, "mix",
+          any: ["compile", "test", "run", "docs"]),
+    rule!("dotnet-build", "builds dotnet projects", Verdict::Allow, "dotnet",
+          any: ["build", "test", "run", "restore"]),
+    rule!(
+        "maven-gradle",
+        "builds Java/Kotlin projects",
+        Verdict::Allow,
+        "{mvn,mvnw,gradle,gradlew}"
+    ),
+    rule!(
+        "js-formatters",
+        "formats JS/TS source",
+        Verdict::Allow,
+        "{prettier,gofmt,shellcheck,shfmt}"
+    ),
+    rule!(
+        "make-build",
+        "runs make targets",
+        Verdict::Allow,
+        "{make,ninja,meson,cmake}"
+    ),
+    // --- v2 allowlist: narrow network shapes (Category 4) ---
+    rule!("gh-api", "calls GitHub API", Verdict::Ask, "gh", any: ["api"],
+          net: true),
+    rule!("glab-api", "calls GitLab API", Verdict::Ask, "glab", any: ["api"],
+          net: true),
+    rule!("traceroute", "probes network routes", Verdict::Ask,
+          "{traceroute,mtr}", net: true),
+    rule!("whois", "looks up WHOIS records", Verdict::Ask, "whois", net: true),
+    rule!("ssh-keyscan", "scans SSH host keys", Verdict::Ask, "ssh-keyscan",
+          net: true),
+    // --- v2 allowlist: local VCS additions (Category 5) ---
+    rule!("git-add", "stages files", Verdict::Allow, "git", any: ["add"]),
+    rule!("git-rm-cached", "removes from index, keeps file on disk",
+          Verdict::Allow, "git", any: ["rm"], all: ["--cached"]),
+    rule!("git-mv", "moves files inside the index", Verdict::Allow, "git",
+          any: ["mv"]),
+    rule!("git-commit", "commits staged changes", Verdict::Allow, "git",
+          any: ["commit"]),
+    rule!("git-checkout-new", "creates a new branch", Verdict::Allow, "git",
+          any: ["checkout"], all: ["-b"]),
+    rule!("git-switch-new", "creates a new branch via switch", Verdict::Allow,
+          "git", any: ["switch"], all: ["-c"]),
+    rule!("git-stash", "stashes/unstashes working tree", Verdict::Allow, "git",
+          any: ["stash", "apply", "pop"]),
+    rule!("git-tag-add", "creates a tag", Verdict::Allow, "git", any: ["tag"]),
+    rule!("git-init", "initializes a repository", Verdict::Allow, "git",
+          any: ["init"]),
+    rule!("git-revert", "reverts a commit (reversible)", Verdict::Allow, "git",
+          any: ["revert"]),
+    rule!("git-config-get", "reads git config", Verdict::Allow, "git",
+          any: ["config"], all: ["--get"]),
+    // --- v2 allowlist: filesystem creation (Category 6) ---
+    rule!("mkdir-p", "creates directories", Verdict::Allow, "mkdir",
+          any: ["-p"]),
+    rule!("zip-create", "creates zip archives", Verdict::Allow, "zip",
+          any: ["-r", "-r*"]),
+    rule!("tar-create", "creates tar archives", Verdict::Allow, "{tar,gtar}",
+          any: ["-c", "--create", "-c*", "--create*", "cf"]),
+    rule!(
+        "compress",
+        "compresses files",
+        Verdict::Allow,
+        "{gzip,bzip2,xz,zstd}"
+    ),
+    // --- v2 allowlist: system read-only (Category 7) ---
+    rule!("ps-top", "lists processes", Verdict::Allow, "{ps,top,pgrep}",
+          any: ["-l", "-p", "-ef", "-ax", "-axo"]),
+    rule!(
+        "net-readonly",
+        "inspects network state",
+        Verdict::Allow,
+        "{lsof,netstat,ss,ifconfig,ip}"
+    ),
+    rule!("diskutil-list", "lists disks/volumes", Verdict::Allow, "diskutil",
+          any: ["list", "info", "apfs"]),
+    rule!("sysctl-n", "reads sysctl values", Verdict::Allow, "sysctl",
+          any: ["-n"]),
+    rule!(
+        "vmstat",
+        "reads vm stats",
+        Verdict::Allow,
+        "{iostat,vm_stat}"
+    ),
+    rule!("uptime", "shows uptime", Verdict::Allow, "uptime"),
+    rule!("launchctl-list", "lists launchd services", Verdict::Allow, "launchctl",
+          any: ["list"]),
+    // --- v2 allowlist: dev helpers (Category 8) ---
+    rule!("docker-ps", "lists containers/images", Verdict::Allow, "docker",
+          any: ["ps", "images", "logs", "inspect", "version", "info"]),
+    rule!("kubectl-get", "inspects kubernetes resources", Verdict::Allow,
+          "kubectl", any: ["get", "describe", "logs", "version"]),
+    rule!("kubectl-config-view", "views kubeconfig", Verdict::Allow, "kubectl",
+          any: ["config"], all: ["view"]),
+    rule!("nix-build", "builds nix derivations", Verdict::Allow, "nix",
+          any: ["build", "develop", "run", "flake"]),
+    rule!("make-dry-run", "drys runs a makefile", Verdict::Allow, "make",
+          any: ["-n", "--dry-run"]),
 ];
 
 struct CompiledRule {
@@ -549,17 +730,88 @@ fn args_match(rule: &CompiledRule, args: &[String]) -> bool {
 
 /// Programs whose positional arguments are write targets when they resolve
 /// outside the workspace.
-const WRITE_PROGS: &[&str] = &[
+pub const WRITE_PROGS: &[&str] = &[
     "touch", "mkdir", "cp", "mv", "rm", "ln", "tee", "truncate", "install", "dd", "rsync", "unzip",
     "tar", "patch", "rmdir",
 ];
 
-const NETWORK_BASENAMES: &[&str] = &[
+pub const NETWORK_BASENAMES: &[&str] = &[
     "curl", "wget", "nc", "ncat", "netcat", "telnet", "ssh", "scp", "sftp", "ftp", "lftp", "rsync",
     "dig", "nslookup", "host", "ping",
 ];
 
-const SHELLS: &[&str] = &["bash", "sh", "zsh", "dash", "ksh", "fish"];
+pub const SHELLS: &[&str] = &["bash", "sh", "zsh", "dash", "ksh", "fish"];
+
+/// Programs considered dangerous: accept-all prefix rules are capped
+/// at one word so `[a]` on `rm -rf /tmp/foo` creates the wide `rm *`
+/// rule instead of a narrow `rm -rf /tmp/foo *` that wouldn't catch
+/// the next `rm -rf /var/log` shape.
+pub fn dangerous_heads(head: &str) -> bool {
+    matches!(
+        head,
+        "rm" | "sudo"
+            | "su"
+            | "doas"
+            | "pfexec"
+            | "chmod"
+            | "chown"
+            | "chgrp"
+            | "dd"
+            | "mkfs"
+            | "shutdown"
+            | "reboot"
+            | "halt"
+            | "poweroff"
+            | "init"
+            | "telinit"
+            | "kill"
+            | "killall"
+            | "pkill"
+            | "launchctl"
+            | "csrutil"
+            | "nvram"
+            | "pmset"
+            | "kextload"
+            | "kextunload"
+            | "kextutil"
+            | "spctl"
+            | "installer"
+            | "dscl"
+            | "diskutil"
+            | "mount"
+            | "umount"
+            | "osascript"
+            | "crontab"
+            | "defaults"
+    )
+}
+
+/// Whitespace-tokenize a command for prefix-rule construction. Stops
+/// at shell metacharacters (`&&`, `|`, `;`, `>`). Used by
+/// `policy::prefix_for_command`.
+pub fn tokenize_for_prefix(cmd: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut started = false;
+    for c in cmd.chars() {
+        if c.is_whitespace() {
+            if started {
+                out.push(std::mem::take(&mut cur));
+                started = false;
+            }
+            continue;
+        }
+        if matches!(c, '&' | '|' | ';' | '>' | '<' | '#' | '\n' | '\r') {
+            break;
+        }
+        cur.push(c);
+        started = true;
+    }
+    if started {
+        out.push(cur);
+    }
+    out
+}
 
 fn expand_tilde(token: &str, home: Option<&Path>) -> PathBuf {
     if let Some(h) = home {
@@ -708,6 +960,9 @@ fn analyze_segment(
 
     let args = &effective[1..];
     let mut matched_any_rule = false;
+    let mut best_allow_id: Option<&'static str> = None;
+    let mut best_ask_id: Option<&'static str> = None;
+    let mut best_deny_id: Option<&'static str> = None;
 
     for cr in COMPILED_RULES.iter() {
         let count = args.len();
@@ -722,8 +977,24 @@ fn analyze_segment(
         if cr.rule.network {
             a.uses_network = true;
         }
-        if cr.rule.verdict > a.verdict {
-            a.verdict = cr.rule.verdict;
+        match cr.rule.verdict {
+            Verdict::Deny => {
+                best_deny_id = Some(cr.rule.id);
+                if cr.rule.verdict > a.verdict {
+                    a.verdict = cr.rule.verdict;
+                }
+            }
+            Verdict::Ask => {
+                best_ask_id = Some(cr.rule.id);
+                if cr.rule.verdict > a.verdict {
+                    a.verdict = cr.rule.verdict;
+                }
+            }
+            Verdict::Allow => {
+                if best_allow_id.is_none() {
+                    best_allow_id = Some(cr.rule.id);
+                }
+            }
         }
     }
 
@@ -734,6 +1005,8 @@ fn analyze_segment(
     // Path scan: resolve every non-flag argument against cwd/home and see
     // whether it escapes the workspace.
     let mut force_write_next = false;
+    let mut path_escape = false;
+    let mut guardrail = false;
     for tok in effective.iter().map(String::as_str) {
         let mut write_ctx = WRITE_PROGS.contains(&base);
 
@@ -760,16 +1033,62 @@ fn analyze_segment(
             continue;
         }
 
+        let before = (a.verdict, a.matched_rules.len());
         scan_path_token(target, write_ctx, ws, cwd, home, strict, &mut a);
+        if a.matched_rules.len() != before.1 {
+            path_escape = a.verdict > before.0;
+        }
+        if tok.starts_with("/System/")
+            || tok.starts_with("/bin/")
+            || tok.starts_with("/sbin/")
+            || tok.starts_with("/usr/")
+            || tok.starts_with("/etc/")
+            || tok.starts_with("/private/etc/")
+            || tok.starts_with("/boot/")
+        {
+            guardrail = true;
+        }
     }
 
-    if !matched_any_rule && a.matched_rules.is_empty() {
+    if !matched_any_rule && !path_escape && a.matched_rules.is_empty() {
         a.matched_rules.push("unknown-command".to_string());
         a.verdict = Verdict::Ask;
     }
     if a.writes_git_hooks && a.verdict < Verdict::Deny {
         a.verdict = Verdict::Deny;
+        guardrail = true;
     }
+
+    a.tier_origin = match a.verdict {
+        Verdict::Deny => {
+            if guardrail {
+                "guardrail".into()
+            } else if let Some(id) = best_deny_id {
+                format!("static deny ({})", id)
+            } else {
+                "guardrail".into()
+            }
+        }
+        Verdict::Ask => {
+            if path_escape {
+                "path escape write".into()
+            } else if let Some(id) = best_ask_id {
+                format!("static ask ({})", id)
+            } else if a.matched_rules.iter().any(|r| r == "unknown-command") {
+                "unknown command".into()
+            } else {
+                "approval needed".into()
+            }
+        }
+        Verdict::Allow => {
+            if let Some(id) = best_allow_id {
+                format!("static allowlist ({})", id)
+            } else {
+                "static allowlist".into()
+            }
+        }
+    };
+
     a
 }
 

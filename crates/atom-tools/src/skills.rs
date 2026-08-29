@@ -99,13 +99,94 @@ pub fn parse_skill_markdown(
     let body = body.strip_prefix('\r').unwrap_or(body);
     let body = body.strip_prefix('\n').unwrap_or(body);
 
-    let meta: SkillFrontmatter = serde_yaml::from_str(fm).map_err(|e| format!("yaml: {e}"))?;
+    let meta: SkillFrontmatter = match serde_yaml::from_str(fm) {
+        Ok(m) => m,
+        Err(_) => parse_lenient_frontmatter(fm),
+    };
     if !meta.name.trim().is_empty() {
         s.name = meta.name.trim().to_string();
     }
     s.description = meta.description.trim().to_string();
     s.body = body.trim().to_string();
     Ok(s)
+}
+
+/// isSimpleKey reports whether `s` is a bare YAML key — letters,
+/// digits, `-`, `_`. Conservative so we don't mistake a continuation
+/// line that happens to contain a colon for a new key.
+fn is_simple_key(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// stripYamlQuotes unwraps a single layer of matching " or ' quotes,
+/// leaving the contents alone otherwise.
+fn strip_yaml_quotes(v: &str) -> &str {
+    let t = v.trim();
+    if t.len() >= 2 {
+        let bytes = t.as_bytes();
+        if (bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\'')
+        {
+            return &t[1..t.len() - 1];
+        }
+    }
+    t
+}
+
+/// parseLenientFrontmatter parses simple `key: value` pairs without
+/// serde_yaml. The only SKILL.md fields atom cares about are `name` and
+/// `description`, so this is enough. Unlike serde_yaml it accepts
+/// multi-line plain scalars whose continuation lines sit at the same
+/// indent as the key — a common hand-written pattern that strict YAML
+/// rejects. The lenient parse only runs when serde_yaml fails, so it
+/// doesn't replace the existing strict path.
+fn parse_lenient_frontmatter(fm: &str) -> SkillFrontmatter {
+    let mut out = SkillFrontmatter::default();
+    let mut cur_key: Option<String> = None;
+    let mut cur_value = String::new();
+
+    let flush = |key: &str, value: String, out: &mut SkillFrontmatter| {
+        let v = strip_yaml_quotes(&value).trim().to_string();
+        match key {
+            "name" => out.name = v,
+            "description" => out.description = v,
+            _ => {}
+        }
+    };
+
+    for line in fm.lines() {
+        let trimmed = line.trim_end_matches(['\r']);
+        if trimmed.is_empty() {
+            if cur_key.is_some() && !cur_value.is_empty() {
+                cur_value.push('\n');
+            }
+            continue;
+        }
+        if let Some((k, v)) = trimmed.split_once(':') {
+            let k_trim = k.trim();
+            if !k_trim.is_empty() && is_simple_key(k_trim) {
+                if let Some(prev) = cur_key.take() {
+                    flush(&prev, std::mem::take(&mut cur_value), &mut out);
+                }
+                cur_key = Some(k_trim.to_string());
+                cur_value = v.trim_start().to_string();
+                continue;
+            }
+        }
+        // Continuation line for the current key.
+        if cur_key.is_some() {
+            if !cur_value.is_empty() {
+                cur_value.push('\n');
+            }
+            cur_value.push_str(trimmed.trim_start());
+        }
+    }
+    if let Some(prev) = cur_key.take() {
+        flush(&prev, cur_value, &mut out);
+    }
+    out
 }
 
 fn load_skills_from_dir(root: &Path, into: &mut BTreeMap<String, Skill>) {
@@ -203,6 +284,9 @@ pub fn execute_skill_in(
     struct Args {
         #[serde(default)]
         name: String,
+    }
+    if arguments.trim().is_empty() {
+        return crate::exec::empty_arguments_msg("skill");
     }
     let args: Args = match serde_json::from_str(arguments) {
         Ok(a) => a,
@@ -306,6 +390,44 @@ mod tests {
         let s = parse_skill_markdown("just text\n", "fb", "d").unwrap();
         assert_eq!(s.name, "fb");
         assert_eq!(s.body, "just text");
+    }
+
+    #[test]
+    fn parses_multiline_plain_scalar_at_column_zero() {
+        // Hand-written SKILL.md files often describe a skill with
+        // several wrapped lines at the same indent as the key. Strict
+        // YAML rejects that — the lenient fallback must fold them.
+        let raw = "\
+---
+name: meta-ads
+description: Read and manage Meta Ads campaigns, ad sets, ads, and account
+insights via the Graph Marketing API. Use when the user asks about
+Meta/Facebook ad performance, spend, status, or wants to pause/resume ads.
+Token lives at ~/.local/share/atom-dev/meta-ads/token.
+---
+# body
+Do the thing.
+";
+        let s = parse_skill_markdown(raw, "fallback", "/tmp/meta-ads").unwrap();
+        assert_eq!(s.name, "meta-ads");
+        assert!(
+            s.description
+                .starts_with("Read and manage Meta Ads campaigns"),
+            "{}",
+            s.description
+        );
+        assert!(
+            s.description.contains("Graph Marketing API"),
+            "{}",
+            s.description
+        );
+        assert!(
+            s.description
+                .contains("~/.local/share/atom-dev/meta-ads/token"),
+            "continuation lines must be folded: {}",
+            s.description
+        );
+        assert_eq!(s.body, "# body\nDo the thing.");
     }
 
     #[test]

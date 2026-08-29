@@ -36,6 +36,11 @@ fn child_result(child: &Session, include_result: bool) -> serde_json::Value {
             tail = m.content.clone();
             break;
         }
+        // User-initiated stop (Esc in the TUI): bookkeeping, not an error.
+        if m.role == "stopped" && !m.content.trim().is_empty() {
+            tail = m.content.clone();
+            break;
+        }
         if m.role == "error" && !m.content.trim().is_empty() {
             tail = format!("error: {}", m.content);
             break;
@@ -67,7 +72,15 @@ fn child_result(child: &Session, include_result: bool) -> serde_json::Value {
 
 fn status_snapshot(batch_id: &str, children: &[Session], include_results: bool) -> String {
     let mut counts = serde_json::Map::new();
-    for name in ["queued", "working", "sandbox", "error", "done", "cancelled"] {
+    for name in [
+        "queued",
+        "working",
+        "sandbox",
+        "error",
+        "done",
+        "cancelled",
+        "stopped",
+    ] {
         counts.insert(
             name.into(),
             json!(children
@@ -86,7 +99,15 @@ fn status_snapshot(batch_id: &str, children: &[Session], include_results: bool) 
 
 fn status_snapshot_info(batch_id: &str, children: &[SessionInfo]) -> String {
     let mut counts = serde_json::Map::new();
-    for name in ["queued", "working", "sandbox", "error", "done", "cancelled"] {
+    for name in [
+        "queued",
+        "working",
+        "sandbox",
+        "error",
+        "done",
+        "cancelled",
+        "stopped",
+    ] {
         counts.insert(
             name.into(),
             json!(children
@@ -131,14 +152,21 @@ pub struct ServerApprover {
 
 /// Builds the `approval_request` event for one pending prompt. When the
 /// session is a dispatched subagent, the event carries the child's
-/// identity (`from_subagent`, `child_title`) so the parent view can
-/// surface the prompt and answer it without navigating into the child.
+/// identity (`from_subagent`, `child_title`, `origin = "child"`) so the
+/// parent view can surface the prompt and answer it without navigating
+/// into the child. The v2 `origin` tag is the wire-level name; existing
+/// `from_subagent` is kept for back-compat with older TUI consumers.
 pub fn approval_request_event(
     state: &AppState,
     session_id: &str,
     id: &str,
     req: &ApprovalRequest,
 ) -> serde_json::Value {
+    let is_child = state
+        .store
+        .get_info(session_id)
+        .map(|c| !c.parent_id.is_empty())
+        .unwrap_or(false);
     let mut ev = json!({
         "type": "approval_request",
         "id": id,
@@ -147,6 +175,10 @@ pub fn approval_request_event(
         "cwd": req.cwd.display().to_string(),
         "rule_id": req.rule_id,
         "reason": req.reason,
+        // v2 origin tag: "self" for the current session, "child" when
+        // the prompt surfaced via a dispatched subagent. Drives the
+        // "from subagent: <title>" header in the TUI approval block.
+        "origin": if is_child { "child" } else { "self" },
     });
     if let Some(child) = state.store.get_info(session_id) {
         if !child.parent_id.is_empty() {
@@ -160,6 +192,13 @@ pub fn approval_request_event(
                 short
             };
             ev["child_title"] = json!(title);
+        }
+    }
+    // Forward the server-computed prefix-rule preview for `[a]`. The
+    // TUI renders it as a dim hint under the command details.
+    if let Some(preview) = req.accept_all_preview.as_deref() {
+        if !preview.is_empty() {
+            ev["accept_all_preview"] = json!(preview);
         }
     }
     ev
@@ -242,14 +281,14 @@ impl Approver for ServerApprover {
         let decision = match &self.cancel {
             Some(cancel) => {
                 tokio::select! {
-                    res = rx => res.unwrap_or(Decision::Deny),
-                    _ = cancel.cancelled() => Decision::Deny,
+                    res = rx => res.unwrap_or(Decision::DenyOnce),
+                    _ = cancel.cancelled() => Decision::DenyOnce,
                 }
             }
             None => {
                 // No cancel token: block indefinitely until user responds
                 // or the oneshot sender is dropped (session cleanup).
-                rx.await.unwrap_or(Decision::Deny)
+                rx.await.unwrap_or(Decision::DenyOnce)
             }
         };
         self.state.approvals.remove(&self.session_id, &id);
@@ -817,10 +856,16 @@ async fn maybe_auto_continue_parent(
         .iter()
         .filter(|c| c.status == DelegateStatus::Error)
         .count();
+    let stopped_count = children
+        .iter()
+        .filter(|c| c.status == DelegateStatus::Stopped)
+        .count();
     let total = children.len();
 
     let status_summary = if error_count > 0 {
         format!("{done_count} done, {error_count} errored (out of {total})")
+    } else if stopped_count > 0 {
+        format!("{done_count} done, {stopped_count} stopped by user (out of {total})")
     } else {
         format!("all {total} done")
     };
@@ -838,12 +883,44 @@ async fn maybe_auto_continue_parent(
 
     let parent_thinking = parent_sess.thinking.clone();
     let parent_id_owned = parent_id.to_string();
+    // The child's turn ran with the model plumbing the parent handed to
+    // dispatch — the caller's provider at spawn time. The parent's own
+    // turn must pair its stored model with its own provider: mixing the
+    // child's plumbing with a provider the parent has since switched to
+    // (e.g. the parent dispatched on amazon-bedrock but itself runs on
+    // ollama) sends an invalid model id to the wrong endpoint
+    // ("The provided model identifier is invalid.").
+    let parent_provider = parent_sess.provider.trim().to_string();
+    let (continue_key, continue_base_url, continue_reasoning_field) = if parent_provider.is_empty()
+    {
+        (
+            key.to_string(),
+            base_url.to_string(),
+            reasoning_field.to_string(),
+        )
+    } else {
+        atom_core::providers::modelsdev::ensure_models_dev_catalog().await;
+        match atom_core::providers::providers::build_providers()
+            .await
+            .into_iter()
+            .find(|p| p.name == parent_provider || p.id == parent_provider)
+        {
+            Some(p) => (p.key, p.base_url, p.reasoning_field),
+            // Not a resolvable provider (custom/local): the dispatch
+            // plumbing was the caller's own and is the best guess.
+            None => (
+                key.to_string(),
+                base_url.to_string(),
+                reasoning_field.to_string(),
+            ),
+        }
+    };
     let opts = crate::turn::TurnOpts {
         message: notification,
         thinking: parent_thinking,
-        key: key.to_string(),
-        base_url: base_url.to_string(),
-        reasoning_field: reasoning_field.to_string(),
+        key: continue_key,
+        base_url: continue_base_url,
+        reasoning_field: continue_reasoning_field,
         turn_id: format!("auto-continue-{parent_id_owned}"),
         images: Vec::new(),
         compact: false,
@@ -954,6 +1031,29 @@ mod tests {
         assert_eq!(result["result"], "error: provider returned 400");
     }
 
+    #[test]
+    fn format_result_reports_user_stop_without_error_prefix() {
+        let mut child = atom_core::session::store::Session {
+            id: "0123456789abcdef".into(),
+            ..Default::default()
+        };
+        child.messages.push(atom_core::types::Message {
+            role: "assistant".into(),
+            content: "partial work".into(),
+            ..Default::default()
+        });
+        child.messages.push(atom_core::types::Message {
+            role: "stopped".into(),
+            content: "stopped by the user".into(),
+            ..Default::default()
+        });
+
+        child.status = DelegateStatus::Stopped;
+        let result = child_result(&child, true);
+        assert_eq!(result["result"], "stopped by the user");
+        assert_eq!(result["status"], "stopped");
+    }
+
     #[tokio::test]
     async fn inspect_returns_all_children_with_status_counts() {
         let dir = tempfile::tempdir().unwrap();
@@ -1011,12 +1111,17 @@ mod tests {
             cwd: "/repo".into(),
             rule_id: "git-push".into(),
             reason: "push to remote".into(),
+            accept_all_preview: Some("git push *".into()),
         };
 
         // A plain session's event carries no subagent identity.
         let plain = approval_request_event(&state, &parent.id, "a1", &req);
         assert_eq!(plain["session_id"], parent.id);
         assert_ne!(plain.get("from_subagent"), Some(&json!(true)));
+        // v2 origin tag defaults to "self" for non-subagent sessions.
+        assert_eq!(plain["origin"], "self");
+        // Prefix preview rides through when the server populated it.
+        assert_eq!(plain["accept_all_preview"], "git push *");
 
         // A dispatch child's event names it so the parent view can
         // surface the prompt.
@@ -1026,6 +1131,8 @@ mod tests {
         assert_eq!(ev["child_title"], "verify build");
         assert_eq!(ev["command"], "git push");
         assert_eq!(ev["id"], "a2");
+        // v2 origin tag flips to "child" for dispatched subagents.
+        assert_eq!(ev["origin"], "child");
     }
 
     #[tokio::test]
@@ -1042,6 +1149,7 @@ mod tests {
             cwd: "/work".into(),
             rule_id: "rm-rf".into(),
             reason: "clean build dir".into(),
+            accept_all_preview: None,
         };
         let (tx, _rx) = tokio::sync::oneshot::channel();
         state

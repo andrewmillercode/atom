@@ -11,16 +11,71 @@ use unicode_width::UnicodeWidthChar;
 use super::colors::{ansi_bg, ansi_fg, COLOR_SECONDARY};
 
 /// linkRe matches http(s) and file URLs, home-relative paths, and
-/// absolute Unix paths with at least two segments (so /thinking and
-/// other slash-commands stay plain text). A backticked or double-quoted
-/// span that starts with a path prefix links in full, so paths
-/// containing spaces (`~/Library/Application Support/...` or
-/// "/Users/me/My Docs/...") aren't truncated at the space.
+/// absolute or repo-relative Unix paths with at least two segments
+/// (so /thinking and other slash-commands stay plain text). A
+/// backticked or double-quoted span that starts with a path prefix
+/// links in full, so paths containing spaces (`~/Library/Application
+/// Support/...` or "/Users/me/My Docs/...") aren't truncated at the
+/// space.
+///
+/// The trailing `:N[-M|,M]` line anchor is **optional** on every
+/// path-shaped alternative: prose like `bar:5` stays plain only
+/// because the leading path alternatives require at least one `/`,
+/// not because of the anchor. Without the anchor optional, plain
+/// repo-relative paths like `crates/foo.rs` inside a ``code`` span
+/// would inherit the syntax color but never get an OSC 8 click
+/// region — exactly the regression visible as green-and-not-clickable.
 static LINK_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-    r#"(?i)`(?:~/|/)[^`\n]+`|"(?:~/|/)[^"\n]+"|\bhttps?://[^\s<>\[\]"'`]+|file://[^\s<>\[\]"'`]+|~/(?:[A-Za-z0-9._+-]+/)*[A-Za-z0-9._+-]+|/(?:[A-Za-z0-9._+-]+/){1,}[A-Za-z0-9._+-]+"#,
-).unwrap()
+        r#"(?ix)
+    `(?:~/|/)[^`\n]+`                       # backticked ~/path or /abs/path
+  | "(?:~/|/)[^"\n]+"                       # double-quoted ~/path or /abs/path
+  | \bhttps?://[^\s<>\[\]"'`]+              # http(s) URL
+  | file://[^\s<>\[\]"'`]+                  # file URL
+  | ~/(?:[A-Za-z0-9._+-]+/)*[A-Za-z0-9._+-]+    # ~/path
+        (?::[0-9]+(?:[-,][0-9]+)*)?             # optional :N[-M|,M] line anchor
+  | /(?:[A-Za-z0-9._+-]+/){1,}[A-Za-z0-9._+-]+    # /abs/path
+        (?::[0-9]+(?:[-,][0-9]+)*)?             # optional :N[-M|,M] line anchor
+  | (?:[A-Za-z0-9._+-]+/){1,}[A-Za-z0-9._+-]+    # rel/path (needs a /)
+        (?::[0-9]+(?:[-,][0-9]+)*)?             # optional :N[-M|,M] line anchor
+"#,
+    )
+    .unwrap()
 });
+
+/// split_line_anchor peels a trailing `:N[-M|,M]` off a path-shaped
+/// match so the URI builder can preserve it. Returns (path, Some(line))
+/// when present, else (raw, None). The path part is the display text
+/// the user sees; the line part goes into the OSC 8 URI as
+/// `?line=N` (or `?line=N-M`, `?line=N,M`).
+pub(crate) fn split_line_anchor(raw: &str) -> (&str, Option<&str>) {
+    let bytes = raw.as_bytes();
+    let mut i = raw.len();
+    while i > 0 {
+        i -= 1;
+        let b = bytes[i];
+        if b.is_ascii_digit() || b == b'-' || b == b',' {
+            continue;
+        }
+        if b == b':' {
+            // Reject Windows drive letters (`C:\` / `C:/` / `C:foo`):
+            // the byte immediately before is an ASCII letter AND
+            // there's no `/` or `\` between it and the start of the
+            // raw match.
+            if i > 0 && bytes[i - 1].is_ascii_alphabetic() && !raw[..i].contains(['/', '\\']) {
+                break;
+            }
+            // Must be followed by a digit to count as an anchor.
+            if !bytes.get(i + 1).is_some_and(|b| b.is_ascii_digit()) {
+                break;
+            }
+            return (&raw[..i], Some(&raw[i + 1..]));
+        }
+        // Anything else (`.`, `_`, `)`, `]`, `;`, …) ends the scan.
+        break;
+    }
+    (raw, None)
+}
 
 pub const ANSI_UNDERLINE: &str = "\x1b[4m";
 pub const ANSI_NO_UNDERLINE: &str = "\x1b[24m";
@@ -41,11 +96,20 @@ pub fn osc8_close() -> &'static str {
 /// styled hyperlinks. restoreFg/restoreBg are theme hex colors written
 /// after each link so a parent renderer's colors survive; empty
 /// restoreFg returns to the default foreground.
-pub fn wrap_linked(text: &str, width: usize, restore_fg: &str, restore_bg: &str) -> String {
-    ansi_wrap(&linkify(text, restore_fg, restore_bg), width)
+///
+/// `cwd` is the base for resolving repo-relative paths
+/// (e.g. `crates/foo.rs`); empty falls back to the process cwd.
+pub fn wrap_linked(
+    text: &str,
+    width: usize,
+    restore_fg: &str,
+    restore_bg: &str,
+    cwd: &str,
+) -> String {
+    ansi_wrap(&linkify(text, restore_fg, restore_bg, cwd), width)
 }
 
-pub fn linkify(text: &str, restore_fg: &str, restore_bg: &str) -> String {
+pub fn linkify(text: &str, restore_fg: &str, restore_bg: &str, cwd: &str) -> String {
     if !LINK_RE.is_match(text) {
         return text.to_string();
     }
@@ -66,7 +130,7 @@ pub fn linkify(text: &str, restore_fg: &str, restore_bg: &str) -> String {
             sb.push(delim);
             sb.push_str(&render_link(
                 inner,
-                &link_uri(inner),
+                &link_uri(inner, cwd),
                 restore_fg,
                 restore_bg,
             ));
@@ -81,7 +145,7 @@ pub fn linkify(text: &str, restore_fg: &str, restore_bg: &str) -> String {
         sb.push_str(&text[last..m.start()]);
         sb.push_str(&render_link(
             display,
-            &link_uri(display),
+            &link_uri(display, cwd),
             restore_fg,
             restore_bg,
         ));
@@ -93,27 +157,58 @@ pub fn linkify(text: &str, restore_fg: &str, restore_bg: &str) -> String {
 
 /// linkifyPath turns a filesystem path into an OSC 8 file:// hyperlink,
 /// including relative paths like tui.go or src/main.go. Display text stays
-/// as given; the URI is the absolute path.
-pub fn linkify_path(display: &str, restore_fg: &str, restore_bg: &str) -> String {
-    render_link(display, &path_file_uri(display), restore_fg, restore_bg)
+/// as given; the URI is the absolute path. A trailing `:N[-M|,M]` line
+/// anchor is preserved in the URI as `?line=N`.
+///
+/// `cwd` is the base for resolving relative paths; empty falls back to
+/// the process cwd.
+pub fn linkify_path(display: &str, restore_fg: &str, restore_bg: &str, cwd: &str) -> String {
+    render_link(
+        display,
+        &path_file_uri(display, cwd),
+        restore_fg,
+        restore_bg,
+    )
 }
 
-pub fn path_file_uri(display: &str) -> String {
-    let mut p = display.to_string();
+pub fn path_file_uri(display: &str, cwd: &str) -> String {
+    let (path, line) = split_line_anchor(display);
+    let mut p = path.to_string();
     // get(..7) instead of [..7]: a leading multi-byte rune can make byte 7
     // a non-boundary; the ASCII check then simply fails, as it should.
     if p.get(..7)
         .is_some_and(|s| s.eq_ignore_ascii_case("file://"))
     {
-        return p;
+        return append_line_query(p, line);
     }
     if let Some(rest) = p.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
             p = format!("{}/{}", home.display(), rest);
         }
     }
-    p = lexical_abs(&p);
-    file_uri(&p)
+    let mut uri = file_uri(&lexical_abs(&p, cwd));
+    if let Some(line) = line {
+        uri.push('?');
+        uri.push_str("line=");
+        uri.push_str(line);
+    }
+    uri
+}
+
+/// append_line_query tags `?line=N[-M|,M]` onto a `file://` URI when
+/// the display text had a line anchor. Already-queried URIs use `;`
+/// to keep the existing query intact.
+fn append_line_query(mut uri: String, line: Option<&str>) -> String {
+    if let Some(line) = line {
+        if uri.contains('?') {
+            uri.push_str(";line=");
+        } else {
+            uri.push('?');
+            uri.push_str("line=");
+        }
+        uri.push_str(line);
+    }
+    uri
 }
 
 pub fn render_link(display: &str, uri: &str, restore_fg: &str, restore_bg: &str) -> String {
@@ -143,7 +238,7 @@ pub fn trim_link(s: &str) -> &str {
     s
 }
 
-pub fn link_uri(display: &str) -> String {
+pub fn link_uri(display: &str, cwd: &str) -> String {
     // Byte-wise prefix check: matched text can contain multi-byte runes
     // (e.g. "https://" + em dash), so a p.len() byte cut may land mid-rune
     // and slicing there panics. ASCII case-insensitive comparison on bytes
@@ -154,16 +249,16 @@ pub fn link_uri(display: &str) -> String {
             .get(..p.len())
             .is_some_and(|b| b.eq_ignore_ascii_case(p.as_bytes()))
     };
-    if lower_prefix("http://") || lower_prefix("https://") || lower_prefix("file://") {
-        display.to_string()
-    } else if let Some(rest) = display.strip_prefix("~/") {
-        match dirs::home_dir() {
-            Some(home) => file_uri(&format!("{}/{}", home.display(), rest)),
-            None => file_uri(display),
-        }
-    } else {
-        file_uri(display)
+    if lower_prefix("http://") || lower_prefix("https://") {
+        // HTTP(S) URLs: a line anchor is meaningless, keep display as-is.
+        return display.to_string();
     }
+    if lower_prefix("file://") {
+        // Already an absolute file:// URI; just preserve any line anchor.
+        return path_file_uri(display, cwd);
+    }
+    // ~/ or relative: build an absolute file:// URI.
+    path_file_uri(display, cwd)
 }
 
 /// fileURI mirrors Go's (&url.URL{Scheme:"file", Path:path}).String():
@@ -198,15 +293,21 @@ fn should_escape_path(ch: char) -> bool {
 }
 
 /// lexical_abs stands in for Go's filepath.Abs: pure lexical join with
-/// the process cwd plus dot/dotdot cleanup, no filesystem access.
-fn lexical_abs(p: &str) -> String {
+/// `cwd` plus dot/dotdot cleanup, no filesystem access. An empty
+/// `cwd` falls back to the process cwd so old single-argument
+/// callers (e.g. tests that don't care about resolution) still work.
+fn lexical_abs(p: &str, cwd: &str) -> String {
     let joined = if p.starts_with('/') {
         p.to_string()
     } else {
-        let cwd = std::env::current_dir()
-            .map(|d| d.display().to_string())
-            .unwrap_or_else(|_| "/".to_string());
-        format!("{}/{}", cwd.trim_end_matches('/'), p)
+        let base = if cwd.is_empty() {
+            std::env::current_dir()
+                .map(|d| d.display().to_string())
+                .unwrap_or_else(|_| "/".to_string())
+        } else {
+            cwd.to_string()
+        };
+        format!("{}/{}", base.trim_end_matches('/'), p)
     };
     let mut parts: Vec<&str> = Vec::new();
     for comp in joined.split('/') {
@@ -218,7 +319,15 @@ fn lexical_abs(p: &str) -> String {
             other => parts.push(other),
         }
     }
-    format!("/{}", parts.join("/"))
+    // A trailing slash is a directory marker (e.g. "`~/Library/.../`");
+    // lexical normalization must not eat it or the file:// URI silently
+    // points at the parent path. Root "/" stays exactly "/".
+    let trailing_slash = joined.ends_with('/') && joined.len() > 1;
+    let mut out = format!("/{}", parts.join("/"));
+    if trailing_slash && out.len() > 1 {
+        out.push('/');
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -434,14 +543,44 @@ mod tests {
     #[test]
     fn slash_commands_stay_plain() {
         let in_text = "run /thinking or /compact now";
-        assert_eq!(linkify(in_text, "", ""), in_text);
+        assert_eq!(linkify(in_text, "", "", ""), in_text);
+    }
+
+    /// Repo-relative paths inside a backticked code span must end up
+    /// inside an OSC 8 wrap. Visible regression: `\`crates/foo.rs\``
+    /// rendered green (syntax color) but was non-clickable because
+    /// the regex had required a trailing `:N` line anchor that bare
+    /// file references don't carry.
+    #[test]
+    fn code_span_repo_relative_path_is_clickable() {
+        let in_text = "see `crates/foo.rs` for details";
+        let cwd = "/Users/andrewmiller/projects/atom";
+        let out = linkify(in_text, "", "", cwd);
+        let expected_uri = file_uri(&format!("{cwd}/crates/foo.rs"));
+        assert!(
+            out.contains(&osc8_open(&expected_uri)),
+            "missing OSC 8 wrap for crates/foo.rs: {out:?}"
+        );
+        // The path itself stays visible as link text.
+        assert!(
+            out.contains("crates/foo.rs"),
+            "link text dropped from output: {out:?}"
+        );
+    }
+
+    /// `bar:5` is prose — no `/` means no path-shaped match. The
+    /// optional line anchor can't drag this into a hyperlink.
+    #[test]
+    fn prose_colon_number_stays_plain() {
+        let in_text = "use bar:5 for the config version";
+        assert_eq!(linkify(in_text, "", "", ""), in_text);
     }
 
     #[test]
     fn linkify_styles_and_hyperlinks() {
         let in_text =
             "see https://ness-health.com and /Users/andrewmiller/.config/atom/AGENTS.md please";
-        let out = linkify(in_text, COLOR_FOREGROUND, "");
+        let out = linkify(in_text, COLOR_FOREGROUND, "", "");
         assert!(out.contains(&osc8_open("https://ness-health.com")));
         assert!(out.contains(&osc8_open(&file_uri(
             "/Users/andrewmiller/.config/atom/AGENTS.md"
@@ -457,7 +596,7 @@ mod tests {
 
     #[test]
     fn trim_link_punct_and_quotes() {
-        let out = linkify("try 'https://ness-health.com'.", "", "");
+        let out = linkify("try 'https://ness-health.com'.", "", "", "");
         assert!(
             out.contains(&osc8_open("https://ness-health.com")),
             "{}",
@@ -469,7 +608,7 @@ mod tests {
     #[test]
     fn linkify_home_path_keeps_display() {
         let home = dirs::home_dir().unwrap().display().to_string();
-        let out = linkify("open ~/.config/atom/AGENTS.md", "", "");
+        let out = linkify("open ~/.config/atom/AGENTS.md", "", "", "");
         assert!(out.contains(&osc8_open(&file_uri(&format!(
             "{}/.config/atom/AGENTS.md",
             home
@@ -481,15 +620,16 @@ mod tests {
     fn linkify_backticked_path_with_space() {
         let in_text = "`~/Library/Application Support/atom/diagrams/`";
         let home = dirs::home_dir().unwrap().display().to_string();
-        let out = linkify(in_text, "", "");
+        let out = linkify(in_text, "", "", "");
         // The full path — space included — becomes the URI, escaped.
+        // The trailing slash is a real directory marker and survives.
         assert!(out.contains(&osc8_open(&file_uri(&format!(
             "{home}/Library/Application Support/atom/diagrams/"
         )))));
         // Backticks remain visible and no text is lost.
         assert_eq!(visible_width(&out), visible_width(in_text));
         // Absolute backticked paths behave the same.
-        let out = linkify("`/Users/a/My Docs/x.md`", "", "");
+        let out = linkify("`/Users/a/My Docs/x.md`", "", "", "");
         assert!(out.contains(&osc8_open(&file_uri("/Users/a/My Docs/x.md"))));
     }
 
@@ -498,7 +638,7 @@ mod tests {
         // The visualize tool marker quotes artifact paths; a
         // space-containing path must not truncate at the space.
         let in_text = "png=\"/Users/a/My Docs/x.png\" html=\"/Users/a/My Docs/x.html\"";
-        let out = linkify(in_text, "", "");
+        let out = linkify(in_text, "", "", "");
         assert!(out.contains(&osc8_open(&file_uri("/Users/a/My Docs/x.png"))));
         assert!(out.contains(&osc8_open(&file_uri("/Users/a/My Docs/x.html"))));
         // The full display text survives (no truncation at the space).
@@ -514,7 +654,7 @@ mod tests {
     #[test]
     fn linkify_path_relative_makes_absolute_uri() {
         for rel in ["tui.go", "src/main.go"] {
-            let out = linkify_path(rel, COLOR_FOREGROUND, COLOR_CARD_DARK);
+            let out = linkify_path(rel, COLOR_FOREGROUND, COLOR_CARD_DARK, "");
             let cwd = std::env::current_dir().unwrap();
             let abs = format!("{}/{}", cwd.display(), rel);
             assert!(
@@ -545,14 +685,14 @@ mod tests {
             "hit http://\u{4e2d}\u{6587} ok",
             "accent \u{e9}\u{e9}\u{e9}\u{e9}\u{e9} plain",
         ] {
-            let out = linkify(text, "", "");
+            let out = linkify(text, "", "", "");
             assert_eq!(visible_width(&out), visible_width(text), "{text}");
             assert!(out.contains('\u{2014}') || !text.contains('\u{2014}'));
         }
         // Direct calls with multi-byte leading runes must not panic either.
-        let _ = link_uri("\u{2014}\u{2014}\u{2014}");
-        let _ = link_uri("\u{e9}\u{e9}\u{e9}\u{e9}");
-        let _ = path_file_uri("\u{2014}\u{2014}\u{2014}/x");
+        let _ = link_uri("\u{2014}\u{2014}\u{2014}", "");
+        let _ = link_uri("\u{e9}\u{e9}\u{e9}\u{e9}", "");
+        let _ = path_file_uri("\u{2014}\u{2014}\u{2014}/x", "");
     }
 
     /// Golden captured from charmbracelet/x/ansi v0.11.8 via the real
@@ -560,7 +700,13 @@ mod tests {
     #[test]
     fn wrap_linked_golden_matches_go() {
         let url = "https://ness-health.com/a/very/long/path/that/will/wrap";
-        let got = wrap_linked(&format!("prefix {url} suffix"), 20, COLOR_FOREGROUND, "");
+        let got = wrap_linked(
+            &format!("prefix {url} suffix"),
+            20,
+            COLOR_FOREGROUND,
+            "",
+            "",
+        );
         let want = "prefix \x1b]8;;https://ness-health.com/a/very/long/path/that/will/wrap\x07\
 \x1b[38;2;180;145;176m\x1b[4mhttps://ness-\nhealth.com/a/very/lo\nng/path/that/will/wr\nap\
 \x1b[24m\x1b[38;2;206;213;217m\x1b]8;;\x07 suffix";

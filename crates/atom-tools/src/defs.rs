@@ -23,6 +23,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDef> {
             "Search web for current info. Returns titles, URLs, snippets. Use when user asks about current events or info not in training data. Keep query concise, then answer from results.",
             r#"{"type":"object","properties":{"query":{"type":"string","description":"Search query"}},"required":["query"]}"#,
         ),
+        webfetch_def(),
         def(
             "read_file",
             "Read file, returns window of lines (offset default 0, limit default 1000). After this, edit_file and write_file may be used on path. If file changes on disk later, those tools return short diff — do not re-read whole file. Images (png, jpg, gif, webp, bmp) return as image for vision models.",
@@ -50,6 +51,14 @@ pub fn builtin_tool_definitions() -> Vec<ToolDef> {
         dispatch_def(),
         skill_def(),
     ]
+}
+
+pub fn webfetch_def() -> ToolDef {
+    def(
+        "webfetch",
+        "Fetch a single URL and return its content. Format: markdown (default), text, or html. Use when you already have the URL and want its content; use web_search to find URLs first. Read-only. 5MB max, 30s default timeout (max 120s). Bot-challenged sites (Cloudflare, Anubis) may still block.",
+        r#"{"type":"object","properties":{"url":{"type":"string","description":"The URL to fetch (http or https)"},"format":{"type":"string","enum":["markdown","text","html"],"description":"Output format. Default markdown."},"timeout":{"type":"integer","description":"Timeout in seconds, max 120. Default 30."}},"required":["url"]}"#,
+    )
 }
 
 pub fn vector_search_def() -> ToolDef {
@@ -98,7 +107,7 @@ pub fn dispatch_def() -> ToolDef {
     def(
         "dispatch",
         "Manage subagents through one bulk interface. action=models: discover exact providers and model IDs. action=spawn: one subagent per tasks string (max 100, min 1); tasks accepts a single string or a list of strings (a string is treated as a one-item list), all share provider/model/thinking; result has session id; send new prompt to continue, cancel to stop. spawn requires at least one task. action=inspect: status snapshot and optional results for ids, batch_id, or all owned subagents. action=send: continue selected subagents with prompt, or distinct messages per subagent. action=cancel: stop selected. Every operation bulk-capable; prefer batch_id over many IDs. User can open subagent by clicking tool block or shift+down. No nested dispatch, one level only.",
-        r#"{"type":"object","properties":{"action":{"type":"string","enum":["models","spawn","inspect","send","cancel"],"description":"Operation."},"tasks":{"anyOf":[{"type":"string"},{"type":"array","minItems":1,"maxItems":100,"items":{"type":"string"}}],"description":"Spawn only: one prompt per new subagent; a single string is treated as a one-item list."},"provider":{"type":"string","description":"Spawn only: exact provider from action=models. Omit to inherit."},"model":{"type":"string","description":"Spawn only: exact model ID from action=models. Omit to inherit."},"thinking":{"type":"string","description":"Spawn/send reasoning_effort: none, low, high, or max."},"batch_id":{"type":"string","description":"Target every subagent from one spawn."},"ids":{"type":"array","items":{"type":"string"},"description":"Selected subagent IDs. Omit ids and batch_id to target all owned."},"prompt":{"type":"string","description":"Send only: follow-up prompt shared by all targets."},"messages":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"prompt":{"type":"string"}},"required":["id","prompt"]},"description":"Send only: distinct follow-up prompts by subagent ID."},"wait":{"type":"string","enum":["none","any","all"],"description":"Spawn/inspect: when to return, default none."},"results":{"type":"boolean","description":"Inspect: include available results, default true."},"statuses":{"type":"array","items":{"type":"string","enum":["queued","working","sandbox","error","done","cancelled"]},"description":"Cancel only: restrict cancellation to these statuses."},"query":{"type":"string","description":"Models only: optional model ID filter."}},"required":["action"]}"#,
+        r#"{"type":"object","properties":{"action":{"type":"string","enum":["models","spawn","inspect","send","cancel"],"description":"Operation."},"tasks":{"anyOf":[{"type":"string"},{"type":"array","minItems":1,"maxItems":100,"items":{"type":"string"}}],"description":"Spawn only: one prompt per new subagent; a single string is treated as a one-item list."},"provider":{"type":"string","description":"Spawn only: exact provider from action=models. Omit to inherit."},"model":{"type":"string","description":"Spawn only: exact model ID from action=models. Omit to inherit."},"thinking":{"type":"string","description":"Spawn/send reasoning_effort: none, low, high, or max."},"batch_id":{"type":"string","description":"Target every subagent from one spawn."},"ids":{"type":"array","items":{"type":"string"},"description":"Selected subagent IDs. Omit ids and batch_id to target all owned."},"prompt":{"type":"string","description":"Send only: follow-up prompt shared by all targets."},"messages":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"prompt":{"type":"string"}},"required":["id","prompt"]},"description":"Send only: distinct follow-up prompts by subagent ID."},"wait":{"type":"string","enum":["none","any","all"],"description":"Spawn/inspect: when to return, default none."},"results":{"type":"boolean","description":"Inspect: include available results, default true."},"statuses":{"type":"array","items":{"type":"string","enum":["queued","working","sandbox","error","done","cancelled","stopped"]},"description":"Cancel only: restrict cancellation to these statuses."},"query":{"type":"string","description":"Models only: optional model ID filter."}},"required":["action"]}"#,
     )
 }
 
@@ -107,6 +116,17 @@ pub fn skill_def() -> ToolDef {
         "skill",
         "Load skill instructions by exact name from skills catalog (system prompt lists name + description only). Call when request matches listed skill, then follow instructions. Never load irrelevant skill.",
         r#"{"type":"object","properties":{"name":{"type":"string","description":"Exact skill name from catalog"}},"required":["name"]}"#,
+    )
+}
+
+/// findToolDef is the entry point for deferred MCP tool catalogs.
+/// Included only when at least one configured server defers its tools;
+/// large MCP servers (100+ tools) would otherwise flood the context.
+pub fn find_tool_def() -> ToolDef {
+    def(
+        "find_tool",
+        "Search hidden MCP tool catalogs. Large MCP servers hide their tool definitions behind this: their tools are not in your tool list until found. Use only when no already-visible tool fits. Query with a server or capability keyword (\"campaigns\", \"github pull request\"). Full schemas of matching tools are returned and stay loaded for the session — then call the chosen tool directly. Matched tool names are prefixed mcp_<server>_.",
+        r#"{"type":"object","properties":{"query":{"type":"string","description":"Server or capability keywords, e.g. 'campaigns', 'github pull request'"}},"required":["query"]}"#,
     )
 }
 
@@ -133,6 +153,7 @@ mod tests {
             names,
             vec![
                 "web_search",
+                "webfetch",
                 "read_file",
                 "write_file",
                 "edit_file",
@@ -145,7 +166,7 @@ mod tests {
                 "skill",
             ]
         );
-        assert_eq!(crate::tool_definitions().len(), 11);
+        assert_eq!(crate::tool_definitions().len(), 12);
     }
 
     #[test]
@@ -171,7 +192,7 @@ mod tests {
         assert_eq!(without_tool(&tools, "dispatch").len(), tools.len());
         // Stripping everything but keeping order otherwise.
         let no_bash = without_tool(&crate::tool_definitions(), "bash");
-        assert_eq!(no_bash.len(), 10);
-        assert_eq!(no_bash[4].function.name, "vector_search");
+        assert_eq!(no_bash.len(), 11);
+        assert_eq!(no_bash[4].function.name, "edit_file");
     }
 }

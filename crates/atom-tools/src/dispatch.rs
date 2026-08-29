@@ -215,6 +215,9 @@ pub async fn execute_dispatch_models(ctx: &ToolCtx<'_>, arguments: &str) -> Stri
         query: String,
     }
 
+    if arguments.trim().is_empty() {
+        return crate::exec::empty_arguments_msg("dispatch_models");
+    }
     let args: Args = match serde_json::from_str(arguments) {
         Ok(args) => args,
         Err(err) => return format!("error parsing arguments: {err}"),
@@ -353,6 +356,9 @@ where
 /// result, or cancels it. Without a spawner this mirrors Go's nil
 /// store/parent error.
 pub async fn execute_dispatch(ctx: &ToolCtx<'_>, arguments: &str) -> String {
+    if arguments.trim().is_empty() {
+        return crate::exec::empty_arguments_msg("dispatch");
+    }
     let args: DispatchArgs = match serde_json::from_str(arguments) {
         Ok(a) => a,
         Err(e) => return format!("error parsing arguments: {e}"),

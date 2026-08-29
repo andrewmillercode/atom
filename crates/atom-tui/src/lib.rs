@@ -13,6 +13,7 @@ pub mod api;
 pub mod app;
 pub mod blocks;
 pub mod events;
+pub mod fullscreen_view;
 pub mod hot;
 pub mod math;
 pub mod outputtest;
@@ -760,6 +761,41 @@ async fn run_effects(
                     let _ = tx.send(AppMsg::ContextLoaded(rows));
                 });
             }
+            Effect::LoadForkSource { id } => {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    match api::get_session(&id).await {
+                        Ok(sess) => {
+                            let _ = tx.send(AppMsg::ForkSourceLoaded {
+                                id,
+                                sess: Box::new(sess),
+                            });
+                        }
+                        Err(e) => {
+                            let _ = tx.send(AppMsg::Errored(e.to_string()));
+                        }
+                    }
+                });
+            }
+            Effect::ForkSession {
+                source_id,
+                position,
+            } => {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    match api::fork_session(&source_id, position).await {
+                        Ok(forked) => {
+                            let _ = tx.send(AppMsg::ForkedSession {
+                                info: Box::new(forked.info),
+                                draft: forked.draft,
+                            });
+                        }
+                        Err(e) => {
+                            let _ = tx.send(AppMsg::Errored(e.to_string()));
+                        }
+                    }
+                });
+            }
             Effect::CreateSession {
                 provider,
                 model,
@@ -890,6 +926,43 @@ async fn run_effects(
                     let _ = tx.send(AppMsg::OAuthDone(result));
                 });
             }
+            Effect::StartMcpOAuth {
+                server,
+                url,
+                client_id,
+                client_secret,
+                token_endpoint_auth_method,
+            } => {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    // bearer_token with interactive=true runs the full
+                    // PKCE flow when no usable cached token is present,
+                    // persists the resulting tokens, and returns them.
+                    // On success the auth store is already updated —
+                    // the App only needs to refresh the picker / catalog.
+                    let result = tokio::time::timeout(
+                        tokio::time::Duration::from_secs(3 * 60),
+                        atom_tools::mcp_oauth::bearer_token(
+                            &server,
+                            &url,
+                            &client_id,
+                            &client_secret,
+                            token_endpoint_auth_method.as_deref(),
+                            true,
+                        ),
+                    )
+                    .await
+                    .unwrap_or_else(|_| Err("MCP OAuth sign-in timed out".into()))
+                    .and_then(|tok| {
+                        if tok.is_none() {
+                            Err("OAuth flow returned no token".into())
+                        } else {
+                            Ok(())
+                        }
+                    });
+                    let _ = tx.send(AppMsg::McpOAuthDone { server, result });
+                });
+            }
             Effect::ReloadProviders => {
                 let tx = tx.clone();
                 tokio::spawn(async move {
@@ -925,6 +998,27 @@ async fn run_effects(
             }
             Effect::OpenLink { uri } => {
                 atom_core::util::open_url(&uri);
+            }
+            Effect::RunShell { cmd, cwd } => {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let (output, code, new_cwd) = run_user_shell(&cmd, &cwd, &tx).await;
+                    let _ = tx.send(AppMsg::ShellDone {
+                        cmd,
+                        cwd,
+                        output,
+                        code,
+                        new_cwd,
+                    });
+                });
+            }
+            Effect::PatchSessionCwd { id, cwd } => {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = api::patch_session_cwd(&id, &cwd).await {
+                        let _ = tx.send(AppMsg::Errored(e.to_string()));
+                    }
+                });
             }
             Effect::PaintPreviews => {
                 if !preview::kitty_terminal() {
@@ -1112,6 +1206,99 @@ fn hot_handoff(app: &mut App, build: &hot::HotBuild, path: &std::path::Path) -> 
     };
     hot::write_state(path, &state)?;
     hot::restart_self(&build.executable, &app.session.id, path)
+}
+
+// ---------------------------------------------------------------------------
+// Shell mode: run a user-typed command, reporting $PWD afterwards so a
+// `cd` moves the app (and the session) with the shell.
+// ---------------------------------------------------------------------------
+
+/// The user's login shell when it can host the POSIX wrapper (zsh, bash,
+/// sh…); fish gets /bin/sh because the marker script isn't fish syntax.
+fn user_shell() -> String {
+    let shell = std::env::var("SHELL").unwrap_or_default();
+    let base = shell.rsplit('/').next().unwrap_or_default();
+    if shell.is_empty() || base == "fish" {
+        "/bin/sh".to_string()
+    } else {
+        shell
+    }
+}
+
+/// Marker the wrapper prints to stderr after the command runs: the shell's
+/// final $PWD, which shell mode uses to follow `cd`.
+const SHELL_PWD_MARKER: &str = "__ATOM_PWD__";
+
+/// Runs `cmd` from `cwd` in the user's shell. Returns (output, exit code,
+/// new $PWD). The code is None when the command was killed via the armed
+/// kill switch (Ctrl+C in shell mode).
+async fn run_user_shell(
+    cmd: &str,
+    cwd: &str,
+    tx: &tokio::sync::mpsc::UnboundedSender<AppMsg>,
+) -> (String, Option<i32>, String) {
+    let mut command = tokio::process::Command::new(user_shell());
+    // eval keeps the user's quoting intact while letting the wrapper print
+    // its marker afterwards, even when the command `cd`s mid-way.
+    command
+        .arg("-c")
+        .arg(format!(
+            "eval \"$ATOM_SHELL_CMD\"; __atom_ec=$?; printf '\\n{SHELL_PWD_MARKER}%s' \"$PWD\" >&2; exit $__atom_ec"
+        ))
+        .env("ATOM_SHELL_CMD", cmd)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) => return (format!("error: {e}"), Some(127), String::new()),
+    };
+    let (kill_tx, mut kill_rx) = tokio::sync::oneshot::channel::<()>();
+    // The App stores kill_tx so Ctrl+C can abort the command while it runs.
+    let _ = tx.send(AppMsg::ShellKillArmed(kill_tx));
+
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let (mut out, mut err) = (String::new(), String::new());
+    let status = tokio::select! {
+        _ = async {
+            if let Some(s) = stdout.as_mut() {
+                let _ = tokio::io::AsyncReadExt::read_to_string(s, &mut out).await;
+            }
+            if let Some(s) = stderr.as_mut() {
+                let _ = tokio::io::AsyncReadExt::read_to_string(s, &mut err).await;
+            }
+        } => {
+            // Both pipes closed; reap the exit status.
+            child.wait().await.ok().and_then(|st| st.code())
+        }
+        _ = &mut kill_rx => {
+            let _ = child.start_kill();
+            // Reap so the child doesn't linger as a zombie.
+            let _ = child.wait().await;
+            None
+        }
+    };
+
+    // Strip the trailing $PWD marker from the displayed stderr.
+    let new_cwd = match err.rfind(SHELL_PWD_MARKER) {
+        Some(i) => {
+            let pwd = err[i + SHELL_PWD_MARKER.len()..].trim().to_string();
+            err.truncate(i);
+            pwd
+        }
+        None => String::new(),
+    };
+
+    let mut output = out;
+    if !err.trim().is_empty() {
+        if !output.is_empty() && !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push_str(&err);
+    }
+    (output, status, new_cwd)
 }
 
 // ---------------------------------------------------------------------------

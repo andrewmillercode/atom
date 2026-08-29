@@ -1,42 +1,77 @@
 //! The execution pipeline everything calls:
-//! analyze -> approval gate -> confinement -> audit.
 //!
-//! `SandboxMode::Off` skips the gate and confinement but still audits.
+//! `analyze -> guardrail floor -> approval gate -> spawn -> audit`.
+//!
+//! v2 drops kernel confinement (seatbelt / bwrap). The wide static
+//! allowlist + guardrail floor replaces the deny-by-default sandbox:
+//! commands land in Tier 1 silently when they match the table, in
+//! Tier 2 with a prompt otherwise. Guardrails (recursive rm, sudo, …)
+//! still block outright, even for commands the user has accepted.
+//!
+//! Per-session tmpdir setup + subprocess env scrubbing happen inside
+//! [`run_with`], the single entry point for both `run` (which uses
+//! the data dir) and direct test calls.
 
-use crate::approvals::{ApprovalRequest, ApprovalStore, Approver, Decision};
-use crate::policy::{SandboxConfig, SandboxMode};
-use crate::rules::{self, Analysis, Verdict, RULES};
-use crate::seatbelt::{self, bwrap_args, linux_confine, ConfineKind};
+use crate::approvals::{ApprovalRequest, ApprovalStore, Approver};
+use crate::policy::{prefix_for_command, RuleMatch, SandboxConfig};
+use crate::rules::{self, Analysis, Verdict};
 use atom_core::session::store::data_dir;
 use atom_core::util::sha256_hash;
 use once_cell::sync::Lazy;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::Mutex;
 use std::time::Duration;
 use tokio::process::Command;
 
-/// Hard wall-clock limit for one confined command.
+/// Hard wall-clock limit for one command. v2 has no confinement, so
+/// this is just a runaway safety net.
 pub const EXEC_TIMEOUT: Duration = Duration::from_secs(120);
 
 const BASH: &str = "/bin/bash";
 
-/// Process-global approval store so AllowSession grants persist across
-/// calls within a session and globals survive restarts via approvals.json.
+/// Process-global approval store backed by sandbox.json. Held behind a
+/// `Lazy` so the disk read happens once on first use; per-process
+/// callers who want a fresh view call [`ApprovalStore::reload`].
 static APPROVAL_STORE: Lazy<ApprovalStore> = Lazy::new(ApprovalStore::new);
 
 pub fn approval_store() -> &'static ApprovalStore {
     &APPROVAL_STORE
 }
 
+/// How a command was confined (v2: always `None` — kept so audit
+/// records and downstream tests still compile).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfineKind {
+    None,
+    /// Legacy values kept for backward-compatible audit-log parsing
+    /// (older logs may emit "seatbelt" or "bwrap"; they collapse to
+    /// None here since v2 has no kernel confinement).
+    #[serde(other)]
+    SeatbeltOrBwrap,
+}
+
+impl ConfineKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ConfineKind::None => "none",
+            ConfineKind::SeatbeltOrBwrap => "none",
+        }
+    }
+}
+
 /// Result of one sandboxed execution.
 #[derive(Debug, Clone)]
 pub struct ExecOutcome {
-    /// -1 when the command never ran (blocked/timeout kill without code).
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
     pub timed_out: bool,
     pub verdict: Analysis,
     pub approved: bool,
+    /// v2: always `ConfineKind::None`. Field kept so audit log records
+    /// stay well-formed and downstream code keeps compiling.
     pub confined: ConfineKind,
 }
 
@@ -59,13 +94,13 @@ impl Default for ExecOutcome {
 fn primary_rule_id(a: &Analysis) -> String {
     a.matched_rules
         .iter()
-        .find(|id| RULES.iter().any(|r| r.id == *id))
+        .find(|id| rules::RULES.iter().any(|r| r.id == *id))
         .cloned()
         .unwrap_or_default()
 }
 
 fn reason_for(rule_id: &str) -> String {
-    RULES
+    rules::RULES
         .iter()
         .find(|r| r.id == rule_id)
         .map(|r| r.reason.to_string())
@@ -93,20 +128,9 @@ pub async fn run(
     .await
 }
 
-/// Whether a run may use outbound network inside its confinement profile.
-///
-/// The config's [`NetPolicy`] is the baseline; additionally, a command that
-/// touches the network (`Analysis::uses_network`) and passed the approval
-/// gate (`approved`) is granted network egress for that single run. This is
-/// what makes the network approval prompt meaningful: approving curl/wget
-/// actually lets them connect, while unapproved or non-network commands stay
-/// confined by the policy.
-pub fn net_allowed_for_run(cfg: &SandboxConfig, uses_network: bool, approved: bool) -> bool {
-    cfg.net_allowed() || (uses_network && approved)
-}
-
 /// Like [`run`] with an explicit data dir for the audit log (tests use
 /// unique temp dirs so parallel runs stay hermetic).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_with(
     data_dir_path: &Path,
     cmd: &str,
@@ -117,67 +141,58 @@ pub async fn run_with(
     approver: &dyn Approver,
 ) -> ExecOutcome {
     // 1. analyze
-    let verdict = rules::analyze_full(cmd, workspace_root, cwd, cfg.strict());
+    let verdict = rules::analyze_full(cmd, workspace_root, cwd, false);
 
-    // Off mode: no gate, no confinement — still audited.
-    if cfg.mode == SandboxMode::Off {
-        let mut outcome = spawn_and_wait(None, cmd, cwd).await;
-        outcome.verdict = verdict.clone();
-        outcome.approved = false;
-        outcome.confined = ConfineKind::None;
+    // 2. guardrail floor: hard Deny is terminal, no prompt.
+    if verdict.verdict == Verdict::Deny {
+        let rule_id = primary_rule_id(&verdict);
+        let reason = reason_for(&rule_id);
+        let outcome = ExecOutcome {
+            exit_code: -1,
+            stderr: format!("atom: blocked by sandbox policy ({rule_id}): {reason}\n"),
+            verdict: verdict.clone(),
+            approved: false,
+            ..Default::default()
+        };
         audit(
             data_dir_path,
             session_id,
             cmd,
             &verdict,
-            "off",
-            ConfineKind::None,
+            "deny",
             &outcome,
             None,
         );
         return outcome;
     }
 
-    // 2. approval gate
+    // 3. approval gate: Tier 1 → Allow (no prompt), Tier 2 → prompt.
     let mut approved = true;
     let decision;
     match verdict.verdict {
-        Verdict::Deny => {
-            let rule_id = primary_rule_id(&verdict);
-            let reason = reason_for(&rule_id);
-            let outcome = ExecOutcome {
-                exit_code: -1,
-                stderr: format!("atom: blocked by sandbox policy ({rule_id}): {reason}\n"),
-                verdict: verdict.clone(),
-                approved: false,
-                ..Default::default()
-            };
-            audit(
-                data_dir_path,
-                session_id,
-                cmd,
-                &verdict,
-                Decision::Deny.as_str(),
-                ConfineKind::None,
-                &outcome,
-                None,
-            );
-            return outcome;
-        }
+        Verdict::Allow => decision = "allow",
         Verdict::Ask => {
-            let rule_id = primary_rule_id(&verdict);
-            let key = crate::approvals::key_for(&rule_id, cmd, cwd);
-            if APPROVAL_STORE.check(session_id, &key) {
-                decision = Decision::AllowSession.as_str();
+            // User rules can promote a Tier 2 command back to Tier 1
+            // (allow rule) or pin it to Tier 2 with the rule name as
+            // reason (deny rule). Allow short-circuits entirely; deny
+            // just decorates the prompt.
+            if let Some(RuleMatch::Allow(_)) = cfg.classify(cmd) {
+                decision = "allow";
             } else {
+                let mut reason = reason_for(&primary_rule_id(&verdict));
+                if let Some(RuleMatch::Deny(rule)) = cfg.classify(cmd) {
+                    reason = format!("deny rule \"{rule}\": {reason}");
+                }
+                let rule_id = primary_rule_id(&verdict);
                 let req = ApprovalRequest {
                     session_id: session_id.to_string(),
                     command: cmd.to_string(),
                     cwd: cwd.to_path_buf(),
                     rule_id: rule_id.clone(),
-                    reason: reason_for(&rule_id),
+                    reason: reason.clone(),
+                    accept_all_preview: Some(prefix_for_command(cmd)),
                 };
-                let d = APPROVAL_STORE.gate(&req, &key, approver).await;
+                let d = APPROVAL_STORE.gate(&req, approver, &cfg.save_path()).await;
                 decision = d.as_str();
                 approved = d.allows();
                 if !approved {
@@ -194,7 +209,6 @@ pub async fn run_with(
                         cmd,
                         &verdict,
                         decision,
-                        ConfineKind::None,
                         &outcome,
                         None,
                     );
@@ -202,177 +216,206 @@ pub async fn run_with(
                 }
             }
         }
-        Verdict::Allow => decision = "allow",
+        Verdict::Deny => unreachable!(),
     }
 
-    // 3. confinement
-    // An approved network command runs with network egress enabled even
-    // when the sandbox config denies network by default; otherwise the
-    // approval prompt would be pointless (the profile's `(deny network*)`
-    // would still kill the request). Denied commands never reach this
-    // point, so `approved` is the only extra signal needed.
-    let net_allowed = net_allowed_for_run(cfg, verdict.uses_network, approved);
-    let net_denied = !net_allowed;
-    let profile = if seatbelt::seatbelt_available() {
-        Some(seatbelt::generate_profile(
-            cfg,
-            workspace_root,
-            &std::env::temp_dir(),
-            data_dir_path,
-            net_allowed,
-        ))
-    } else {
-        None
-    };
-
-    let (confined, note): (ConfineKind, Option<String>) = match profile {
-        Some(p) => match write_profile_file(&p) {
-            Ok(tmp) => {
-                let out = spawn_and_wait(
-                    Some((seatbelt::SANDBOX_EXEC.into(), tmp.path().into())),
-                    cmd,
-                    cwd,
-                )
-                .await;
-                drop(tmp);
-                let mut o = out;
-                o.verdict = verdict.clone();
-                o.approved = approved;
-                o.confined = ConfineKind::Seatbelt;
-                audit(
-                    data_dir_path,
-                    session_id,
-                    cmd,
-                    &verdict,
-                    decision,
-                    ConfineKind::Seatbelt,
-                    &o,
-                    None,
-                );
-                return o;
-            }
-            Err(e) => (
-                ConfineKind::None,
-                Some(format!("failed to write seatbelt profile: {e}")),
-            ),
-        },
-        None => {
-            if cfg!(target_os = "linux")
-                && linux_confine(workspace_root, &std::env::temp_dir(), net_denied)
-                    == ConfineKind::Bwrap
-            {
-                let args = bwrap_args(
-                    workspace_root,
-                    &std::env::temp_dir(),
-                    data_dir_path,
-                    net_denied,
-                );
-                let out = spawn_bwrap(&args, cmd, cwd).await;
-                let mut o = out;
-                o.verdict = verdict.clone();
-                o.approved = approved;
-                o.confined = ConfineKind::Bwrap;
-                audit(
-                    data_dir_path,
-                    session_id,
-                    cmd,
-                    &verdict,
-                    decision,
-                    ConfineKind::Bwrap,
-                    &o,
-                    None,
-                );
-                return o;
-            }
-            (
-                ConfineKind::None,
-                Some("no confinement mechanism available".into()),
-            )
+    // 4. spawn (with env scrub + per-session tmpdir).
+    let tmpdir = match setup_session_tmpdir(session_id, data_dir_path) {
+        Ok(t) => Some(t),
+        Err(e) => {
+            // tmpdir failure is non-fatal; the command still runs in the
+            // host's $TMPDIR. Audit notes the fallback.
+            eprintln!("atom: failed to create session tmpdir: {e}");
+            None
         }
     };
 
-    // Unconfined fallback path (still gated + audited).
-    let mut outcome = spawn_and_wait(None, cmd, cwd).await;
+    let mut outcome = spawn_and_wait(tmpdir.as_ref().map(|t| t.path()), cmd, cwd).await;
     outcome.verdict = verdict.clone();
     outcome.approved = approved;
-    outcome.confined = confined;
+    outcome.confined = ConfineKind::None;
     audit(
         data_dir_path,
         session_id,
         cmd,
         &verdict,
         decision,
-        confined,
         &outcome,
-        note.as_deref(),
+        None,
     );
+
+    if let Some(t) = tmpdir {
+        if let Err(e) = t.cleanup() {
+            eprintln!("atom: failed to remove session tmpdir: {e}");
+        }
+    }
     outcome
 }
 
-/// Write an SBPL profile to a fresh 0600 file under temp_dir().
-/// Caller must keep the guard alive until the child has spawned and
-/// read it; dropping deletes the file.
-fn write_profile_file(profile: &str) -> anyhow::Result<tempfile::NamedTempFile> {
-    use std::io::Write;
-    let mut f = tempfile::Builder::new()
-        .prefix("atom-sbx-")
-        .rand_bytes(8)
-        .tempfile_in(std::env::temp_dir())?;
-    f.write_all(profile.as_bytes())?;
-    f.flush()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        f.as_file()
-            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+/// RAII guard for the per-session scratch directory under
+/// `dataDir()/tmp/atom-<session>-<rand>`. The directory is created
+/// `0700` (so other users on a shared box can't read scratch files)
+/// and removed when the guard drops unless [`SessionTmpdir::leak`] is
+/// called. The directory is exposed via `path()` so callers can wire
+/// it into `$TMPDIR` for spawned commands.
+pub struct SessionTmpdir {
+    path: PathBuf,
+    leaked: bool,
+}
+
+impl SessionTmpdir {
+    pub fn path(&self) -> &Path {
+        &self.path
     }
-    Ok(f)
+
+    /// Detach the guard so the directory is preserved (used by long-
+    /// running sessions that want their tmpdir to outlive a single
+    /// command). Cleanup must then happen explicitly.
+    pub fn leak(mut self) {
+        self.leaked = true;
+    }
+
+    pub fn cleanup(&self) -> std::io::Result<()> {
+        if self.leaked {
+            return Ok(());
+        }
+        std::fs::remove_dir_all(&self.path)
+    }
 }
 
-/// Spawn `/bin/bash -lc cmd`, optionally wrapped in
-/// `/usr/bin/sandbox-exec -f <profile>`, capturing stdout/stderr
-/// separately with a 120s timeout that kills the child.
-async fn spawn_and_wait(confine: Option<(String, PathBuf)>, cmd: &str, cwd: &Path) -> ExecOutcome {
-    let mut command = match confine {
-        Some((frontend, profile)) => {
-            let mut c = Command::new(&frontend);
-            c.arg("-f").arg(&profile);
-            c.arg(BASH).arg("-lc").arg(cmd);
-            c
+impl Drop for SessionTmpdir {
+    fn drop(&mut self) {
+        if !self.leaked {
+            let _ = std::fs::remove_dir_all(&self.path);
         }
-        None => {
-            let mut c = Command::new(BASH);
-            c.arg("-lc").arg(cmd);
-            c
+    }
+}
+
+/// Lazy host $TMPDIR so we honor `XDG_RUNTIME_DIR` first (private to
+/// the user, often `noexec`), then `$TMPDIR`, then `/tmp`. Computed
+/// once per process — the host's tmpdir doesn't move underneath us.
+static HOST_TMPDIR: Lazy<PathBuf> = Lazy::new(|| {
+    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").filter(|s| !s.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    if let Some(dir) = std::env::var_os("TMPDIR").filter(|s| !s.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    PathBuf::from("/tmp")
+});
+
+/// Per-session tmpdir bookkeeping. v2 doesn't expose a session-start
+/// hook yet, so we lazy-create the directory on first use and reuse
+/// it for subsequent commands in the same session. Cleanup happens
+/// when the explicit `cleanup_session_tmpdir` is called or on Drop.
+static SESSION_TMPDIRS: Lazy<Mutex<std::collections::HashMap<String, PathBuf>>> =
+    Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+
+fn setup_session_tmpdir(session_id: &str, _data_dir_path: &Path) -> std::io::Result<SessionTmpdir> {
+    let mut cache = SESSION_TMPDIRS
+        .lock()
+        .map_err(|_| std::io::Error::other("tmpdir cache poisoned"))?;
+    if let Some(existing) = cache.get(session_id) {
+        if existing.exists() {
+            return Ok(SessionTmpdir {
+                path: existing.clone(),
+                leaked: true, // owned by the cache, not by this guard
+            });
         }
+    }
+    // Build the parent: <host-tmpdir>/atom-<session>-<rand>. Honors
+    // `$XDG_RUNTIME_DIR` first so per-user sandboxes on shared boxes
+    // don't collide.
+    let rand = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let session = if session_id.is_empty() {
+        format!("anon-{rand}")
+    } else {
+        // Session ids are 16-hex in practice; sanitize for the path.
+        let safe: String = session_id
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .take(32)
+            .collect();
+        format!("{safe}-{rand}")
     };
-    command.current_dir(cwd);
-    command.stdin(std::process::Stdio::null());
-    command.stdout(std::process::Stdio::piped());
-    command.stderr(std::process::Stdio::piped());
-    run_child(command).await
+    let dir = HOST_TMPDIR.join(format!("atom-{session}"));
+    std::fs::create_dir_all(&dir)?;
+    set_dir_permissions_700(&dir)?;
+    cache.insert(session_id.to_string(), dir.clone());
+    Ok(SessionTmpdir {
+        path: dir,
+        leaked: true,
+    })
 }
 
-async fn spawn_bwrap(args: &[String], cmd: &str, cwd: &Path) -> ExecOutcome {
-    let mut command = Command::new("bwrap");
-    command.args(args);
-    command
-        .arg("--")
-        .arg(BASH)
-        .arg("-lc")
-        .arg(cmd)
-        .current_dir(cwd);
-    command.stdin(std::process::Stdio::null());
-    command.stdout(std::process::Stdio::piped());
-    command.stderr(std::process::Stdio::piped());
+#[cfg(unix)]
+fn set_dir_permissions_700(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn set_dir_permissions_700(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Environment scrubbing: every spawn_* helper drops credentials and
+/// secrets before exec so a sub-process can't exfiltrate them via
+/// `[ -n "$ANTHROPIC_API_KEY" ] && curl …` style shapes. Returns a
+/// owned Vec<(OsString, OsString)> so callers can `.clear()` and
+/// `.extend()` without aliasing the live env.
+pub fn scrub_env() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    let mut out = Vec::with_capacity(8);
+    let drop_suffixes = ["_TOKEN", "_KEY", "_SECRET", "_PASSWORD"];
+    let drop_prefixes = ["ANTHROPIC_", "OPENAI_", "GITHUB_TOKEN", "GH_TOKEN"];
+    for (key, value) in std::env::vars_os() {
+        let k = key.to_string_lossy();
+        if drop_prefixes.iter().any(|p| k.starts_with(p)) {
+            continue;
+        }
+        if drop_suffixes.iter().any(|s| k.ends_with(s)) {
+            continue;
+        }
+        // Keep everything else (PATH, LANG, HOME, …) intact.
+        out.push((key, value));
+    }
+    out
+}
+
+/// Spawn `/bin/bash -lc cmd`, capturing stdout/stderr separately with
+/// a 120s timeout. `tmpdir` (if set) is exported as `$TMPDIR` so tools
+/// that read it (cargo, go, sccache, …) Just Work without
+/// configuration.
+async fn spawn_and_wait(tmpdir: Option<&Path>, cmd: &str, cwd: &Path) -> ExecOutcome {
+    let mut command = Command::new(BASH);
+    command.arg("-lc").arg(cmd);
+    command.current_dir(cwd);
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    command.env_clear();
+    let scrubbed = scrub_env();
+    for (k, v) in &scrubbed {
+        command.env(k, v);
+    }
+    if let Some(t) = tmpdir {
+        command.env("TMPDIR", t);
+        command.env("TMP", t);
+        command.env("TEMP", t);
+    }
     run_child(command).await
 }
 
 async fn run_child(mut command: Command) -> ExecOutcome {
-    // kill_on_drop makes a dropped timeout future kill the child.
     command.kill_on_drop(true);
-    let child = command.spawn();
-    let child = match child {
+    let child = match command.spawn() {
         Ok(c) => c,
         Err(e) => {
             return ExecOutcome {
@@ -382,7 +425,6 @@ async fn run_child(mut command: Command) -> ExecOutcome {
             };
         }
     };
-
     let res = tokio::time::timeout(EXEC_TIMEOUT, child.wait_with_output()).await;
     match res {
         Ok(Ok(output)) => ExecOutcome {
@@ -397,8 +439,6 @@ async fn run_child(mut command: Command) -> ExecOutcome {
             stderr: format!("atom: wait failed: {e}\n"),
             ..Default::default()
         },
-        // Timeout: the future was dropped, which killed the child
-        // (kill_on_drop); partial output is lost by design.
         Err(_) => ExecOutcome {
             exit_code: -1,
             timed_out: true,
@@ -409,14 +449,12 @@ async fn run_child(mut command: Command) -> ExecOutcome {
 
 /// Append one JSONL audit record to dataDir()/sandbox-audit.log.
 /// Best-effort: audit failures never fail the command result.
-#[allow(clippy::too_many_arguments)]
 fn audit(
     data_dir_path: &Path,
     session_id: &str,
     cmd: &str,
     verdict: &Analysis,
     decision: &str,
-    confined: ConfineKind,
     outcome: &ExecOutcome,
     note: Option<&str>,
 ) {
@@ -425,8 +463,9 @@ fn audit(
         "session_id": session_id,
         "cmd_sha256": sha256_hash(cmd.as_bytes()),
         "verdict": verdict.verdict.as_str(),
+        "tier_origin": verdict.tier_origin,
         "decision": decision,
-        "confined": confined.as_str(),
+        "confined": outcome.confined.as_str(),
         "exit_code": outcome.exit_code,
         "timed_out": outcome.timed_out,
         "uses_network": verdict.uses_network,
@@ -451,8 +490,7 @@ fn audit(
 mod tests {
     use super::*;
     use crate::approvals::{AutoApprover, Decision, DenyAllApprover};
-    use crate::policy::{NetPolicy, SandboxConfig};
-    use std::time::Instant;
+    use crate::policy::{Rules, SandboxConfig};
 
     /// Unique per-test workspace/data dirs so parallel tests never share
     /// state (pid + atomic counter + unique tempdir root).
@@ -468,12 +506,8 @@ mod tests {
         }
     }
 
-    fn workspace_cfg() -> SandboxConfig {
-        SandboxConfig {
-            mode: SandboxMode::Workspace,
-            network: NetPolicy::Deny,
-            ..Default::default()
-        }
+    fn default_cfg() -> SandboxConfig {
+        SandboxConfig::default()
     }
 
     async fn run_in(
@@ -494,133 +528,37 @@ mod tests {
         .await
     }
 
-    #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn echo_hi_runs_confined_and_captures_stdout() {
+    async fn echo_hi_runs_and_captures_stdout() {
         let e = env();
-        let out = run_in(&e, "echo hi", &workspace_cfg(), &DenyAllApprover).await;
+        let out = run_in(&e, "echo hi", &default_cfg(), &DenyAllApprover).await;
         assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
         assert_eq!(out.stdout.trim_end(), "hi");
         assert!(!out.timed_out);
-        assert_eq!(out.confined, ConfineKind::Seatbelt);
+        assert_eq!(out.confined, ConfineKind::None);
         assert_eq!(out.verdict.verdict, Verdict::Allow);
 
         let log = std::fs::read_to_string(e._data.path().join("sandbox-audit.log")).unwrap();
         let rec: serde_json::Value = serde_json::from_str(log.lines().last().unwrap()).unwrap();
-        assert_eq!(rec["confined"], "seatbelt");
+        assert_eq!(rec["confined"], "none");
         assert_eq!(rec["decision"], "allow");
         assert_eq!(rec["exit_code"], 0);
         assert_eq!(rec["timed_out"], false);
         assert!(rec["cmd_sha256"].as_str().unwrap().len() == 64);
         assert!(rec["ts"].as_str().unwrap().contains('T'));
         assert_eq!(rec["session_id"], format!("sess-{}", std::process::id()));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn touch_home_blocked_by_confinement() {
-        let tag = format!("atom-sbx-probe-{}-{}", std::process::id(), uuid_like(),);
-        let probe = dirs::home_dir().unwrap().join(&tag);
-        let _ = std::fs::remove_file(&probe);
-
-        // Approver allows the Ask so the kernel layer is what stops us.
-        let e = env();
-        let out = run_in(
-            &e,
-            &format!("touch ~/{tag}"),
-            &workspace_cfg(),
-            &AutoApprover(Decision::AllowOnce),
-        )
-        .await;
-        assert_ne!(
-            out.exit_code, 0,
-            "home write must fail confined: {:?}",
-            out.stdout
-        );
-        assert!(
-            !probe.exists(),
-            "probe file must not exist after confined touch"
-        );
-        assert_eq!(out.confined, ConfineKind::Seatbelt);
-
-        let _ = std::fs::remove_file(&probe);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn curl_blocked_at_approval_gate_when_not_approved() {
-        let e = env();
-        let started = Instant::now();
-        let out = run_in(
-            &e,
-            "curl -sS --max-time 15 http://example.com -o /dev/null",
-            &workspace_cfg(),
-            &DenyAllApprover,
-        )
-        .await;
-        let elapsed = started.elapsed();
-        assert!(out.verdict.uses_network);
-        assert!(!out.approved);
-        assert_ne!(out.exit_code, 0, "unapproved curl must not run");
-        assert!(
-            out.stderr.contains("not approved"),
-            "stderr: {}",
-            out.stderr
-        );
-        assert!(
-            elapsed < Duration::from_secs(20),
-            "curl should fail fast at the gate, took {elapsed:?}"
-        );
-    }
-
-    #[test]
-    fn net_allowed_for_run_matrix() {
-        use crate::policy::NetPolicy;
-        let deny = SandboxConfig {
-            network: NetPolicy::Deny,
-            ..Default::default()
-        };
-        let ask = SandboxConfig {
-            network: NetPolicy::Ask,
-            ..Default::default()
-        };
-        let allow = SandboxConfig {
-            network: NetPolicy::Allow,
-            ..Default::default()
-        };
-        // Config baseline: Allow always grants network.
-        assert!(net_allowed_for_run(&allow, false, false));
-        assert!(net_allowed_for_run(&allow, true, true));
-        // Non-network commands never gain egress, approved or not.
-        assert!(!net_allowed_for_run(&deny, false, true));
-        assert!(!net_allowed_for_run(&ask, false, false));
-        // Network commands need approval: unapproved stay denied...
-        assert!(!net_allowed_for_run(&deny, true, false));
-        assert!(!net_allowed_for_run(&ask, true, false));
-        // ...but approval grants egress for that run (the fix for the
-        // approval prompt that could never actually reach the network).
-        assert!(net_allowed_for_run(&deny, true, true));
-        assert!(net_allowed_for_run(&ask, true, true));
+        // v2: tier_origin is recorded.
+        assert!(rec["tier_origin"].is_string());
     }
 
     #[tokio::test]
-    async fn off_mode_runs_unsandboxed_and_audits() {
+    async fn tier1_command_does_not_prompt() {
         let e = env();
-        let cfg = SandboxConfig {
-            mode: SandboxMode::Off,
-            ..Default::default()
-        };
-        let out = run_in(&e, "echo off-run", &cfg, &DenyAllApprover).await;
-        assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
-        assert_eq!(out.stdout.trim_end(), "off-run");
-        assert_eq!(out.confined, ConfineKind::None);
-        assert!(!out.approved);
-
-        let log = std::fs::read_to_string(e._data.path().join("sandbox-audit.log")).unwrap();
-        let rec: serde_json::Value = serde_json::from_str(log.lines().last().unwrap()).unwrap();
-        assert_eq!(rec["decision"], "off");
-        assert_eq!(rec["confined"], "none");
-        assert_eq!(rec["exit_code"], 0);
+        // Use a DenyAllApprover so any prompt would fail the test.
+        let out = run_in(&e, "ls -la", &default_cfg(), &DenyAllApprover).await;
+        assert_eq!(out.exit_code, 0);
+        assert!(out.approved);
+        assert_eq!(out.verdict.verdict, Verdict::Allow);
     }
 
     #[tokio::test]
@@ -632,9 +570,8 @@ mod tests {
                 panic!("approver must not be consulted for Deny verdicts");
             }
         }
-
         let e = env();
-        let out = run_in(&e, "sudo reboot", &workspace_cfg(), &Panic).await;
+        let out = run_in(&e, "sudo reboot", &default_cfg(), &Panic).await;
         assert_eq!(out.exit_code, -1);
         assert!(out.stdout.is_empty());
         assert!(out.stderr.contains("blocked by sandbox policy"));
@@ -643,48 +580,206 @@ mod tests {
 
         let log = std::fs::read_to_string(e._data.path().join("sandbox-audit.log")).unwrap();
         let rec: serde_json::Value = serde_json::from_str(log.lines().last().unwrap()).unwrap();
+        // Guardrail denials audit as plain "deny" — no prompt fires.
         assert_eq!(rec["decision"], "deny");
         assert_eq!(rec["exit_code"], -1);
     }
 
     #[tokio::test]
-    async fn ask_with_session_grant_skips_prompt_on_second_call() {
+    async fn ask_with_auto_deny_does_not_run() {
         let e = env();
-        let cfg = workspace_cfg();
-        let session = "ask-sess-1";
-        let approver = AutoApprover(Decision::AllowSession);
+        let out = run_in(
+            &e,
+            "curl -sS --max-time 15 http://example.com -o /dev/null",
+            &default_cfg(),
+            &DenyAllApprover,
+        )
+        .await;
+        assert!(out.verdict.uses_network);
+        assert!(!out.approved);
+        assert_ne!(out.exit_code, 0);
+        assert!(out.stderr.contains("not approved"), "{}", out.stderr);
+    }
 
-        // First call: prompts (global store has no grant for this fresh key).
+    #[tokio::test]
+    async fn allow_all_persists_allow_rule_and_skips_prompt() {
+        let e = env();
+        let cfg_path = e._data.path().join("sandbox.json");
+        let cfg = SandboxConfig {
+            version: crate::policy::VERSION,
+            rules: Rules::default(),
+            path: Some(cfg_path.clone()),
+        };
+        cfg.save_to(&cfg_path).unwrap();
+        // First call: prompt + AllowAll → persists rule. `awk` is Tier 2
+        // (Ask) and available in every sensible test environment.
         let first = run_with(
             e._data.path(),
-            "wget --version",
+            "awk 'BEGIN{print 1}'",
             e._ws.path(),
             e._ws.path(),
-            session,
+            "ask-allow-all-sess",
             &cfg,
-            &approver,
+            &AutoApprover(Decision::AllowAll),
         )
         .await;
         assert!(first.approved);
-
-        // The grant recorded by call one lives in the process-global store.
-        let rule_id = primary_rule_id(&first.verdict);
-        let key = crate::approvals::key_for(&rule_id, "wget --version", e._ws.path());
+        // Rule landed in the config.
+        let on_disk = SandboxConfig::load_from(&cfg_path);
         assert!(
-            approval_store().check(session, &key),
-            "session grant should be reusable"
+            on_disk.rules.allow.iter().any(|r| r.starts_with("awk")),
+            "rule should be saved; got {:?}",
+            on_disk.rules.allow
         );
+        // Second call with a fresh store: classify() finds the allow
+        // rule and short-circuits the prompt.
+        let store = ApprovalStore::with_config_path(cfg_path);
+        assert!(matches!(
+            store.classify("awk 'BEGIN{print 1}'"),
+            Some(RuleMatch::Allow(_))
+        ));
     }
 
-    fn uuid_like() -> u128 {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        ((std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos())
-            << 8)
-            | n as u128
+    #[tokio::test]
+    async fn deny_all_persists_deny_rule_and_re_prompts() {
+        let e = env();
+        let cfg_path = e._data.path().join("sandbox.json");
+        let cfg = SandboxConfig {
+            version: crate::policy::VERSION,
+            rules: Rules::default(),
+            path: Some(cfg_path.clone()),
+        };
+        cfg.save_to(&cfg_path).unwrap();
+        let out = run_with(
+            e._data.path(),
+            "awk 'BEGIN{print 1}'",
+            e._ws.path(),
+            e._ws.path(),
+            "ask-deny-all-sess",
+            &cfg,
+            &AutoApprover(Decision::DenyAll),
+        )
+        .await;
+        assert!(!out.approved);
+        let on_disk = SandboxConfig::load_from(&cfg_path);
+        assert!(on_disk.rules.deny.iter().any(|r| r.starts_with("awk")));
+    }
+
+    #[tokio::test]
+    async fn config_allow_rule_promotes_to_tier1() {
+        let e = env();
+        let cfg_path = e._data.path().join("sandbox.json");
+        // Pre-seed: `awk *` is allowed globally.
+        let cfg = SandboxConfig {
+            version: crate::policy::VERSION,
+            rules: Rules {
+                allow: vec!["awk *".into()],
+                deny: vec![],
+            },
+            path: Some(cfg_path.clone()),
+        };
+        cfg.save_to(&cfg_path).unwrap();
+        // The DenyAllApprover would block a prompt, but the config
+        // short-circuits it.
+        let out = run_with(
+            e._data.path(),
+            "awk 'BEGIN{print 1}'",
+            e._ws.path(),
+            e._ws.path(),
+            "config-allow-sess",
+            &cfg,
+            &DenyAllApprover,
+        )
+        .await;
+        assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
+        assert!(out.approved);
+    }
+
+    #[tokio::test]
+    async fn env_scrub_strips_credential_keys() {
+        // Set a few keys that should be dropped.
+        // SAFETY: tests run single-threaded for env mutation here.
+        unsafe {
+            std::env::set_var("ATOM_TEST_TOKEN", "secret-token");
+            std::env::set_var("ATOM_TEST_API_KEY", "secret-key");
+            std::env::set_var("ATOM_TEST_PASSWORD", "secret-pw");
+            std::env::set_var("ATOM_TEST_KEEP", "kept");
+        }
+        let scrubbed = scrub_env();
+        let names: Vec<String> = scrubbed
+            .iter()
+            .map(|(k, _)| k.to_string_lossy().to_string())
+            .collect();
+        assert!(!names.iter().any(|k| k == "ATOM_TEST_TOKEN"));
+        assert!(!names.iter().any(|k| k == "ATOM_TEST_API_KEY"));
+        assert!(!names.iter().any(|k| k == "ATOM_TEST_PASSWORD"));
+        assert!(names.iter().any(|k| k == "ATOM_TEST_KEEP"));
+        unsafe {
+            std::env::remove_var("ATOM_TEST_TOKEN");
+            std::env::remove_var("ATOM_TEST_API_KEY");
+            std::env::remove_var("ATOM_TEST_PASSWORD");
+            std::env::remove_var("ATOM_TEST_KEEP");
+        }
+    }
+
+    #[tokio::test]
+    async fn per_session_tmpdir_is_created_and_set() {
+        let e = env();
+        // Use a custom TMPDIR parent so we don't litter /tmp.
+        let parent = tempfile::tempdir().unwrap();
+        // SAFETY: single-threaded test for env mutation.
+        unsafe {
+            std::env::set_var("TMPDIR", parent.path());
+        }
+        let out = run_with(
+            e._data.path(),
+            "echo $TMPDIR",
+            e._ws.path(),
+            e._ws.path(),
+            "tmpdir-sess",
+            &default_cfg(),
+            &DenyAllApprover,
+        )
+        .await;
+        assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
+        assert!(
+            out.stdout.contains("atom-tmpdir-sess-"),
+            "stdout: {}",
+            out.stdout
+        );
+        unsafe {
+            std::env::remove_var("TMPDIR");
+        }
+    }
+
+    #[test]
+    fn primary_rule_id_picks_first_real_rule() {
+        let a = Analysis {
+            matched_rules: vec![
+                "unknown-command".to_string(),
+                "curl".to_string(),
+                "path-escape-write".to_string(),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(primary_rule_id(&a), "curl");
+    }
+
+    #[test]
+    fn reason_for_known_rule_returns_table_text() {
+        assert!(reason_for("curl").contains("network"));
+        assert_eq!(reason_for("not-a-real-rule"), "requires approval");
+    }
+
+    #[test]
+    fn deny_all_writes_a_deny_rule_via_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sandbox.json");
+        let store = ApprovalStore::with_config_path(path.clone());
+        store
+            .record("rm -rf /tmp/foo", Decision::DenyAll, &path)
+            .unwrap();
+        let cfg = SandboxConfig::load_from(&path);
+        assert!(cfg.rules.deny.iter().any(|r| r.starts_with("rm")));
     }
 }

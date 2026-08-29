@@ -1,0 +1,21 @@
+{
+  "name": "Nord",
+  "author": "Arctic Ice Studio & Sven Greb (nordtheme.com)",
+  "border": "#3b4252",
+  "card_dark": "#292e39",
+  "card_light": "#3b4252",
+  "secondary": "#b48ead",
+  "primary": "#88c0d0",
+  "primary_dark": "#5e81ac",
+  "select": "#434c5e",
+  "background": "#2e3440",
+  "foreground": "#d8dee9",
+  "muted": "#7b88a1",
+  "muted_extra": "#4b5363",
+  "diff_add": "#20362b",
+  "diff_del": "#3b2529",
+  "diff_add_bg": "#2f4038",
+  "diff_del_bg": "#402f35",
+  "syntax_type": "#ebcb8b",
+  "syntax_string": "#a3be8c"
+}

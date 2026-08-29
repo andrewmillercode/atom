@@ -1,0 +1,21 @@
+{
+  "name": "Flexoki Dark",
+  "author": "Steph Ango",
+  "border": "#343331",
+  "card_dark": "#1c1b1a",
+  "card_light": "#282726",
+  "secondary": "#a02f6f",
+  "primary": "#205ea6",
+  "primary_dark": "#24837b",
+  "select": "#282726",
+  "background": "#100f0c",
+  "foreground": "#cecdc3",
+  "muted": "#6f6e69",
+  "muted_extra": "#43423f",
+  "diff_add": "#66800b",
+  "diff_del": "#af3029",
+  "diff_add_bg": "#25261f",
+  "diff_del_bg": "#2d1d1b",
+  "syntax_type": "#bc5215",
+  "syntax_string": "#879a39"
+}

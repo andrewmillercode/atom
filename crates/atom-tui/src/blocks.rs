@@ -64,6 +64,15 @@ pub struct InlineApproval {
     pub reason: String,
     pub from_subagent: bool,
     pub child_title: String,
+    /// v2 origin tag: "self" for the current session, "child" when
+    /// surfaced via a dispatched subagent. Mirrors `from_subagent`
+    /// for the renderer — kept separate because the wire name is
+    /// `origin` and we want the block to be readable without joining.
+    pub origin: String,
+    /// Prefix-rule preview for `[a] accept-all` (e.g. `"cargo test *"`).
+    /// Pre-computed by the server; rendered as a dim hint under the
+    /// command details.
+    pub accept_all_preview: Option<String>,
 }
 
 /// Button regions (col_start..col_end) within the rendered approval block,
@@ -219,13 +228,21 @@ impl Block {
         self.title.to_lowercase().replace(' ', "_")
     }
 
-    fn tool_output_exceeds_preview(&self, result_inner: usize, diff_width: usize) -> bool {
-        wrapped_line_count(tool_result_summary(&self.result, &self.diff), result_inner)
-            > TOOL_RESULT_PREVIEW_LINES
-            || wrapped_line_count(&self.diff, diff_width) > TOOL_RESULT_PREVIEW_LINES
+    fn tool_output_exceeds_preview(
+        &self,
+        result_inner: usize,
+        diff_width: usize,
+        cwd: &str,
+    ) -> bool {
+        wrapped_line_count(
+            tool_result_summary(&self.result, &self.diff),
+            result_inner,
+            cwd,
+        ) > TOOL_RESULT_PREVIEW_LINES
+            || wrapped_line_count(&self.diff, diff_width, cwd) > TOOL_RESULT_PREVIEW_LINES
     }
 
-    pub fn tool_collapsible(&self, result_inner: usize, diff_width: usize) -> bool {
+    pub fn tool_collapsible(&self, result_inner: usize, diff_width: usize, cwd: &str) -> bool {
         // A visualize block renders its diagram inline (plus the "⤢ open"
         // hint); there is no extra output behind an expand toggle.
         if self.diagram.is_some() {
@@ -234,15 +251,19 @@ impl Block {
         if hidden_output_tool(&self.resolved_tool_name()) {
             return !self.result.is_empty() || !self.diff.is_empty();
         }
-        self.tool_output_exceeds_preview(result_inner, diff_width)
+        self.tool_output_exceeds_preview(result_inner, diff_width, cwd)
     }
 
     /// userCollapsible: a user card collapses when its wrapped, rendered
     /// body (text rows plus image placeholder rows) exceeds the preview
     /// budget. One extremely long pasted line wraps into many rows and
     /// therefore collapses like a multi-line message would.
-    pub fn user_collapsible(&self, inner: usize) -> bool {
-        render_user_body_linked(&self.text, &self.images, inner, None)
+    ///
+    /// `cwd` is plumbed through to the path linkifier so file refs
+    /// in the user's message resolve against the session cwd; empty
+    /// falls back to the process cwd.
+    pub fn user_collapsible(&self, inner: usize, cwd: &str) -> bool {
+        render_user_body_linked(&self.text, &self.images, inner, None, cwd)
             .rows
             .len()
             > USER_PREVIEW_LINES
@@ -878,12 +899,18 @@ pub fn file_path_tool(name: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// wrappedLineCount: display lines after wrapping to width. Empty is 0.
-pub fn wrapped_line_count(s: &str, width: usize) -> usize {
+///
+/// `cwd` flows into the path linkifier so paths inside the wrapped
+/// text resolve against the session cwd; empty falls back to the
+/// process cwd.
+pub fn wrapped_line_count(s: &str, width: usize, cwd: &str) -> usize {
     if s.is_empty() {
         return 0;
     }
     let width = width.max(1);
-    display_line_count(&atom_core::render::links::wrap_linked(s, width, "", ""))
+    display_line_count(&atom_core::render::links::wrap_linked(
+        s, width, "", "", cwd,
+    ))
 }
 
 pub fn display_line_count(s: &str) -> usize {
@@ -950,13 +977,18 @@ impl RenderedBlock {
 
 /// Renders one conversation block wrapped to width. The viewport owns
 /// vertical padding and spacing between blocks.
+///
+/// `cwd` is the base for resolving repo-relative paths in tool call
+/// headers (e.g. `crates/foo.rs:42`) and assistant prose; an empty
+/// `cwd` falls back to the process cwd via the underlying links API.
 pub fn render_block(
     b: &mut Block,
     width: usize,
     _show_reasoning: bool,
     spinner_frame: &str,
+    cwd: &str,
 ) -> Vec<Line<'static>> {
-    render_block_linked(b, width, _show_reasoning, spinner_frame).lines
+    render_block_linked(b, width, _show_reasoning, spinner_frame, cwd).lines
 }
 
 /// Like [`render_block`] but also returns the clickable OSC 8 link
@@ -966,6 +998,7 @@ pub fn render_block_linked(
     width: usize,
     _show_reasoning: bool,
     spinner_frame: &str,
+    cwd: &str,
 ) -> RenderedBlock {
     let mut out = RenderedBlock {
         lines: Vec::new(),
@@ -977,7 +1010,7 @@ pub fn render_block_linked(
             // Render the full body first; collapse only when the wrapped
             // rows exceed the preview budget so short messages stay
             // untouched (and every collapsed card is expandable).
-            let mut body = render_user_body_linked(&b.text, &b.images, inner, None);
+            let mut body = render_user_body_linked(&b.text, &b.images, inner, None, cwd);
             if !b.expanded && body.rows.len() > USER_PREVIEW_LINES {
                 // Re-render capped at the preview budget: the cap applies
                 // to wrapped rows (one extremely long pasted line
@@ -987,6 +1020,7 @@ pub fn render_block_linked(
                     &b.images,
                     inner,
                     Some(USER_PREVIEW_LINES - 1),
+                    cwd,
                 );
                 body.rows.push(vec![Span::styled(
                     USER_EXPAND_HINT,
@@ -1015,20 +1049,34 @@ pub fn render_block_linked(
                 out.links.extend(math.links);
             } else {
                 b.line_formula_gen = 0;
-                let md = atom_core::render::markdown::render_markdown(&b.text, width.max(1));
+                let md = atom_core::render::markdown::render_markdown(&b.text, width.max(1), cwd);
                 let parsed = ansi::ansi_to_lines_linked(&md);
                 out.lines.extend(parsed.lines);
                 out.links.extend(parsed.links);
             }
             if !b.model.is_empty() {
-                let footer = match b.turn_duration {
-                    Some(duration) => {
-                        format!("{} | {}", b.model, format_turn_duration(duration))
-                    }
+                let dur = b.turn_duration.map(format_turn_duration);
+                let plain = match &dur {
+                    Some(dur) => format!("{} {dur}", b.model),
                     None => b.model.clone(),
                 };
-                for row in crate::prompt::wrap_plain(&footer, width.max(1)) {
-                    out.push_blank(Line::from(Span::styled(row, ansi::style_reasoning())));
+                for row in crate::prompt::wrap_plain(&plain, width.max(1)) {
+                    // The duration is extra-muted so it recedes behind the
+                    // model id; wrap_plain may put it on its own row.
+                    let spans = match &dur {
+                        Some(dur) if row.ends_with(dur.as_str()) => {
+                            let head = row[..row.len() - dur.len()].trim_end();
+                            vec![
+                                Span::styled(head.to_string(), ansi::style_reasoning()),
+                                Span::styled(
+                                    format!(" {dur}"),
+                                    ansi::style_reasoning().fg(ansi::c_muted_extra()),
+                                ),
+                            ]
+                        }
+                        _ => vec![Span::styled(row, ansi::style_reasoning())],
+                    };
+                    out.push_blank(Line::from(spans));
                 }
             }
         }
@@ -1043,6 +1091,7 @@ pub fn render_block_linked(
                     width.max(1),
                     atom_core::render::colors::COLOR_MUTED,
                     "",
+                    cwd,
                 );
                 let styled = format!(
                     "{}{}\x1b[39m",
@@ -1063,7 +1112,7 @@ pub fn render_block_linked(
                 return out;
             }
             if !b.text.is_empty() {
-                let md = atom_core::render::markdown::render_markdown(&b.text, width.max(1));
+                let md = atom_core::render::markdown::render_markdown(&b.text, width.max(1), cwd);
                 let parsed = ansi::ansi_to_lines_linked(&md);
                 out.lines.extend(parsed.lines);
                 out.links.extend(parsed.links);
@@ -1073,7 +1122,7 @@ pub fn render_block_linked(
                 out.push_blank(Line::from(Span::styled(row, ansi::style_reasoning())));
             }
         }
-        BlockKind::Tool => return render_tool_block_linked(b, width, spinner_frame),
+        BlockKind::Tool => return render_tool_block_linked(b, width, spinner_frame, cwd),
         BlockKind::Error => {
             let text = format!("error: {}", b.text);
             let body = atom_core::render::links::wrap_linked(
@@ -1081,6 +1130,7 @@ pub fn render_block_linked(
                 width.max(1),
                 atom_core::render::colors::COLOR_SECONDARY,
                 "",
+                cwd,
             );
             let styled = format!(
                 "{}{}\x1b[39m",
@@ -1156,11 +1206,15 @@ impl UserBody {
 /// is applied to wrapped rows, so one extremely long pasted line
 /// collapses; images are treated atomically — a placeholder grid that
 /// would straddle the cap is dropped whole rather than cut halfway.
+///
+/// `cwd` is the base for resolving repo-relative file refs in the
+/// user's message; empty falls back to the process cwd.
 fn render_user_body_linked(
     text: &str,
     images: &[PendingImage],
     inner: usize,
     preview: Option<usize>,
+    cwd: &str,
 ) -> UserBody {
     let segments = split_user_segments(text);
     if segments.is_empty() {
@@ -1183,6 +1237,7 @@ fn render_user_body_linked(
                     inner,
                     atom_core::render::colors::COLOR_FOREGROUND,
                     atom_core::render::colors::COLOR_CARD_LIGHT,
+                    cwd,
                 );
                 let parsed = ansi::ansi_to_lines_linked(&body);
                 if parsed.lines.is_empty() {
@@ -1262,7 +1317,12 @@ fn format_turn_duration(duration: Duration) -> String {
     }
 }
 
-fn render_tool_block_linked(b: &mut Block, width: usize, spinner_frame: &str) -> RenderedBlock {
+fn render_tool_block_linked(
+    b: &mut Block,
+    width: usize,
+    spinner_frame: &str,
+    cwd: &str,
+) -> RenderedBlock {
     const PAD: usize = 1;
     let inner = width.saturating_sub(2 * PAD).max(1);
     let running = !b.tool_done;
@@ -1274,7 +1334,7 @@ fn render_tool_block_linked(b: &mut Block, width: usize, spinner_frame: &str) ->
     if !b.title.is_empty() {
         left.push(Span::styled(b.title.clone(), ansi::style_tool_name()));
     }
-    let collapsible = b.diagram.is_none() && b.tool_collapsible(inner, inner);
+    let collapsible = b.diagram.is_none() && b.tool_collapsible(inner, inner, cwd);
     let mut right: Vec<Span> = Vec::new();
     // A finished visualize block swaps the expand toggle for a hint that
     // opens the browser pan/zoom viewer (top-right corner of the card).
@@ -1321,10 +1381,15 @@ fn render_tool_block_linked(b: &mut Block, width: usize, spinner_frame: &str) ->
         }
         if file_path_tool(&b.resolved_tool_name()) {
             let action_col: usize = left.iter().map(span_width).sum();
+            // Path tool headers (e.g. "read_file crates/foo.rs:42") get
+            // a clickable OSC 8 link whose URI resolves against the
+            // session cwd — repo-relative paths otherwise open from
+            // whichever directory the TUI happens to be in.
             let linked = atom_core::render::links::linkify_path(
                 &action,
                 atom_core::render::colors::COLOR_FOREGROUND,
                 atom_core::render::colors::COLOR_CARD_DARK,
+                cwd,
             );
             let (spans, links) = split_ansi_spans_linked(&linked, ansi::style_tool());
             left.extend(spans);
@@ -1356,6 +1421,10 @@ fn render_tool_block_linked(b: &mut Block, width: usize, spinner_frame: &str) ->
         let btn_line = approval_button_line();
         body.push(btn_line);
         body_links.push(Vec::new());
+        // Help line (v2 spec: dim list of every binding under the
+        // buttons, with a "press ? for details" pointer).
+        body.push(approval_help_line(inner));
+        body_links.push(Vec::new());
     } else if !b.tool_done && b.tool_name == "sandbox" {
         // Still pending but somehow approval was removed — shouldn't happen
     } else {
@@ -1385,6 +1454,7 @@ fn render_tool_block_linked(b: &mut Block, width: usize, spinner_frame: &str) ->
                             inner,
                             atom_core::render::colors::COLOR_FOREGROUND,
                             atom_core::render::colors::COLOR_CARD_DARK,
+                            cwd,
                         );
                         let parsed = ansi::ansi_to_lines_linked(&w);
                         body.extend(parsed.lines);
@@ -1422,6 +1492,7 @@ fn render_tool_block_linked(b: &mut Block, width: usize, spinner_frame: &str) ->
                         inner,
                         atom_core::render::colors::COLOR_FOREGROUND,
                         atom_core::render::colors::COLOR_CARD_DARK,
+                        cwd,
                     )
                 };
                 let parsed = ansi::ansi_to_lines_linked(&rendered);
@@ -1489,16 +1560,19 @@ fn render_tool_block_linked(b: &mut Block, width: usize, spinner_frame: &str) ->
 /// Build the body lines for a pending approval block (details).
 fn approval_block_body(appr: &InlineApproval, width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    if appr.from_subagent {
-        let who = if appr.child_title.is_empty() {
-            "a subagent".to_string()
+    // Subagent prompts surface a small header above the command so the
+    // user knows which dispatched child is asking. Driven by the v2
+    // `origin` tag, with `from_subagent` as a back-compat fallback for
+    // older payloads that only set the bool.
+    let is_child = appr.origin == "child" || appr.from_subagent;
+    if is_child {
+        let header = if appr.child_title.is_empty() {
+            "from subagent: (unnamed)".to_string()
         } else {
-            format!("subagent \"{}\"", appr.child_title)
+            format!("from subagent: {}", appr.child_title)
         };
-        lines.push(Line::from(Span::styled(
-            format!("{who} needs permission"),
-            ansi::style_reasoning(),
-        )));
+        let truncated = atom_core::render::highlight::truncate_width(&header, width);
+        lines.push(Line::from(Span::styled(truncated, ansi::style_reasoning())));
     }
     let fields = [
         ("rule    ", &appr.rule_id),
@@ -1513,7 +1587,28 @@ fn approval_block_body(appr: &InlineApproval, width: usize) -> Vec<Line<'static>
         let truncated = atom_core::render::highlight::truncate_width(&text, width);
         lines.push(Line::from(Span::styled(truncated, ansi::style_dim())));
     }
+    // Prefix-rule preview: when the server sent an `accept_all_preview`
+    // (e.g. "cargo test *"), show the rule `[a]` would save. This is the
+    // v2 "this would let all `cargo test` invocations run unprompted"
+    // affordance from the spec.
+    if let Some(preview) = appr.accept_all_preview.as_deref() {
+        if !preview.is_empty() {
+            let text = format!("accept-all would let: {preview}");
+            let truncated = atom_core::render::highlight::truncate_width(&text, width);
+            lines.push(Line::from(Span::styled(truncated, ansi::style_dim())));
+        }
+    }
     lines
+}
+
+/// Help line under the buttons. Lists every binding on one row at the
+/// current content width, truncating if the terminal is too narrow to
+/// fit the full sentence. Matches the v2 spec's "dim line under the
+/// buttons" requirement.
+fn approval_help_line(width: usize) -> Line<'static> {
+    let text = "y once · a always · n no · d never · esc cancel — press ? for details";
+    let truncated = atom_core::render::highlight::truncate_width(text, width);
+    Line::from(Span::styled(truncated, ansi::style_dim()))
 }
 
 /// Produce the clickable button line for an approval block.
@@ -1532,12 +1627,15 @@ fn approval_button_line() -> Line<'static> {
 /// Button layout constants for approval blocks. Column offsets are relative
 /// to the content area (after left pad).
 pub fn approval_buttons() -> Vec<ApprovalButton> {
-    // Layout: "[a] allow  [s] session  [g] always  [d] deny"
+    // v2 spec: four buttons, no session-scoped grant.
+    //   [y] once   [a] always   [n] deny   [d] never
+    // Each maps to one of the v2 Decision wire names
+    // (allow_once / allow_always / deny_once / deny_always).
     let labels: &[(&str, &str)] = &[
-        ("[a] allow", "allow_once"),
-        ("[s] session", "allow_session"),
-        ("[g] always", "allow_global"),
-        ("[d] deny", "deny"),
+        ("[y] once", "allow_once"),
+        ("[a] always", "allow_always"),
+        ("[n] deny", "deny_once"),
+        ("[d] never", "deny_always"),
     ];
     let gap = 2usize;
     let mut col = 0;
@@ -1669,7 +1767,7 @@ mod tests {
             text: "see [the docs](https://docs.example.com) for more".into(),
             ..Default::default()
         };
-        let out = render_block_linked(&mut b, 80, true, "*");
+        let out = render_block_linked(&mut b, 80, true, "*", "");
         let idx = out
             .lines
             .iter()
@@ -1691,7 +1789,7 @@ mod tests {
             text: "look at https://example.com/x please".into(),
             ..Default::default()
         };
-        let out = render_block_linked(&mut b, 60, true, "*");
+        let out = render_block_linked(&mut b, 60, true, "*", "");
         let idx = out
             .lines
             .iter()
@@ -1717,7 +1815,7 @@ mod tests {
             result: "done".into(),
             ..Default::default()
         };
-        let out = render_block_linked(&mut b, 80, true, "*");
+        let out = render_block_linked(&mut b, 80, true, "*", "");
         // Row 1 is the header box row.
         assert_eq!(out.links[1].len(), 1);
         let r = &out.links[1][0];
@@ -1806,7 +1904,7 @@ mod tests {
             ..Default::default()
         };
 
-        let lines = render_block(&mut b, 80, true, "*");
+        let lines = render_block(&mut b, 80, true, "*", "");
         assert_eq!(
             ansi::line_plain(lines.last().unwrap()),
             "Compaction | compact-model | 2.3s"
@@ -1899,7 +1997,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let running = render_block(&mut blocks[0], 40, true, "*");
+        let running = render_block(&mut blocks[0], 40, true, "*", "");
         assert!(running
             .iter()
             .any(|line| crate::ansi::line_plain(line).contains('*')));
@@ -1908,7 +2006,7 @@ mod tests {
         assert!(blocks[0].tool_done);
         assert!(blocks[0].result.is_empty());
         assert_eq!(blocks[1].result, "done");
-        let finished = render_block(&mut blocks[0], 40, true, "*");
+        let finished = render_block(&mut blocks[0], 40, true, "*", "");
         assert!(!finished
             .iter()
             .any(|line| crate::ansi::line_plain(line).contains('*')));
@@ -1933,10 +2031,13 @@ mod tests {
             tool_name: "bash".into(),
             ..Default::default()
         };
-        assert!(!b.tool_collapsible(80, 80), "running bash not collapsible");
+        assert!(
+            !b.tool_collapsible(80, 80, ""),
+            "running bash not collapsible"
+        );
         b.result = "done".into();
         assert!(
-            b.tool_collapsible(80, 80),
+            b.tool_collapsible(80, 80, ""),
             "finished hidden tool always collapsible"
         );
 
@@ -1946,9 +2047,9 @@ mod tests {
             result: "short".into(),
             ..Default::default()
         };
-        assert!(!small.tool_collapsible(80, 80));
+        assert!(!small.tool_collapsible(80, 80, ""));
         small.result = "line\n".repeat(20);
-        assert!(small.tool_collapsible(80, 80));
+        assert!(small.tool_collapsible(80, 80, ""));
     }
 
     #[test]
@@ -1971,7 +2072,7 @@ mod tests {
             result: "file\nlist".into(),
             ..Default::default()
         };
-        let lines = render_block(&mut b, 40, true, "*");
+        let lines = render_block(&mut b, 40, true, "*", "");
         for l in &lines {
             assert_eq!(ansi::line_width(l), 40, "{l:?}");
         }
@@ -1985,7 +2086,7 @@ mod tests {
             ..Default::default()
         };
 
-        let lines = render_block(&mut block, 40, true, "*");
+        let lines = render_block(&mut block, 40, true, "*", "");
         assert_eq!(lines.len(), 3);
         for line in &lines {
             assert_eq!(ansi::line_width(line), 40, "{line:?}");
@@ -2006,7 +2107,7 @@ mod tests {
             ..Default::default()
         };
 
-        let lines = render_block(&mut block, 60, true, "*");
+        let lines = render_block(&mut block, 60, true, "*", "");
         for line in &lines {
             for span in &line.spans {
                 assert_eq!(span.style.bg, Some(ansi::c_card_dark()), "{span:?}");
@@ -2026,7 +2127,7 @@ mod tests {
             ..Default::default()
         };
 
-        let lines = render_block(&mut block, 80, true, "*");
+        let lines = render_block(&mut block, 80, true, "*", "");
         let colors: Vec<_> = lines
             .iter()
             .flat_map(|line| line.spans.iter().filter_map(|span| span.style.fg))
@@ -2051,7 +2152,7 @@ mod tests {
             result: "fn main() { let message: &str = \"hello\"; }".into(),
             ..Default::default()
         };
-        let lines = render_block(&mut block, 80, true, "*");
+        let lines = render_block(&mut block, 80, true, "*", "");
         // Header + padding only; no syntax-highlighted body rows.
         let colors: Vec<_> = lines
             .iter()
@@ -2074,7 +2175,7 @@ mod tests {
             expanded: true,
             ..Default::default()
         };
-        let lines = render_block(&mut block, 80, true, "*");
+        let lines = render_block(&mut block, 80, true, "*", "");
         let plain: String = lines
             .iter()
             .map(crate::ansi::line_plain)
@@ -2113,7 +2214,7 @@ mod tests {
             expanded: true,
             ..Default::default()
         };
-        let lines = render_block(&mut block, 80, true, "*");
+        let lines = render_block(&mut block, 80, true, "*", "");
         let colors: Vec<_> = lines
             .iter()
             .flat_map(|line| line.spans.iter().filter_map(|span| span.style.fg))
@@ -2456,11 +2557,11 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            !b.tool_collapsible(70, 70),
+            !b.tool_collapsible(70, 70, ""),
             "diagram blocks never collapse behind an expand toggle"
         );
         assign_block_diagram_ids(std::slice::from_mut(&mut b));
-        let out = render_block_linked(&mut b, 80, true, "*");
+        let out = render_block_linked(&mut b, 80, true, "*", "");
         // Line 0 is the top pad, line 1 the header.
         let header = ansi::line_plain(&out.lines[1]);
         assert!(header.contains("Visualize"), "header: {header:?}");
@@ -2525,7 +2626,7 @@ mod tests {
             ..Default::default()
         };
         assert!(parse_diagram_marker(&b.result).is_none());
-        let out = render_block_linked(&mut b, 80, true, "*");
+        let out = render_block_linked(&mut b, 80, true, "*", "");
         for line in &out.lines {
             assert!(!ansi::line_plain(line).contains("atom-diagram"));
         }
@@ -2562,12 +2663,16 @@ mod render_tests {
             ..Default::default()
         };
 
-        let lines = render_block(&mut block, 60, true, "*");
+        let lines = render_block(&mut block, 60, true, "*", "");
 
-        assert_eq!(ansi::line_plain(lines.last().unwrap()), "model-b | 2m 15s");
+        assert_eq!(ansi::line_plain(lines.last().unwrap()), "model-b 2m 15s");
         assert_eq!(
             lines.last().unwrap().spans[0].style,
             ansi::style_reasoning()
+        );
+        assert_eq!(
+            lines.last().unwrap().spans[1].style,
+            ansi::style_reasoning().fg(ansi::c_muted_extra())
         );
     }
 
@@ -2591,9 +2696,9 @@ mod render_tests {
             ..Default::default()
         };
 
-        for line in render_block(&mut assistant, 20, true, "*")
+        for line in render_block(&mut assistant, 20, true, "*", "")
             .into_iter()
-            .chain(render_block(&mut error, 20, true, "*"))
+            .chain(render_block(&mut error, 20, true, "*", ""))
         {
             assert!(
                 ansi::line_width(&line) <= 20,
@@ -2614,10 +2719,10 @@ mod render_tests {
             result: long.trim_end().to_string(),
             ..Default::default()
         };
-        let collapsed = render_block(&mut b, 60, true, "*");
+        let collapsed = render_block(&mut b, 60, true, "*", "");
         b.expanded = true;
         b.lines = None;
-        let expanded = render_block(&mut b, 60, true, "*");
+        let expanded = render_block(&mut b, 60, true, "*", "");
         assert_eq!(
             collapsed.len(),
             crate::blocks::TOOL_RESULT_PREVIEW_LINES + 3
@@ -2629,7 +2734,7 @@ mod render_tests {
     fn markdown_wraps_within_width() {
         use unicode_width::UnicodeWidthStr;
         let md = "# Heading\n\nA paragraph with a [link](https://example.com) and `code span`, long enough to wrap several times over the requested width in the rendered output.\n\n- one\n- two\n";
-        let out = atom_core::render::markdown::render_markdown(md, 40);
+        let out = atom_core::render::markdown::render_markdown(md, 40, "");
         for line in ansi::ansi_to_lines(&out) {
             assert!(
                 ansi::line_width(&line) <= 40,
@@ -2645,7 +2750,7 @@ mod render_tests {
         let mut b = Block::new(BlockKind::Reasoning);
         b.text = "The user just sent a message that wraps onto several lines".into();
         b.expanded = true;
-        let lines = render_block(&mut b, 20, true, "*");
+        let lines = render_block(&mut b, 20, true, "*", "");
         assert!(lines.len() > 2, "reasoning should wrap onto multiple lines");
         assert_eq!(ansi::line_plain(&lines[0]), "Thinking");
         for line in &lines {
@@ -2673,7 +2778,7 @@ mod render_tests {
             ..Default::default()
         };
 
-        let lines = render_block(&mut b, 40, true, "*");
+        let lines = render_block(&mut b, 40, true, "*", "");
 
         assert_eq!(ansi::line_plain(&lines[0]), "* Thinking");
         assert_eq!(lines[0].spans[0].style.fg, Some(ansi::c_muted()));
@@ -2690,7 +2795,7 @@ mod render_tests {
             ..Default::default()
         };
 
-        let lines = render_block(&mut b, 40, true, "*");
+        let lines = render_block(&mut b, 40, true, "*", "");
 
         assert_eq!(lines.len(), 1);
         assert_eq!(ansi::line_plain(&lines[0]), "* Compacting");
@@ -2716,7 +2821,7 @@ mod render_tests {
             text: "hello".into(),
             ..Default::default()
         };
-        let lines = render_block(&mut block, 40, true, "*");
+        let lines = render_block(&mut block, 40, true, "*", "");
         // Top + body + bottom padding rows.
         assert_eq!(lines.len(), 3);
         for line in &lines {
@@ -2732,7 +2837,7 @@ mod render_tests {
             images: vec![fake_image(1), fake_image(2)],
             ..Default::default()
         };
-        let lines = render_block(&mut block, 40, true, "*");
+        let lines = render_block(&mut block, 40, true, "*", "");
         // Padding row + image 1 rows + text + image 2 rows + padding row.
         assert!(lines.len() > 4);
         // The image marker text is gone from any line.
@@ -2758,7 +2863,7 @@ mod render_tests {
             text: "word ".repeat(400),
             ..Default::default()
         };
-        let lines = render_block(&mut block, 40, true, "*");
+        let lines = render_block(&mut block, 40, true, "*", "");
         // Top pad + (content rows + hint) + bottom pad.
         assert_eq!(lines.len(), USER_PREVIEW_LINES + 2);
         let hint = ansi::line_plain(&lines[USER_PREVIEW_LINES]);
@@ -2776,13 +2881,14 @@ mod render_tests {
             expanded: true,
             ..Default::default()
         };
-        let lines = render_block(&mut block, 40, true, "*");
+        let lines = render_block(&mut block, 40, true, "*", "");
         let inner = 40 - 2 * PAD_CELL;
         let full = atom_core::render::links::wrap_linked(
             &block.text,
             inner,
             atom_core::render::colors::COLOR_FOREGROUND,
             atom_core::render::colors::COLOR_CARD_LIGHT,
+            "",
         );
         assert_eq!(lines.len(), ansi::ansi_to_lines(&full).len() + 2);
         for line in &lines {
@@ -2798,7 +2904,7 @@ mod render_tests {
             text: "hello".into(),
             ..Default::default()
         };
-        let lines = render_block(&mut block, 40, true, "*");
+        let lines = render_block(&mut block, 40, true, "*", "");
         assert_eq!(lines.len(), 3);
         assert!(ansi::line_plain(&lines[1]).contains("hello"));
     }
@@ -2810,7 +2916,7 @@ mod render_tests {
             text: "word ".repeat(400),
             ..Default::default()
         };
-        let rendered = render_block(&mut block, 40, true, "*");
+        let rendered = render_block(&mut block, 40, true, "*", "");
         block.lines = Some(rendered.into_iter().map(Arc::new).collect());
         block.line_width = 40;
         block.line_show_r = true;
@@ -2839,7 +2945,7 @@ mod render_tests {
             images: vec![fake_image(1)],
             ..Default::default()
         };
-        let lines = render_block(&mut block, 40, true, "*");
+        let lines = render_block(&mut block, 40, true, "*", "");
         assert_eq!(lines.len(), USER_PREVIEW_LINES + 2);
         assert!(ansi::line_plain(&lines[USER_PREVIEW_LINES]).contains(USER_EXPAND_HINT));
         let body = &lines[1..lines.len() - 1];

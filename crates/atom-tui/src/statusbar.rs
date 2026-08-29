@@ -112,23 +112,57 @@ pub(crate) fn truncate_width(text: &str, width: usize) -> String {
     out
 }
 
-fn status_head(app: &App) -> String {
+/// The model head: plain text for width math plus its styled spans
+/// (dim model name, then the thinking level in the primary color).
+#[derive(Clone)]
+struct Head {
+    text: String,
+    spans: Vec<Span<'static>>,
+}
+
+fn head_from_spans(text: String, spans: Vec<Span<'static>>) -> Head {
+    debug_assert_eq!(
+        text_width(&text),
+        spans.iter().map(|s| text_width(&s.content)).sum::<usize>()
+    );
+    Head { text, spans }
+}
+
+fn status_head(app: &App) -> Head {
     let lvl = app.thinking_level();
     if lvl.is_empty() {
-        app.sel_model.clone()
+        head_from_spans(
+            app.sel_model.clone(),
+            vec![Span::styled(
+                app.sel_model.clone(),
+                ansi::style_foreground(),
+            )],
+        )
     } else {
-        format!("{} ({})", app.sel_model, lvl)
+        head_from_spans(
+            format!("{} {}", app.sel_model, lvl),
+            vec![
+                Span::styled(app.sel_model.clone(), ansi::style_foreground()),
+                Span::styled(" ", ansi::style_dim()),
+                Span::styled(lvl, ansi::style_primary()),
+            ],
+        )
     }
 }
 
-fn fitted_status_head(app: &App, width: usize, head: &str) -> String {
-    if text_width(head) <= width {
-        return head.to_string();
+fn fitted_status_head(app: &App, width: usize, head: &Head) -> Head {
+    if text_width(&head.text) <= width {
+        return head.clone();
     }
-    if !app.sel_model.is_empty() {
-        return truncate_width(&app.sel_model, width);
-    }
-    truncate_width(head, width)
+    let text = if !app.sel_model.is_empty() {
+        truncate_width(&app.sel_model, width)
+    } else {
+        truncate_width(&head.text, width)
+    };
+    head_from_spans(
+        text.clone(),
+        vec![Span::styled(text, ansi::style_foreground())],
+    )
 }
 
 fn usage_variants(app: &App, width: usize) -> Vec<String> {
@@ -140,20 +174,36 @@ fn usage_variants(app: &App, width: usize) -> Vec<String> {
     }
 }
 
+/// An action bound to a clickable status-bar hint. The hints double as
+/// touch/click targets so menus and parent navigation work without a
+/// keyboard (e.g. atom over SSH from a phone).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavAction {
+    /// Open the subagent manager (mirrors Shift+↓).
+    OpenSubagents,
+    /// Return to the parent session (mirrors Shift+↑).
+    ReturnToParent,
+    /// Close the open footer menu (mirrors Esc).
+    CloseMenu,
+}
+
 /// Footer-menu and parent/child navigation hints. These used to occupy a
 /// dedicated row above the prompt; they now share the status bar with the
 /// context meter, wrapping across lines when the terminal is too narrow.
-/// Returns the hint phrases as styled segments (each a short dim phrase);
-/// empty when there is nothing to hint.
-pub fn nav_segments(app: &App) -> Vec<Vec<Span<'static>>> {
+/// Returns the hint phrases as styled segments tagged with the action a
+/// click on them triggers; empty when there is nothing to hint.
+pub fn nav_segments(app: &App) -> Vec<(NavAction, Vec<Span<'static>>)> {
     use crate::overlays::PickerKind;
-    let mut segs: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut segs: Vec<(NavAction, Vec<Span<'static>>)> = Vec::new();
     if app.manage_visible
         || !matches!(app.picker_kind, PickerKind::None)
         || app.context_visible
         || app.reasoning_visible
     {
-        segs.push(vec![Span::styled("esc to close", ansi::style_dim())]);
+        segs.push((
+            NavAction::CloseMenu,
+            vec![Span::styled("esc to close", ansi::style_dim())],
+        ));
     } else {
         let n = app.manage_agents.len();
         if n > 0 {
@@ -162,13 +212,46 @@ pub fn nav_segments(app: &App) -> Vec<Vec<Span<'static>>> {
             } else {
                 format!("({n} subagents) Shift ↓")
             };
-            segs.push(vec![Span::styled(label, ansi::style_dim())]);
+            segs.push((
+                NavAction::OpenSubagents,
+                vec![Span::styled(label, ansi::style_dim())],
+            ));
         }
     }
     if !app.session.parent_id.is_empty() {
-        segs.push(vec![Span::styled("Shift ↑ to return", ansi::style_dim())]);
+        segs.push((
+            NavAction::ReturnToParent,
+            vec![Span::styled("Shift ↑ to return", ansi::style_dim())],
+        ));
     }
     segs
+}
+
+/// Hit regions for the clickable nav hints inside the laid-out status
+/// bar, as `(row, col_start, col_end, action)`. Rows are offsets from the
+/// first status-bar row; columns are relative to the content's left edge
+/// (the same coordinates the prompt click handling uses). Truncated
+/// phrases are not clickable.
+pub fn nav_hit_regions(app: &App) -> Vec<(usize, usize, usize, NavAction)> {
+    let phrases: Vec<(String, NavAction)> = nav_segments(app)
+        .into_iter()
+        .filter_map(|(a, segs)| segs.into_iter().next().map(|s| (s.content.to_string(), a)))
+        .collect();
+    if phrases.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (row, line) in status_bar_layout(app).iter().enumerate() {
+        let mut col = 0usize;
+        for span in &line.spans {
+            let w = text_width(&span.content);
+            if let Some((_, action)) = phrases.iter().find(|(p, _)| *p == span.content) {
+                out.push((row, col, col + w, *action));
+            }
+            col += w;
+        }
+    }
+    out
 }
 
 /// Cell width of the nav phrases joined by their internal " / "
@@ -288,8 +371,8 @@ fn append_suffix(lines: &mut Vec<Line<'static>>, text: &str, style: Style, width
     lines.push(Line::from(Span::styled(truncate_width(text, width), style)));
 }
 
-fn one_line(head: String, usage: Option<String>, suffix: Option<(String, Style)>) -> Line<'static> {
-    let mut spans = vec![Span::styled(head, ansi::style_dim())];
+fn one_line(head: Head, usage: Option<String>, suffix: Option<(String, Style)>) -> Line<'static> {
+    let mut spans = head.spans;
     if let Some(usage) = usage {
         spans.push(Span::styled(format!("  {usage}"), ansi::style_dim()));
     }
@@ -351,12 +434,12 @@ fn secondary_line(
 /// context meter, nav hints, transient suffix), joined by dim gaps. The
 /// nav hints already carry their own internal " / " styling.
 fn one_line_full(
-    head: String,
+    head: Head,
     usage: Option<String>,
     nav: Option<Vec<Span<'static>>>,
     suffix: Option<(String, Style)>,
 ) -> Line<'static> {
-    let mut spans = vec![Span::styled(head, ansi::style_dim())];
+    let mut spans = head.spans;
     if let Some(usage) = usage {
         spans.push(Span::styled(format!("  {usage}"), ansi::style_dim()));
     }
@@ -373,7 +456,7 @@ fn one_line_full(
 /// Returns a single-line status bar when every segment fits in `width`.
 fn try_one_line(
     width: usize,
-    head: &str,
+    head: &Head,
     usage_variants: &[String],
     nav: &[Vec<Span<'static>>],
     suffix: Option<&(String, Style)>,
@@ -384,7 +467,7 @@ fn try_one_line(
         2 + nav_width(nav)
     };
     let suffixw = suffix.map(|(text, _)| 2 + text_width(text)).unwrap_or(0);
-    let headw = text_width(head);
+    let headw = text_width(&head.text);
     let nav_spans_opt = if nav.is_empty() {
         None
     } else {
@@ -393,7 +476,7 @@ fn try_one_line(
     if usage_variants.is_empty() {
         if headw + navw + suffixw <= width {
             return Some(one_line_full(
-                head.to_string(),
+                head.clone(),
                 None,
                 nav_spans_opt,
                 suffix.cloned(),
@@ -403,7 +486,7 @@ fn try_one_line(
         let usage = &usage_variants[0];
         if headw + 2 + text_width(usage) + navw + suffixw <= width {
             return Some(one_line_full(
-                head.to_string(),
+                head.clone(),
                 Some(usage.clone()),
                 nav_spans_opt,
                 suffix.cloned(),
@@ -448,7 +531,7 @@ fn status_bar_layout(app: &App) -> Vec<Line<'static>> {
     let width = app.inner_width();
     let head = status_head(app);
     let usage_variants = usage_variants(app, width);
-    let nav = nav_segments(app);
+    let nav: Vec<Vec<Span<'static>>> = nav_segments(app).into_iter().map(|(_, seg)| seg).collect();
     let suffix = status_suffix(app);
 
     // Everything fits on one line: model + context meter + hints + status.
@@ -467,7 +550,7 @@ fn status_bar_layout(app: &App) -> Vec<Line<'static>> {
     let tail_empty = tail
         .iter()
         .all(|line| ansi::line_plain(line).trim().is_empty());
-    if fitted_head.is_empty() {
+    if fitted_head.text.is_empty() {
         if tail_empty {
             vec![one_line(fitted_head, None, None)]
         } else {
@@ -633,7 +716,14 @@ mod tests {
         app.thinking_idx = 1;
         let line = &status_bar_lines(&app)[0];
         let txt = ansi::line_plain(line);
-        assert_eq!(txt, "deepseek-v4 (high)");
+        assert_eq!(txt, "deepseek-v4 high");
+        // model foreground(ish), level primary
+        assert_eq!(line.spans[0].style, ansi::style_foreground());
+        assert_eq!(line.spans[0].content, "deepseek-v4");
+        assert_eq!(line.spans[1].style, ansi::style_dim());
+        assert_eq!(line.spans[1].content, " ");
+        assert_eq!(line.spans[2].style, ansi::style_primary());
+        assert_eq!(line.spans[2].content, "high");
     }
 
     #[test]
@@ -813,5 +903,86 @@ mod tests {
         assert!(txt.contains("gpt-5"));
         assert!(txt.contains("8.5K (7%)"));
         assert!(!txt.contains("Shift"));
+    }
+
+    /// Plain text of a laid-out line restricted to cells [c0, c1).
+    fn line_slice(line: &Line<'_>, c0: usize, c1: usize) -> String {
+        let mut out = String::new();
+        let mut col = 0usize;
+        for span in &line.spans {
+            for ch in span.content.chars() {
+                let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if col + w > c0 && col < c1 {
+                    out.push(ch);
+                }
+                col += w;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn nav_hit_regions_cover_rendered_phrases() {
+        let u = StreamUsage {
+            total_tokens: 8500,
+            ..Default::default()
+        };
+        let mut app = app_with_subagent(u, 100);
+        app.session.parent_id = "parent".into();
+        let lines = status_bar_lines(&app);
+        let regions = nav_hit_regions(&app);
+        assert_eq!(regions.len(), 2, "subagent + return hints clickable");
+        assert_eq!(regions[0].3, NavAction::OpenSubagents);
+        assert_eq!(regions[1].3, NavAction::ReturnToParent);
+        let texts: Vec<String> = regions
+            .iter()
+            .map(|(r, c0, c1, _)| line_slice(&lines[*r], *c0, *c1))
+            .collect();
+        assert_eq!(texts[0], "(1 subagent) Shift ↓", "{texts:?}");
+        assert_eq!(texts[1], "Shift ↑ to return", "{texts:?}");
+        // Regions sit inside the rendered row.
+        for (row, _, c1, _) in &regions {
+            assert!(*c1 <= ansi::line_width(&lines[*row]));
+        }
+    }
+
+    #[test]
+    fn nav_hit_regions_track_wrapped_rows() {
+        // Narrow terminal: the hints wrap; each region must land on the
+        // row its phrase was laid out on.
+        let u = StreamUsage {
+            total_tokens: 8500,
+            ..Default::default()
+        };
+        let mut app = app_with_subagent(u, 36);
+        app.session.parent_id = "parent".into();
+        let lines = status_bar_lines(&app);
+        let regions = nav_hit_regions(&app);
+        assert_eq!(regions.len(), 2);
+        for (row, c0, c1, action) in &regions {
+            let text = line_slice(&lines[*row], *c0, *c1);
+            match action {
+                NavAction::OpenSubagents => {
+                    assert!(text.starts_with("(1 subagent)"), "{text:?}");
+                }
+                NavAction::ReturnToParent => {
+                    assert_eq!(text, "Shift ↑ to return", "{text:?}");
+                    assert!(*row > 0, "return hint wrapped to a later row");
+                }
+                NavAction::CloseMenu => panic!("no menu open"),
+            }
+        }
+    }
+
+    #[test]
+    fn nav_hit_regions_when_menu_open_is_esc() {
+        let mut app = app_with_usage(StreamUsage::default(), 100);
+        app.context_visible = true;
+        let lines = status_bar_lines(&app);
+        let regions = nav_hit_regions(&app);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].3, NavAction::CloseMenu);
+        let text = line_slice(&lines[regions[0].0], regions[0].1, regions[0].2);
+        assert_eq!(text, "esc to close");
     }
 }

@@ -19,6 +19,9 @@ pub enum DelegateStatus {
     #[default]
     Done,
     Cancelled,
+    /// StoppedByUser: the user pressed Esc on the subagent's live turn.
+    /// Not an error; the parent is told the user stopped it.
+    Stopped,
 }
 
 impl DelegateStatus {
@@ -34,6 +37,7 @@ impl DelegateStatus {
             Self::Error => "error",
             Self::Done => "done",
             Self::Cancelled => "cancelled",
+            Self::Stopped => "stopped",
         }
     }
 }
@@ -626,6 +630,32 @@ impl SessionStore {
         }
     }
 
+    /// UpdateCwd moves the session's working directory (shell mode `cd`):
+    /// future turns run the agent's tools from the new directory.
+    pub fn update_cwd(&self, id: &str, cwd: &str) {
+        let _mutation = self.mutation.lock().unwrap();
+        if !self.index.read().unwrap().contains_key(id) {
+            return;
+        }
+        let now = Utc::now();
+        if self
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET cwd = ?1, updated_at = ?2 WHERE id = ?3",
+                params![cwd, now.to_rfc3339(), id],
+            )
+            .is_ok()
+        {
+            // SessionInfo doesn't carry cwd; sessions re-read it from the
+            // store (turn.rs reads sess.cwd per turn).
+            if let Some(info) = self.index.write().unwrap().get_mut(id) {
+                info.updated_at = now;
+            }
+        }
+    }
+
     /// SetCancelled records whether a dispatched subagent was explicitly
     /// killed by its parent (true) or revived by a follow-up (false).
     pub fn set_cancelled(&self, id: &str, cancelled: bool) -> bool {
@@ -829,8 +859,20 @@ impl SessionStore {
 
     /// save replaces all persisted session state atomically. Callers hold the
     /// index lock to keep SQLite and metadata updates ordered.
-    fn save(&self, sess: &Session) {
+    pub fn save(&self, sess: &Session) {
         let _ = self.save_result(sess);
+    }
+
+    /// save_with_index persists a new session and installs its index
+    /// entry in one shot. Used by /fork where the caller is creating a
+    /// brand-new session with custom messages and needs the listing
+    /// metadata available immediately.
+    pub fn save_with_index(&self, sess: &Session) {
+        self.save(sess);
+        self.index
+            .write()
+            .unwrap()
+            .insert(sess.id.clone(), sess.info());
     }
 
     fn save_result(&self, sess: &Session) -> anyhow::Result<()> {
@@ -998,6 +1040,10 @@ fn status_from_str(value: &str) -> rusqlite::Result<DelegateStatus> {
         "error" => Ok(DelegateStatus::Error),
         "done" => Ok(DelegateStatus::Done),
         "cancelled" => Ok(DelegateStatus::Cancelled),
+        // StoppedByUser rows must load: an Esc-stopped dispatch child keeps
+        // its record, and a missing read arm here makes every later load()
+        // fail — the session vanishes from inspect and the TUI 404s on it.
+        "stopped" => Ok(DelegateStatus::Stopped),
         _ => Err(rusqlite::Error::FromSqlConversionFailure(
             0,
             rusqlite::types::Type::Text,
@@ -1268,6 +1314,48 @@ mod tests {
             !store.set_cancelled("missing-session", true),
             "unknown sessions are a no-op"
         );
+    }
+
+    #[test]
+    fn stopped_status_round_trips_through_the_store() {
+        // An Esc-stopped dispatch child keeps its DB row with status
+        // "stopped". Every read path (info, get, children_info) must load
+        // it: a missing arm made load() fail, so the subagent vanished
+        // from dispatch inspect and the TUI 404'd on its session view.
+        let dir = temp_dir("stopped-status");
+        let child = {
+            let store = SessionStore::open_in_dir(&dir).unwrap();
+            let parent = store.create("m", "/tmp", vec![]);
+            let child = store.create_child(
+                &parent.id,
+                "child-a",
+                "/tmp",
+                "high",
+                "",
+                vec![user_msg("First child prompt")],
+            );
+            store.update_delegate_status(&child.id, DelegateStatus::Stopped);
+            assert!(
+                store.get_info(&child.id).is_some(),
+                "index holds the stopped child"
+            );
+            let loaded = store
+                .get(&child.id)
+                .expect("a stopped child must load like any other status");
+            assert_eq!(loaded.status, DelegateStatus::Stopped);
+            assert_eq!(loaded.info().status.as_str(), "stopped");
+            let infos = store.children_info(&parent.id);
+            assert_eq!(infos.len(), 1);
+            assert_eq!(infos[0].status, DelegateStatus::Stopped);
+            child.id
+        };
+        // Reopening the store must not lose it either (startup load_all).
+        let reopened = SessionStore::open_in_dir(&dir).unwrap();
+        let reopened_child = reopened
+            .get(&child)
+            .expect("stopped child survives a store reopen");
+        assert_eq!(reopened_child.status, DelegateStatus::Stopped);
+        let _cleanup = Cleanup(dir);
     }
 
     #[test]

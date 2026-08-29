@@ -1,35 +1,65 @@
-//! Layer 2 — approval gate. Session-scoped "always allow" plus a
-//! persisted global set; other sessions always re-prompt.
+//! Layer 2 — approval gate.
+//!
+//! v2 narrows the decision set to four buttons:
+//!
+//! - [`Decision::AllowOnce`] — run, no memory.
+//! - [`Decision::AllowAll`] — run + save a prefix rule to
+//!   `sandbox.json` so the command family lands in Tier 1.
+//! - [`Decision::DenyOnce`] — refuse this run.
+//! - [`Decision::DenyAll`] — refuse + save a deny rule so the family
+//!   never goes silent (still prompts, but with the rule name as
+//!   reason).
+//!
+//! Session-scoped grants are gone. The only persistent state is the
+//! user's `rules` block in [`crate::policy::SandboxConfig`].
 
-use crate::rules::command_fallback_key;
+use crate::policy::{prefix_for_command, RuleKind, RuleMatch, Rules, SandboxConfig};
 use async_trait::async_trait;
-use atom_core::session::store::data_dir;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 /// What the user (or an auto-approver) decided for one prompt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Decision {
+    /// Run this once, no memory of the grant.
     AllowOnce,
-    AllowSession,
-    AllowGlobal,
-    Deny,
+    /// Run this + save a prefix allow rule to sandbox.json.
+    AllowAll,
+    /// Refuse this run, no memory.
+    #[default]
+    DenyOnce,
+    /// Refuse this run + save a prefix deny rule.
+    DenyAll,
 }
 
 impl Decision {
     pub fn allows(&self) -> bool {
-        !matches!(self, Decision::Deny)
+        matches!(self, Decision::AllowOnce | Decision::AllowAll)
     }
 
     pub fn as_str(&self) -> &'static str {
         match self {
             Decision::AllowOnce => "allow_once",
-            Decision::AllowSession => "allow_session",
-            Decision::AllowGlobal => "allow_global",
-            Decision::Deny => "deny",
+            Decision::AllowAll => "allow_always",
+            Decision::DenyOnce => "deny_once",
+            Decision::DenyAll => "deny_always",
+        }
+    }
+
+    /// Map the v1 wire names onto v2's smaller set so existing TUI /
+    /// server code keeps compiling during the rename. Old
+    /// AllowSession → AllowOnce (the session-scoped concept no longer
+    /// exists); old AllowGlobal → AllowAll.
+    pub fn from_legacy_wire(s: &str) -> Option<Self> {
+        match s {
+            "allow_once" => Some(Decision::AllowOnce),
+            "allow_session" => Some(Decision::AllowOnce),
+            "allow_always" | "allow_all" | "allow_global" => Some(Decision::AllowAll),
+            "deny_once" | "deny" => Some(Decision::DenyOnce),
+            "deny_always" | "deny_all" => Some(Decision::DenyAll),
+            _ => None,
         }
     }
 }
@@ -44,6 +74,10 @@ pub struct ApprovalRequest {
     /// command fallback.
     pub rule_id: String,
     pub reason: String,
+    /// Optional prefix-rule preview for `[a] accept-all`. Pre-computed
+    /// by the server so the TUI doesn't have to re-tokenize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accept_all_preview: Option<String>,
 }
 
 /// Who answers approval prompts. The server wires this to an
@@ -69,30 +103,23 @@ pub struct DenyAllApprover;
 #[async_trait]
 impl Approver for DenyAllApprover {
     async fn decide(&self, _req: ApprovalRequest) -> Decision {
-        Decision::Deny
+        Decision::DenyOnce
     }
 }
 
-/// Approval bookkeeping:
-/// - session-scoped grants live in memory only, keyed `(session_id, key)`
-///   so an allow in session A never satisfies session B;
-/// - global grants persist to `dataDir()/approvals.json`, written ONLY
-///   when a decision is AllowGlobal.
+/// Process-global approval bookkeeping. v2 keeps only a tiny in-memory
+/// cache for `AllowAll`/`DenyAll` echoes (so a single session can see
+/// its own rule before the file system flush lands) and a single-
+/// writer mutex around the config so concurrent sessions don't
+/// trample each other's rule writes. The durable state is
+/// [`SandboxConfig`].
 pub struct ApprovalStore {
-    sessions: Mutex<HashMap<(String, String), ()>>,
-    globals: Mutex<HashSet<String>>,
-    global_path: Option<PathBuf>,
+    inner: Mutex<Inner>,
 }
 
-/// Stable key for a grant: matched rule id when present, otherwise the
-/// sha256 of the command text — combined with the cwd per the spec.
-pub fn key_for(rule_id: &str, command: &str, cwd: &Path) -> String {
-    let id_part = if rule_id.is_empty() {
-        command_fallback_key(command)
-    } else {
-        rule_id.to_string()
-    };
-    format!("{}\u{1f}{}", id_part, cwd.display())
+struct Inner {
+    config_path: PathBuf,
+    rules: Rules,
 }
 
 impl Default for ApprovalStore {
@@ -102,105 +129,135 @@ impl Default for ApprovalStore {
 }
 
 impl ApprovalStore {
-    /// Store backed by dataDir()/approvals.json.
+    /// Store backed by dataDir()/sandbox.json.
     pub fn new() -> Self {
-        Self::with_global_path(data_dir().join("approvals.json"))
+        Self::with_config_path(crate::policy::SandboxConfig::path())
     }
 
-    /// Store with a custom persistence path (tests use unique temp dirs).
-    pub fn with_global_path(path: PathBuf) -> Self {
-        let globals = std::fs::read(&path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<HashSet<String>>(&bytes).ok())
-            .unwrap_or_default();
+    /// Store with a custom config path (tests use unique temp dirs).
+    pub fn with_config_path(path: PathBuf) -> Self {
+        let cfg = SandboxConfig::load_from(&path);
         ApprovalStore {
-            sessions: Mutex::new(HashMap::new()),
-            globals: Mutex::new(globals),
-            global_path: Some(path),
+            inner: Mutex::new(Inner {
+                config_path: path,
+                rules: cfg.rules,
+            }),
         }
     }
 
     /// In-memory store that never persists (unit tests).
     pub fn in_memory() -> Self {
         ApprovalStore {
-            sessions: Mutex::new(HashMap::new()),
-            globals: Mutex::new(HashSet::new()),
-            global_path: None,
+            inner: Mutex::new(Inner {
+                config_path: PathBuf::new(),
+                rules: Rules::default(),
+            }),
         }
     }
 
-    /// Has this session (or the global set) already approved `key`?
-    pub fn check(&self, session_id: &str, key: &str) -> bool {
-        if self
-            .sessions
-            .lock()
-            .map(|s| s.contains_key(&(session_id.to_string(), key.to_string())))
-            .unwrap_or(false)
-        {
-            return true;
+    /// Refresh the in-memory cache from disk. Concurrent writers call
+    /// this first so they don't drop a sibling session's rule.
+    pub fn reload(&self) {
+        if let Ok(mut g) = self.inner.lock() {
+            let cfg = SandboxConfig::load_from(&g.config_path);
+            g.rules = cfg.rules;
         }
-        self.globals
-            .lock()
-            .map(|g| g.contains(key))
-            .unwrap_or(false)
     }
 
-    /// Record a decision. Only AllowSession and AllowGlobal have lasting
-    /// effect; AllowGlobal is the sole trigger for a disk write.
-    pub fn record(&self, session_id: &str, key: &str, decision: Decision) {
-        match decision {
-            Decision::AllowOnce => {}
-            Decision::AllowSession => {
-                if let Ok(mut s) = self.sessions.lock() {
-                    s.insert((session_id.to_string(), key.to_string()), ());
-                }
+    /// Consult the rules for `command`. Returns `Allow(rule)` if a
+    /// user-level allow rule covers it (Tier 1 — run silently),
+    /// `Deny(rule)` if a deny rule covers it (still Tier 2 — prompt,
+    /// with the rule name in the reason), or `None` if the prompt
+    /// should run with whatever reason the analyzer produced.
+    pub fn classify(&self, command: &str) -> Option<RuleMatch> {
+        let g = self.inner.lock().ok()?;
+        let cfg = SandboxConfig {
+            version: crate::policy::VERSION,
+            rules: g.rules.clone(),
+            path: None,
+        };
+        cfg.classify(command)
+    }
+
+    /// Record a decision. `AllowAll`/`DenyAll` persist a prefix rule
+    /// to `sandbox.json`; `AllowOnce`/`DenyOnce` are no-ops at this
+    /// layer (they live only in the prompt outcome, not in any store).
+    /// `path` is the config path to persist to (typically the
+    /// per-call `SandboxConfig::save_path()`).
+    pub fn record(&self, command: &str, decision: Decision, path: &Path) -> anyhow::Result<()> {
+        let kind = match decision {
+            Decision::AllowAll => RuleKind::Allow,
+            Decision::DenyAll => RuleKind::Deny,
+            Decision::AllowOnce | Decision::DenyOnce => return Ok(()),
+        };
+        let prefix = prefix_for_command(command);
+        if prefix == "*" {
+            // Refuse to save a rule that would shadow literally
+            // everything (a degenerate input).
+            return Ok(());
+        }
+        // Re-read from disk first so concurrent writers don't drop
+        // each other's rules.
+        let mut cfg = SandboxConfig::load_from(path);
+        let trimmed = prefix.trim();
+        let target = match kind {
+            RuleKind::Allow => &mut cfg.rules.allow,
+            RuleKind::Deny => &mut cfg.rules.deny,
+        };
+        if !target.iter().any(|r| r == trimmed) {
+            target.push(trimmed.to_string());
+            target.sort();
+        }
+        let other = match kind {
+            RuleKind::Allow => &mut cfg.rules.deny,
+            RuleKind::Deny => &mut cfg.rules.allow,
+        };
+        other.retain(|r| r != trimmed);
+        cfg.save_to(path)?;
+        // Update in-memory cache if we're the configured store.
+        if let Ok(mut g) = self.inner.lock() {
+            if g.config_path == path {
+                g.rules = cfg.rules.clone();
             }
-            Decision::AllowGlobal => {
-                if let Ok(mut g) = self.globals.lock() {
-                    g.insert(key.to_string());
-                    self.persist_globals_locked(&g);
-                }
-            }
-            Decision::Deny => {}
         }
+        Ok(())
     }
 
-    /// Gate helper used by exec.rs: consult the store first (no prompt),
-    /// otherwise ask the approver and record the outcome.
+    /// Gate helper: consult the in-memory rule cache first (no
+    /// prompt), otherwise ask the approver. Returns the decision the
+    /// gate settled on. The caller is responsible for the spawn /
+    /// audit side of the decision.
     pub async fn gate(
         &self,
         req: &ApprovalRequest,
-        key: &str,
         approver: &dyn Approver,
+        config_path: &Path,
     ) -> Decision {
-        if self.check(&req.session_id, key) {
-            return Decision::AllowSession;
+        if let Some(RuleMatch::Allow(_)) = self.classify(&req.command) {
+            return Decision::AllowAll;
         }
         let decision = approver.decide(req.clone()).await;
-        self.record(&req.session_id, key, decision);
+        if let Err(e) = self.record(&req.command, decision, config_path) {
+            // Persistence failures must not fail the gate — the run
+            // can still go through. The next save attempt will surface
+            // the issue via copied_msg / log.
+            eprintln!("atom: failed to record sandbox rule: {e}");
+        }
         decision
     }
+}
 
-    fn persist_globals_locked(&self, globals: &HashSet<String>) {
-        let Some(path) = &self.global_path else {
-            return;
-        };
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let mut sorted: Vec<&String> = globals.iter().collect();
-        sorted.sort();
-        if let Ok(json) = serde_json::to_vec_pretty(&sorted) {
-            let _ = std::fs::write(path, json);
-        }
-    }
+/// Backwards-compatible key helper. v1 callers used this to build a
+/// session-scoped grant key; v2 has no sessions. Returns the sha256
+/// of the command text — useful for audit / dedup.
+pub fn key_for(_rule_id: &str, command: &str, _cwd: &Path) -> String {
+    crate::rules::command_fallback_key(command)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const KEY: &str = "curl\x1f/ws";
+    use crate::rules::command_fallback_key;
 
     #[tokio::test]
     async fn auto_and_deny_approvers() {
@@ -210,100 +267,151 @@ mod tests {
             cwd: "/ws".into(),
             rule_id: "curl".into(),
             reason: "net".into(),
+            accept_all_preview: None,
         };
         assert_eq!(
             AutoApprover(Decision::AllowOnce).decide(req.clone()).await,
             Decision::AllowOnce
         );
-        assert_eq!(DenyAllApprover.decide(req).await, Decision::Deny);
+        assert_eq!(DenyAllApprover.decide(req).await, Decision::DenyOnce);
     }
 
     #[tokio::test]
-    async fn session_allow_does_not_leak_to_other_sessions() {
-        let store = ApprovalStore::in_memory();
-        store.record("session-a", KEY, Decision::AllowSession);
-        assert!(store.check("session-a", KEY));
-        assert!(
-            !store.check("session-b", KEY),
-            "session A allow leaked to B"
-        );
-        // Global grants satisfy every session...
-        store.record("session-a", KEY, Decision::AllowGlobal);
-        assert!(store.check("session-b", KEY));
+    async fn allow_all_persists_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sandbox.json");
+        let store = ApprovalStore::with_config_path(path.clone());
+        store
+            .record("cargo test --release", Decision::AllowAll, &path)
+            .unwrap();
+        let cfg = SandboxConfig::load_from(&path);
+        assert!(cfg.rules.allow.contains(&"cargo test *".to_string()));
     }
 
     #[tokio::test]
-    async fn gate_consults_store_before_approver() {
-        let store = ApprovalStore::in_memory();
+    async fn deny_all_persists_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sandbox.json");
+        let store = ApprovalStore::with_config_path(path.clone());
+        store
+            .record("rm -rf /tmp/foo", Decision::DenyAll, &path)
+            .unwrap();
+        let cfg = SandboxConfig::load_from(&path);
+        assert!(cfg.rules.deny.contains(&"rm *".to_string()));
+    }
+
+    #[tokio::test]
+    async fn allow_once_does_not_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sandbox.json");
+        let store = ApprovalStore::with_config_path(path.clone());
+        store
+            .record("cargo test --release", Decision::AllowOnce, &path)
+            .unwrap();
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn gate_returns_allow_all_when_classify_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sandbox.json");
+        // Pre-seed an allow rule.
+        let cfg = SandboxConfig {
+            version: crate::policy::VERSION,
+            rules: Rules {
+                allow: vec!["cargo test *".into()],
+                deny: vec![],
+            },
+            path: Some(path.clone()),
+        };
+        cfg.save_to(&path).unwrap();
+        let store = ApprovalStore::with_config_path(path.clone());
         let prompts = std::sync::atomic::AtomicUsize::new(0);
         struct Counting<'a>(&'a std::sync::atomic::AtomicUsize);
         #[async_trait]
         impl Approver for Counting<'_> {
             async fn decide(&self, _req: ApprovalRequest) -> Decision {
                 self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Decision::AllowSession
+                Decision::DenyOnce
             }
         }
         let req = ApprovalRequest {
             session_id: "s1".into(),
+            command: "cargo test --release".into(),
+            cwd: "/ws".into(),
+            rule_id: "cargo-test-bench".into(),
+            reason: "r".into(),
+            accept_all_preview: None,
+        };
+        let d = store.gate(&req, &Counting(&prompts), &path).await;
+        assert_eq!(d, Decision::AllowAll);
+        assert_eq!(
+            prompts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "allow rule short-circuits the prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_prompts_when_no_rule_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sandbox.json");
+        let store = ApprovalStore::with_config_path(path.clone());
+        let prompts = std::sync::atomic::AtomicUsize::new(0);
+        struct Counting<'a>(&'a std::sync::atomic::AtomicUsize);
+        #[async_trait]
+        impl Approver for Counting<'_> {
+            async fn decide(&self, _req: ApprovalRequest) -> Decision {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Decision::AllowOnce
+            }
+        }
+        let req = ApprovalRequest {
+            session_id: "s".into(),
             command: "wget http://x".into(),
             cwd: "/ws".into(),
             rule_id: "wget".into(),
             reason: "r".into(),
+            accept_all_preview: None,
         };
-        let key = key_for("wget", &req.command, &req.cwd);
         assert_eq!(
-            store.gate(&req, &key, &Counting(&prompts)).await,
-            Decision::AllowSession
-        );
-        assert_eq!(prompts.load(std::sync::atomic::Ordering::SeqCst), 1);
-        // Second ask in same session: satisfied from the store, no prompt.
-        assert_eq!(
-            store.gate(&req, &key, &Counting(&prompts)).await,
-            Decision::AllowSession
+            store.gate(&req, &Counting(&prompts), &path).await,
+            Decision::AllowOnce
         );
         assert_eq!(prompts.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
-    fn global_grants_persist_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("approvals.json");
-        assert!(!path.exists());
-        let first = ApprovalStore::with_global_path(path.clone());
-        assert!(!first.check("any", KEY));
-        // AllowGlobal writes the file; AllowSession must not.
-        first.record("s", KEY, Decision::AllowGlobal);
-        first.record("s", "other-key\x1f/x", Decision::AllowSession);
-        assert!(path.exists(), "AllowGlobal must persist");
-
-        let second = ApprovalStore::with_global_path(path);
-        assert!(
-            second.check("fresh-session", KEY),
-            "global round trip failed"
-        );
-        assert!(
-            !second.check("fresh-session", "other-key\x1f/x"),
-            "session-scoped grant must not be persisted"
-        );
-    }
-
-    #[test]
-    fn deny_records_nothing() {
-        let store = ApprovalStore::in_memory();
-        store.record("s", KEY, Decision::Deny);
-        store.record("s", KEY, Decision::AllowOnce);
-        assert!(!store.check("s", KEY));
-    }
-
-    #[test]
-    fn key_for_prefers_rule_id_then_hashes_command() {
+    fn key_for_returns_command_sha256() {
         assert_eq!(
-            key_for("curl", "curl x", Path::new("/ws")),
-            "curl\u{1f}/ws".to_string()
+            key_for("curl", "weird -cmd", Path::new("/ws")),
+            command_fallback_key("weird -cmd")
         );
-        let k = key_for("", "weird -cmd", Path::new("/w"));
-        assert!(k.starts_with(&command_fallback_key("weird -cmd")));
-        assert!(k.ends_with("/w"));
+    }
+
+    #[test]
+    fn legacy_wire_names_map() {
+        assert_eq!(
+            Decision::from_legacy_wire("allow_once"),
+            Some(Decision::AllowOnce)
+        );
+        assert_eq!(
+            Decision::from_legacy_wire("allow_session"),
+            Some(Decision::AllowOnce)
+        );
+        assert_eq!(
+            Decision::from_legacy_wire("allow_global"),
+            Some(Decision::AllowAll)
+        );
+        assert_eq!(
+            Decision::from_legacy_wire("allow_always"),
+            Some(Decision::AllowAll)
+        );
+        assert_eq!(Decision::from_legacy_wire("deny"), Some(Decision::DenyOnce));
+        assert_eq!(
+            Decision::from_legacy_wire("deny_always"),
+            Some(Decision::DenyAll)
+        );
+        assert_eq!(Decision::from_legacy_wire("nonsense"), None);
     }
 }

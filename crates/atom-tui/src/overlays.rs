@@ -26,6 +26,11 @@ pub enum OverlayKind {
     ProviderKey,
     Settings,
     WebSearch,
+    Theme,
+    /// /fork: pick a user message in the current session to fork from.
+    /// Rendered via the reusable fullscreen view template in
+    /// [`crate::fullscreen_view`].
+    Fork,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -48,6 +53,9 @@ pub enum PickerKind {
 pub struct PickerItem {
     pub title: String,
     pub meta: String,
+    /// Set for MCP rows so Enter on an auth-required server can trigger
+    /// the OAuth flow instead of just inserting the slash text.
+    pub mcp_server: Option<String>,
 }
 
 /// command is a slash command the user can type in the chat.
@@ -59,7 +67,7 @@ pub struct Command {
     pub kind: &'static str,
 }
 
-pub const COMMANDS: [Command; 14] = [
+pub const COMMANDS: [Command; 16] = [
     Command {
         name: "/new",
         desc: "start a new session",
@@ -68,6 +76,11 @@ pub const COMMANDS: [Command; 14] = [
     Command {
         name: "/sessions",
         desc: "list all sessions",
+        kind: "",
+    },
+    Command {
+        name: "/fork",
+        desc: "fork this session from a user message",
         kind: "",
     },
     Command {
@@ -118,6 +131,11 @@ pub const COMMANDS: [Command; 14] = [
     Command {
         name: "/reasoning",
         desc: "select reasoning level",
+        kind: "",
+    },
+    Command {
+        name: "/theme",
+        desc: "select color theme",
         kind: "",
     },
     Command {
@@ -207,11 +225,14 @@ pub fn discover_commands(cwd: &str) -> Vec<DynamicCommand> {
         cfgs.iter()
             .filter(|(name, _)| name.as_str() != selected.server)
             .map(|(name, cfg)| {
-                let meta = if !cfg.command.trim().is_empty() {
-                    cfg.command.trim().to_string()
-                } else {
-                    cfg.url.trim().to_string()
-                };
+                let meta =
+                    atom_tools::mcp_oauth::mcp_auth_display(cfg, name).unwrap_or_else(|| {
+                        if !cfg.command.trim().is_empty() {
+                            cfg.command.trim().to_string()
+                        } else {
+                            cfg.url.trim().to_string()
+                        }
+                    });
                 command_from(format!("/{name}"), meta, "mcp")
             }),
     );
@@ -363,6 +384,7 @@ pub fn overlay_has_query(kind: Option<OverlayKind>) -> bool {
             | Some(OverlayKind::Session)
             | Some(OverlayKind::Providers)
             | Some(OverlayKind::ProviderKey)
+            | Some(OverlayKind::Fork)
     )
 }
 
@@ -379,6 +401,8 @@ pub fn overlay_count(app: &App) -> usize {
         Some(OverlayKind::ProviderMethod) => 2,
         Some(OverlayKind::Settings) => 3,
         Some(OverlayKind::WebSearch) => web_search_rows(app).len(),
+        Some(OverlayKind::Theme) => atom_core::render::colors::available_themes().len(),
+        Some(OverlayKind::Fork) => fork_rows(app).len(),
         _ => 0,
     }
 }
@@ -398,6 +422,11 @@ pub fn settings_labels(app: &App) -> Vec<String> {
             "Done".into()
         },
     ]
+}
+
+/// themeRows lists selectable themes with their id and source label.
+pub fn theme_rows() -> Vec<atom_core::render::colors::ThemeEntry> {
+    atom_core::render::colors::available_themes()
 }
 
 pub fn web_search_rows(app: &App) -> Vec<(String, String, String)> {
@@ -719,6 +748,121 @@ pub struct SessionRow {
     pub date: bool,
     pub label: String,
     pub sess: Option<SessionInfo>,
+}
+
+// ---------------------------------------------------------------------------
+// Fork picker rows.
+// ---------------------------------------------------------------------------
+
+/// One row in the /fork overlay. The SessionLatest variant is the
+/// "fork from latest" sentinel (no position); UserMessage rows carry the
+/// position of the source message so the server can truncate up to (and
+/// excluding) that point.
+#[derive(Debug, Clone)]
+pub struct ForkRow {
+    pub kind: ForkRowKind,
+    pub label: String,
+    /// When set, formatted HH:MM in the user's local time. Rendered as
+    /// the row's trailing tag.
+    pub timestamp: String,
+    /// Position in the source session's messages array for UserMessage
+    /// rows; None for the SessionLatest sentinel and Header rows.
+    pub position: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForkRowKind {
+    Header,
+    SessionLatest,
+    UserMessage,
+}
+
+/// Returns the rendered fork rows: one Header, the SessionLatest
+/// sentinel, a User-messages Header, and one row per user message
+/// filtered by case-insensitive substring match against the label.
+/// The SessionLatest row is always present (pin it at the top) so the
+/// user can always fork from the full transcript.
+pub fn fork_rows(app: &App) -> Vec<ForkRow> {
+    let mut rows: Vec<ForkRow> = Vec::new();
+    rows.push(ForkRow {
+        kind: ForkRowKind::Header,
+        label: "Session".into(),
+        timestamp: String::new(),
+        position: None,
+    });
+    rows.push(ForkRow {
+        kind: ForkRowKind::SessionLatest,
+        label: fork_session_latest_label(app),
+        timestamp: fork_session_latest_trailing(app),
+        position: None,
+    });
+    let user_count = app.overlay_fork_user_messages.len();
+    if user_count > 0 {
+        rows.push(ForkRow {
+            kind: ForkRowKind::Header,
+            label: "User messages".into(),
+            timestamp: String::new(),
+            position: None,
+        });
+        let q = app.overlay_q.to_lowercase();
+        for msg in &app.overlay_fork_user_messages {
+            if !q.is_empty() && !msg.preview.to_lowercase().contains(&q) {
+                continue;
+            }
+            rows.push(ForkRow {
+                kind: ForkRowKind::UserMessage,
+                label: msg.preview.clone(),
+                timestamp: msg.timestamp.clone(),
+                position: Some(msg.position),
+            });
+        }
+    }
+    rows
+}
+
+/// firstForkRow: the index of the SessionLatest row, which the overlay
+/// opens on. 0 when the source session has no user messages.
+pub fn first_fork_row() -> usize {
+    1
+}
+
+/// moveForkSel skips Header rows so ↑/↓ always lands on a pickable row.
+pub fn move_fork_sel(rows: &[ForkRow], sel: usize, dir: i32) -> usize {
+    if rows.is_empty() {
+        return 0;
+    }
+    let mut i = sel as i32 + dir;
+    while i >= 0 && i < rows.len() as i32 {
+        if rows[i as usize].kind != ForkRowKind::Header {
+            return i as usize;
+        }
+        i += dir;
+    }
+    sel.min(rows.len().saturating_sub(1))
+}
+
+fn fork_session_latest_label(app: &App) -> String {
+    let title = if app.session.title.is_empty() {
+        "this session".to_string()
+    } else {
+        app.session.title.clone()
+    };
+    format!("Fork from latest — {title}")
+}
+
+fn fork_session_latest_trailing(app: &App) -> String {
+    let model = if app.session.model.is_empty() {
+        app.sel_model.clone()
+    } else {
+        app.session.model.clone()
+    };
+    let count = app.session.message_count;
+    let msg = if count == 1 { "msg" } else { "msg" };
+    if model.is_empty() {
+        format!("{count} {msg}")
+    } else {
+        format!("{model} · {count} {msg}")
+    }
 }
 
 /// Muted right-aligned tag marking subagent sessions in the picker.
@@ -1130,6 +1274,9 @@ pub fn overlay_title(app: &App, kind: OverlayKind) -> String {
             "Settings — ↑↓ to navigate, Enter to change, Esc to close".to_string(),
         OverlayKind::WebSearch =>
             "Web search provider — ↑↓ to navigate, Enter to select, Esc to settings".to_string(),
+        OverlayKind::Theme =>
+            "Theme — ↑↓ to navigate, Enter to apply, Esc to cancel".to_string(),
+        OverlayKind::Fork => String::new(),
     }
 }
 
@@ -1148,9 +1295,10 @@ pub fn overlay_header_rows(app: &App) -> usize {
             };
             title_rows + wrap_plain(&query, width).len().max(1) + 2
         }
-        OverlayKind::ProviderMethod | OverlayKind::Settings | OverlayKind::WebSearch => {
-            title_rows + 1
-        }
+        OverlayKind::ProviderMethod
+        | OverlayKind::Settings
+        | OverlayKind::WebSearch
+        | OverlayKind::Theme => title_rows + 1,
         _ => 0,
     }
 }
@@ -1264,6 +1412,49 @@ pub fn overlay_row_at_y(app: &App, y: usize) -> Option<usize> {
 }
 
 pub fn hover_overlay_row(app: &mut App, y: usize) {
+    // The /fork picker uses the generic fullscreen-view template with
+    // its own hit-test; the other overlays share the legacy geometry.
+    if app.overlay == Some(OverlayKind::Fork) {
+        let width = app.width.max(1) as usize;
+        let height = app.height.max(1) as usize;
+        let rows = fork_rows(app);
+        let view_rows: Vec<crate::fullscreen_view::ViewRow> = rows
+            .iter()
+            .map(|r| match r.kind {
+                ForkRowKind::Header => crate::fullscreen_view::ViewRow::Header(r.label.clone()),
+                ForkRowKind::SessionLatest | ForkRowKind::UserMessage => {
+                    crate::fullscreen_view::ViewRow::Item(crate::fullscreen_view::ViewItem {
+                        id: r.position.map(|p| p.to_string()),
+                        label: r.label.clone(),
+                        trailing: r.timestamp.clone(),
+                        meta: String::new(),
+                    })
+                }
+            })
+            .collect();
+        let footer = fork_footer(app, &view_rows);
+        let spec = crate::fullscreen_view::ViewSpec {
+            title: "Fork session",
+            description: "",
+            search_placeholder: "Search",
+            search_query: app.overlay_q.as_str(),
+            search_selected: app.overlay_q_sel,
+            rows: &view_rows,
+            selected: app.overlay_sel.min(view_rows.len().saturating_sub(1)),
+            footer: footer.as_str(),
+            loading: None,
+            spinner_frame: app.spinner_frame,
+        };
+        if let Some(idx) = crate::fullscreen_view::hit_test(&spec, y, width, height) {
+            if idx < view_rows.len() {
+                if !matches!(view_rows[idx], crate::fullscreen_view::ViewRow::Header(_)) {
+                    app.overlay_sel = idx;
+                    app.overlay_scroll = 0;
+                }
+            }
+        }
+        return;
+    }
     if let Some(idx) = overlay_row_at_y(app, y) {
         let is_session_header = app.overlay == Some(OverlayKind::Session) && {
             let rows = session_rows(app);
@@ -1285,6 +1476,46 @@ pub fn hover_overlay_row(app: &mut App, y: usize) {
 }
 
 pub fn click_overlay(app: &mut App, y: usize) -> Vec<crate::events::Effect> {
+    // The /fork picker uses the generic fullscreen-view template.
+    if app.overlay == Some(OverlayKind::Fork) {
+        let width = app.width.max(1) as usize;
+        let height = app.height.max(1) as usize;
+        let rows = fork_rows(app);
+        let view_rows: Vec<crate::fullscreen_view::ViewRow> = rows
+            .iter()
+            .map(|r| match r.kind {
+                ForkRowKind::Header => crate::fullscreen_view::ViewRow::Header(r.label.clone()),
+                ForkRowKind::SessionLatest | ForkRowKind::UserMessage => {
+                    crate::fullscreen_view::ViewRow::Item(crate::fullscreen_view::ViewItem {
+                        id: r.position.map(|p| p.to_string()),
+                        label: r.label.clone(),
+                        trailing: r.timestamp.clone(),
+                        meta: String::new(),
+                    })
+                }
+            })
+            .collect();
+        let footer = fork_footer(app, &view_rows);
+        let spec = crate::fullscreen_view::ViewSpec {
+            title: "Fork session",
+            description: "",
+            search_placeholder: "Search",
+            search_query: app.overlay_q.as_str(),
+            search_selected: app.overlay_q_sel,
+            rows: &view_rows,
+            selected: app.overlay_sel.min(view_rows.len().saturating_sub(1)),
+            footer: footer.as_str(),
+            loading: None,
+            spinner_frame: app.spinner_frame,
+        };
+        if let Some(idx) = crate::fullscreen_view::hit_test(&spec, y, width, height) {
+            if !matches!(view_rows[idx], crate::fullscreen_view::ViewRow::Header(_)) {
+                app.overlay_sel = idx;
+                return app.confirm_overlay();
+            }
+        }
+        return Vec::new();
+    }
     let Some(idx) = overlay_row_at_y(app, y) else {
         return Vec::new();
     };
@@ -1302,6 +1533,24 @@ pub fn click_overlay(app: &mut App, y: usize) -> Vec<crate::events::Effect> {
     }
     app.overlay_sel = idx;
     app.confirm_overlay()
+}
+
+/// Shared footer helper used by both the renderer and the click/hover
+/// paths so they agree on the visible count.
+fn fork_footer(app: &App, view_rows: &[crate::fullscreen_view::ViewRow]) -> String {
+    if app.overlay_fork_user_messages.is_empty() {
+        return String::new();
+    }
+    let visible = view_rows
+        .iter()
+        .filter(|r| matches!(r, crate::fullscreen_view::ViewRow::Item(item) if item.id.is_some()))
+        .count();
+    let total = app.overlay_fork_user_messages.len();
+    if visible == total {
+        format!("{visible}/{total} user messages")
+    } else {
+        format!("{visible}/{total} user messages match")
+    }
 }
 
 #[cfg(test)]
@@ -1500,5 +1749,125 @@ mod tests {
             ..crate::app::empty_session_info()
         }];
         assert_eq!(session_rows(&app)[0].label, "Pinned - None");
+    }
+
+    // -- /fork picker -----------------------------------------------------
+
+    fn user_msg(position: i64, preview: &str) -> crate::app::ForkUserMessage {
+        crate::app::ForkUserMessage {
+            position,
+            preview: preview.into(),
+            timestamp: "—".into(),
+        }
+    }
+
+    #[test]
+    fn fork_overlay_filter_drops_user_messages_keeps_session_latest() {
+        let mut app = App::new_test(80, 24);
+        app.overlay_fork_user_messages = vec![
+            user_msg(0, "convert loader"),
+            user_msg(1, "extract auth"),
+            user_msg(2, "add retry route"),
+        ];
+        let rows = fork_rows(&app);
+        // Layout: Session header, SessionLatest, User messages header, 3 rows.
+        assert_eq!(rows.len(), 6);
+        assert_eq!(rows[0].kind, ForkRowKind::Header);
+        assert_eq!(rows[1].kind, ForkRowKind::SessionLatest);
+        assert_eq!(rows[2].kind, ForkRowKind::Header);
+        assert_eq!(rows[3].kind, ForkRowKind::UserMessage);
+        assert_eq!(rows[4].kind, ForkRowKind::UserMessage);
+        assert_eq!(rows[5].kind, ForkRowKind::UserMessage);
+
+        // Typing "auth" should filter to the matching row, but the
+        // SessionLatest sentinel stays at the top.
+        app.overlay_q = "auth".into();
+        let rows = fork_rows(&app);
+        assert_eq!(rows[1].kind, ForkRowKind::SessionLatest);
+        assert_eq!(rows[3].kind, ForkRowKind::UserMessage);
+        assert!(rows[3].label.contains("auth"));
+        // The other two rows are dropped by the filter.
+        assert_eq!(rows.len(), 4);
+    }
+
+    #[test]
+    fn fork_overlay_skips_header_rows_in_nav() {
+        let rows = vec![
+            ForkRow {
+                kind: ForkRowKind::Header,
+                label: "Session".into(),
+                timestamp: String::new(),
+                position: None,
+            },
+            ForkRow {
+                kind: ForkRowKind::SessionLatest,
+                label: "latest".into(),
+                timestamp: String::new(),
+                position: None,
+            },
+            ForkRow {
+                kind: ForkRowKind::Header,
+                label: "User messages".into(),
+                timestamp: String::new(),
+                position: None,
+            },
+            ForkRow {
+                kind: ForkRowKind::UserMessage,
+                label: "msg 1".into(),
+                timestamp: String::new(),
+                position: Some(0),
+            },
+        ];
+        assert_eq!(move_fork_sel(&rows, 0, 1), 1);
+        assert_eq!(move_fork_sel(&rows, 1, 1), 3);
+        assert_eq!(move_fork_sel(&rows, 3, -1), 1);
+        // Past the end clamps to the last item.
+        assert_eq!(move_fork_sel(&rows, 3, 1), 3);
+        // Before the start clamps to the first item.
+        assert_eq!(move_fork_sel(&rows, 0, -1), 0);
+    }
+
+    #[test]
+    fn fork_overlay_enter_emits_fork_session_with_selected_position() {
+        // This is the lookup pattern used by confirm_overlay: read the
+        // selected row, emit Effect::ForkSession with the chosen
+        // position. SessionLatest → None; UserMessage → Some(pos).
+        let mut rows = vec![
+            ForkRow {
+                kind: ForkRowKind::SessionLatest,
+                label: "latest".into(),
+                timestamp: String::new(),
+                position: None,
+            },
+            ForkRow {
+                kind: ForkRowKind::UserMessage,
+                label: "msg 0".into(),
+                timestamp: String::new(),
+                position: Some(0),
+            },
+            ForkRow {
+                kind: ForkRowKind::UserMessage,
+                label: "msg 1".into(),
+                timestamp: String::new(),
+                position: Some(1),
+            },
+        ];
+        // SessionLatest → position = None.
+        let row = &rows[0];
+        let position = match row.kind {
+            ForkRowKind::SessionLatest => None,
+            ForkRowKind::UserMessage => row.position,
+            ForkRowKind::Header => None,
+        };
+        assert!(position.is_none());
+        // UserMessage → position = Some(1).
+        rows[1].kind = ForkRowKind::UserMessage;
+        let row = &rows[1];
+        let position = match row.kind {
+            ForkRowKind::SessionLatest => None,
+            ForkRowKind::UserMessage => row.position,
+            ForkRowKind::Header => None,
+        };
+        assert_eq!(position, Some(0));
     }
 }

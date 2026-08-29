@@ -21,6 +21,9 @@ pub fn execute_read_file(arguments: &str, ctx: &ToolCtx<'_>) -> ToolOutcome {
         #[serde(default)]
         limit: i64,
     }
+    if arguments.trim().is_empty() {
+        return ToolOutcome::from_text(crate::exec::empty_arguments_msg("read_file"));
+    }
     let args: Args = match serde_json::from_str(arguments) {
         Ok(a) => a,
         Err(e) => {

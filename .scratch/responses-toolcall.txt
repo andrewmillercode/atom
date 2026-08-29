@@ -1,0 +1,51 @@
+event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_6a928b3cce2e5f3cb97d4909","object":"response","created_at":1787988796,"status":"in_progress","parallel_tool_calls":true,"temperature":1,"top_p":1,"max_output_tokens":500,"background":false,"truncation":"disabled","top_logprobs":0,"model":"muse-spark-1.2-contributor-free","error":null,"incomplete_details":null,"output":[],"instructions":null,"tool_choice":"auto","tools":[{"type":"function","name":"calculator","description":"Add two numbers","parameters":{"properties":{"a":{"type":"number"},"b":{"type":"number"}},"required":["a","b"],"type":"object"}}],"reasoning":{"effort":"high"}}}
+
+event: response.in_progress
+data: {"type":"response.in_progress","sequence_number":1,"response":{"id":"resp_6a928b3cce2e5f3cb97d4909","object":"response","created_at":1787988796,"status":"in_progress","parallel_tool_calls":true,"temperature":1,"top_p":1,"max_output_tokens":500,"background":false,"truncation":"disabled","top_logprobs":0,"model":"muse-spark-1.2-contributor-free","error":null,"incomplete_details":null,"output":[],"instructions":null,"tool_choice":"auto","tools":[{"type":"function","name":"calculator","description":"Add two numbers","parameters":{"properties":{"a":{"type":"number"},"b":{"type":"number"}},"required":["a","b"],"type":"object"}}],"reasoning":{"effort":"high"}}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":2,"output_index":0,"item":{"id":"rs_6a928b3cce2e5f3cb97d4909:rs_01a04c6fe5677ce0ae756bc01fc75127","type":"reasoning","status":"in_progress","summary":[]}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","sequence_number":3,"output_index":0,"item":{"id":"rs_6a928b3cce2e5f3cb97d4909:rs_01a04c6fe5677ce0ae756bc01fc75127","type":"reasoning","status":"completed","encrypted_content":"Q-PaDgGNDar7Ojzm5kcx8uIfFDoB66MMUNObt7Ow8YPmaOoIC5OVCXuszUxe2K4ONiXCk2zQlFDxNhJi8oSYVT4v---P7EtFQLUqQsZ0P2SUBDyHfuswJZNJfdwZu0JxxFN2N90nOoeGKzXOdOWEQtT69nia5a4gZigL_XxfXXSsgws_9RfApuz3YhF14pOIJmHEDL8R5SCvPBwI_SBWzqAKGyETWUgTOzpfK5usEfTsDsN_UnXG2hRbJTII4K6-GtUyV-xu--by4tXve9pmwsPqb0wG8KgUnREXQbJPo3F-XxIojQglFR-QTWkqvPqBExpRkK8FqWNtFsEm0uOKHn-9ZQYBT9MTBLHPkt91OVyzNNo95X-dXhtN-0wsXSv-jQ64e5p8KVYNpavtMHPPK0tF_JO5MFL5IvqbZFIGufZOyy2h2vytxEPTWduLwR-N8dod2gIN8qxDILrP9AwiLBFA1cz6noMPY0mkRzWgianVfwV7pu_KUK8Ow_M4og_wenEFM3bIADp5XMcEncbiW7hZrUSf-VSMvKKvPcQOT8vI5kuhGaEv4CyFZwwwwDDmijwxDOPisA01MY28s6-qnNzqnxJ0H_QaiakU3Hb7pFXwX9uKHIE5yCiGhZd53PXnIubL690tO8ysfBD77f5bcoa_jhjXaOcnubiON44gRuUJM6dTETVy9Rq4bPnJuier4RSr2M47pGyNffkhghIOqlnFspK0Qhb0s7F4IrJzOsgwsyjFnPzo0Q-SHXDL0pO75D23BAw7JnzroKI3Sj2tP0HMueqq4NGnuXDdufu44DStHwi_el3BTIwldNVHZ3cxZzd38s6hoHBtrA9ts93XKNOAu4l9rj7FW3OMNcRCz1tNpxx9naW-SvI9LzA92FJXrINVjZF4z7OrYPFKwzG9udw9hxNk1_mLFz94-dvZLVLOOV2Yi973uoLRMy1pNABEGORkCdqU2MSktPJWVno4B_NqMIpD5VP3nIv8dm1vfwQjydV7PwaCnVUn3eMFUMRKaDTpB0aOt_-Q9ATKSBvQ1DXWpw5svCbJuvAeqFTvd-TXK4a-RcXPtu-OhWUmOWDxpn-chDI127W4EQYsjJ0xDyVKPCABOezYMBpZ1R2o1zn_TkyTaNPzbM_oLptqDWq1DTylOlL3cV0ahbw1k4DRORfbDjyNDaIC7RpwhfB21W2lBr00dGqsKht9N7E_WFXNi7gKpAiFXhC9d2psYPoXh21R1A41YrV3Ibi3BMlUkaoy-fbYTQgDWHh-wP-Q00sq9Bd-jLnv4mQZkQBDDqLgjnRkb3Efa4g1yWWzqU4knBQ_ODVhgeNVraN91ANM0EsBLXvxr7G2p3PvOX8mvXk1mzrWDh40KZHmV_oD9slJOssSq02JAIAu8ioNIJz7LdOb3XjhOY44mo4PNEU1kg","summary":[]}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":4,"output_index":1,"item":{"id":"rs_01a04c6fe7a67c2389245a1550074650","type":"message","status":"in_progress","role":"assistant","phase":"commentary","content":[]}}
+
+event: response.content_part.added
+data: {"type":"response.content_part.added","sequence_number":5,"output_index":1,"content_index":0,"item_id":"rs_01a04c6fe7a67c2389245a1550074650","part":{"type":"output_text","text":"","annotations":[],"logprobs":[]}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":6,"output_index":1,"content_index":0,"item_id":"rs_01a04c6fe7a67c2389245a1550074650","delta":"I'll add 2 and 3 for you with the calculator.","logprobs":[]}
+
+event: response.output_text.done
+data: {"type":"response.output_text.done","sequence_number":7,"output_index":1,"content_index":0,"item_id":"rs_01a04c6fe7a67c2389245a1550074650","text":"I'll add 2 and 3 for you with the calculator.","logprobs":[]}
+
+event: response.content_part.done
+data: {"type":"response.content_part.done","sequence_number":8,"output_index":1,"content_index":0,"item_id":"rs_01a04c6fe7a67c2389245a1550074650","part":{"type":"output_text","text":"I'll add 2 and 3 for you with the calculator.","annotations":[],"logprobs":[]}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","sequence_number":9,"output_index":1,"item":{"id":"rs_01a04c6fe7a67c2389245a1550074650","type":"message","status":"completed","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"I'll add 2 and 3 for you with the calculator.","annotations":[],"logprobs":[]}]}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":10,"output_index":2,"item":{"id":"fc_01a04c6fe7da72839792de541e5bfc0c","type":"function_call","status":"in_progress","name":"calculator","call_id":"call_01a04c6fe7da72839792de541e5bfc0c","arguments":""}}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","sequence_number":11,"output_index":2,"item_id":"fc_01a04c6fe7da72839792de541e5bfc0c","delta":"{\"a\":2.0"}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","sequence_number":12,"output_index":2,"item_id":"fc_01a04c6fe7da72839792de541e5bfc0c","delta":",\"b\":3.0}"}
+
+event: response.function_call_arguments.done
+data: {"type":"response.function_call_arguments.done","sequence_number":13,"output_index":2,"item_id":"fc_01a04c6fe7da72839792de541e5bfc0c","arguments":"{\"a\":2.0,\"b\":3.0}","name":"calculator"}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","sequence_number":14,"output_index":2,"item":{"id":"fc_01a04c6fe7da72839792de541e5bfc0c","type":"function_call","status":"completed","name":"calculator","call_id":"call_01a04c6fe7da72839792de541e5bfc0c","arguments":"{\"a\":2.0,\"b\":3.0}"}}
+
+event: response.completed
+data: {"type":"response.completed","sequence_number":15,"response":{"id":"resp_6a928b3cce2e5f3cb97d4909","object":"response","created_at":1787988796,"completed_at":1787988797,"status":"completed","parallel_tool_calls":true,"temperature":1,"top_p":1,"max_output_tokens":500,"background":false,"truncation":"disabled","top_logprobs":0,"model":"muse-spark-1.2-contributor-free","error":null,"incomplete_details":null,"output":[{"id":"rs_6a928b3cce2e5f3cb97d4909:rs_01a04c6fe5677ce0ae756bc01fc75127","type":"reasoning","status":"completed","encrypted_content":"Q-PaDgFYSO__03iCqXI1-EReqr9BjLNBIZUGCLqhpsWMLJ3oCUU6lOWGT1JstARiQrmUNSKEb9gzhwHCPSEwOWfunvOtaebNGsmOy0cyOMh0ASnIMtRZy25uyX4PuDRCLKQmQ5Ns2sBdhzXJ0zqPUZRANbLB8jX9l1aPf_cUeVs7qlqE48yL8ar82UvraBIZxUEbATVMc2VjMDU2FyMM72T2y4wlDwCu6qftOx8ZElN4p8cRB7k4rDcqF8B2lWEFxvwiU8WIsrvCD6miexC0gAouXdYyPkRrvVt0zF-wF8hRXvD0Lrs82tWKw_ir0CokkR1rQoH2dDKmg8KhLR7M7vGZKFa1l3pENC3C5SosJE6rCZmQCP_xdPpg4nKlS_GHEptH6AUsUDRG0jxjmX6cXKR1rd34SUneimHglKBKd70FfbInlt0iH6GdHfyAMsX-U1_O2YhnVoDe0RWQYsm0n4OsnnNlFi7uhuxIL1COerXM2Qq-lU6O6J00EU8zNoZyyBVAZLe_pPY0QwIs7sDRjDuqZKDQW2KMSnA2jbYvDN97RUV5GJhh7lUSVd8Eh9sxEBDo1zsd0q3sfzTScw6KrHx9LiMmxJDn1qKV7MahfCdgGxvOx3mrwMMhl2smc-Tgn6y2O7ZyytS_RdvlUiZeJm7iHECpBfjdrgIoif6WTHGf6go4HKXjBJyJeoN3Gd7_wMtJNQIUI_DSR4PXoJLIVfyjj_MU7K1q3kTNC-_OzZ6sdinV_oHKa8HVKbniK8jbZo0pSICIBcPLD4QlS2bYeX6CHJKqYQEM4ig0VplJgu66buyvToku6byiZHrIeWfpHrClLOgYoSSYq_gERGidMuUea3V8SFnnxHg_cjySFPX8mcdzXZOSj-PJ4m7SJqDIdZfP2HTgKejfbZTuWVm8oPAnvGd2m7Q8Hvp3gm0E30_YvAfnsmEk1ijzoap7JPxDQFxLpdR8VIYaz-WnvH59-Raa_SqJo_1HtyTz_Sbge-4trjC6XkJdZ7ijUVaBZag6SGPEGGgbWqcz_RQ5yclp_ZQJLIClf50D4fxJTT4G4gMjn3kJ3vj65zJ9g3FRZWDlDbvNPJps13MeGz2Gf-F4Unyvnjeg3juI4RH0j2eKK14k7zgqwbOIhL5-8zSvZm_yAcUPhxBrozZO6q37XXdM8FF55gKlAZtaVreCu5U5lyJiqJCsQLZzopsNXC94swAcKHXQZHiX9OXULfoPgDVn8CXwmPVoPv2QxY2D-IZ4ihD5lCiNJ4Tsly9W6WxWhTAQfuTxQuS4UYUbfy-d9uIxn0jgqS5Nv183QDQAfrvnJZO0gc35u7B33ogRxFArtlUzy6oLarKAy4caE_Ea6ZXHxOKLK3rbHql2XCUy7pGyxlEoi8cyw_mgI4lYnr3j3zE2CZ8mE3ceKElU13WYwQ","summary":[]},{"id":"rs_01a04c6fe7a67c2389245a1550074650","type":"message","status":"completed","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"I'll add 2 and 3 for you with the calculator.","annotations":[],"logprobs":[]}]},{"id":"fc_01a04c6fe7da72839792de541e5bfc0c","type":"function_call","status":"completed","name":"calculator","call_id":"call_01a04c6fe7da72839792de541e5bfc0c","arguments":"{\"a\":2.0,\"b\":3.0}"}],"usage":{"input_tokens":555,"output_tokens":213,"total_tokens":768,"input_tokens_details":{"cached_tokens":113},"output_tokens_details":{"reasoning_tokens":123}},"instructions":null,"tool_choice":"auto","tools":[{"type":"function","name":"calculator","description":"Add two numbers","parameters":{"properties":{"a":{"type":"number"},"b":{"type":"number"}},"required":["a","b"],"type":"object"}}],"reasoning":{"effort":"high"}}}
+
+event: ping
+data: {"type":"ping","cost":"0"}
+

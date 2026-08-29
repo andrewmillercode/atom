@@ -275,6 +275,9 @@ fn default_true() -> bool {
 }
 
 pub async fn grep_search_with(arguments: &str, cwd: &Path, runner: &dyn RgRunner) -> String {
+    if arguments.trim().is_empty() {
+        return crate::exec::empty_arguments_msg("grep");
+    }
     let args: GrepArgs = match serde_json::from_str(arguments) {
         Ok(a) => a,
         Err(e) => return format!("error parsing arguments: {e}"),
@@ -312,6 +315,9 @@ struct GlobArgs {
 }
 
 pub async fn glob_search_with(arguments: &str, cwd: &Path, runner: &dyn RgRunner) -> String {
+    if arguments.trim().is_empty() {
+        return crate::exec::empty_arguments_msg("glob");
+    }
     let args: GlobArgs = match serde_json::from_str(arguments) {
         Ok(a) => a,
         Err(e) => return format!("error parsing arguments: {e}"),

@@ -1,0 +1,21 @@
+{
+  "name": "Kanso Ink",
+  "author": "Ported from webhooked/kanso-zed (Kanso Ink for Zed)",
+  "border": "#22262d",
+  "card_dark": "#1b1e24",
+  "card_light": "#25272e",
+  "secondary": "#a292a3",
+  "primary": "#8ba4b0",
+  "primary_dark": "#658594",
+  "select": "#393b44",
+  "background": "#14171d",
+  "foreground": "#c5c9c7",
+  "muted": "#75797f",
+  "muted_extra": "#47494d",
+  "diff_add": "#87a987",
+  "diff_del": "#c4746e",
+  "diff_add_bg": "#2b3328",
+  "diff_del_bg": "#2d2a2e",
+  "syntax_type": "#8ea4a2",
+  "syntax_string": "#8a9a7b"
+}

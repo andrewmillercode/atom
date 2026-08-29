@@ -83,6 +83,21 @@ pub struct ApprovalPrompt {
     pub from_subagent: bool,
 }
 
+/// One user message in the /fork overlay: a one-line preview plus the
+/// timestamp tag rendered on the right edge. The server uses
+/// `position` to truncate the transcript (the position is the index
+/// into the source session's `messages` array); the client uses
+/// `preview` to filter the picker.
+#[derive(Debug, Clone)]
+pub struct ForkUserMessage {
+    pub position: i64,
+    /// Single-line preview of the user message, already trimmed.
+    pub preview: String,
+    /// Local-time HH:MM formatted timestamp; falls back to "—" when
+    /// the server didn't record `created_at` (older sessions).
+    pub timestamp: String,
+}
+
 pub struct App {
     // session and provider state
     pub providers: Vec<Provider>,
@@ -167,6 +182,17 @@ pub struct App {
     pub settings_onboarding: bool,
     pub pending_model_provider: String,
 
+    /// /fork overlay: user messages from the source session, used to
+    /// build picker rows. The SessionLatest sentinel row is computed on
+    /// the fly from `self.session`. Empty until the user opens `/fork`
+    /// and the source loads via `Effect::LoadForkSource`.
+    pub overlay_fork_user_messages: Vec<ForkUserMessage>,
+    /// /fork overlay: id of the session being forked (always equal to
+    /// `self.session.id` while the overlay is open, but cached so we
+    /// don't have to remember which entry was loaded if the user
+    /// navigates around before confirming).
+    pub overlay_fork_source: String,
+
     // terminal dimensions
     pub width: u16,
     pub height: u16,
@@ -229,6 +255,14 @@ pub struct App {
     pub input: Prompt,
 
     pub cwd: String,
+
+    // shell mode (! prefix): typed input runs in the shell instead of
+    // going to the model; `cd` moves the app (and the session) with it.
+    pub shell_mode: bool,
+    pub shell_running: bool,
+    /// Kill switch for the running shell command, armed by the spawned
+    /// task; Ctrl+C sends on it to abort the child process.
+    pub shell_kill: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl App {
@@ -291,6 +325,8 @@ impl App {
             model_picker_purpose: overlays::ModelPickerPurpose::Chat,
             settings_onboarding: false,
             pending_model_provider: String::new(),
+            overlay_fork_user_messages: Vec::new(),
+            overlay_fork_source: String::new(),
             width: 80,
             height: 24,
             err_msg: String::new(),
@@ -325,9 +361,21 @@ impl App {
             test_scene: -1,
             input: Prompt::new(),
             cwd,
+            shell_mode: false,
+            shell_running: false,
+            shell_kill: None,
         };
         m.refresh_thinking_levels();
         m.apply_thinking(&m.session.thinking.clone());
+        // Apply the persisted theme after any dev hot-theme load so the
+        // user's selection wins in normal runs (hot reload only runs in
+        // --hot mode, which layers on top of this afterwards).
+        if let Some(theme) = m.atom_config.theme.clone() {
+            if let Err(error) = atom_core::render::colors::apply_theme(&theme) {
+                m.err_msg = format!("theme: {error}");
+                m.atom_config.theme = None;
+            }
+        }
         // If no model was found, auto-open the provider selector.
         if m.sel_model.is_empty() && m.session.id.is_empty() {
             m.overlay = Some(OverlayKind::Providers);
@@ -376,6 +424,21 @@ impl App {
     /// Rows reserved inside the prompt box for image previews.
     pub fn preview_row_count(&self) -> usize {
         crate::preview::preview_row_count(self)
+    }
+
+    /// Read-only transcript view: subagent sessions accept no user input.
+    pub fn read_only_view(&self) -> bool {
+        !self.session.parent_id.is_empty()
+    }
+
+    /// Rows the prompt card occupies (padding + input + previews). Zero
+    /// in read-only subagent views, where the prompt is hidden entirely.
+    pub fn prompt_height(&self) -> usize {
+        if self.read_only_view() {
+            0
+        } else {
+            2 * PROMPT_PAD + self.input_height() + self.preview_row_count()
+        }
     }
 
     /// inputHeight: wrapped prompt rows clamped to INPUT_MAX_HEIGHT or
@@ -594,7 +657,7 @@ impl App {
             let show_r = self.show_reasoning;
             let b = &mut self.blocks[i];
             if !b.lines_valid(width, show_r) {
-                let rendered = blocks::render_block_linked(b, width, show_r, &frame);
+                let rendered = blocks::render_block_linked(b, width, show_r, &frame, &self.cwd);
                 let lines = rendered.lines.into_iter().map(Arc::new).collect();
                 b.lines = Some(lines);
                 b.line_links = rendered.links;
@@ -669,11 +732,7 @@ impl App {
     /// Conversation rows available before a footer menu is accounted for.
     pub fn base_viewport_height(&self) -> usize {
         let vp = (self.height as usize).saturating_sub(
-            crate::statusbar::status_bar_rows(self)
-                + STATUS_FOOTER_ROWS
-                + 2 * PROMPT_PAD
-                + self.input_height()
-                + self.preview_row_count(),
+            crate::statusbar::status_bar_rows(self) + STATUS_FOOTER_ROWS + self.prompt_height(),
         );
         // Reserve only the top viewport padding: the prompt card sits
         // directly below the scrolling region with no empty row in
@@ -970,6 +1029,11 @@ impl App {
                         reason: ev.reason.clone(),
                         from_subagent: ev.from_subagent,
                         child_title: ev.child_title.clone(),
+                        // v2: forward the origin tag (defaults to "self"
+                        // when the server didn't set one) and the
+                        // accept-all prefix preview for `[a]`.
+                        origin: ev.origin.clone(),
+                        accept_all_preview: ev.accept_all_preview.clone(),
                     }),
                     expanded: true,
                     ..Default::default()
@@ -1327,6 +1391,10 @@ impl App {
                 self.err_msg = "no session to compact".into();
                 return Vec::new();
             }
+            if self.read_only_view() {
+                self.err_msg = "subagent sessions are managed by their parent".into();
+                return Vec::new();
+            }
             let extra = text
                 .strip_prefix("/compact")
                 .unwrap_or("")
@@ -1381,6 +1449,16 @@ impl App {
                 self.settings_onboarding = false;
                 Vec::new()
             }
+            "/theme" => {
+                let rows = overlays::theme_rows();
+                self.overlay = Some(OverlayKind::Theme);
+                self.overlay_sel = rows
+                    .iter()
+                    .position(|entry| entry.id == atom_core::render::colors::active_theme_name())
+                    .unwrap_or(0);
+                self.overlay_q.clear();
+                Vec::new()
+            }
             "/model" => {
                 self.model_picker_purpose = overlays::ModelPickerPurpose::Chat;
                 self.overlay = Some(OverlayKind::Model);
@@ -1428,6 +1506,31 @@ impl App {
                 self.working_msg = "loading sessions...".into();
                 vec![Effect::FetchSessions]
             }
+            "/fork" => {
+                if self.streaming || self.remote_working {
+                    self.err_msg = "wait for the current turn to finish before forking".into();
+                    return Vec::new();
+                }
+                if self.session.id.is_empty() {
+                    self.err_msg = "no session to fork".into();
+                    return Vec::new();
+                }
+                if self.read_only_view() {
+                    self.err_msg = "cannot fork a subagent session".into();
+                    return Vec::new();
+                }
+                self.overlay = Some(OverlayKind::Fork);
+                self.overlay_q.clear();
+                self.overlay_q_sel = false;
+                self.overlay_sel = overlays::first_fork_row();
+                self.overlay_scroll = 0;
+                self.overlay_fork_user_messages.clear();
+                self.overlay_fork_source = self.session.id.clone();
+                self.working_msg = "loading session...".into();
+                vec![Effect::LoadForkSource {
+                    id: self.session.id.clone(),
+                }]
+            }
             "/thinking" => {
                 self.show_reasoning = !self.show_reasoning;
                 for block in &mut self.blocks {
@@ -1470,7 +1573,32 @@ impl App {
             self.close_picker();
             return Vec::new();
         }
-        let name = self.picker_items[self.picker_sel].title.trim().to_string();
+        // Snapshot the row fields we care about so the immutable borrow
+        // of `self.picker_items` ends before we touch `self` mutably
+        // (e.g. when starting the OAuth flow).
+        let item = &self.picker_items[self.picker_sel];
+        let title = item.title.clone();
+        let meta = item.meta.clone();
+        let mcp_server = item.mcp_server.clone();
+        // For MCP rows that need OAuth ("auth required" / "auth expired"
+        // — see atom_tools::mcp_oauth::mcp_auth_display), Enter on the
+        // server should kick off the browser sign-in instead of just
+        // inserting "/name" into the prompt. Authenticated MCPs fall
+        // through and behave like skills (insert the slash text).
+        if self.picker_kind == PickerKind::Mcp {
+            if let Some(server) = mcp_server.as_deref() {
+                let needs_auth = matches!(meta.as_str(), "auth required" | "auth expired");
+                if needs_auth {
+                    if let Some(fx) = self.start_mcp_oauth(server) {
+                        if close {
+                            self.close_picker();
+                        }
+                        return fx;
+                    }
+                }
+            }
+        }
+        let name = title.trim().to_string();
         if !name.is_empty() {
             self.apply_picker_insert(&format!("/{name}"));
         }
@@ -1478,6 +1606,26 @@ impl App {
             self.close_picker();
         }
         Vec::new()
+    }
+
+    /// Build a StartMcpOAuth effect for `server`, looking up its URL
+    /// and static client id from the cwd's MCP configs. Returns None
+    /// when the server isn't configured or doesn't opt into OAuth so
+    /// callers can fall back to inserting the slash text.
+    fn start_mcp_oauth(&mut self, server: &str) -> Option<Vec<Effect>> {
+        let cfgs = atom_tools::mcp::load_mcp_configs(&self.cwd);
+        let cfg = cfgs.get(server)?;
+        if !cfg.auth.eq_ignore_ascii_case("oauth") {
+            return None;
+        }
+        self.working_msg = format!("waiting for {server} sign-in in the browser...");
+        Some(vec![Effect::StartMcpOAuth {
+            server: server.to_string(),
+            url: cfg.url.clone(),
+            client_id: cfg.client_id.clone(),
+            client_secret: cfg.client_secret.clone(),
+            token_endpoint_auth_method: cfg.token_endpoint_auth_method.clone(),
+        }])
     }
 
     pub fn apply_picker_insert(&mut self, text: &str) {
@@ -1695,6 +1843,8 @@ impl App {
             AppMsg::ProvidersRebuilt(providers) => self.providers_rebuilt(providers),
             AppMsg::CreatedSession(info) => self.created_session(*info),
             AppMsg::SessionLoaded(sess) => self.session_loaded(*sess),
+            AppMsg::ForkSourceLoaded { id, sess } => self.fork_source_loaded(id, *sess),
+            AppMsg::ForkedSession { info, draft } => self.forked_session(*info, draft),
             AppMsg::ClipboardText(text) => {
                 if self.overlay.is_some() {
                     if overlays::overlay_has_query(Some(self.overlay.unwrap())) && !text.is_empty()
@@ -1703,7 +1853,7 @@ impl App {
                     }
                     return Vec::new();
                 }
-                if !text.is_empty() {
+                if !text.is_empty() && !self.read_only_view() {
                     self.input.insert_str(&text);
                     return self.after_input_change();
                 }
@@ -1787,7 +1937,7 @@ impl App {
             }
             AppMsg::TickSpinner => {
                 self.spinner_frame = self.spinner_frame.wrapping_add(1);
-                if self.streaming || self.remote_working || self.test_mode {
+                if self.streaming || self.remote_working || self.test_mode || self.shell_running {
                     self.invalidate_live_blocks();
                 }
                 Vec::new()
@@ -1806,6 +1956,20 @@ impl App {
                 crate::outputtest::advance_output_test_scene(self)
             }
             AppMsg::OAuthDone(result) => self.oauth_done(result),
+            AppMsg::McpOAuthDone { server, result } => self.mcp_oauth_done(&server, result),
+            AppMsg::ShellKillArmed(tx) => {
+                // Stale senders from an already-finished command are
+                // dropped by the next ShellDone.
+                self.shell_kill = Some(tx);
+                Vec::new()
+            }
+            AppMsg::ShellDone {
+                cmd,
+                output,
+                code,
+                new_cwd,
+                ..
+            } => self.shell_done(cmd, output, code, new_cwd),
             // Handled by the loop before reaching the state machine.
             AppMsg::SubscribeNow(_)
             | AppMsg::HotRebuilt(_)
@@ -1916,6 +2080,77 @@ impl App {
         fx
     }
 
+    /// fork_source_loaded: the /fork overlay's source-session fetch
+    /// resolved. Filter user messages into picker rows, install them on
+    /// the App, and clear the loading spinner.
+    ///
+    /// Race: the user may have navigated to a different session while
+    /// the request was in flight; if so, drop the response.
+    fn fork_source_loaded(
+        &mut self,
+        id: String,
+        sess: atom_core::session::store::Session,
+    ) -> Vec<Effect> {
+        if self.overlay != Some(OverlayKind::Fork) || id != self.overlay_fork_source {
+            return Vec::new();
+        }
+        let mut user_messages: Vec<ForkUserMessage> = sess
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message.role == "user")
+            .map(|(idx, message)| {
+                let preview = first_line(&message.content);
+                ForkUserMessage {
+                    position: idx as i64,
+                    preview,
+                    timestamp: fork_format_timestamp(None),
+                }
+            })
+            .collect();
+        // Drop empty user messages (a forked session can have a placeholder
+        // user turn); they're not useful fork points.
+        user_messages.retain(|msg| !msg.preview.is_empty());
+        self.overlay_fork_user_messages = user_messages;
+        self.overlay_sel = overlays::first_fork_row();
+        self.overlay_scroll = 0;
+        self.working_msg.clear();
+        Vec::new()
+    }
+
+    /// forked_session: the server confirmed the fork. Switch into the
+    /// child session (same as a /new, but with a pre-filled prompt and
+    /// a `parent_id` lineage marker already set server-side) and write
+    /// the chosen message's text into the prompt.
+    fn forked_session(&mut self, info: SessionInfo, draft: String) -> Vec<Effect> {
+        self.manage_restore_from.clear();
+        self.hide_manage_menu();
+        self.manage_agents.clear();
+        self.manage_sel = 0;
+        self.close_picker();
+        self.close_context_menu();
+        self.pending.clear();
+        self.input.set_value(&draft);
+        self.last_picker_insert.clear();
+        self.session = info;
+        self.apply_thinking(&self.session.thinking.clone());
+        self.persist_defaults();
+        self.blocks.clear();
+        self.streaming = false;
+        self.paused = false;
+        self.following = true;
+        self.interrupting = false;
+        self.overlay = None;
+        self.overlay_q.clear();
+        self.overlay_fork_user_messages.clear();
+        self.overlay_fork_source.clear();
+        self.working_msg.clear();
+        self.refresh_viewport();
+        vec![Effect::Subscribe {
+            id: self.session.id.clone(),
+        }]
+    }
+
     /// sessionLoaded: switching sessions resets paused/following; the
     /// "saved" reload path keeps both.
     fn session_loaded(&mut self, sess: atom_core::session::store::Session) -> Vec<Effect> {
@@ -1926,6 +2161,11 @@ impl App {
             self.following = true;
             self.streaming = false;
             self.interrupting = false;
+            // The turn id belongs to the session it was generated for: a
+            // stale id from the previous view would make a pause target a
+            // turn that never exists (e.g. a subagent's "dispatch-<id>"
+            // turn) instead of the session's live turns.
+            self.turn_id = String::new();
             self.manage_restore_from = self.session.id.clone();
             self.hide_manage_menu();
             self.manage_agents.clear();
@@ -2133,6 +2373,52 @@ impl App {
         self.working_msg = "loading models...".into();
     }
 
+    /// Handle the result of Effect::StartMcpOAuth. On success the
+    /// auth store already holds fresh tokens for `server`, so the
+    /// slash catalog is rebuilt and the picker (if still open) is
+    /// refreshed in place. On failure surface the error and bail
+    /// back to the picker so the user can retry.
+    fn mcp_oauth_done(&mut self, server: &str, result: Result<(), String>) -> Vec<Effect> {
+        self.working_msg.clear();
+        match result {
+            Err(e) => {
+                if !e.contains("canceled") && !e.contains("cancel") {
+                    self.err_msg = format!("MCP sign-in failed for {server}: {e}");
+                }
+                if !matches!(self.picker_kind, PickerKind::None) {
+                    self.refresh_picker_items();
+                }
+                Vec::new()
+            }
+            Ok(()) => {
+                // Slash catalog items are computed once on init and
+                // cached on the App; rebuild so the meta column flips
+                // from "auth required" to "authenticated" for this
+                // server and any picker still open reflects that.
+                self.slash_commands = overlays::discover_commands(&self.cwd);
+                if !matches!(self.picker_kind, PickerKind::None) {
+                    self.refresh_picker_items();
+                }
+                Vec::new()
+            }
+        }
+    }
+
+    /// Re-populate picker items for the current picker_kind without
+    /// resetting the selection so the highlighted row stays where it
+    /// was after a state change (e.g. an MCP just finished OAuth).
+    fn refresh_picker_items(&mut self) {
+        let kind = match self.picker_kind {
+            PickerKind::Mcp => "mcp",
+            PickerKind::Skills => "skill",
+            PickerKind::None => return,
+        };
+        self.picker_items = picker_items(&self.slash_commands, kind);
+        if self.picker_sel >= self.picker_items.len() {
+            self.picker_sel = self.picker_items.len().saturating_sub(1);
+        }
+    }
+
     /// Shared resize path for AppMsg::Resize and view::draw's
     /// area-size sync: update dims, re-wrap content when width moved.
     pub(crate) fn apply_resize(&mut self, w: u16, h: u16) {
@@ -2179,6 +2465,9 @@ impl App {
         if !files.is_empty() {
             return preview::paste_local_images(self, files);
         }
+        if self.read_only_view() {
+            return Vec::new();
+        }
         self.input.insert_str(&content);
         self.after_input_change()
     }
@@ -2186,6 +2475,13 @@ impl App {
     /// afterInputChange syncs menus/previews after prompt edits.
     pub fn after_input_change(&mut self) -> Vec<Effect> {
         let mut effects = Vec::new();
+        if self.shell_mode {
+            // Shell mode has no slash/@ menus; keep image chips in sync.
+            if preview::sync_pending_from_input(self) {
+                effects.push(Effect::PaintPreviews);
+            }
+            return effects;
+        }
         if (!matches!(self.picker_kind, PickerKind::None)
             || self.context_visible
             || self.reasoning_visible)
@@ -2222,6 +2518,85 @@ impl App {
         effects
     }
 
+    // -- shell mode ----------------------------------------------------------
+
+    /// Submits a shell-mode command: append a running tool block and
+    /// spawn the shell. The result arrives as AppMsg::ShellDone.
+    fn run_shell_command(&mut self, cmd: &str) -> Vec<Effect> {
+        self.shell_running = true;
+        self.err_msg.clear();
+        let mut block = Block::new(BlockKind::Tool);
+        block.title = format!("! {cmd}");
+        block.tool_name = "shell".into();
+        block.tool_done = false;
+        self.blocks.push(block);
+        self.following = true;
+        self.refresh_viewport();
+        vec![Effect::RunShell {
+            cmd: cmd.to_string(),
+            cwd: self.cwd.clone(),
+        }]
+    }
+
+    /// Leaves shell mode, aborting any running command (Ctrl+C, or
+    /// backspacing out of an empty prompt).
+    pub fn exit_shell_mode(&mut self) {
+        self.shell_mode = false;
+        self.shell_running = false;
+        self.input.clear();
+        if let Some(tx) = self.shell_kill.take() {
+            let _ = tx.send(());
+        }
+    }
+
+    /// ShellDone: fill in the running block, then follow a `cd` by moving
+    /// the app's cwd (footer, @-completion, skill discovery) and patching
+    /// the session on the server so the agent's tools move too.
+    fn shell_done(
+        &mut self,
+        cmd: String,
+        output: String,
+        code: Option<i32>,
+        new_cwd: String,
+    ) -> Vec<Effect> {
+        self.shell_running = false;
+        self.shell_kill = None;
+
+        let mut result = output;
+        match code {
+            Some(0) | None => {}
+            Some(exit) => result.push_str(&format!("\nexit code {exit}")),
+        }
+        // Killed commands report code None; say so unless output already
+        // explains itself (spawn errors carry their own message).
+        if code.is_none() && !result.starts_with("error:") {
+            result.push_str("\nkilled");
+        }
+
+        let title = format!("! {cmd}");
+        if let Some(block) = self.blocks.iter_mut().rev().find(|b| {
+            b.kind == BlockKind::Tool && b.tool_name == "shell" && !b.tool_done && b.title == title
+        }) {
+            block.tool_done = true;
+            block.result = result;
+            block.lines = None;
+            self.viewport_dirty = true;
+        }
+
+        let mut effects = Vec::new();
+        if !new_cwd.is_empty() && new_cwd != self.cwd {
+            self.cwd = new_cwd.clone();
+            self.slash_commands = overlays::discover_commands(&self.cwd);
+            if !self.session.id.is_empty() {
+                effects.push(Effect::PatchSessionCwd {
+                    id: self.session.id.clone(),
+                    cwd: new_cwd,
+                });
+            }
+        }
+        effects
+    }
+
     // -- keys ----------------------------------------------------------------
 
     pub fn key(&mut self, k: KeyEvent) -> Vec<Effect> {
@@ -2240,10 +2615,35 @@ impl App {
             return self.update_overlay_key(k);
         }
 
+        // Read-only subagent views accept no user input: swallow the
+        // editing/sending keys and let everything else (Esc, arrows,
+        // Ctrl+C, Ctrl+P, Shift+Up) fall through to the global bindings.
+        if self.read_only_view() {
+            match k.code {
+                KeyCode::Char(_) => {
+                    let global = k.modifiers.contains(KeyModifiers::CONTROL)
+                        || k.modifiers.contains(KeyModifiers::ALT)
+                        || k.modifiers.contains(KeyModifiers::SUPER);
+                    if !global {
+                        return Vec::new();
+                    }
+                }
+                KeyCode::Enter | KeyCode::Backspace | KeyCode::Delete => return Vec::new(),
+                _ => {}
+            }
+        }
+
         let mods = k.modifiers;
         let shift = mods.contains(KeyModifiers::SHIFT);
         let ctrl = mods.contains(KeyModifiers::CONTROL);
         let alt = mods.contains(KeyModifiers::ALT);
+
+        // Shell mode: Ctrl+C leaves (aborting a running command) instead
+        // of clearing the prompt / quitting the app.
+        if self.shell_mode && ctrl && matches!(k.code, KeyCode::Char('c')) {
+            self.exit_shell_mode();
+            return Vec::new();
+        }
 
         // Alt/Shift+Enter insert a newline instead of sending; Ctrl+J too.
         if let KeyCode::Enter = k.code {
@@ -2378,6 +2778,17 @@ impl App {
                     self.paused = true;
                     return vec![Effect::PauseTurn];
                 }
+                // A detached subagent turn (dispatch) runs without a TUI
+                // /send stream, so `streaming` stays false while the child
+                // works. Esc in a subagent view must still stop it, with an
+                // empty turn_id: the server registers the child turn as
+                // "dispatch-<child id>", so a stale turn id from a previous
+                // send would only record a pending pause that never fires.
+                if !self.session.parent_id.is_empty() && self.remote_working {
+                    self.paused = true;
+                    self.turn_id = String::new();
+                    return vec![Effect::PauseTurn];
+                }
             }
             KeyCode::Enter => {
                 let text = self.input.value.trim().to_string();
@@ -2385,6 +2796,25 @@ impl App {
                     return Vec::new();
                 }
                 self.set_menu_visible(false);
+                if self.shell_running {
+                    // One command at a time; the running block's spinner
+                    // shows why the submit is a no-op.
+                    return Vec::new();
+                }
+                if self.shell_mode {
+                    self.input.clear();
+                    return self.run_shell_command(&text);
+                }
+                // `!` prefix enters shell mode; `!cmd` runs right away.
+                if let Some(rest) = text.strip_prefix('!') {
+                    self.shell_mode = true;
+                    let cmd = rest.trim();
+                    if cmd.is_empty() {
+                        return Vec::new();
+                    }
+                    self.input.clear();
+                    return self.run_shell_command(cmd);
+                }
                 return self.handle_input(&text);
             }
             KeyCode::Tab => {
@@ -2426,6 +2856,12 @@ impl App {
                 self.refresh_viewport();
             }
             KeyCode::Backspace => {
+                // Deleting backwards past the start of an empty shell-mode
+                // prompt leaves shell mode.
+                if self.shell_mode && self.input.value.is_empty() {
+                    self.exit_shell_mode();
+                    return Vec::new();
+                }
                 self.input.backspace();
                 return self.after_input_change();
             }
@@ -2437,6 +2873,12 @@ impl App {
             KeyCode::Right => self.input.right(),
             KeyCode::Char(ch) => {
                 if ctrl || alt {
+                    return Vec::new();
+                }
+                // `!` on an empty prompt enters shell mode; the bang
+                // itself is not inserted.
+                if ch == '!' && self.input.value.is_empty() {
+                    self.shell_mode = true;
                     return Vec::new();
                 }
                 self.input.insert_str(&ch.to_string());
@@ -2696,6 +3138,16 @@ impl App {
                         self.accept_settings_defaults();
                         self.overlay = None;
                     }
+                    OverlayKind::Fork => {
+                        // Drop the picker state so reopening /fork reloads
+                        // the source session from scratch — the user
+                        // might have added a message in the meantime.
+                        self.overlay_fork_user_messages.clear();
+                        self.overlay_fork_source.clear();
+                        self.overlay = None;
+                        self.overlay_q.clear();
+                        self.working_msg.clear();
+                    }
                     _ => {
                         self.overlay = None;
                         self.overlay_q.clear();
@@ -2714,6 +3166,11 @@ impl App {
                     }
                     OverlayKind::Session => overlays::move_session_sel(self, -1),
                     OverlayKind::Model => overlays::move_model_sel(self, -1),
+                    OverlayKind::Fork => {
+                        let rows = overlays::fork_rows(self);
+                        let new_sel = overlays::move_fork_sel(&rows, self.overlay_sel, -1);
+                        self.overlay_sel = new_sel;
+                    }
                     OverlayKind::ProviderKey => {}
                     _ => {
                         if self.overlay_sel > 0 {
@@ -2733,6 +3190,11 @@ impl App {
                     }
                     OverlayKind::Session => overlays::move_session_sel(self, 1),
                     OverlayKind::Model => overlays::move_model_sel(self, 1),
+                    OverlayKind::Fork => {
+                        let rows = overlays::fork_rows(self);
+                        let new_sel = overlays::move_fork_sel(&rows, self.overlay_sel, 1);
+                        self.overlay_sel = new_sel;
+                    }
                     OverlayKind::ProviderKey => {}
                     _ => {
                         let cnt = overlays::overlay_count(self);
@@ -2789,6 +3251,19 @@ impl App {
             self.overlay_sel = overlays::first_model_row(self);
             self.overlay_scroll = 0;
             overlays::sync_model_scroll(self);
+        } else if self.overlay == Some(OverlayKind::Fork) {
+            // Typing in the search box always lands the selection on
+            // the SessionLatest sentinel when no filter matches, or
+            // the first matching user message otherwise. This mirrors
+            // the behavior of /sessions: the picker resets to the top.
+            let rows = overlays::fork_rows(self);
+            // Find the first non-Header row.
+            let first_pick = rows
+                .iter()
+                .position(|r| r.kind != overlays::ForkRowKind::Header)
+                .unwrap_or(0);
+            self.overlay_sel = first_pick;
+            self.overlay_scroll = 0;
         } else if self.overlay != Some(OverlayKind::ProviderKey) {
             self.overlay_sel = 0;
         }
@@ -3146,17 +3621,66 @@ impl App {
                 self.overlay_sel = 1;
                 Vec::new()
             }
+            OverlayKind::Theme => {
+                let rows = overlays::theme_rows();
+                let Some(entry) = rows.get(self.overlay_sel) else {
+                    return Vec::new();
+                };
+                let id = entry.id.clone();
+                let name = entry.name.clone();
+                if let Err(error) = atom_core::render::colors::apply_theme(&id) {
+                    self.err_msg = format!("theme: {error}");
+                    return Vec::new();
+                }
+                self.atom_config.theme = Some(id);
+                self.save_atom_config();
+                self.overlay = None;
+                self.copied_msg = format!("theme: {name}");
+                self.copied_at = Some(Instant::now());
+                // The palette changed behind every cached render: drop the
+                // block caches and repaint previews, mirroring what the
+                // hot theme reload path does. The next frame's
+                // refresh_viewport rebuilds against the new palette.
+                self.invalidate_all_blocks();
+                self.preview_dirty = true;
+                vec![Effect::PaintPreviews]
+            }
+            OverlayKind::Fork => {
+                let rows = overlays::fork_rows(self);
+                if self.overlay_sel >= rows.len() {
+                    return Vec::new();
+                }
+                let row = &rows[self.overlay_sel];
+                if row.kind == overlays::ForkRowKind::Header {
+                    return Vec::new();
+                }
+                let source_id = self.overlay_fork_source.clone();
+                let position = match row.kind {
+                    overlays::ForkRowKind::SessionLatest => None,
+                    overlays::ForkRowKind::UserMessage => row.position,
+                    overlays::ForkRowKind::Header => return Vec::new(),
+                };
+                self.working_msg = "forking session...".into();
+                vec![Effect::ForkSession {
+                    source_id,
+                    position,
+                }]
+            }
         }
     }
 
     // -- approval ----------------------------------------------------------
 
     fn approval_key(&mut self, k: KeyEvent, req: ApprovalPrompt) -> Vec<Effect> {
+        // v2 spec: four buttons, no session-scoped grant.
+        //   y → allow_once, a → allow_always, n → deny_once,
+        //   d / Esc → deny_once.
         let decision = match k.code {
-            KeyCode::Char('a') => Some(("allow_once", "allow once")),
-            KeyCode::Char('s') => Some(("allow_session", "allowed this session")),
-            KeyCode::Char('g') => Some(("allow_global", "always allowed")),
-            KeyCode::Char('d') | KeyCode::Esc => Some(("deny", "denied")),
+            KeyCode::Char('y') => Some(("allow_once", "allowed once")),
+            KeyCode::Char('a') => Some(("allow_always", "always allowed")),
+            KeyCode::Char('n') => Some(("deny_once", "denied")),
+            KeyCode::Char('d') => Some(("deny_always", "denied, rule saved")),
+            KeyCode::Esc => Some(("deny_once", "denied")),
             KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.quitting = true;
                 return vec![Effect::Quit];
@@ -3228,16 +3752,17 @@ impl App {
     /// Check if a click at (content_row, col) falls on an approval button in
     /// block `bi`. Returns the decision string ("allow_once" etc.) or None.
     fn approval_button_hit(&self, bi: usize, content_row: usize, col: usize) -> Option<String> {
-        // The buttons are on the last rendered line of the block.
-        // Determine which content line the buttons are on by finding the
-        // block start + offset.
+        // The buttons are on the rendered line just above the help row,
+        // which is itself above the bottom pad row. With the v2 layout:
+        //   ... body rows ... [buttons] [help] [pad]
+        // so the buttons live three lines from the end (antepenultimate).
         let block_start = *self.block_start.get(bi)?;
         let block_lines = self.blocks[bi].lines.as_ref()?;
-        let button_row = block_start + block_lines.len().saturating_sub(2); // penultimate = buttons row
+        let button_row = block_start + block_lines.len().saturating_sub(3);
         if content_row != button_row {
             return None;
         }
-        // Button layout: "  [a] allow   [s] session   [g] always   [d] deny  "
+        // Button layout: "  [y] once   [a] always   [n] deny   [d] never  "
         let buttons = blocks::approval_buttons();
         for btn in &buttons {
             if col >= btn.col_start && col < btn.col_end {
@@ -3256,9 +3781,9 @@ impl App {
         };
         let note = match decision {
             "allow_once" => "allow once",
-            "allow_session" => "allowed this session",
-            "allow_global" => "always allowed",
-            "deny" => "denied",
+            "allow_always" => "always allowed",
+            "deny_once" => "denied",
+            "deny_always" => "denied",
             _ => "denied",
         };
         self.blocks[bi].tool_done = true;
@@ -3287,6 +3812,15 @@ impl App {
                     overlays::hover_overlay_row(self, y);
                     Vec::new()
                 }
+                // Wheel scrolls modal overlays by moving the selection the
+                // same way the arrow keys do (scroll follows via the
+                // sticky keep-visible logic).
+                MouseEventKind::ScrollUp => {
+                    self.update_overlay_key(KeyEvent::new(KeyCode::Up, KeyModifiers::empty()))
+                }
+                MouseEventKind::ScrollDown => {
+                    self.update_overlay_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()))
+                }
                 _ => Vec::new(),
             };
         }
@@ -3302,6 +3836,12 @@ impl App {
 
     fn click(&mut self, x: usize, y: usize) -> Vec<Effect> {
         self.link_pending = None;
+        // Status-bar hints are clickable: the subagent indicator opens the
+        // subagent menu (Shift+↓), "Shift ↑ to return" goes to the parent
+        // session, and "esc to close" dismisses an open footer menu.
+        if let Some(action) = self.status_nav_hit(x, y) {
+            return self.run_status_nav_action(action);
+        }
         // Scrollbar click: the rightmost SCROLLBAR_WIDTH columns within the
         // viewport region. The wider target also helps in terminal
         // multiplexer splits where the absolute last column's mouse events
@@ -3425,7 +3965,9 @@ impl App {
         if idx >= 0 {
             let bi = idx as usize;
             let inner = self.inner_width().saturating_sub(2).max(1);
-            if self.blocks[bi].kind == BlockKind::User && self.blocks[bi].user_collapsible(inner) {
+            if self.blocks[bi].kind == BlockKind::User
+                && self.blocks[bi].user_collapsible(inner, &self.cwd)
+            {
                 self.blocks[bi].expanded = !self.blocks[bi].expanded;
                 self.blocks[bi].lines = None;
                 self.viewport_dirty = true;
@@ -3450,7 +3992,7 @@ impl App {
                     self.copied_at = Some(Instant::now());
                     return vec![Effect::OpenLink { uri }];
                 }
-                if self.blocks[bi].tool_collapsible(inner, inner) {
+                if self.blocks[bi].tool_collapsible(inner, inner, &self.cwd) {
                     self.blocks[bi].expanded = !self.blocks[bi].expanded;
                     self.blocks[bi].lines = None;
                     self.viewport_dirty = true;
@@ -3542,6 +4084,11 @@ impl App {
     }
 
     fn wheel(&mut self, down: bool, y: usize) -> Vec<Effect> {
+        // An open footer menu owns the wheel: scroll its selection the
+        // same way the arrow keys do (the menu window follows).
+        if self.footer_menu_wheel(down) {
+            return Vec::new();
+        }
         if self.prompt_navigable() && self.mouse_in_prompt(y) {
             let h = self.input_height();
             let total = self.input.content_lines(self.input_width());
@@ -3562,12 +4109,81 @@ impl App {
     }
 
     pub fn mouse_in_prompt(&self, y: usize) -> bool {
+        if self.read_only_view() {
+            return false;
+        }
         let geo = crate::view::Layout::compute(self);
         y >= geo.prompt_top_y
             && y < geo.prompt_top_y
                 + 2 * PROMPT_PAD
                 + self.input_height()
                 + self.preview_row_count()
+    }
+
+    /// The clickable status-bar hint under a screen position, if any.
+    fn status_nav_hit(&self, x: usize, y: usize) -> Option<crate::statusbar::NavAction> {
+        let geo = crate::view::Layout::compute(self);
+        let row = y.checked_sub(geo.status_y)?;
+        let col = x.saturating_sub(TUI_HPAD);
+        crate::statusbar::nav_hit_regions(self)
+            .into_iter()
+            .find(|(r, c0, c1, _)| *r == row && col >= *c0 && col < *c1)
+            .map(|(_, _, _, action)| action)
+    }
+
+    /// Routes a wheel event to the open footer menu's arrow-key handler.
+    /// Returns false when no menu is open (the wheel then scrolls the
+    /// viewport or prompt as usual).
+    fn footer_menu_wheel(&mut self, down: bool) -> bool {
+        let code = if down { KeyCode::Down } else { KeyCode::Up };
+        if self.context_visible {
+            self.context_key(code).is_some()
+        } else if self.reasoning_visible {
+            self.reasoning_key(code).is_some()
+        } else if !matches!(self.picker_kind, PickerKind::None) {
+            self.picker_key(code).is_some()
+        } else if self.manage_visible {
+            self.manage_key(code).is_some()
+        } else if self.menu_visible {
+            self.menu_key(code).is_some()
+        } else if self.at_menu_visible {
+            self.at_menu_key(code).is_some()
+        } else {
+            false
+        }
+    }
+
+    /// Runs the action bound to a clicked status-bar hint.
+    fn run_status_nav_action(&mut self, action: crate::statusbar::NavAction) -> Vec<Effect> {
+        use crate::statusbar::NavAction;
+        match action {
+            NavAction::OpenSubagents => self.open_manage_menu(),
+            NavAction::ReturnToParent => {
+                if !self.session.parent_id.is_empty() {
+                    vec![Effect::LoadSession {
+                        id: self.session.parent_id.clone(),
+                    }]
+                } else {
+                    Vec::new()
+                }
+            }
+            NavAction::CloseMenu => {
+                if self.context_visible {
+                    self.close_context_menu();
+                } else if self.reasoning_visible {
+                    self.close_reasoning_menu();
+                } else if !matches!(self.picker_kind, PickerKind::None) {
+                    self.close_picker();
+                } else if self.manage_visible {
+                    self.dismiss_manage_menu();
+                } else if self.menu_visible {
+                    self.set_menu_visible(false);
+                } else if self.at_menu_visible {
+                    self.close_at_menu();
+                }
+                Vec::new()
+            }
+        }
     }
 
     pub fn content_pos_at(&self, x: usize, y: usize) -> Option<(usize, usize)> {
@@ -3728,13 +4344,59 @@ fn chrono_now() -> chrono::DateTime<chrono::Utc> {
     chrono::Utc::now()
 }
 
+/// Returns the first non-empty line of `text`, trimmed and clipped to
+/// a friendly preview length. Used for /fork row labels and similar
+/// one-line title summaries.
+fn first_line(text: &str) -> String {
+    let mut iter = text.lines();
+    let mut line = iter.next().unwrap_or("").trim().to_string();
+    // Skip leading blank lines.
+    while line.is_empty() {
+        line = iter.next().unwrap_or("").trim().to_string();
+    }
+    // Collapse internal whitespace so a wrapped preview fits one visual line.
+    let collapsed: String = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    const MAX: usize = 80;
+    if collapsed.chars().count() > MAX {
+        let mut out: String = collapsed.chars().take(MAX - 1).collect();
+        out.push('…');
+        out
+    } else {
+        collapsed
+    }
+}
+
+/// Formats a DateTime as a local HH:MM stamp for the /fork picker.
+/// Returns "—" when the timestamp is missing or unparseable.
+fn fork_format_timestamp(created_at: Option<chrono::DateTime<chrono::Utc>>) -> String {
+    let Some(ts) = created_at else {
+        return "—".into();
+    };
+    let local: chrono::DateTime<chrono::Local> = ts.with_timezone(&chrono::Local);
+    local.format("%H:%M").to_string()
+}
+
 fn picker_items(commands: &[DynamicCommand], kind: &str) -> Vec<PickerItem> {
     commands
         .iter()
         .filter(|command| command.kind == kind)
-        .map(|command| PickerItem {
-            title: command.name.trim_start_matches('/').to_string(),
-            meta: command.desc.clone(),
+        .map(|command| {
+            let title = command.name.trim_start_matches('/').to_string();
+            // Catalog rows are slash-prefixed (e.g. "/meta-ads"); the
+            // picker title strips the leading "/" but Enter still
+            // inserts the full "/name". The MCP server name is the bare
+            // form, so keep both so the picker can resolve back to a
+            // config entry on activation.
+            let mcp_server = if command.kind == "mcp" {
+                Some(title.clone())
+            } else {
+                None
+            };
+            PickerItem {
+                title,
+                meta: command.desc.clone(),
+                mcp_server,
+            }
         })
         .collect()
 }
@@ -3809,11 +4471,13 @@ mod tests {
     #[test]
     fn approval_keys_map_to_wire_decisions() {
         let cases = [
-            (KeyCode::Char('a'), "allow_once"),
-            (KeyCode::Char('s'), "allow_session"),
-            (KeyCode::Char('g'), "allow_global"),
-            (KeyCode::Char('d'), "deny"),
-            (KeyCode::Esc, "deny"),
+            // v2 spec: y/a/n/d map to the four decisions; Esc cancels
+            // into deny_once. The session/global keys are gone.
+            (KeyCode::Char('y'), "allow_once"),
+            (KeyCode::Char('a'), "allow_always"),
+            (KeyCode::Char('n'), "deny_once"),
+            (KeyCode::Char('d'), "deny_always"),
+            (KeyCode::Esc, "deny_once"),
         ];
         for (code, wire) in cases {
             let mut app = approval_app();
@@ -3843,6 +4507,276 @@ mod tests {
         // Ctrl+C still quits.
         let fx = app.key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(matches!(fx.last(), Some(Effect::Quit)));
+    }
+
+    // -- shell mode ----------------------------------------------------------
+
+    #[test]
+    fn bang_enters_shell_mode_and_ctrl_c_exits_without_quitting() {
+        let mut app = App::new_test(90, 30);
+        // `!` on an empty prompt enters shell mode; the bang is not inserted.
+        assert!(app
+            .key(key(KeyCode::Char('!'), KeyModifiers::NONE))
+            .is_empty());
+        assert!(app.shell_mode);
+        assert!(app.input.value.is_empty());
+        // Ctrl+C clears shell mode instead of quitting the app.
+        let fx = app.key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(!app.shell_mode);
+        assert!(!matches!(fx.last(), Some(Effect::Quit)));
+        // `!` mid-text in normal mode is an ordinary character.
+        let mut app = App::new_test(90, 30);
+        app.input.set_value("hi");
+        app.key(key(KeyCode::Char('!'), KeyModifiers::NONE));
+        assert_eq!(app.input.value, "hi!");
+        assert!(!app.shell_mode);
+    }
+
+    #[test]
+    fn backspace_out_of_empty_prompt_exits_shell_mode() {
+        let mut app = App::new_test(90, 30);
+        app.key(key(KeyCode::Char('!'), KeyModifiers::NONE));
+        assert!(app.shell_mode);
+        app.key(key(KeyCode::Backspace, KeyModifiers::NONE));
+        assert!(!app.shell_mode);
+    }
+
+    #[test]
+    fn shell_mode_enter_spawns_command_block() {
+        let mut app = App::new_test(90, 30);
+        app.session.id = "sess1".into();
+        app.key(key(KeyCode::Char('!'), KeyModifiers::NONE));
+        app.input.set_value("echo hi");
+        let fx = app.key(key(KeyCode::Enter, KeyModifiers::NONE));
+        match &fx[..] {
+            [Effect::RunShell { cmd, cwd }] => {
+                assert_eq!(cmd, "echo hi");
+                assert_eq!(cwd, &app.cwd);
+            }
+            other => panic!("unexpected effects {other:?}"),
+        }
+        assert!(app.shell_mode, "mode persists after a command");
+        assert!(app.shell_running);
+        assert!(app.input.value.is_empty());
+        let block = app.blocks.last().unwrap();
+        assert_eq!(block.kind, BlockKind::Tool);
+        assert_eq!(block.tool_name, "shell");
+        assert_eq!(block.title, "! echo hi");
+        assert!(!block.tool_done);
+        // Enter while a command runs is a no-op.
+        app.input.set_value("echo again");
+        assert!(app.key(key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
+    }
+
+    #[test]
+    fn shell_done_fills_block_and_cd_moves_the_app() {
+        let mut app = App::new_test(90, 30);
+        app.session.id = "sess1".into();
+        app.cwd = "/work".into();
+        app.key(key(KeyCode::Char('!'), KeyModifiers::NONE));
+        app.input.set_value("cd /tmp && echo hi");
+        let fx = app.key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(fx[0], Effect::RunShell { .. }));
+
+        let fx = app.handle_msg(AppMsg::ShellDone {
+            cmd: "cd /tmp && echo hi".into(),
+            cwd: "/work".into(),
+            output: "hi\n".into(),
+            code: Some(0),
+            new_cwd: "/tmp".into(),
+        });
+        let block = app.blocks.last().unwrap();
+        assert!(block.tool_done);
+        assert_eq!(block.result, "hi\n");
+        assert!(!app.shell_running);
+        assert_eq!(app.cwd, "/tmp", "app follows the shell's cd");
+        match &fx[..] {
+            [Effect::PatchSessionCwd { id, cwd }] => {
+                assert_eq!(id, "sess1");
+                assert_eq!(cwd, "/tmp");
+            }
+            other => panic!("unexpected effects {other:?}"),
+        }
+        // Unchanged cwd patches nothing, even though no block matches.
+        let fx = app.handle_msg(AppMsg::ShellDone {
+            cmd: "echo again".into(),
+            cwd: "/tmp".into(),
+            output: String::new(),
+            code: Some(0),
+            new_cwd: "/tmp".into(),
+        });
+        assert!(fx.is_empty());
+        assert_eq!(app.cwd, "/tmp");
+    }
+
+    #[test]
+    fn shell_done_reports_nonzero_exit_and_kill() {
+        let mut app = App::new_test(90, 30);
+        app.session.id = "sess1".into();
+        app.key(key(KeyCode::Char('!'), KeyModifiers::NONE));
+        app.input.set_value("false");
+        app.key(key(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_msg(AppMsg::ShellDone {
+            cmd: "false".into(),
+            cwd: app.cwd.clone(),
+            output: String::new(),
+            code: Some(1),
+            new_cwd: String::new(),
+        });
+        assert!(app.blocks.last().unwrap().result.contains("exit code 1"));
+
+        // A killed command (Ctrl+C during a run) marks the block killed.
+        app.key(key(KeyCode::Char('!'), KeyModifiers::NONE));
+        app.input.set_value("sleep 100");
+        app.key(key(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_msg(AppMsg::ShellDone {
+            cmd: "sleep 100".into(),
+            cwd: app.cwd.clone(),
+            output: String::new(),
+            code: None,
+            new_cwd: String::new(),
+        });
+        assert!(app.blocks.last().unwrap().result.contains("killed"));
+    }
+
+    #[test]
+    fn shell_ctrl_c_kills_the_running_command() {
+        let mut app = App::new_test(90, 30);
+        app.key(key(KeyCode::Char('!'), KeyModifiers::NONE));
+        app.input.set_value("sleep 100");
+        app.key(key(KeyCode::Enter, KeyModifiers::NONE));
+        let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+        app.handle_msg(AppMsg::ShellKillArmed(tx));
+        let fx = app.key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(!app.shell_mode);
+        assert!(!matches!(fx.last(), Some(Effect::Quit)));
+        assert!(rx.try_recv().is_ok(), "kill switch fired");
+    }
+
+    #[test]
+    fn bang_prefix_one_shots_into_shell_mode() {
+        let mut app = App::new_test(90, 30);
+        app.input.set_value("!echo hi");
+        let fx = app.key(key(KeyCode::Enter, KeyModifiers::NONE));
+        match &fx[..] {
+            [Effect::RunShell { cmd, .. }] => assert_eq!(cmd, "echo hi"),
+            other => panic!("unexpected effects {other:?}"),
+        }
+        assert!(app.shell_mode, "! prefix leaves shell mode enabled");
+    }
+
+    // -- subagent read-only views --------------------------------------------
+
+    #[test]
+    fn subagent_view_hides_prompt_and_reclaims_rows() {
+        let mut parent = App::new_test(90, 30);
+        let mut child = App::new_test(90, 30);
+        child.session.parent_id = "parent".into();
+        assert!(child.read_only_view());
+        assert_eq!(child.prompt_height(), 0);
+        let pgeo = crate::view::Layout::compute(&parent);
+        let cgeo = crate::view::Layout::compute(&child);
+        assert!(
+            cgeo.viewport_h > pgeo.viewport_h,
+            "subagent viewport reclaims the prompt rows: {} vs {}",
+            cgeo.viewport_h,
+            pgeo.viewport_h
+        );
+        // The status bar stays bottom-anchored; only the viewport grows.
+        assert_eq!(cgeo.status_y, pgeo.status_y);
+    }
+
+    #[test]
+    fn subagent_view_swallows_input_keys() {
+        let mut app = App::new_test(90, 30);
+        app.session.parent_id = "parent".into();
+        // Typing does nothing — no shell mode either.
+        assert!(app
+            .key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+            .is_empty());
+        assert!(app
+            .key(key(KeyCode::Char('!'), KeyModifiers::NONE))
+            .is_empty());
+        assert!(!app.shell_mode);
+        assert!(app.input.value.is_empty());
+        // Enter sends nothing: no SendTurn, no RunShell.
+        app.input.set_value("stale draft");
+        let fx = app.key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            fx.is_empty(),
+            "subagent views send nothing on Enter: {fx:?}"
+        );
+        // Backspace/Delete are swallowed too.
+        assert!(app
+            .key(key(KeyCode::Backspace, KeyModifiers::NONE))
+            .is_empty());
+    }
+
+    #[test]
+    fn subagent_view_esc_pauses_the_running_turn() {
+        let mut app = App::new_test(90, 30);
+        app.session.parent_id = "parent".into();
+        app.streaming = true;
+        let fx = app.key(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            matches!(fx.as_slice(), [Effect::PauseTurn]),
+            "Esc stops the running child turn: {fx:?}"
+        );
+        // Esc with no live turn just clears selection.
+        app.streaming = false;
+        assert!(app.key(key(KeyCode::Esc, KeyModifiers::NONE)).is_empty());
+    }
+
+    #[test]
+    fn subagent_view_esc_pauses_a_detached_turn() {
+        let mut app = App::new_test(90, 30);
+        app.session.parent_id = "parent".into();
+        // A dispatch child never opens a TUI /send stream: streaming stays
+        // false while its turn runs; only remote events mark it working.
+        app.streaming = false;
+        app.remote_working = true;
+        // A turn id left over from a previous send must not leak into the
+        // pause: a non-matching id would only record a pending pause that
+        // never matches the child's "dispatch-<id>" turn.
+        app.turn_id = "stale-turn".into();
+        let fx = app.key(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            matches!(fx.as_slice(), [Effect::PauseTurn]),
+            "Esc stops a detached subagent turn: {fx:?}"
+        );
+        assert!(
+            app.turn_id.is_empty(),
+            "Esc must pause with an empty turn_id, got {:?}",
+            app.turn_id
+        );
+        // No live remote activity: Esc does nothing.
+        app.remote_working = false;
+        assert!(app.key(key(KeyCode::Esc, KeyModifiers::NONE)).is_empty());
+    }
+
+    #[test]
+    fn subagent_view_keeps_global_bindings() {
+        let mut app = App::new_test(90, 30);
+        app.session.parent_id = "parent".into();
+        // Shift+Up returns to the parent.
+        let fx = app.key(key(KeyCode::Up, KeyModifiers::SHIFT));
+        assert!(matches!(
+            fx.as_slice(),
+            [Effect::LoadSession { id }] if id == "parent"
+        ));
+        // Ctrl+P still opens the slash menu.
+        app.key(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert!(app.menu_visible);
+    }
+
+    #[test]
+    fn subagent_view_refuses_compact() {
+        let mut app = App::new_test(90, 30);
+        app.session.parent_id = "parent".into();
+        app.session.id = "sess1".into();
+        let fx = app.handle_input("/compact");
+        assert!(fx.is_empty());
+        assert!(app.err_msg.contains("managed by their parent"));
     }
 
     #[test]
@@ -3975,7 +4909,8 @@ mod tests {
         let matches = overlays::match_commands(&app.menu_typed(), &app.slash_commands);
         assert_eq!(matches[0].name, "/new");
         assert_eq!(matches[1].name, "/sessions");
-        assert_eq!(matches[2].name, "/settings");
+        assert_eq!(matches[2].name, "/fork");
+        assert_eq!(matches[3].name, "/settings");
         // Enter runs the highlighted row (/new); the prompt is cleared
         // as with any submitted command.
         let fx = app.key(key(KeyCode::Enter, KeyModifiers::NONE));
@@ -4243,6 +5178,137 @@ mod tests {
     }
 
     #[test]
+    fn click_on_subagent_indicator_opens_manage_menu() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = App::new_test(100, 40);
+        app.session.id = "sess-1".into();
+        app.manage_agents = vec![empty_session_info()];
+        app.refresh_viewport();
+        let geo = crate::view::Layout::compute(&app);
+        let regions = crate::statusbar::nav_hit_regions(&app);
+        assert_eq!(regions.len(), 1, "subagent indicator is clickable");
+        let (row, c0, _, action) = regions[0];
+        assert_eq!(action, crate::statusbar::NavAction::OpenSubagents);
+        let ev = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: (TUI_HPAD + c0) as u16,
+            row: (geo.status_y + row) as u16,
+            modifiers: KeyModifiers::empty(),
+        };
+        let effects = app.mouse(ev);
+        assert!(app.manage_visible, "click opened the subagent menu");
+        assert!(
+            matches!(effects.first(), Some(Effect::ListChildren { .. })),
+            "click listed children: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn click_on_return_hint_loads_parent_session() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = App::new_test(100, 40);
+        app.session.parent_id = "parent-1".into();
+        app.refresh_viewport();
+        let geo = crate::view::Layout::compute(&app);
+        let regions = crate::statusbar::nav_hit_regions(&app);
+        let (row, c0, _, action) = regions[0];
+        assert_eq!(action, crate::statusbar::NavAction::ReturnToParent);
+        let ev = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: (TUI_HPAD + c0) as u16,
+            row: (geo.status_y + row) as u16,
+            modifiers: KeyModifiers::empty(),
+        };
+        let effects = app.mouse(ev);
+        assert!(
+            matches!(
+                effects.first(),
+                Some(Effect::LoadSession { id }) if id == "parent-1"
+            ),
+            "click returned to the parent: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn click_on_esc_hint_closes_open_menu() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = App::new_test(100, 40);
+        app.context_visible = true;
+        app.refresh_viewport();
+        let geo = crate::view::Layout::compute(&app);
+        let regions = crate::statusbar::nav_hit_regions(&app);
+        let (row, c0, _, action) = regions[0];
+        assert_eq!(action, crate::statusbar::NavAction::CloseMenu);
+        let ev = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: (TUI_HPAD + c0) as u16,
+            row: (geo.status_y + row) as u16,
+            modifiers: KeyModifiers::empty(),
+        };
+        let _ = app.mouse(ev);
+        assert!(!app.context_visible, "click closed the open menu");
+    }
+
+    #[test]
+    fn wheel_scrolls_footer_menu_selection() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = App::new_test(100, 40);
+        app.session.id = "sess-1".into();
+        app.manage_agents = (0..5).map(|_| empty_session_info()).collect();
+        let _ = app.open_manage_menu();
+        assert_eq!(app.manage_sel, 0);
+        let ev = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 4,
+            row: 1,
+            modifiers: KeyModifiers::empty(),
+        };
+        let _ = app.mouse(ev);
+        assert_eq!(app.manage_sel, 1, "wheel down moved the menu selection");
+        let ev = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 4,
+            row: 1,
+            modifiers: KeyModifiers::empty(),
+        };
+        let _ = app.mouse(ev);
+        assert_eq!(app.manage_sel, 0, "wheel up moved back");
+        // With the menu closed the wheel no longer touches the selection.
+        app.dismiss_manage_menu();
+        let ev = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 4,
+            row: 1,
+            modifiers: KeyModifiers::empty(),
+        };
+        let _ = app.mouse(ev);
+        assert_eq!(app.manage_sel, 0);
+    }
+
+    #[test]
+    fn wheel_scrolls_modal_overlay_selection() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = App::new_test(100, 40);
+        app.overlay = Some(OverlayKind::Settings);
+        let ev = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 4,
+            row: 2,
+            modifiers: KeyModifiers::empty(),
+        };
+        let _ = app.mouse(ev);
+        assert_eq!(app.overlay_sel, 1, "wheel down moved the overlay selection");
+        let ev = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 4,
+            row: 2,
+            modifiers: KeyModifiers::empty(),
+        };
+        let _ = app.mouse(ev);
+        assert_eq!(app.overlay_sel, 0, "wheel up moved back");
+    }
+
+    #[test]
     fn click_anywhere_on_diagram_block_opens_viewer() {
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
         let mut app = App::new_test(80, 40);
@@ -4338,7 +5404,9 @@ mod tests {
         app.refresh_viewport();
         // Long cards start collapsed to the preview budget.
         assert!(!app.blocks[0].expanded);
-        assert!(app.blocks[0].user_collapsible(app.inner_width().saturating_sub(2).max(1)));
+        assert!(
+            app.blocks[0].user_collapsible(app.inner_width().saturating_sub(2).max(1), &app.cwd)
+        );
         assert_eq!(app.content_lines.len(), blocks::USER_PREVIEW_LINES + 2);
 
         let click = |row| MouseEvent {
@@ -5397,6 +6465,43 @@ mod tests {
             app.scroll_y > 0,
             "scrollbar click at width-1 should scroll: scroll_y = {}",
             app.scroll_y
+        );
+    }
+
+    #[test]
+    fn theme_switch_drops_cached_block_colors() {
+        let mut app = App::new_test(80, 20);
+        app.blocks.push(Block {
+            kind: BlockKind::Tool,
+            title: "Fetch".into(),
+            tool_name: "webfetch".into(),
+            text: "example".into(),
+            ..Default::default()
+        });
+        app.refresh_viewport();
+        assert!(app.blocks[0].lines.as_ref().is_some(), "block cache built");
+
+        // Re-select the active theme: the palette is unchanged, so this
+        // stays race-free for other tests that pin default-theme colors,
+        // while still exercising the switch path end to end. The cached
+        // lines must be dropped so the next frame re-renders against
+        // whatever palette is active.
+        let active = atom_core::render::colors::active_theme_name();
+        let target = overlays::theme_rows()
+            .iter()
+            .position(|entry| entry.id == active)
+            .expect("active theme is selectable");
+        app.overlay = Some(OverlayKind::Theme);
+        app.overlay_sel = target;
+
+        let effects = app.key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.overlay.is_none());
+        assert!(app.preview_dirty);
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(effects[0], Effect::PaintPreviews));
+        assert!(
+            app.blocks[0].lines.as_ref().is_none(),
+            "theme switch must drop cached block colors"
         );
     }
 }

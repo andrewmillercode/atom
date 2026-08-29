@@ -26,7 +26,7 @@ cargo build --bin atom --bin atoms --bin atomdev --bin atomsdev
 To make `atom` available on your PATH during development:
 
 ```sh
-make install-dev
+make dev
 ```
 
 This links the debug build into `~/.local/bin` as `atomdev` and
@@ -94,7 +94,7 @@ There are two binaries in `crates/atom/Cargo.toml`, plus dev aliases:
   symlinks; meaningful only in the debug profile.
 
 All four are built by `cargo build` and installed together by
-`make install-dev` (as `atomdev`/`atomsdev`) or `make install` (as
+`make dev` (as `atomdev`/`atomsdev`) or `make install` (as
 `atom`/`atoms`).
 
 ## Bundled instructions

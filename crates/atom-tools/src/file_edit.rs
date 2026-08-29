@@ -10,6 +10,7 @@ use crate::{ToolCtx, ToolOutcome};
 use atom_core::render::diff::file_diff;
 use atom_core::util::sha256_hash;
 use atom_sandbox::approvals::ApprovalRequest;
+use atom_sandbox::protected::is_protected_write;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -461,11 +462,38 @@ fn observe_or_drift(ctx: &ToolCtx<'_>, path: &Path, disk: &[u8]) -> Result<(), S
     }
 }
 
-/// Gate helper shared by write_file/edit_file: paths inside ctx.cwd pass
-/// untouched; anything else asks the approver (rule "fs_write_outside").
+/// Gate helper shared by write_file/edit_file. The protected-path floor
+/// runs first: writes into atom's own state (dataDir/config dir), shell
+/// startup files, $PATH entries, ~/.ssh, or any .git/hooks/ escalate to
+/// the prompt no matter where they live — no tier writes these without a
+/// prompt, and the in-workspace short-circuit below can't bypass it. Then
+/// ordinary containment applies: paths inside ctx.cwd pass untouched;
+/// anything else asks the approver (rule "fs_write_outside").
 pub(crate) async fn gate_fs_write(ctx: &ToolCtx<'_>, abs: &Path) -> Result<(), String> {
     let cwd_norm = canonicalize_with_missing(&ctx.cwd);
     let target_norm = canonicalize_with_missing(abs);
+    if is_protected_write(
+        &target_norm,
+        dirs::home_dir().as_deref(),
+        Some(&atom_core::session::store::data_dir()),
+        Some(&atom_core::config::config_dir()),
+    ) {
+        let decision = ctx
+            .approver
+            .decide(ApprovalRequest {
+                session_id: ctx.session_id.clone(),
+                command: abs.display().to_string(),
+                cwd: ctx.cwd.clone(),
+                rule_id: "protected_write".to_string(),
+                reason: "protected path (agent self-escalation floor)".to_string(),
+                accept_all_preview: None,
+            })
+            .await;
+        if decision.allows() {
+            return Ok(());
+        }
+        return Err("error: write to a protected path was not approved".to_string());
+    }
     if target_norm.starts_with(&cwd_norm) {
         return Ok(());
     }
@@ -477,6 +505,7 @@ pub(crate) async fn gate_fs_write(ctx: &ToolCtx<'_>, abs: &Path) -> Result<(), S
             cwd: ctx.cwd.clone(),
             rule_id: "fs_write_outside".to_string(),
             reason: "writes outside the workspace directory".to_string(),
+            accept_all_preview: None,
         })
         .await;
     if decision.allows() {
@@ -557,6 +586,9 @@ pub async fn execute_write_file(arguments: &str, ctx: &ToolCtx<'_>) -> ToolOutco
         #[serde(default)]
         content: String,
     }
+    if arguments.trim().is_empty() {
+        return ToolOutcome::from_text(crate::exec::empty_arguments_msg("write_file"));
+    }
     let args: Args = match serde_json::from_str(arguments) {
         Ok(a) => a,
         Err(e) => return parse_err(e),
@@ -623,6 +655,9 @@ pub async fn execute_edit_file(arguments: &str, ctx: &ToolCtx<'_>) -> ToolOutcom
         old_text: String,
         #[serde(default)]
         new_text: String,
+    }
+    if arguments.trim().is_empty() {
+        return ToolOutcome::from_text(crate::exec::empty_arguments_msg("edit_file"));
     }
     let args: Args = match serde_json::from_str(arguments) {
         Ok(a) => a,
@@ -1019,7 +1054,7 @@ mod tests {
 
         let denied = execute_write_file(
             &serde_json::json!({"path": path.display().to_string(), "content": "x"}).to_string(),
-            &env.ctx_with(&AutoApprover(Decision::Deny)),
+            &env.ctx_with(&AutoApprover(Decision::DenyOnce)),
         )
         .await;
         assert!(
@@ -1033,7 +1068,7 @@ mod tests {
 
         let allowed = execute_write_file(
             &serde_json::json!({"path": path.display().to_string(), "content": "x"}).to_string(),
-            &env.ctx_with(&AutoApprover(Decision::AllowSession)),
+            &env.ctx_with(&AutoApprover(Decision::AllowOnce)),
         )
         .await;
         assert!(allowed.text.starts_with("wrote "), "{}", allowed.text);
@@ -1049,7 +1084,7 @@ mod tests {
 
         let denied = execute_write_file(
             r#"{"path":"outside-link/new.txt","content":"x"}"#,
-            &env.ctx_with(&AutoApprover(Decision::Deny)),
+            &env.ctx_with(&AutoApprover(Decision::DenyOnce)),
         )
         .await;
 
@@ -1059,6 +1094,30 @@ mod tests {
             denied.text
         );
         assert!(!outside.path().join("new.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn protected_path_write_prompts_even_inside_workspace() {
+        let env = FileEnv::new();
+        // .git/hooks inside the workspace hits the anti-self-escalation
+        // floor: the approver is consulted even though the path is
+        // inside ctx.cwd (the in-workspace short-circuit must not fire).
+        let hooks = env.ws.path().join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+
+        let denied = execute_write_file(
+            r##"{"path":".git/hooks/pre-commit","content":"#!/bin/sh\n"}"##,
+            &env.ctx_with(&AutoApprover(Decision::DenyOnce)),
+        )
+        .await;
+        assert!(
+            denied
+                .text
+                .starts_with("error: write to a protected path was not approved"),
+            "{}",
+            denied.text
+        );
+        assert!(!hooks.join("pre-commit").exists());
     }
 
     // ---- pure helpers ported from file_edit_test coverage ----

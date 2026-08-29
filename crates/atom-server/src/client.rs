@@ -603,7 +603,7 @@ fn find_server_binary() -> Result<PathBuf> {
     let name = atom_core::build::server_name();
 
     // 1. Next to the running executable: the release install dir, or
-    //    the dev install dir — `make install-dev` links the real
+    //    the dev install dir — `make dev` links the real
     //    cargo-built atomsdev binary into ~/.local/bin.
     let candidate = dir.join(name);
     if candidate.is_file() {
@@ -632,7 +632,7 @@ fn find_server_binary() -> Result<PathBuf> {
         }
     }
     let hint = if atom_core::build::is_dev() {
-        " — dev builds expect the atomdev/atomsdev binaries; run `make install-dev`"
+        " — dev builds expect the atomdev/atomsdev binaries; run `make dev`"
     } else {
         ""
     };

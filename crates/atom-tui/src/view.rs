@@ -6,12 +6,13 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block as RtBlock, Borders, Clear};
 
 use crate::ansi;
 use crate::app::{App, ApprovalPrompt};
+use crate::fullscreen_view;
 use crate::overlays::{self, OverlayKind, PickerKind};
 use crate::preview;
 use crate::prompt::wrap_plain;
@@ -54,20 +55,21 @@ impl Layout {
 
     pub fn compute(app: &App) -> Self {
         let status_rows = crate::statusbar::status_bar_rows(app);
-        let input_h = app.input_height();
-        let preview_rows = preview::preview_row_count(app);
-        let reserved = status_rows
-            + crate::app::STATUS_FOOTER_ROWS
-            + 2 * crate::app::PROMPT_PAD
-            + input_h
-            + preview_rows;
+        // Read-only subagent views hide the prompt entirely; the
+        // viewport claims its rows.
+        let prompt_h = app.prompt_height();
+        let reserved = status_rows + crate::app::STATUS_FOOTER_ROWS + prompt_h;
         let viewport_h = (app.height as usize).saturating_sub(reserved).max(1);
         // The prompt's top border sits directly below the viewport; the
         // former working row now shares the status bar (see statusbar.rs),
         // so no chrome is reserved above the prompt.
         let prompt_top_y = viewport_h;
-        let preview_y = prompt_top_y + crate::app::PROMPT_PAD + input_h;
-        let status_y = preview_y + preview_rows + crate::app::PROMPT_PAD;
+        let preview_y = if prompt_h == 0 {
+            viewport_h
+        } else {
+            prompt_top_y + crate::app::PROMPT_PAD + app.input_height()
+        };
+        let status_y = prompt_top_y + prompt_h;
         let cwd_y = status_y + status_rows;
         Layout {
             viewport_h,
@@ -148,41 +150,62 @@ pub fn draw(app: &mut App, area: Rect, buf: &mut Buffer) -> Option<(u16, u16)> {
     );
 
     // --- prompt input ------------------------------------------------------
-    let in_h = app.input_height();
-    let input_w = app.input_width().min(inner_w).max(1);
-    let (rows, cur) = app.input.view(input_w, in_h);
-    let pad = card_line(Line::from(""), inner_w, 0);
-    write_line(
-        buf,
-        area.x + 1,
-        area.y + geo.prompt_top_y as u16,
-        inner_w,
-        &pad,
-    );
-    for (i, row) in rows.iter().enumerate() {
-        let y = area.y + (geo.prompt_top_y + crate::app::PROMPT_PAD + i) as u16;
-        let chipped = card_line(
-            line_with_chips_styled(row, app),
-            inner_w,
-            crate::app::PROMPT_PAD,
-        );
-        write_line(buf, area.x + 1, y, inner_w, &chipped);
-    }
-
-    // --- preview placeholders inside the input box -------------------------
-    let preview_lines = render_previews(app);
-    for (i, line) in preview_lines.iter().enumerate() {
-        let y = area.y + (geo.preview_y + i) as u16;
+    // Read-only subagent views draw no prompt: the transcript owns the
+    // rows down to the status bar.
+    let prompt_cur = if !app.read_only_view() {
+        let in_h = app.input_height();
+        let input_w = app.input_width().min(inner_w).max(1);
+        let (rows, cur) = app.input.view(input_w, in_h);
+        let pad = card_line(Line::from(""), inner_w, 0);
+        // Shell mode replaces the blank padding above the input with a mode
+        // label so the prompt reads as a shell, not a chat box.
+        let top_line = if app.shell_mode {
+            card_line(
+                Line::from(Span::styled(
+                    "shell mode · enter runs a command · ctrl+c exits",
+                    ansi::style_dim(),
+                )),
+                inner_w,
+                crate::app::PROMPT_PAD,
+            )
+        } else {
+            pad.clone()
+        };
         write_line(
             buf,
             area.x + 1,
-            y,
+            area.y + geo.prompt_top_y as u16,
             inner_w,
-            &card_line(line.clone(), inner_w, crate::app::PROMPT_PAD),
+            &top_line,
         );
-    }
-    let bottom_y = geo.status_y.saturating_sub(crate::app::PROMPT_PAD);
-    write_line(buf, area.x + 1, area.y + bottom_y as u16, inner_w, &pad);
+        for (i, row) in rows.iter().enumerate() {
+            let y = area.y + (geo.prompt_top_y + crate::app::PROMPT_PAD + i) as u16;
+            let chipped = card_line(
+                line_with_chips_styled(row, app),
+                inner_w,
+                crate::app::PROMPT_PAD,
+            );
+            write_line(buf, area.x + 1, y, inner_w, &chipped);
+        }
+
+        // --- preview placeholders inside the input box -------------------
+        let preview_lines = render_previews(app);
+        for (i, line) in preview_lines.iter().enumerate() {
+            let y = area.y + (geo.preview_y + i) as u16;
+            write_line(
+                buf,
+                area.x + 1,
+                y,
+                inner_w,
+                &card_line(line.clone(), inner_w, crate::app::PROMPT_PAD),
+            );
+        }
+        let bottom_y = geo.status_y.saturating_sub(crate::app::PROMPT_PAD);
+        write_line(buf, area.x + 1, area.y + bottom_y as u16, inner_w, &pad);
+        cur
+    } else {
+        None
+    };
 
     // --- status bar ----------------------------------------------------------
     for (i, line) in crate::statusbar::status_bar_lines(app).iter().enumerate() {
@@ -204,7 +227,7 @@ pub fn draw(app: &mut App, area: Rect, buf: &mut Buffer) -> Option<(u16, u16)> {
     if app.approval.is_some() {
         return None;
     }
-    cur.map(|(cx, cy)| {
+    prompt_cur.map(|(cx, cy)| {
         let x = area.x + 1 + crate::app::PROMPT_PAD as u16 + cx as u16;
         let y = area.y + (geo.prompt_top_y + crate::app::PROMPT_PAD + cy) as u16;
         (
@@ -506,6 +529,16 @@ fn command_desc(app: &App, c: &overlays::DynamicCommand) -> String {
             return format!("{} ({})", c.desc, app.thinking_pref);
         }
     }
+    // Catalog rows (skills + MCPs) share the slash menu with built-ins,
+    // so make the kind explicit in the description column — without
+    // this, "/meta-ads" reads identically to a skill and the user can't
+    // tell at a glance whether it ships locally or talks to a server.
+    if c.kind == "mcp" {
+        return format!("mcp · {}", c.desc);
+    }
+    if c.kind == "skill" {
+        return format!("skill · {}", c.desc);
+    }
     c.desc.clone()
 }
 
@@ -551,6 +584,9 @@ fn render_manage_menu(app: &App) -> Vec<Line<'static>> {
             }
             atom_core::session::store::DelegateStatus::Cancelled => {
                 ("Cancelled", false, ansi::style_error())
+            }
+            atom_core::session::store::DelegateStatus::Stopped => {
+                ("Stopped", false, ansi::style_dim())
             }
         };
         let mut status_text = String::new();
@@ -609,7 +645,21 @@ fn render_picker_menu(app: &App) -> Vec<Line<'static>> {
         };
         let mut spans = vec![Span::styled(title_txt, name_style)];
         if !item.meta.is_empty() {
-            spans.push(Span::styled(format!("  {}", item.meta), ansi::style_dim()));
+            // Auth-required MCP rows should stand out so users see
+            // "Enter signs me in" before they press it. Style the tag
+            // instead of the whole row to keep the highlight clean.
+            let (tag, rest) = match item.meta.as_str() {
+                "auth required" => ("sign-in", "auth required".to_string()),
+                "auth expired" => ("reauth", "auth expired".to_string()),
+                _ => ("", item.meta.clone()),
+            };
+            spans.push(Span::styled("  ".to_string(), ansi::style_dim()));
+            if !tag.is_empty() {
+                spans.push(Span::styled(format!("[{tag}]"), ansi::style_error()));
+                spans.push(Span::styled(format!(" {rest}"), ansi::style_dim()));
+            } else {
+                spans.push(Span::styled(rest, ansi::style_dim()));
+            }
         }
         out.push(Line::from(spans));
     }
@@ -664,7 +714,7 @@ pub fn working_status_line(app: &App) -> Line<'static> {
     }
     let sep = vec![Span::styled(" / ", ansi::style_prompt_border())];
     let mut spans: Vec<Span> = Vec::new();
-    for (i, s) in segs.into_iter().enumerate() {
+    for (i, (_, s)) in segs.into_iter().enumerate() {
         if i > 0 {
             spans.extend(sep.clone());
         }
@@ -909,7 +959,7 @@ fn approval_body(req: &ApprovalPrompt, width: usize) -> Vec<Line<'static>> {
         width,
     );
     approval_field(&mut body, "reason  ", &req.reason, width);
-    for row in wrap_approval_text("a allow · s this session · g always · d/Esc deny", width) {
+    for row in wrap_approval_text("y once · a always · n no · d never · esc cancel", width) {
         body.push(Line::from(Span::styled(row, ansi::style_reasoning())));
     }
     body
@@ -1010,6 +1060,8 @@ fn render_overlay(app: &mut App, kind: OverlayKind) -> Vec<Line<'static>> {
         OverlayKind::ProviderKey => render_provider_key_overlay(app),
         OverlayKind::Settings => render_settings_overlay(app),
         OverlayKind::WebSearch => render_web_search_overlay(app),
+        OverlayKind::Theme => render_theme_overlay(app),
+        OverlayKind::Fork => render_fork_overlay(app),
     }
 }
 
@@ -1327,6 +1379,44 @@ fn render_settings_overlay(app: &App) -> Vec<Line<'static>> {
     out
 }
 
+/// renderThemeOverlay lists selectable themes with color swatches.
+/// The active theme is marked; Enter applies and persists the selection.
+fn render_theme_overlay(app: &App) -> Vec<Line<'static>> {
+    let width = app.width.max(1) as usize;
+    let mut out = wrapped_header(&overlays::overlay_title(app, OverlayKind::Theme), width);
+    out.push(blank());
+    let active = atom_core::render::colors::active_theme_name();
+    for (index, entry) in overlays::theme_rows().into_iter().enumerate() {
+        let (prefix, style) = if index == app.overlay_sel {
+            ("▸ ", ansi::style_selected())
+        } else {
+            ("  ", ansi::style_inactive())
+        };
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        spans.push(Span::styled(prefix.to_string(), style));
+        let marker = if entry.id == active { "● " } else { "" };
+        spans.push(Span::styled(format!("{marker}{}", entry.name), style));
+        // Swatches: background, primary, secondary, foreground chips.
+        for role in [
+            entry.theme.background.as_str(),
+            entry.theme.primary.as_str(),
+            entry.theme.secondary.as_str(),
+            entry.theme.foreground.as_str(),
+        ] {
+            let (r, g, b) = atom_core::render::colors::hex_to_rgb(role);
+            spans.push(Span::styled(
+                "   ".to_string(),
+                Style::default().bg(Color::Rgb(r, g, b)),
+            ));
+            spans.push(Span::raw(" "));
+        }
+        let source = if entry.builtin { "built-in" } else { "custom" };
+        spans.push(Span::styled(source.to_string(), ansi::style_dim()));
+        out.push(Line::from(spans));
+    }
+    out
+}
+
 fn render_web_search_overlay(app: &App) -> Vec<Line<'static>> {
     let width = app.width.max(1) as usize;
     let mut out = wrapped_header(&overlays::overlay_title(app, OverlayKind::WebSearch), width);
@@ -1343,6 +1433,76 @@ fn render_web_search_overlay(app: &App) -> Vec<Line<'static>> {
         }
     }
     out
+}
+
+/// renderForkOverlay: /fork picker. Uses the reusable fullscreen-view
+/// template (title, description, search box, list, footer) so future
+/// overlays can share the same chrome — see [`crate::fullscreen_view`].
+/// Each ForkRow is translated into a `ViewRow`: Headers as section
+/// labels, the SessionLatest sentinel as a `ViewItem` with `id=None`,
+/// and UserMessage rows as `ViewItem`s keyed by `position`.
+fn render_fork_overlay(app: &App) -> Vec<Line<'static>> {
+    let width = app.width.max(1) as usize;
+    let source_rows = overlays::fork_rows(app);
+    let mut rows: Vec<fullscreen_view::ViewRow> = Vec::with_capacity(source_rows.len());
+    for row in &source_rows {
+        match row.kind {
+            overlays::ForkRowKind::Header => {
+                rows.push(fullscreen_view::ViewRow::Header(row.label.clone()));
+            }
+            overlays::ForkRowKind::SessionLatest => {
+                rows.push(fullscreen_view::ViewRow::Item(fullscreen_view::ViewItem {
+                    id: None,
+                    label: row.label.clone(),
+                    trailing: row.timestamp.clone(),
+                    meta: String::new(),
+                }));
+            }
+            overlays::ForkRowKind::UserMessage => {
+                rows.push(fullscreen_view::ViewRow::Item(fullscreen_view::ViewItem {
+                    id: Some(row.position.unwrap_or(-1).to_string()),
+                    label: row.label.clone(),
+                    trailing: row.timestamp.clone(),
+                    meta: String::new(),
+                }));
+            }
+        }
+    }
+    let footer = if app.overlay_fork_user_messages.is_empty() {
+        String::new()
+    } else {
+        // Filter-aware footer: visible (matching) user-message rows vs
+        // total. The SessionLatest row is always present so we count
+        // items, not all rows.
+        let visible = rows
+            .iter()
+            .filter(|r| matches!(r, fullscreen_view::ViewRow::Item(item) if item.id.is_some()))
+            .count();
+        let total = app.overlay_fork_user_messages.len();
+        if visible == total {
+            format!("{visible}/{total} user messages")
+        } else {
+            format!("{visible}/{total} user messages match")
+        }
+    };
+    let loading = if !app.working_msg.is_empty() {
+        Some(app.working_msg.as_str())
+    } else {
+        None
+    };
+    let spec = fullscreen_view::ViewSpec {
+        title: "Fork session",
+        description: "type to filter, ↑↓ to navigate, Enter to fork, Esc to cancel",
+        search_placeholder: "Search",
+        search_query: app.overlay_q.as_str(),
+        search_selected: app.overlay_q_sel,
+        rows: &rows,
+        selected: app.overlay_sel.min(rows.len().saturating_sub(1)),
+        footer: footer.as_str(),
+        loading,
+        spinner_frame: app.spinner_frame,
+    };
+    fullscreen_view::render_view(&spec, width)
 }
 
 #[cfg(test)]
@@ -1404,7 +1564,7 @@ mod tests {
         app.refresh_viewport();
         let term = frame(&mut app, 80, 24);
         let s = text(&term);
-        assert!(s.contains("test-model (none)"), "status bar head");
+        assert!(s.contains("test-model none"), "status bar head");
         assert!(s.contains("hello"), "conversation content");
         assert!(!s.contains("you:"), "user label removed");
         assert_eq!(cell(&term, 1, 21).bg, ansi::c_card_light());
@@ -1446,6 +1606,8 @@ mod tests {
                 reason: "ask network".into(),
                 from_subagent: false,
                 child_title: String::new(),
+                origin: "self".into(),
+                accept_all_preview: Some("curl *".into()),
             }),
             expanded: true,
             ..Default::default()
@@ -1456,7 +1618,11 @@ mod tests {
         let s = text(&term);
         assert!(s.contains("Sandbox"), "title visible: {s}");
         assert!(s.contains("curl https://x.co"), "command visible: {s}");
-        assert!(s.contains("[a] allow"), "buttons visible: {s}");
+        assert!(s.contains("[a] always"), "buttons visible: {s}");
+        assert!(
+            s.contains("accept-all would let: curl *"),
+            "prefix preview visible: {s}"
+        );
     }
 
     #[test]
@@ -1486,6 +1652,8 @@ mod tests {
                 reason: "push to remote".into(),
                 from_subagent: true,
                 child_title: "push the release".into(),
+                origin: "child".into(),
+                accept_all_preview: None,
             }),
             expanded: true,
             ..Default::default()
@@ -1495,11 +1663,11 @@ mod tests {
         let term = frame(&mut app, 90, 30);
         let s = text(&term);
         assert!(
-            s.contains("push the release") && s.contains("needs permission"),
-            "subagent hint visible: {s}"
+            s.contains("from subagent: push the release"),
+            "subagent header visible: {s}"
         );
         assert!(s.contains("git push"), "command visible: {s}");
-        assert!(s.contains("[a] allow"), "buttons visible: {s}");
+        assert!(s.contains("[a] always"), "buttons visible: {s}");
     }
 
     #[test]
@@ -1529,6 +1697,8 @@ mod tests {
                 reason: "run workspace tests".into(),
                 from_subagent: false,
                 child_title: String::new(),
+                origin: "self".into(),
+                accept_all_preview: None,
             }),
             expanded: true,
             ..Default::default()
@@ -1538,7 +1708,7 @@ mod tests {
         let term = frame(&mut app, 40, 24);
         let s = text(&term);
         assert!(s.contains("Sandbox"), "title visible: {s}");
-        assert!(s.contains("[a] allow"), "buttons visible: {s}");
+        assert!(s.contains("[a] always"), "buttons visible: {s}");
     }
 
     #[test]
@@ -1998,12 +2168,12 @@ mod tests {
             assert!(!row_text(&term, y).contains('─'));
         }
 
-        // Status bar head is dim-styled, not frame-colored.
+        // Status bar head is foreground-styled, not dim.
         let sx = first_char_x(&term, 28).expect("status bar drawn");
         assert_eq!(
             cell(&term, sx, 28).fg,
-            ansi::c_muted(),
-            "status bar must not fall back to the frame fg"
+            ansi::c_foreground(),
+            "status bar head must use the foreground color"
         );
     }
 

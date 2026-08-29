@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; overflow: hidden; background: __BG__; color: __FG__; }
+  body { display: flex; flex-direction: column; font: 13px/1.4 -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; align-items: center; gap: 12px; padding: 8px 14px;
+    border-bottom: 1px solid __BORDER__; user-select: none; z-index: 10; }
+  header .title { font-weight: 600; flex: 1; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; }
+  header button { font: inherit; border: 1px solid __BORDER__;
+    background: __CARD__; color: __FG__; border-radius: 6px;
+    padding: 3px 10px; cursor: pointer; }
+  header button:hover { background: __BORDER__; }
+  #viewport { flex: 1; position: relative; overflow: hidden; cursor: grab;
+    touch-action: none; user-select: none;
+    background-color: __BG__;
+    background-image: radial-gradient(circle, __MUTED_EXTRA__ 1px, transparent 1px);
+    background-size: 24px 24px; }
+  #stage { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
+  #stage svg { display: block; max-width: none; }
+  details { position: fixed; right: 12px; bottom: 12px; max-width: min(640px, 80vw);
+    background: __CARD__; border: 1px solid __BORDER__;
+    border-radius: 8px; padding: 8px 12px; font: 12px ui-monospace, monospace;
+    box-shadow: 0 4px 16px rgba(0,0,0,.4); z-index: 10; }
+  details pre { max-height: 40vh; overflow: auto; white-space: pre-wrap; color: __MUTED__; }
+  summary { cursor: pointer; color: __MUTED__; }
+  span#pct { min-width: 3em; text-align: right; color: __MUTED__; }
+</style>
+</head>
+<body>
+<header>
+  <div class="title">__TITLE__</div>
+  <button onclick="fit()">Fit</button>
+  <button onclick="zoomBy(1.25)">+</button>
+  <button onclick="zoomBy(0.8)">&minus;</button>
+  <button onclick="reset()">100%</button>
+  <button onclick="downloadSvg()">SVG</button>
+  <span id="pct"></span>
+</header>
+<div id="viewport"><div id="stage"></div></div>
+<details><summary>&#9654; Mermaid source</summary><pre>__CODE_HTML__</pre></details>
+<script>
+__VIEWER_JS__
+</script>
+</body>
+</html>

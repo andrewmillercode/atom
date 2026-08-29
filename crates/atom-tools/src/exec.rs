@@ -11,6 +11,21 @@ use atom_sandbox::approvals::Approver;
 use atom_sandbox::policy::SandboxConfig;
 use std::path::PathBuf;
 
+/// empty_arguments_msg is the standard diagnostic when a tool call
+/// arrives with no JSON arguments at all (an empty or whitespace-only
+/// string). serde's own error in that case — "EOF while parsing a value
+/// at line 1 column 0" — is technically correct but confuses models
+/// into thinking the stream/network closed early, and they end up
+/// retrying with the same broken call. This message keeps the
+/// "error parsing arguments:" prefix so callers that grep on it keep
+/// working, but spells out the cause and the fix so the next model turn
+/// can recover.
+pub(crate) fn empty_arguments_msg(tool: &str) -> String {
+    format!(
+        "error parsing arguments: model emitted no arguments for tool \"{tool}\" (empty arguments string); pass a JSON object like {{\"arg\": \"value\"}}"
+    )
+}
+
 /// Everything a tool call needs: session identity, provider plumbing for
 /// dispatch turns, sandbox policy, the approval gate, the subagent
 /// spawner, and the per-session seen-file cache.
@@ -88,6 +103,9 @@ pub async fn execute_tool(ctx: &ToolCtx<'_>, name: &str, args_json: &str) -> Too
                 #[serde(default)]
                 query: String,
             }
+            if args_json.trim().is_empty() {
+                return ToolOutcome::from_text(empty_arguments_msg("web_search"));
+            }
             let args: Args = match serde_json::from_str(args_json) {
                 Ok(a) => a,
                 Err(e) => return ToolOutcome::from_text(format!("error parsing arguments: {e}")),
@@ -132,6 +150,9 @@ async fn execute_bash(args_json: &str, ctx: &ToolCtx<'_>) -> ToolOutcome {
     struct Args {
         #[serde(default)]
         command: String,
+    }
+    if args_json.trim().is_empty() {
+        return ToolOutcome::from_text(empty_arguments_msg("bash"));
     }
     let args: Args = match serde_json::from_str(args_json) {
         Ok(a) => a,
@@ -280,6 +301,50 @@ mod tests {
             "{}",
             out.text
         );
+    }
+
+    #[tokio::test]
+    async fn bash_empty_arguments_friendly_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+        let out = execute_tool(&ctx, "bash", "").await;
+        assert!(
+            out.text.starts_with("error parsing arguments:"),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text.contains("\"bash\""),
+            "tool name should appear in the message: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("empty arguments string"),
+            "reason should be explained: {}",
+            out.text
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_empty_arguments_friendly_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+        let out = execute_tool(&ctx, "read_file", "   ").await;
+        assert!(
+            out.text.starts_with("error parsing arguments:"),
+            "{}",
+            out.text
+        );
+        assert!(out.text.contains("\"read_file\""), "{}", out.text);
+    }
+
+    #[test]
+    fn empty_arguments_msg_format() {
+        let m = empty_arguments_msg("grep");
+        assert!(m.starts_with("error parsing arguments:"));
+        assert!(m.contains("\"grep\""));
+        assert!(m.contains("empty arguments string"));
+        assert!(m.contains("JSON object"));
     }
 
     #[tokio::test]

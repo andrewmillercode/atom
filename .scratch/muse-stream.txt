@@ -1,0 +1,1 @@
+{"type":"error","error":{"type":"DataPolicyError","message":"This model collects data used to improve its quality and requires explicit opt in: https://opencode.ai/workspace/wrk_01KDX019BJTV1Q93TZ93V94XDM/go"}}

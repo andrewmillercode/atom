@@ -529,9 +529,37 @@ where
                 }
             }
             "message_delta" => {
-                let output = num(&v["usage"], "output_tokens");
+                let usage = &v["usage"];
+                // Anthropic's message_delta.usage carries the cumulative
+                // input/cache totals (per Anthropic streaming docs); the
+                // first-party client also re-emits output_tokens. Some
+                // Anthropic-compatible gateways (e.g. MiniMax's
+                // /anthropic/v1 mirror, ai-gateway proxies) populate
+                // the input/cache fields only on message_delta and leave
+                // them at zero on message_start — treating message_delta
+                // as the final report. Mirror what bedrock's `metadata`
+                // event already does: overwrite self.* only when the
+                // value is non-zero so a missing field on message_delta
+                // leaves the message_start snapshot intact. Without this,
+                // MiniMax-style streams report a near-zero prompt
+                // (message_start zeros), the total collapses to
+                // output-only, and the per-turn meter reads just the
+                // 50–500-token completion.
+                let prompt = num(usage, "input_tokens");
+                if prompt > 0 {
+                    self.prompt = prompt;
+                }
+                let output = num(usage, "output_tokens");
                 if output > 0 {
                     self.output = output;
+                }
+                let cache_read = num(usage, "cache_read_input_tokens");
+                if cache_read > 0 {
+                    self.cache_read = cache_read;
+                }
+                let cache_write = num(usage, "cache_creation_input_tokens");
+                if cache_write > 0 {
+                    self.cache_write = cache_write;
                 }
                 let finish = map_stop_reason(
                     v.pointer("/delta/stop_reason")
@@ -741,5 +769,112 @@ mod tests {
         assert_eq!(chunk.choices[0].delta.reasoning_signature, "sig-xyz");
         assert!(chunk.choices[0].delta.reasoning.is_empty());
         assert!(chunk.choices[0].delta.content.is_empty());
+    }
+
+    #[test]
+    fn message_delta_carries_final_input_and_cache_usage() {
+        // Anthropic-compatible gateways (MiniMax's /anthropic/v1 mirror
+        // is the documented example) populate input/cache fields on
+        // message_delta and leave them at zero on message_start. Reading
+        // input/cache only from message_start undercounts the prompt and
+        // makes the per-turn meter collapse to the output-only
+        // 50–500-token completion. message_delta must overwrite the
+        // cached state so the final usage reports the real prompt
+        // total: prompt + cache_read + cache_write + output.
+        let reader = SseLineReader::new(futures::stream::empty());
+        let mut st = AnthropicStreamState::new(reader);
+
+        // MiniMax-style message_start: usage present but every input
+        // field zero. (Real streams carry cache_creation/ cache_read as
+        // the prefix grows; a cold request still reports input_tokens
+        // here, but a cached prefix leaves them at zero.)
+        let start = json!({
+            "type": "message_start",
+            "message": {
+                "id": "msg-x",
+                "usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0
+                }
+            }
+        });
+        assert!(st.handle_event(&start).is_none());
+
+        // message_delta emits the FINAL cumulative counts. MiniMax uses
+        // this event as the source of truth for input + cache; first-
+        // party Anthropic emits the same shape (with output_tokens
+        // updated) so the fix is uniform across providers.
+        let delta = json!({
+            "type": "message_delta",
+            "delta": { "stop_reason": "end_turn" },
+            "usage": {
+                "input_tokens": 1252,
+                "output_tokens": 213,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 114
+            }
+        });
+        let chunk = st
+            .handle_event(&delta)
+            .expect("message_delta emits a chunk");
+        let usage = chunk.usage.expect("usage on message_delta chunk");
+        // prompt_total = input + cache_read + cache_write = 1252 + 114 + 0.
+        assert_eq!(usage.prompt_tokens, 1366);
+        assert_eq!(usage.completion_tokens, 213);
+        assert_eq!(usage.total_tokens, 1579);
+        assert_eq!(usage.cache_read_tokens, 114);
+        assert_eq!(usage.cache_write_tokens, 0);
+
+        // message_stop re-emits the same totals so a subscriber that
+        // only reads the final chunk still sees the corrected prompt.
+        let stop = json!({ "type": "message_stop" });
+        let final_chunk = st.handle_event(&stop).expect("message_stop emits a chunk");
+        let final_usage = final_chunk.usage.expect("usage on message_stop chunk");
+        assert_eq!(final_usage.prompt_tokens, 1366);
+        assert_eq!(final_usage.completion_tokens, 213);
+        assert_eq!(final_usage.total_tokens, 1579);
+        assert_eq!(final_usage.cache_read_tokens, 114);
+    }
+
+    #[test]
+    fn message_delta_missing_usage_fields_preserves_message_start() {
+        // A message_delta event that omits some usage fields (or omits
+        // the whole usage object) must NOT zero out the message_start
+        // snapshot. The `if X > 0` guard keeps the partial update
+        // behavior, matching bedrock's `metadata` handler and avoiding
+        // a regression for Anthropic streams where message_delta only
+        // carries output_tokens.
+        let reader = SseLineReader::new(futures::stream::empty());
+        let mut st = AnthropicStreamState::new(reader);
+
+        let start = json!({
+            "type": "message_start",
+            "message": {
+                "usage": {
+                    "input_tokens": 25,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0
+                }
+            }
+        });
+        assert!(st.handle_event(&start).is_none());
+
+        // message_delta with ONLY output_tokens (no usage fields for
+        // input or cache). The state must keep prompt=25 from
+        // message_start; output updates to 15.
+        let delta = json!({
+            "type": "message_delta",
+            "delta": { "stop_reason": "end_turn" },
+            "usage": { "output_tokens": 15 }
+        });
+        let chunk = st
+            .handle_event(&delta)
+            .expect("message_delta emits a chunk");
+        let usage = chunk.usage.expect("usage on message_delta chunk");
+        assert_eq!(usage.prompt_tokens, 25, "message_start prompt preserved");
+        assert_eq!(usage.completion_tokens, 15);
+        assert_eq!(usage.total_tokens, 40);
     }
 }

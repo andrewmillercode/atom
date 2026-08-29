@@ -366,6 +366,9 @@ pub async fn execute_visualize(args_json: &str, _ctx: &ToolCtx<'_>) -> ToolOutco
         #[serde(default)]
         title: String,
     }
+    if args_json.trim().is_empty() {
+        return ToolOutcome::from_text(crate::exec::empty_arguments_msg("visualize"));
+    }
     let args: Args = match serde_json::from_str(args_json) {
         Ok(a) => a,
         Err(e) => return ToolOutcome::from_text(format!("error parsing arguments: {e}")),

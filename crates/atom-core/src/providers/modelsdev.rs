@@ -96,6 +96,122 @@ pub fn models_dev_style(id_or_name: &str) -> &'static str {
     }
 }
 
+/// APIProtocol is the wire dialect a model speaks. Routing picks the
+/// stream function that knows how to talk to it. Per-model npm from
+/// models.dev overrides provider-level npm, so a model on a
+/// Chat-Completions-shaped provider can still speak the Responses API
+/// (and vice versa). The default is ChatCompletions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum APIProtocol {
+    /// POST {base}/chat/completions. Used by Ollama, OpenCode Go, and
+    /// the bulk of models.dev models (npm = "@ai-sdk/openai-compatible"
+    /// or "@ai-sdk/azure", or unset).
+    ChatCompletions,
+    /// POST {base}/responses. Newer OpenAI dialect; npm =
+    /// "@ai-sdk/openai". muse-spark-1.2-contributor-free on opencode's
+    /// Zen tier is the motivating example — Chat Completions returns
+    /// "Internal server error" because the upstream gateway only routes
+    /// Responses requests for it.
+    OpenAIResponses,
+    /// POST {base}/messages. Anthropic Messages; npm =
+    /// "@ai-sdk/anthropic". Handled separately by anthropic_style_for_url
+    /// but listed here so a model-level npm override can route to it
+    /// even when the provider URL doesn't have the /anthropic/ segment.
+    AnthropicMessages,
+    /// Bedrock Converse; npm = "@ai-sdk/amazon-bedrock". Handled by
+    /// bedrock_style_for_url today, kept here for parity.
+    BedrockConverse,
+    /// POST to {base}/v1beta/models/{model}:streamGenerateContent.
+    /// npm = "@ai-sdk/google". Not implemented in MVP; surfaces as a
+    /// clear error so users know their model needs new wiring instead
+    /// of falling back to Chat Completions and silently 400ing.
+    GoogleGemini,
+}
+
+impl APIProtocol {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            APIProtocol::ChatCompletions => "chat_completions",
+            APIProtocol::OpenAIResponses => "openai_responses",
+            APIProtocol::AnthropicMessages => "anthropic_messages",
+            APIProtocol::BedrockConverse => "bedrock_converse",
+            APIProtocol::GoogleGemini => "google_gemini",
+        }
+    }
+}
+
+/// protocolForNPM maps a models.dev AI SDK npm marker to the wire
+/// dialect. Unrecognized npm values fall through to ChatCompletions —
+/// most third-party gateways (mistral, deepinfra, openrouter,
+/// togetherai, groq, cohere, ...) speak the OpenAI Chat Completions
+/// dialect at the wire level even when their npm differs from
+/// @ai-sdk/openai-compatible.
+pub fn protocol_for_npm(npm: &str) -> APIProtocol {
+    match npm {
+        "" => APIProtocol::ChatCompletions,
+        "@ai-sdk/openai" => APIProtocol::OpenAIResponses,
+        "@ai-sdk/anthropic" => APIProtocol::AnthropicMessages,
+        "@ai-sdk/amazon-bedrock" | "@ai-sdk/amazon-bedrock/mantle" => APIProtocol::BedrockConverse,
+        "@ai-sdk/google" | "@ai-sdk/google-vertex" => APIProtocol::GoogleGemini,
+        // Anything else (openai-compatible, azure, gateway, deepinfra,
+        // mistral, groq, togetherai, cohere, openrouter, ...) defaults
+        // to Chat Completions. These are all wire-compatible even when
+        // their SDK differs.
+        _ => APIProtocol::ChatCompletions,
+    }
+}
+
+/// effectiveModelNPM returns the AI SDK npm marker atom should use to
+/// route a (provider, model) pair. Per-model `provider.npm` from
+/// models.dev overrides the provider-level `npm` when set; missing on
+/// both sides yields an empty string (treated as ChatCompletions by
+/// protocol_for_npm). An empty provider name searches preferred hosts
+/// first — same policy as reasoning_levels_for.
+pub fn effective_model_npm(provider_name: &str, model_id: &str) -> String {
+    let Some(cat) = current_models_dev_catalog() else {
+        return String::new();
+    };
+    let Some((_, entry)) = find_compact_model(&cat, provider_name, model_id) else {
+        return String::new();
+    };
+    if !entry.npm.is_empty() {
+        return entry.npm.to_string();
+    }
+    // Fall back to provider-level npm when the model didn't override.
+    cat.get(&entry.provider_id)
+        .map(|p| p.npm.to_string())
+        .unwrap_or_default()
+}
+
+/// apiProtocolFor resolves the wire dialect a (provider, model) pair
+/// speaks. An empty provider name searches preferred hosts first.
+/// Returns ChatCompletions when the catalog is empty so unknown models
+/// keep the legacy /chat/completions path instead of erroring.
+pub fn api_protocol_for(provider_name: &str, model_id: &str) -> APIProtocol {
+    if model_id.is_empty() {
+        return APIProtocol::ChatCompletions;
+    }
+    let npm = effective_model_npm(provider_name, model_id);
+    if !npm.is_empty() {
+        return protocol_for_npm(&npm);
+    }
+    // No model entry — fall back to provider-level npm only when the
+    // caller named the provider. Empty provider + unknown model is
+    // ChatCompletions, matching the pre-npm default.
+    if !provider_name.is_empty() {
+        let id = models_dev_provider_id(provider_name);
+        if let Some(p) = current_models_dev_catalog()
+            .as_ref()
+            .and_then(|c| c.get(&id))
+        {
+            if !p.npm.is_empty() {
+                return protocol_for_npm(&p.npm);
+            }
+        }
+    }
+    APIProtocol::ChatCompletions
+}
+
 /// BEDROCK_PROVIDER_ID is the models.dev catalog id whose entry speaks
 /// the Bedrock Converse wire style (npm = "@ai-sdk/amazon-bedrock").
 pub const BEDROCK_PROVIDER_ID: &str = "amazon-bedrock";
@@ -149,6 +265,20 @@ pub struct ModelsDevModel {
     /// stripped before a text-only model rejects them.
     #[serde(default, deserialize_with = "crate::serde_null::null_as_default")]
     pub modalities: ModelsDevModalities,
+    /// Per-model AI SDK npm override. models.dev nests it under
+    /// `provider.npm` (a `provider` sub-object that mirrors the
+    /// provider-level `npm` for the rare cases a single host offers
+    /// different dialects per model — e.g. opencode's Zen tier hosts
+    /// gpt-5 with `@ai-sdk/openai` Responses API while other models
+    /// use `@ai-sdk/openai-compatible` Chat Completions). Empty /
+    /// missing means "use the provider-level npm", which itself can be
+    /// empty (legacy caches) and falls through to Chat Completions.
+    #[serde(
+        rename = "provider_npm",
+        default,
+        deserialize_with = "crate::serde_null::null_as_default"
+    )]
+    pub provider_npm: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -212,6 +342,12 @@ struct CompactModelEntry {
     /// "image"). False for text-only models so images can be stripped
     /// before the request leaves atom.
     image: bool,
+    /// Per-model npm override (models.dev `provider.npm`). Empty means
+    /// "fall back to the provider-level npm" — see effective_model_npm.
+    npm: Box<str>,
+    /// Catalog provider id the model was found under. Used by
+    /// effective_model_npm to fall back to provider-level npm.
+    provider_id: Box<str>,
 }
 
 #[derive(Default, Deserialize)]
@@ -230,6 +366,99 @@ struct CompactModelWire {
     limit: ModelsDevLimit,
     #[serde(default, deserialize_with = "crate::serde_null::null_as_default")]
     modalities: ModelsDevModalities,
+    /// Per-model npm override lives under the `provider` sub-object in
+    /// models.dev. We deserialize only the npm field (and ignore the
+    /// rest of the provider metadata, which is a copy of the
+    /// provider-level entry). An absent `provider`, an absent `npm`,
+    /// and an explicit JSON null all deserialize to "" — the same
+    /// effective default as no override.
+    #[serde(default, deserialize_with = "crate::serde_null::null_as_default")]
+    npm: Box<str>,
+}
+
+/// modelProviderObject is the deserializer for the models.dev
+/// `provider` sub-object on a model entry. Only `npm` is consumed;
+/// other fields (api, env, doc) are duplicates of the provider-level
+/// entry and not worth carrying twice in memory.
+#[derive(Default, Deserialize)]
+struct ModelProviderObject {
+    #[serde(default, deserialize_with = "crate::serde_null::null_as_default")]
+    npm: Box<str>,
+}
+
+/// CompactModelWireRaw mirrors the raw models.dev JSON for a model:
+/// every field is a direct sibling except `provider`, which is a
+/// nested object holding the per-model npm override. We flatten
+/// `provider.npm` into the wire's `npm` field in a custom Deserialize
+/// impl, keeping the rest of the catalog parsing unchanged.
+#[derive(Default)]
+struct CompactModelWireRaw {
+    reasoning: bool,
+    cost: Option<ModelsDevCost>,
+    reasoning_options: Vec<ModelsDevReasoningOpt>,
+    limit: ModelsDevLimit,
+    modalities: ModelsDevModalities,
+    /// Flattened from `provider.npm`; absent / null provider object
+    /// means no override.
+    npm: Box<str>,
+}
+
+impl<'de> Deserialize<'de> for CompactModelWireRaw {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Pull every field the catalog schema declares for a model,
+        // then collapse `provider.npm` into `npm`. Using Value keeps
+        // the parser tolerant: missing fields default to their zero
+        // value (or `null_as_default` for Strings), unknown fields are
+        // silently ignored, and an absent `provider` object just yields
+        // an empty npm override.
+        #[derive(Default, Deserialize)]
+        struct Raw {
+            #[serde(default, deserialize_with = "crate::serde_null::null_as_default")]
+            reasoning: bool,
+            #[serde(default)]
+            cost: Option<ModelsDevCost>,
+            #[serde(
+                default,
+                rename = "reasoning_options",
+                deserialize_with = "crate::serde_null::null_elements_as_default"
+            )]
+            reasoning_options: Vec<ModelsDevReasoningOpt>,
+            #[serde(default, deserialize_with = "crate::serde_null::null_as_default")]
+            limit: ModelsDevLimit,
+            #[serde(default, deserialize_with = "crate::serde_null::null_as_default")]
+            modalities: ModelsDevModalities,
+            #[serde(default)]
+            provider: Option<ModelProviderObject>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        Ok(CompactModelWireRaw {
+            reasoning: raw.reasoning,
+            cost: raw.cost,
+            reasoning_options: raw.reasoning_options,
+            limit: raw.limit,
+            modalities: raw.modalities,
+            npm: raw.provider.map(|p| p.npm).unwrap_or_default(),
+        })
+    }
+}
+
+/// CompactModelWire flattens the raw on-disk shape push_compact_model
+/// expects (no provider object). Keeping a separate struct avoids
+/// leaking the catalog schema into the rest of the crate.
+impl From<CompactModelWireRaw> for CompactModelWire {
+    fn from(raw: CompactModelWireRaw) -> Self {
+        CompactModelWire {
+            reasoning: raw.reasoning,
+            cost: raw.cost,
+            reasoning_options: raw.reasoning_options,
+            limit: raw.limit,
+            modalities: raw.modalities,
+            npm: raw.npm,
+        }
+    }
 }
 
 fn push_compact_model(
@@ -237,6 +466,7 @@ fn push_compact_model(
     pooled_levels: &mut Vec<Box<str>>,
     level_ids: &mut Vec<u16>,
     id: Box<str>,
+    provider_id: Box<str>,
     wire: CompactModelWire,
 ) -> Result<(), &'static str> {
     let model = ModelsDevModel {
@@ -245,6 +475,7 @@ fn push_compact_model(
         reasoning_options: wire.reasoning_options,
         limit: wire.limit,
         modalities: wire.modalities.clone(),
+        provider_npm: wire.npm.to_string(),
     };
     let supports_image = wire
         .modalities
@@ -281,6 +512,8 @@ fn push_compact_model(
             .as_ref()
             .is_some_and(|cost| cost.input == 0.0 && cost.output == 0.0),
         image: supports_image,
+        npm: wire.npm,
+        provider_id,
     });
     Ok(())
 }
@@ -315,14 +548,16 @@ impl<'de> Deserialize<'de> for CompactModels {
                 let mut levels = Vec::new();
                 let mut level_ids = Vec::new();
                 while let Some((id, wire)) =
-                    map.next_entry::<Box<str>, Option<CompactModelWire>>()?
+                    map.next_entry::<Box<str>, Option<CompactModelWireRaw>>()?
                 {
+                    let raw = wire.unwrap_or_default();
                     push_compact_model(
                         &mut entries,
                         &mut levels,
                         &mut level_ids,
                         id,
-                        wire.unwrap_or_default(),
+                        String::new().into_boxed_str(),
+                        raw.into(),
                     )
                     .map_err(serde::de::Error::custom)?;
                 }
@@ -340,7 +575,21 @@ impl<'de> Deserialize<'de> for CompactModels {
 }
 
 impl CompactModels {
+    /// Convenience wrapper for callers that have no provider id handy
+    /// (e.g. legacy in-memory conversions). The provider id is only
+    /// needed for the npm fallback in effective_model_npm; callers
+    /// that don't go through that path can ignore it.
+    #[allow(dead_code)]
     fn from_raw(models: HashMap<String, ModelsDevModel>) -> Self {
+        Self::from_raw_with_provider(models, "")
+    }
+
+    /// from_raw_with_provider builds the compact form knowing which
+    /// catalog provider the models belong to. provider_id is recorded
+    /// on every entry so effective_model_npm can fall back to the
+    /// provider-level npm when the model has no override.
+    fn from_raw_with_provider(models: HashMap<String, ModelsDevModel>, provider_id: &str) -> Self {
+        let pid = provider_id.to_string().into_boxed_str();
         let mut entries = Vec::with_capacity(models.len());
         let mut levels = Vec::new();
         let mut level_ids = Vec::new();
@@ -351,12 +600,14 @@ impl CompactModels {
                 reasoning_options: model.reasoning_options,
                 limit: model.limit,
                 modalities: model.modalities,
+                npm: model.provider_npm.into_boxed_str(),
             };
             push_compact_model(
                 &mut entries,
                 &mut levels,
                 &mut level_ids,
                 id.into_boxed_str(),
+                pid.clone(),
                 wire,
             )
             .expect("in-memory models.dev catalog exceeds compact limits");
@@ -463,8 +714,9 @@ impl CompactModelsDevCatalog {
     fn from_raw(catalog: ModelsDevCatalog) -> Self {
         let mut providers = Vec::with_capacity(catalog.len());
         for (id, provider) in catalog {
+            let id_box = id.clone().into_boxed_str();
             providers.push(CompactProviderEntry {
-                id: id.into_boxed_str(),
+                id: id_box.clone(),
                 provider: CompactProvider {
                     name: provider.name.into_boxed_str(),
                     api: provider.api.into_boxed_str(),
@@ -474,7 +726,7 @@ impl CompactModelsDevCatalog {
                         .into_iter()
                         .map(String::into_boxed_str)
                         .collect(),
-                    models: CompactModels::from_raw(provider.models),
+                    models: CompactModels::from_raw_with_provider(provider.models, &id_box),
                 },
             });
         }
@@ -868,6 +1120,11 @@ pub fn find_catalog_model(provider_name: &str, model_id: &str) -> Option<ModelsD
                 output: vec!["text".into()],
             }
         },
+        // Preserved so any caller that takes the public ModelsDevModel
+        // (e.g. /providers listings) sees the per-model npm. Routing
+        // itself uses effective_model_npm, which reads from the compact
+        // entry directly to avoid reconstructing a ModelsDevModel.
+        provider_npm: model.npm.to_string(),
     })
 }
 
@@ -1623,5 +1880,181 @@ mod tests {
         let first = current_models_dev_catalog().unwrap();
         let second = current_models_dev_catalog().unwrap();
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    /// protocol_for_npm maps each well-known AI SDK marker to the
+    /// wire dialect atom talks in. Unrecognized / unset npm falls
+    /// through to ChatCompletions because most third-party gateways
+    /// (mistral, deepinfra, openrouter, togetherai, groq, cohere, ...)
+    /// speak Chat Completions even though their SDK marker differs.
+    #[test]
+    fn protocol_for_npm_maps_well_known_markers() {
+        assert_eq!(protocol_for_npm(""), APIProtocol::ChatCompletions);
+        assert_eq!(
+            protocol_for_npm("@ai-sdk/openai"),
+            APIProtocol::OpenAIResponses
+        );
+        assert_eq!(
+            protocol_for_npm("@ai-sdk/anthropic"),
+            APIProtocol::AnthropicMessages
+        );
+        assert_eq!(
+            protocol_for_npm("@ai-sdk/amazon-bedrock"),
+            APIProtocol::BedrockConverse
+        );
+        assert_eq!(
+            protocol_for_npm("@ai-sdk/amazon-bedrock/mantle"),
+            APIProtocol::BedrockConverse
+        );
+        assert_eq!(
+            protocol_for_npm("@ai-sdk/google"),
+            APIProtocol::GoogleGemini
+        );
+        assert_eq!(
+            protocol_for_npm("@ai-sdk/google-vertex"),
+            APIProtocol::GoogleGemini
+        );
+        // Chat-Completions-compatible surface (openai-compatible, azure,
+        // openrouter, deepinfra, mistral, groq, togetherai, ...).
+        assert_eq!(
+            protocol_for_npm("@ai-sdk/openai-compatible"),
+            APIProtocol::ChatCompletions
+        );
+        assert_eq!(
+            protocol_for_npm("@ai-sdk/azure"),
+            APIProtocol::ChatCompletions
+        );
+        assert_eq!(
+            protocol_for_npm("@openrouter/ai-sdk-provider"),
+            APIProtocol::ChatCompletions
+        );
+        assert_eq!(protocol_for_npm(""), APIProtocol::ChatCompletions);
+    }
+
+    /// Per-model npm override beats provider-level npm. This is the
+    /// critical case: opencode's Zen tier has provider-level npm =
+    /// "@ai-sdk/openai-compatible" but hosts models that speak
+    /// Responses (npm = "@ai-sdk/openai") and Google Gemini (npm =
+    /// "@ai-sdk/google") on the same base URL — routing must follow
+    /// the model entry.
+    #[test]
+    fn effective_model_npm_per_model_override_wins() {
+        let _g = lock();
+        let mut cat = ModelsDevCatalog::new();
+        cat.insert(
+            "opencode".into(),
+            ModelsDevProvider {
+                // Provider-level npm would default to ChatCompletions
+                // if a model didn't override.
+                npm: "@ai-sdk/openai-compatible".into(),
+                models: HashMap::from([
+                    (
+                        // muse-spark-1.2-contributor-free on the Zen tier
+                        // speaks /responses.
+                        "muse-spark-1.2-contributor-free".into(),
+                        ModelsDevModel {
+                            provider_npm: "@ai-sdk/openai".into(),
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        // gemini-3-pro on the Zen tier speaks Google.
+                        "gemini-3-pro".into(),
+                        ModelsDevModel {
+                            provider_npm: "@ai-sdk/google".into(),
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        // No model-level override → falls back to the
+                        // provider-level npm.
+                        "laguna-s-2.1-free".into(),
+                        ModelsDevModel::default(),
+                    ),
+                ]),
+                ..Default::default()
+            },
+        );
+        set_models_dev_catalog_for_test(Some(cat));
+        assert_eq!(
+            effective_model_npm("opencode", "muse-spark-1.2-contributor-free"),
+            "@ai-sdk/openai",
+            "model-level override beats provider-level default"
+        );
+        assert_eq!(
+            effective_model_npm("opencode", "gemini-3-pro"),
+            "@ai-sdk/google"
+        );
+        assert_eq!(
+            effective_model_npm("opencode", "laguna-s-2.1-free"),
+            "@ai-sdk/openai-compatible",
+            "missing override falls back to provider npm"
+        );
+        // Unknown model: empty result, api_protocol_for falls through.
+        assert_eq!(effective_model_npm("opencode", "not-in-catalog"), "");
+    }
+
+    /// api_protocol_for is the routing entry point used in turn.rs. An
+    /// empty model id defaults to ChatCompletions (defensive against
+    /// uninitialized state), the override path picks Responses for
+    /// muse-spark, and an empty catalog returns ChatCompletions so
+    /// unknown custom models keep the legacy /chat/completions path.
+    #[test]
+    fn api_protocol_for_routes_per_model() {
+        let _g = lock();
+        let mut cat = ModelsDevCatalog::new();
+        cat.insert(
+            "opencode".into(),
+            ModelsDevProvider {
+                npm: "@ai-sdk/openai-compatible".into(),
+                models: HashMap::from([(
+                    "muse-spark-1.2-contributor-free".into(),
+                    ModelsDevModel {
+                        provider_npm: "@ai-sdk/openai".into(),
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            },
+        );
+        cat.insert(
+            "opencode-go".into(),
+            ModelsDevProvider {
+                npm: "@ai-sdk/openai-compatible".into(),
+                ..Default::default()
+            },
+        );
+        set_models_dev_catalog_for_test(Some(cat));
+
+        assert_eq!(
+            api_protocol_for("opencode", "muse-spark-1.2-contributor-free"),
+            APIProtocol::OpenAIResponses,
+            "muse-spark on Zen routes to Responses"
+        );
+        // No override on opencode-go → provider npm wins.
+        assert_eq!(
+            api_protocol_for("opencode-go", "mimo-v2.5"),
+            APIProtocol::ChatCompletions
+        );
+        // Empty model id → default to ChatCompletions.
+        assert_eq!(
+            api_protocol_for("opencode", ""),
+            APIProtocol::ChatCompletions
+        );
+    }
+
+    /// api_protocol_for returns ChatCompletions when the catalog is
+    /// empty (e.g. before the first fetch_models_dev_catalog call
+    /// completes, or when offline). Unknown custom models must keep
+    /// the legacy /chat/completions path so dispatch doesn't suddenly
+    /// error mid-session.
+    #[test]
+    fn api_protocol_for_empty_catalog_defaults_to_chat() {
+        let _g = lock();
+        set_models_dev_catalog_for_test(None);
+        assert_eq!(
+            api_protocol_for("opencode", "muse-spark-1.2-contributor-free"),
+            APIProtocol::ChatCompletions
+        );
     }
 }

@@ -10,9 +10,9 @@ use atom_core::providers::codex::{
     do_openai_codex_round, marshal_openai_codex_request, openai_codex_auth_for_key,
 };
 use atom_core::providers::{
-    anthropic_style_for_url, bedrock_style_for_url, context_window_tokens,
+    anthropic_style_for_url, api_protocol_for, bedrock_style_for_url, context_window_tokens,
     model_supports_image_input, provider_name_for_url, reasoning_field_for_url, stream_anthropic,
-    stream_bedrock, stream_chat,
+    stream_bedrock, stream_chat, stream_responses, APIProtocol,
 };
 use atom_core::session::compaction::{
     compact_session, compact_span, compaction_prompt_text, compaction_target, compaction_threshold,
@@ -144,6 +144,10 @@ impl ToolCallAccumulator {
     /// that can't be appended to the accumulated string.
     pub fn add(&mut self, d: &StreamToolCallDelta) {
         let mut existing = self.by_index.get(&d.index).copied();
+        // Some routers stream an empty arguments object as a placeholder
+        // and send the real object in a later delta; the placeholder must
+        // be overwritten, not treated as a second call.
+        let mut replace_args = false;
         if let Some(i) = existing {
             let e = &self.calls[i];
             // A delta naming a different call ID than the one at this index
@@ -157,8 +161,13 @@ impl ToolCallAccumulator {
                 && !json_valid(&format!("{}{}", e.function.arguments, d.function.arguments))
             {
                 // Two complete JSON objects can't form one argument string:
-                // the delta is a second call reusing this index.
-                existing = None;
+                // the delta is a second call reusing this index — unless the
+                // first is just an empty placeholder object.
+                if e.function.arguments == "{}" {
+                    replace_args = true;
+                } else {
+                    existing = None;
+                }
             }
         }
         let Some(i) = existing else {
@@ -184,7 +193,11 @@ impl ToolCallAccumulator {
         if e.function.name.is_empty() && !d.function.name.is_empty() {
             e.function.name = d.function.name.clone();
         }
-        e.function.arguments += &d.function.arguments;
+        if replace_args {
+            e.function.arguments = d.function.arguments.clone();
+        } else {
+            e.function.arguments += &d.function.arguments;
+        }
     }
 
     /// list returns the accumulated tool calls in the order their first
@@ -990,6 +1003,107 @@ pub async fn run_session_turn(
                     return;
                 }
             }
+        } else if api_protocol_for(&provider, &sess.model) == APIProtocol::OpenAIResponses {
+            // OpenAI Responses API: POST {base}/responses. Picked for
+            // opencode-hosted models with models.dev npm =
+            // "@ai-sdk/openai" — most visibly
+            // muse-spark-1.2-contributor-free on OpenCode's Zen tier
+            // (https://opencode.ai/zen/v1). Chat Completions on the
+            // same base URL answers with a generic Internal server
+            // error and drops the request, so the protocol routing
+            // here is what makes those models reachable from atom at
+            // all. Driven entirely by models.dev metadata
+            // (api_protocol_for) — no provider hardcoding.
+            let opened = await_round(
+                stream_responses(&base_url, &key, &sess.model, &msgs, &tools, &opts.thinking),
+                &turn_cancel,
+                &ctx.parent,
+                &round_cancel,
+            )
+            .await;
+            let chunks = match opened {
+                None => {
+                    ctx.handle.set_round_cancel(None);
+                    if ctx.err() {
+                        finish_paused_turn(state, sess, &out, id).await;
+                        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                        return;
+                    }
+                    if let Some(extra) = ctx.handle.take_compact() {
+                        if let Err(ferr) = fold_session(state, sess, &out, id, &extra).await {
+                            emit(state, &out, id, &fold_error_event(&ferr)).await;
+                        }
+                    }
+                    continue 'rounds;
+                }
+                Some(result) => match result {
+                    Ok(c) => c,
+                    Err(err) => {
+                        ctx.handle.set_round_cancel(None);
+                        if ctx.err() {
+                            finish_paused_turn(state, sess, &out, id).await;
+                            end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                            return;
+                        }
+                        if let Some(extra) = ctx.handle.take_compact() {
+                            if let Err(ferr) = fold_session(state, sess, &out, id, &extra).await {
+                                emit(state, &out, id, &fold_error_event(&ferr)).await;
+                            }
+                            continue 'rounds;
+                        }
+                        let msg = provider_error_message(&err, &base_url);
+                        let ev = event(vec![
+                            ("type", json!("error")),
+                            ("message", json!(msg.clone())),
+                        ]);
+                        emit(state, &out, id, &ev).await;
+                        sess.messages.push(Message {
+                            role: "error".into(),
+                            content: msg,
+                            ..Default::default()
+                        });
+                        persist_session(state, sess, id).await;
+                        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                        return;
+                    }
+                },
+            };
+            let r = stream_model_to_client(
+                state,
+                &out,
+                id,
+                chunks,
+                &turn_cancel,
+                &ctx.parent,
+                &round_cancel,
+                &reasoning_field,
+            )
+            .await;
+            ctx.handle.set_round_cancel(None);
+            match r {
+                Ok(result) => result,
+                Err(err) => {
+                    if ctx.err() {
+                        finish_paused_turn(state, sess, &out, id).await;
+                        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                        return;
+                    }
+                    let msg = provider_error_message(&err, &base_url);
+                    let ev = event(vec![
+                        ("type", json!("error")),
+                        ("message", json!(msg.clone())),
+                    ]);
+                    emit(state, &out, id, &ev).await;
+                    sess.messages.push(Message {
+                        role: "error".into(),
+                        content: msg,
+                        ..Default::default()
+                    });
+                    persist_session(state, sess, id).await;
+                    end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                    return;
+                }
+            }
         } else if openai_codex_auth_for_key(&key).is_some() {
             let codex_body =
                 match marshal_openai_codex_request(&sess.model, &msgs, &tools, &opts.thinking) {
@@ -1564,6 +1678,22 @@ mod tests {
             r#"{"command":"git log --oneline -20"}"#
         );
         assert_eq!(calls[1].function.arguments, r#"{"command":"ls"}"#);
+    }
+
+    /// A router that streams object-form arguments may send an empty
+    /// placeholder object first and the real object in a later delta
+    /// reusing the index. The placeholder must be overwritten, keeping
+    /// one call, instead of opening a bogus second call.
+    #[test]
+    fn accumulator_empty_object_placeholder() {
+        let mut acc = ToolCallAccumulator::new();
+        acc.add(&delta(0, "call_a", "grep", "{}"));
+        acc.add(&delta(0, "", "", r#"{"pattern":"version"}"#));
+        let calls = acc.list();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_a");
+        assert_eq!(calls[0].function.name, "grep");
+        assert_eq!(calls[0].function.arguments, r#"{"pattern":"version"}"#);
     }
 
     /// The same reuse of index 0 with distinct call IDs must also split,

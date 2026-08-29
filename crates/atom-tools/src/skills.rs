@@ -204,6 +204,9 @@ pub fn execute_skill_in(
         #[serde(default)]
         name: String,
     }
+    if arguments.trim().is_empty() {
+        return crate::exec::empty_arguments_msg("skill");
+    }
     let args: Args = match serde_json::from_str(arguments) {
         Ok(a) => a,
         Err(e) => return format!("error parsing arguments: {e}"),

@@ -557,6 +557,9 @@ pub async fn execute_write_file(arguments: &str, ctx: &ToolCtx<'_>) -> ToolOutco
         #[serde(default)]
         content: String,
     }
+    if arguments.trim().is_empty() {
+        return ToolOutcome::from_text(crate::exec::empty_arguments_msg("write_file"));
+    }
     let args: Args = match serde_json::from_str(arguments) {
         Ok(a) => a,
         Err(e) => return parse_err(e),
@@ -623,6 +626,9 @@ pub async fn execute_edit_file(arguments: &str, ctx: &ToolCtx<'_>) -> ToolOutcom
         old_text: String,
         #[serde(default)]
         new_text: String,
+    }
+    if arguments.trim().is_empty() {
+        return ToolOutcome::from_text(crate::exec::empty_arguments_msg("edit_file"));
     }
     let args: Args = match serde_json::from_str(arguments) {
         Ok(a) => a,

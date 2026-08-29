@@ -36,9 +36,15 @@ pub struct FunctionCall {
     /// carrying only `arguments` has no `name`, and one starting a call
     /// has no `arguments`. Go's json.Unmarshal zero-filled both; keep the
     /// same tolerance here so stray fragments never fail the chunk parse.
-    #[serde(default)]
+    ///
+    /// `null_as_default` is required (not just `#[serde(default)]`) for
+    /// the same reason as StreamToolCallDelta.id: some providers (notably
+    /// OpenCode Go's MiMo-v2.5) deliver fragment chunks with `"name":
+    /// null`, which would otherwise fail the whole StreamChunk parse and
+    /// get silently dropped by stream_chat.
+    #[serde(default, deserialize_with = "crate::serde_null::null_as_default")]
     pub name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::serde_null::string_or_object")]
     pub arguments: String,
 }
 
@@ -344,9 +350,23 @@ impl ToolDef {
 pub struct StreamToolCallDelta {
     #[serde(default)]
     pub index: i64,
-    #[serde(default)]
+    // OpenCode Go's MiMo-v2.5 and a handful of other providers stream
+    // a tool call in two phases: first a chunk with id/type/name set
+    // and empty arguments, then fragment chunks with id/type/name as
+    // JSON `null` and a partial arguments string. `#[serde(default)]`
+    // alone only fills the field when the key is *absent*, not when
+    // it is present-but-null, so without `null_as_default` every
+    // fragment chunk fails to deserialize, `stream_chat` silently
+    // drops it (Err(_) => continue), and the tool call ends up with
+    // permanently empty arguments — the model then retries the same
+    // broken call forever. null_as_default treats null as Default.
+    #[serde(default, deserialize_with = "crate::serde_null::null_as_default")]
     pub id: String,
-    #[serde(rename = "type", default)]
+    #[serde(
+        rename = "type",
+        default,
+        deserialize_with = "crate::serde_null::null_as_default"
+    )]
     pub call_type: String,
     #[serde(default)]
     pub function: FunctionCall,
@@ -439,6 +459,35 @@ mod tests {
         assert!(choice.delta.reasoning.is_empty());
         assert!(choice.delta.tool_calls.is_empty());
         assert!(choice.finish_reason.is_empty());
+    }
+
+    /// Some OpenCode Zen free-tier routers stream tool-call arguments as
+    /// an actual JSON object instead of a string. The chunk must decode
+    /// with the object re-serialized to its compact string form; when it
+    /// didn't, the whole chunk was dropped and the tool call survived
+    /// with empty arguments, sending the model into a retry loop.
+    #[test]
+    fn stream_chunk_accepts_object_tool_arguments() {
+        let chunk: StreamChunk = serde_json::from_str(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_718d","type":"function","function":{"name":"grep","arguments":{"pattern":"version"}}}]}}]}"#,
+        )
+        .unwrap();
+        let tc = &chunk.choices[0].delta.tool_calls[0];
+        assert_eq!(tc.function.name, "grep");
+        assert_eq!(tc.function.arguments, r#"{"pattern":"version"}"#);
+    }
+
+    /// The same routers also send `"arguments": null` placeholders; those
+    /// must decode as empty strings rather than failing the chunk.
+    #[test]
+    fn stream_chunk_accepts_null_tool_arguments() {
+        let chunk: StreamChunk = serde_json::from_str(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"grep","arguments":null}}]}}]}"#,
+        )
+        .unwrap();
+        let tc = &chunk.choices[0].delta.tool_calls[0];
+        assert_eq!(tc.function.name, "grep");
+        assert!(tc.function.arguments.is_empty());
     }
 
     #[test]

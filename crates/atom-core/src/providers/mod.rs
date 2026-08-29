@@ -13,6 +13,7 @@ pub mod oauth;
 // providers.go); renaming it would ripple through every caller.
 #[allow(clippy::module_inception)]
 pub mod providers;
+pub mod responses;
 pub mod retry;
 
 // Re-exports other crates are expected to call (atom-server, atom-tools).
@@ -24,13 +25,13 @@ pub use codex::{
     CodexRoundOutcome, CodexStreamOutcome,
 };
 pub use modelsdev::{
-    anthropic_style_for_url, bedrock_style_for_url, catalog_free_model_ids, context_window_tokens,
-    derive_reasoning_levels, ensure_models_dev_catalog, find_catalog_model,
-    load_models_dev_catalog_bytes, model_supports_image_input, models_dev_style,
-    provider_is_anthropic_style, provider_is_bedrock, reasoning_levels_for,
-    set_models_dev_catalog_for_test, suggest_catalog_model_ids, thinking_off_value,
-    valid_thinking_level, ModelsDevCatalog, ModelsDevCost, ModelsDevLimit, ModelsDevModalities,
-    ModelsDevModel, ModelsDevProvider,
+    anthropic_style_for_url, api_protocol_for, bedrock_style_for_url, catalog_free_model_ids,
+    context_window_tokens, derive_reasoning_levels, effective_model_npm, ensure_models_dev_catalog,
+    find_catalog_model, load_models_dev_catalog_bytes, model_supports_image_input,
+    models_dev_style, protocol_for_npm, provider_is_anthropic_style, provider_is_bedrock,
+    reasoning_levels_for, set_models_dev_catalog_for_test, suggest_catalog_model_ids,
+    thinking_off_value, valid_thinking_level, APIProtocol, ModelsDevCatalog, ModelsDevCost,
+    ModelsDevLimit, ModelsDevModalities, ModelsDevModel, ModelsDevProvider,
 };
 pub use oauth::{
     ensure_openai_auth, new_openai_oauth_flow, redact_oauth_text, refresh_openai_token,
@@ -41,6 +42,7 @@ pub use providers::{
     find_provider_for_model, list_addable_providers, provider_by_name, provider_name_for_url,
     reasoning_field_for_url, sse_data, stream_chat, ModelEntry, Provider, ProviderListEntry,
 };
+pub use responses::stream_responses;
 pub use retry::{
     do_http_with_retry, incomplete_reasoning_stream, long_timeout_client,
     should_nudge_incomplete_reasoning, ProviderHTTPError, MAX_EMPTY_RESPONSE_RETRIES,

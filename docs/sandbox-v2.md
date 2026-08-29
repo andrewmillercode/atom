@@ -4,7 +4,7 @@ Rewrite of the bash-command gating system. Replaces the v1
 allow/ask/deny rule ladder + Seatbelt confinement with a three-tier
 escalation model: safe commands run silently, unknown commands get a
 cheap LLM review, and only commands that fail review (or hit a
-guardrail) interrupt the user.
+guardrail) interrupt the user. LLM reviews fail gracefully and escalate to sandbox if failing.
 
 Status: spec. Not implemented.
 

@@ -1122,6 +1122,9 @@ pub async fn execute_find_tool(args_json: &str, cwd: &Path) -> String {
         #[serde(default)]
         query: String,
     }
+    if args_json.trim().is_empty() {
+        return crate::exec::empty_arguments_msg("find_tool");
+    }
     let args: Args = match serde_json::from_str(args_json) {
         Ok(a) => a,
         Err(e) => return format!("error parsing arguments: {e}"),

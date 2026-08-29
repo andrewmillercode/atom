@@ -528,6 +528,16 @@ fn command_desc(app: &App, c: &overlays::DynamicCommand) -> String {
             return format!("{} ({})", c.desc, app.thinking_pref);
         }
     }
+    // Catalog rows (skills + MCPs) share the slash menu with built-ins,
+    // so make the kind explicit in the description column — without
+    // this, "/meta-ads" reads identically to a skill and the user can't
+    // tell at a glance whether it ships locally or talks to a server.
+    if c.kind == "mcp" {
+        return format!("mcp · {}", c.desc);
+    }
+    if c.kind == "skill" {
+        return format!("skill · {}", c.desc);
+    }
     c.desc.clone()
 }
 
@@ -634,7 +644,21 @@ fn render_picker_menu(app: &App) -> Vec<Line<'static>> {
         };
         let mut spans = vec![Span::styled(title_txt, name_style)];
         if !item.meta.is_empty() {
-            spans.push(Span::styled(format!("  {}", item.meta), ansi::style_dim()));
+            // Auth-required MCP rows should stand out so users see
+            // "Enter signs me in" before they press it. Style the tag
+            // instead of the whole row to keep the highlight clean.
+            let (tag, rest) = match item.meta.as_str() {
+                "auth required" => ("sign-in", "auth required".to_string()),
+                "auth expired" => ("reauth", "auth expired".to_string()),
+                _ => ("", item.meta.clone()),
+            };
+            spans.push(Span::styled("  ".to_string(), ansi::style_dim()));
+            if !tag.is_empty() {
+                spans.push(Span::styled(format!("[{tag}]"), ansi::style_error()));
+                spans.push(Span::styled(format!(" {rest}"), ansi::style_dim()));
+            } else {
+                spans.push(Span::styled(rest, ansi::style_dim()));
+            }
         }
         out.push(Line::from(spans));
     }

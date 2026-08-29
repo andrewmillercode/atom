@@ -629,7 +629,7 @@ impl App {
             let show_r = self.show_reasoning;
             let b = &mut self.blocks[i];
             if !b.lines_valid(width, show_r) {
-                let rendered = blocks::render_block_linked(b, width, show_r, &frame);
+                let rendered = blocks::render_block_linked(b, width, show_r, &frame, &self.cwd);
                 let lines = rendered.lines.into_iter().map(Arc::new).collect();
                 b.lines = Some(lines);
                 b.line_links = rendered.links;
@@ -1515,7 +1515,32 @@ impl App {
             self.close_picker();
             return Vec::new();
         }
-        let name = self.picker_items[self.picker_sel].title.trim().to_string();
+        // Snapshot the row fields we care about so the immutable borrow
+        // of `self.picker_items` ends before we touch `self` mutably
+        // (e.g. when starting the OAuth flow).
+        let item = &self.picker_items[self.picker_sel];
+        let title = item.title.clone();
+        let meta = item.meta.clone();
+        let mcp_server = item.mcp_server.clone();
+        // For MCP rows that need OAuth ("auth required" / "auth expired"
+        // — see atom_tools::mcp_oauth::mcp_auth_display), Enter on the
+        // server should kick off the browser sign-in instead of just
+        // inserting "/name" into the prompt. Authenticated MCPs fall
+        // through and behave like skills (insert the slash text).
+        if self.picker_kind == PickerKind::Mcp {
+            if let Some(server) = mcp_server.as_deref() {
+                let needs_auth = matches!(meta.as_str(), "auth required" | "auth expired");
+                if needs_auth {
+                    if let Some(fx) = self.start_mcp_oauth(server) {
+                        if close {
+                            self.close_picker();
+                        }
+                        return fx;
+                    }
+                }
+            }
+        }
+        let name = title.trim().to_string();
         if !name.is_empty() {
             self.apply_picker_insert(&format!("/{name}"));
         }
@@ -1523,6 +1548,26 @@ impl App {
             self.close_picker();
         }
         Vec::new()
+    }
+
+    /// Build a StartMcpOAuth effect for `server`, looking up its URL
+    /// and static client id from the cwd's MCP configs. Returns None
+    /// when the server isn't configured or doesn't opt into OAuth so
+    /// callers can fall back to inserting the slash text.
+    fn start_mcp_oauth(&mut self, server: &str) -> Option<Vec<Effect>> {
+        let cfgs = atom_tools::mcp::load_mcp_configs(&self.cwd);
+        let cfg = cfgs.get(server)?;
+        if !cfg.auth.eq_ignore_ascii_case("oauth") {
+            return None;
+        }
+        self.working_msg = format!("waiting for {server} sign-in in the browser...");
+        Some(vec![Effect::StartMcpOAuth {
+            server: server.to_string(),
+            url: cfg.url.clone(),
+            client_id: cfg.client_id.clone(),
+            client_secret: cfg.client_secret.clone(),
+            token_endpoint_auth_method: cfg.token_endpoint_auth_method.clone(),
+        }])
     }
 
     pub fn apply_picker_insert(&mut self, text: &str) {
@@ -1851,6 +1896,7 @@ impl App {
                 crate::outputtest::advance_output_test_scene(self)
             }
             AppMsg::OAuthDone(result) => self.oauth_done(result),
+            AppMsg::McpOAuthDone { server, result } => self.mcp_oauth_done(&server, result),
             AppMsg::ShellKillArmed(tx) => {
                 // Stale senders from an already-finished command are
                 // dropped by the next ShellDone.
@@ -2194,6 +2240,52 @@ impl App {
         self.overlay_auth_type.clear();
         self.pending_model_provider = id.to_string();
         self.working_msg = "loading models...".into();
+    }
+
+    /// Handle the result of Effect::StartMcpOAuth. On success the
+    /// auth store already holds fresh tokens for `server`, so the
+    /// slash catalog is rebuilt and the picker (if still open) is
+    /// refreshed in place. On failure surface the error and bail
+    /// back to the picker so the user can retry.
+    fn mcp_oauth_done(&mut self, server: &str, result: Result<(), String>) -> Vec<Effect> {
+        self.working_msg.clear();
+        match result {
+            Err(e) => {
+                if !e.contains("canceled") && !e.contains("cancel") {
+                    self.err_msg = format!("MCP sign-in failed for {server}: {e}");
+                }
+                if !matches!(self.picker_kind, PickerKind::None) {
+                    self.refresh_picker_items();
+                }
+                Vec::new()
+            }
+            Ok(()) => {
+                // Slash catalog items are computed once on init and
+                // cached on the App; rebuild so the meta column flips
+                // from "auth required" to "authenticated" for this
+                // server and any picker still open reflects that.
+                self.slash_commands = overlays::discover_commands(&self.cwd);
+                if !matches!(self.picker_kind, PickerKind::None) {
+                    self.refresh_picker_items();
+                }
+                Vec::new()
+            }
+        }
+    }
+
+    /// Re-populate picker items for the current picker_kind without
+    /// resetting the selection so the highlighted row stays where it
+    /// was after a state change (e.g. an MCP just finished OAuth).
+    fn refresh_picker_items(&mut self) {
+        let kind = match self.picker_kind {
+            PickerKind::Mcp => "mcp",
+            PickerKind::Skills => "skill",
+            PickerKind::None => return,
+        };
+        self.picker_items = picker_items(&self.slash_commands, kind);
+        if self.picker_sel >= self.picker_items.len() {
+            self.picker_sel = self.picker_items.len().saturating_sub(1);
+        }
     }
 
     /// Shared resize path for AppMsg::Resize and view::draw's
@@ -3683,7 +3775,9 @@ impl App {
         if idx >= 0 {
             let bi = idx as usize;
             let inner = self.inner_width().saturating_sub(2).max(1);
-            if self.blocks[bi].kind == BlockKind::User && self.blocks[bi].user_collapsible(inner) {
+            if self.blocks[bi].kind == BlockKind::User
+                && self.blocks[bi].user_collapsible(inner, &self.cwd)
+            {
                 self.blocks[bi].expanded = !self.blocks[bi].expanded;
                 self.blocks[bi].lines = None;
                 self.viewport_dirty = true;
@@ -3708,7 +3802,7 @@ impl App {
                     self.copied_at = Some(Instant::now());
                     return vec![Effect::OpenLink { uri }];
                 }
-                if self.blocks[bi].tool_collapsible(inner, inner) {
+                if self.blocks[bi].tool_collapsible(inner, inner, &self.cwd) {
                     self.blocks[bi].expanded = !self.blocks[bi].expanded;
                     self.blocks[bi].lines = None;
                     self.viewport_dirty = true;
@@ -4064,9 +4158,23 @@ fn picker_items(commands: &[DynamicCommand], kind: &str) -> Vec<PickerItem> {
     commands
         .iter()
         .filter(|command| command.kind == kind)
-        .map(|command| PickerItem {
-            title: command.name.trim_start_matches('/').to_string(),
-            meta: command.desc.clone(),
+        .map(|command| {
+            let title = command.name.trim_start_matches('/').to_string();
+            // Catalog rows are slash-prefixed (e.g. "/meta-ads"); the
+            // picker title strips the leading "/" but Enter still
+            // inserts the full "/name". The MCP server name is the bare
+            // form, so keep both so the picker can resolve back to a
+            // config entry on activation.
+            let mcp_server = if command.kind == "mcp" {
+                Some(title.clone())
+            } else {
+                None
+            };
+            PickerItem {
+                title,
+                meta: command.desc.clone(),
+                mcp_server,
+            }
         })
         .collect()
 }
@@ -5071,7 +5179,9 @@ mod tests {
         app.refresh_viewport();
         // Long cards start collapsed to the preview budget.
         assert!(!app.blocks[0].expanded);
-        assert!(app.blocks[0].user_collapsible(app.inner_width().saturating_sub(2).max(1)));
+        assert!(
+            app.blocks[0].user_collapsible(app.inner_width().saturating_sub(2).max(1), &app.cwd)
+        );
         assert_eq!(app.content_lines.len(), blocks::USER_PREVIEW_LINES + 2);
 
         let click = |row| MouseEvent {

@@ -698,12 +698,13 @@ mod tests {
         let out = crate::render::markdown::render_markdown(
             "Count them: $\\pi(x)$ is the number of primes up to $x$.",
             80,
+            "",
         );
         assert!(out.contains("π(x)"), "got {out:?}");
         assert!(out.contains("primes up to"), "got {out:?}");
         assert!(!out.contains("\\pi"), "got {out:?}");
         // Currency is preserved verbatim.
-        let out = crate::render::markdown::render_markdown("it costs $5 vs $10", 80);
+        let out = crate::render::markdown::render_markdown("it costs $5 vs $10", 80, "");
         assert!(out.contains("$5"), "got {out:?}");
         assert!(out.contains("$10"), "got {out:?}");
     }

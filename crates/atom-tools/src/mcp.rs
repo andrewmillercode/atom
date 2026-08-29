@@ -34,9 +34,32 @@ pub struct MCPServerConfig {
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
     /// Statically registered OAuth client id; skips dynamic client
-    /// registration when the remote server requires OAuth.
+    /// registration when the remote server requires OAuth. Required for
+    /// servers like Meta's Ads MCP that disable RFC 7591 dynamic
+    /// registration — get one from
+    /// https://developers.facebook.com/apps for Meta, and pre-register
+    /// atom's loopback redirect URI (default `http://127.0.0.1:9999/callback`,
+    /// overridable via the `ATOM_MCP_OAUTH_PORT` env var) under Facebook
+    /// Login for Business → Settings → Valid OAuth Redirect URIs.
     #[serde(default)]
     pub client_id: String,
+    /// Statically registered OAuth client secret. Used together with
+    /// `client_id` when the server expects a confidential client (e.g.
+    /// `client_secret_post` / `client_secret_basic`). Leave empty for
+    /// public clients (`token_endpoint_auth_method = "none"`).
+    #[serde(default)]
+    pub client_secret: String,
+    /// `token_endpoint_auth_method` overrides the value sent in RFC 7591
+    /// dynamic client registration. When unset, the field is omitted
+    /// from the registration body — RFC 7591 §2 makes it optional, and
+    /// most production OAuth servers default to a confidential-client
+    /// method (e.g. `client_secret_post`) and return a secret that
+    /// atom already stores and uses on token exchange. Set this for
+    /// servers whose default we cannot satisfy, e.g.
+    /// `client_secret_basic`, `client_secret_jwt`, or
+    /// `private_key_jwt`.
+    #[serde(default)]
+    pub token_endpoint_auth_method: Option<String>,
     /// "oauth" opts this server into the interactive browser sign-in on
     /// 401. Stored tokens are always used when present; without this the
     /// server must be authorized by other means (headers/env).
@@ -691,7 +714,16 @@ async fn connect_transport(
             // Attach a cached OAuth bearer up front when one is stored;
             // the 401 retry below handles the interactive sign-in.
             if !header_map.contains_key(reqwest::header::AUTHORIZATION) {
-                match crate::mcp_oauth::bearer_token(name, &cfg.url, &cfg.client_id, false).await {
+                match crate::mcp_oauth::bearer_token(
+                    name,
+                    &cfg.url,
+                    &cfg.client_id,
+                    &cfg.client_secret,
+                    cfg.token_endpoint_auth_method.as_deref(),
+                    false,
+                )
+                .await
+                {
                     Ok(Some(token)) => {
                         if let Ok(v) =
                             reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
@@ -776,10 +808,17 @@ async fn connect_and_list(
             // token was already tried at connect). Opens a browser for
             // first-time sign-in; tokens persist and refresh afterwards.
             eprintln!("mcp: server \"{name}\" requires authorization, starting OAuth sign-in…");
-            let token = crate::mcp_oauth::bearer_token(name, &cfg.url, &cfg.client_id, true)
-                .await
-                .map_err(|e| format!("oauth: {e}"))?
-                .ok_or_else(|| "server requires authorization".to_string())?;
+            let token = crate::mcp_oauth::bearer_token(
+                name,
+                &cfg.url,
+                &cfg.client_id,
+                &cfg.client_secret,
+                cfg.token_endpoint_auth_method.as_deref(),
+                true,
+            )
+            .await
+            .map_err(|e| format!("oauth: {e}"))?
+            .ok_or_else(|| "server requires authorization".to_string())?;
             if let Transport::Http(s) = &mut transport {
                 s.set_bearer(&token);
             }

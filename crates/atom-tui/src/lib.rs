@@ -890,6 +890,43 @@ async fn run_effects(
                     let _ = tx.send(AppMsg::OAuthDone(result));
                 });
             }
+            Effect::StartMcpOAuth {
+                server,
+                url,
+                client_id,
+                client_secret,
+                token_endpoint_auth_method,
+            } => {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    // bearer_token with interactive=true runs the full
+                    // PKCE flow when no usable cached token is present,
+                    // persists the resulting tokens, and returns them.
+                    // On success the auth store is already updated —
+                    // the App only needs to refresh the picker / catalog.
+                    let result = tokio::time::timeout(
+                        tokio::time::Duration::from_secs(3 * 60),
+                        atom_tools::mcp_oauth::bearer_token(
+                            &server,
+                            &url,
+                            &client_id,
+                            &client_secret,
+                            token_endpoint_auth_method.as_deref(),
+                            true,
+                        ),
+                    )
+                    .await
+                    .unwrap_or_else(|_| Err("MCP OAuth sign-in timed out".into()))
+                    .and_then(|tok| {
+                        if tok.is_none() {
+                            Err("OAuth flow returned no token".into())
+                        } else {
+                            Ok(())
+                        }
+                    });
+                    let _ = tx.send(AppMsg::McpOAuthDone { server, result });
+                });
+            }
             Effect::ReloadProviders => {
                 let tx = tx.clone();
                 tokio::spawn(async move {

@@ -165,23 +165,90 @@ struct RegistrationResponse {
     client_secret: String,
 }
 
+/// Builds the RFC 7591 client registration request body. The
+/// `token_endpoint_auth_method` field is omitted when `None` (or empty)
+/// — RFC 7591 §2 makes the field optional, and most production OAuth
+/// servers default to a confidential-client method (e.g.
+/// `client_secret_post`) and return a secret we already store and use
+/// on token exchange.
+fn build_registration_body(
+    redirect_uri: &str,
+    token_endpoint_auth_method: Option<&str>,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "client_name": "atom",
+        "redirect_uris": [redirect_uri],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+    });
+    if let Some(method) = token_endpoint_auth_method {
+        if !method.is_empty() {
+            body["token_endpoint_auth_method"] = serde_json::Value::String(method.to_string());
+        }
+    }
+    body
+}
+
+/// Caps an error response body for surfacing in the user-visible error
+/// string. 4xx bodies carry the server's `error_description` and are
+/// surfaced in full (capped at 4 KiB) so users can read the actual
+/// rejection reason — e.g. `"token_endpoint_auth_method 'none' is not
+/// supported"`. 5xx bodies are usually HTML or large generic dumps and
+/// are truncated harder.
+fn truncate_error_body(status: reqwest::StatusCode, text: &str) -> String {
+    let limit = if status.is_client_error() { 4096 } else { 300 };
+    text.chars().take(limit).collect()
+}
+
+/// Recognizes the RFC 7591 `invalid_client_metadata` rejection that
+/// means the server disables dynamic client registration outright
+/// (Meta's Ads MCP, plus a handful of others). The raw body still gets
+/// surfaced for debugging, but we wrap it in a message that points the
+/// user at the workaround so they don't have to read RFC 7591 to
+/// figure out what to do next.
+fn registration_disabled_hint(text: &str, server: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    if v.get("error").and_then(|e| e.as_str())? != "invalid_client_metadata" {
+        return None;
+    }
+    let desc = v
+        .get("error_description")
+        .and_then(|e| e.as_str())?
+        .to_ascii_lowercase();
+    let matches = desc.contains("dynamic registration is not")
+        || desc.contains("dynamic client registration is not")
+        || desc.contains("client registration is not supported")
+        || desc.contains("registration is not allowed");
+    if !matches {
+        return None;
+    }
+    Some(format!(
+        "this server does not allow dynamic client registration \
+         (RFC 7591). Register a developer app with the provider and \
+         set \"client_id\" (and \"client_secret\" if it expects a \
+         confidential client) in mcp.json's \"{server}\" entry, then \
+         sign in again. For Meta Ads, create an app at \
+         https://developers.facebook.com/apps and add atom's loopback \
+         redirect URI (default http://127.0.0.1:9999/callback, or \
+         whatever ATOM_MCP_OAUTH_PORT is set to) to the app's \
+         \"Valid OAuth Redirect URIs\" list."
+    ))
+}
+
 async fn register_client(
+    server: &str,
     registration_endpoint: &str,
     redirect_uri: &str,
+    token_endpoint_auth_method: Option<&str>,
 ) -> Result<(String, String), String> {
     let client = reqwest::Client::builder()
         .timeout(DISCOVERY_TIMEOUT)
         .build()
         .map_err(|e| e.to_string())?;
-    let body = serde_json::json!({
-        "client_name": "atom",
-        "redirect_uris": [redirect_uri],
-        "grant_types": ["authorization_code", "refresh_token"],
-        "response_types": ["code"],
-        "token_endpoint_auth_method": "none",
-    });
+    let body = build_registration_body(redirect_uri, token_endpoint_auth_method);
     let resp = client
         .post(registration_endpoint)
+        .header("Accept", "application/json")
         .json(&body)
         .send()
         .await
@@ -189,10 +256,18 @@ async fn register_client(
     let status = resp.status();
     let text = resp.text().await.map_err(|e| e.to_string())?;
     if !status.is_success() {
-        return Err(format!("client registration: HTTP {status}: {}", {
-            let t: String = text.chars().take(300).collect();
-            t
-        }));
+        // Specialize the most common 4xx rejection — the server
+        // disables dynamic registration — so the user gets a fixable
+        // path instead of an opaque JSON dump.
+        if status.is_client_error() {
+            if let Some(hint) = registration_disabled_hint(&text, server) {
+                return Err(format!("client registration: HTTP {status}: {hint}"));
+            }
+        }
+        return Err(format!(
+            "client registration: HTTP {status}: {}",
+            truncate_error_body(status, &text)
+        ));
     }
     let reg: RegistrationResponse =
         serde_json::from_str(&text).map_err(|e| format!("bad registration response: {e}"))?;
@@ -321,24 +396,53 @@ pub async fn refresh_entry(server: &str, entry: &AuthEntry) -> Result<AuthEntry,
 // ---------------------------------------------------------------------------
 
 /// Runs the full browser sign-in for `server` and stores the tokens.
-/// `static_client_id` (from mcp.json) skips dynamic registration.
+/// `static_client_id` (from mcp.json) skips dynamic registration and is
+/// required when the server disables RFC 7591 (e.g. Meta's Ads MCP).
+/// `static_client_secret` is used together with `static_client_id` for
+/// confidential clients (e.g. `client_secret_post`); leave empty for
+/// public clients (`token_endpoint_auth_method = "none"`).
+/// `token_endpoint_auth_method` is sent in the RFC 7591 registration
+/// body when dynamic registration is attempted; pass `None` to omit
+/// the field and let the server pick its default.
 pub async fn run_login(
     server: &str,
     server_url: &str,
     static_client_id: &str,
+    static_client_secret: &str,
+    token_endpoint_auth_method: Option<&str>,
 ) -> Result<AuthEntry, String> {
     let disc = discover(server_url).await?;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    // Stable loopback port: Meta's developer apps require an exact
+    // redirect_uri match, and the previous ephemeral bind meant every
+    // sign-in attempt presented a different URI. 9999 is also the
+    // port the OAuth test fixtures use. Override via ATOM_MCP_OAUTH_PORT
+    // when 9999 conflicts with another listener on this machine.
+    let oauth_port: u16 = std::env::var("ATOM_MCP_OAUTH_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(9999);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", oauth_port))
         .await
-        .map_err(|e| format!("bind loopback: {e}"))?;
+        .map_err(|e| {
+            format!(
+                "bind loopback:{oauth_port}: {e} \
+                 (set ATOM_MCP_OAUTH_PORT to a free port and register \
+                  http://127.0.0.1:<port>/callback in your OAuth app)"
+            )
+        })?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
     let redirect_uri = format!("http://127.0.0.1:{port}/callback");
 
     let (client_id, client_secret) = if !static_client_id.is_empty() {
-        (static_client_id.to_string(), String::new())
+        (
+            static_client_id.to_string(),
+            static_client_secret.to_string(),
+        )
     } else {
         match &disc.auth.registration_endpoint {
-            Some(ep) if !ep.is_empty() => register_client(ep, &redirect_uri).await?,
+            Some(ep) if !ep.is_empty() => {
+                register_client(server, ep, &redirect_uri, token_endpoint_auth_method).await?
+            }
             _ => return Err("no registration endpoint and no client_id configured".into()),
         }
     };
@@ -466,10 +570,17 @@ fn find_head_end(buf: &[u8]) -> Option<usize> {
 /// Bearer token for `server`: cached access token, then refresh, then
 /// (when `interactive`) a browser sign-in. None means no credentials
 /// are available and the caller should proceed unauthenticated.
+/// `static_client_id` / `static_client_secret` are used to bypass
+/// dynamic client registration for servers that disable RFC 7591
+/// (e.g. Meta's Ads MCP). `token_endpoint_auth_method` is forwarded
+/// to RFC 7591 dynamic client registration; pass `None` to let the
+/// server pick its default.
 pub async fn bearer_token(
     server: &str,
     server_url: &str,
     static_client_id: &str,
+    static_client_secret: &str,
+    token_endpoint_auth_method: Option<&str>,
     interactive: bool,
 ) -> Result<Option<String>, String> {
     let key = auth_key(server);
@@ -496,7 +607,14 @@ pub async fn bearer_token(
     if !interactive {
         return Ok(None);
     }
-    let entry = run_login(server, server_url, static_client_id).await?;
+    let entry = run_login(
+        server,
+        server_url,
+        static_client_id,
+        static_client_secret,
+        token_endpoint_auth_method,
+    )
+    .await?;
     Ok(Some(entry.access))
 }
 
@@ -565,6 +683,109 @@ mod tests {
         assert_eq!(enc("abc-._~123"), "abc-._~123");
         assert_eq!(enc("a b"), "a%20b");
         assert_eq!(enc("a&b=c"), "a%26b%3Dc");
+    }
+
+    #[test]
+    fn registration_body_omits_auth_method_by_default() {
+        // RFC 7591 §2 makes `token_endpoint_auth_method` optional, and
+        // omitting it lets the server pick its default (typically
+        // `client_secret_post` for production OAuth servers). Sending
+        // `"none"` was breaking Meta's MCP server.
+        let body = build_registration_body("http://127.0.0.1:9999/cb", None);
+        assert_eq!(body["client_name"], "atom");
+        assert_eq!(body["redirect_uris"][0], "http://127.0.0.1:9999/cb");
+        assert_eq!(body["grant_types"][0], "authorization_code");
+        assert_eq!(body["grant_types"][1], "refresh_token");
+        assert_eq!(body["response_types"][0], "code");
+        assert!(
+            body.get("token_endpoint_auth_method").is_none(),
+            "RFC 7591 makes the field optional; omitting it is the spec-correct default. Got: {body}"
+        );
+    }
+
+    #[test]
+    fn registration_body_includes_overridden_auth_method() {
+        // Per-server config can opt into a specific method when the
+        // server's default is unusable (e.g. `client_secret_basic`,
+        // `private_key_jwt`).
+        let body = build_registration_body("http://127.0.0.1:9999/cb", Some("client_secret_basic"));
+        assert_eq!(body["token_endpoint_auth_method"], "client_secret_basic");
+    }
+
+    #[test]
+    fn registration_body_ignores_empty_auth_method() {
+        // Treat empty-string overrides the same as None so an
+        // accidentally blank config field stays silent.
+        let body = build_registration_body("http://127.0.0.1:9999/cb", Some(""));
+        assert!(body.get("token_endpoint_auth_method").is_none());
+    }
+
+    #[test]
+    fn truncate_error_body_caps_5xx_but_keeps_4xx_full() {
+        // Regression test for the meta-ads case: the previous 300-char
+        // cap truncated the error body to "{…", hiding the actual
+        // rejection reason.
+        let big = "x".repeat(10_000);
+        let out5xx = truncate_error_body(reqwest::StatusCode::INTERNAL_SERVER_ERROR, &big);
+        assert_eq!(out5xx.len(), 300);
+
+        // 4xx bodies are surfaced in full (up to 4 KiB) so users can
+        // read `error_description`.
+        let big_4xx = "y".repeat(5_000);
+        let out4xx = truncate_error_body(reqwest::StatusCode::BAD_REQUEST, &big_4xx);
+        assert_eq!(out4xx.len(), 4096);
+
+        // 4xx under the cap is unchanged.
+        let short = "{\"error\":\"invalid_client_metadata\",\"error_description\":\"token_endpoint_auth_method 'none' is not supported\"}";
+        assert_eq!(
+            truncate_error_body(reqwest::StatusCode::BAD_REQUEST, short),
+            short
+        );
+    }
+
+    #[test]
+    fn registration_disabled_hint_matches_meta_ads_response() {
+        // The exact response Meta's MCP OAuth endpoint returns. The
+        // hint must be actionable for someone hitting this error in
+        // the wild — both the server name and the workaround must be
+        // present so the user knows what to put in mcp.json.
+        let body = r#"{"error":"invalid_client_metadata","error_description":"Dynamic registration is not available for this client."}"#;
+        let hint = registration_disabled_hint(body, "meta-ads")
+            .expect("Meta's exact error must be recognized");
+        assert!(hint.contains("\"meta-ads\""), "hint = {hint}");
+        assert!(hint.contains("client_id"), "hint = {hint}");
+        assert!(hint.contains("developers.facebook.com"), "hint = {hint}");
+
+        // Other "not available / not allowed / not supported" phrasings
+        // for the same RFC 7591 error must also be recognized so
+        // similar servers (e.g. Shopify, some Salesforce orgs) get the
+        // same actionable message.
+        for body in [
+            r#"{"error":"invalid_client_metadata","error_description":"Dynamic registration is not allowed"}"#,
+            r#"{"error":"invalid_client_metadata","error_description":"Dynamic client registration is not supported"}"#,
+            r#"{"error":"invalid_client_metadata","error_description":"Client registration is not supported for this client."}"#,
+        ] {
+            assert!(
+                registration_disabled_hint(body, "s").is_some(),
+                "missed: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn registration_disabled_hint_ignores_unrelated_errors() {
+        // Same `invalid_client_metadata` code, but a different reason —
+        // we shouldn't fire the "register an app" hint here.
+        let body = r#"{"error":"invalid_client_metadata","error_description":"redirect_uris must contain at least one URI."}"#;
+        assert!(registration_disabled_hint(body, "x").is_none());
+
+        // Different error code entirely.
+        let body = r#"{"error":"invalid_redirect_uri","error_description":"foo"}"#;
+        assert!(registration_disabled_hint(body, "x").is_none());
+
+        // Non-JSON body — register_client still surfaces the raw text
+        // via truncate_error_body.
+        assert!(registration_disabled_hint("not json", "x").is_none());
     }
 
     #[test]
@@ -791,7 +1012,9 @@ mod tests {
 
         let login_server_url = server_url.clone();
         let login =
-            tokio::spawn(async move { run_login("fakeserver", &login_server_url, "").await });
+            tokio::spawn(
+                async move { run_login("fakeserver", &login_server_url, "", "", None).await },
+            );
         let authorize_url = loop {
             if let Some(u) = captured_url.lock().unwrap().as_ref() {
                 break u.clone();

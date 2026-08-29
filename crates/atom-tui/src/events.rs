@@ -193,6 +193,18 @@ pub enum Effect {
         decision: String,
     },
     StartOpenAIOAuth,
+    /// Run OAuth browser sign-in for an MCP server that has
+    /// `"auth": "oauth"` and is not yet authenticated. The runtime
+    /// re-uses atom_tools::mcp_oauth::bearer_token to discover the
+    /// metadata, walk PKCE, and store the resulting access/refresh
+    /// tokens under the per-server auth key.
+    StartMcpOAuth {
+        server: String,
+        url: String,
+        client_id: String,
+        client_secret: String,
+        token_endpoint_auth_method: Option<String>,
+    },
     ReloadProviders,
     ReadClipboard,
     CopyToClipboard {
@@ -285,6 +297,13 @@ pub enum AppMsg {
     /// placeholder rows. Handled by the loop, not the state machine.
     MathWake,
     OAuthDone(Result<AuthEntry, String>),
+    /// Result of Effect::StartMcpOAuth. The String is the server name
+    /// so the App can refresh the slash catalog / picker once a fresh
+    /// token is persisted.
+    McpOAuthDone {
+        server: String,
+        result: Result<(), String>,
+    },
     HotRebuilt(Result<crate::hot::HotBuild, String>),
     ThemeReloaded(Result<std::time::Duration, String>),
     /// Internal: the spawned shell command armed its kill switch. The App
@@ -342,6 +361,9 @@ impl std::fmt::Debug for AppMsg {
             AppMsg::Redraw => write!(f, "Redraw"),
             AppMsg::MathWake => write!(f, "MathWake"),
             AppMsg::OAuthDone(r) => write!(f, "OAuthDone({r:?})"),
+            AppMsg::McpOAuthDone { server, result } => {
+                write!(f, "McpOAuthDone({server}, {result:?})")
+            }
             AppMsg::HotRebuilt(r) => write!(f, "HotRebuilt({r:?})"),
             AppMsg::ThemeReloaded(r) => write!(f, "ThemeReloaded({r:?})"),
             AppMsg::ShellKillArmed(_) => write!(f, "ShellKillArmed"),

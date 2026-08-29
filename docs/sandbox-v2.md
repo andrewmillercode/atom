@@ -26,7 +26,9 @@ Categories:
 - **Package installs.** Accepts postinstall risk. `cargo add|update|install`, `npm i|install|add|update|ci` (not `publish`), `pnpm i|install|add|update`, `yarn install|add`, `bun install|add`, `pip pip3 pipx`, `uv pip|add|sync|run`, `poetry install|add|update|run`, `gem install`, `bundle install`, `go get|install`, `brew install|upgrade|reinstall|tap`, `apt|apt-get aptitude install|update|upgrade`, `yum dnf zypper pacman apk add`, `asdf install`, `nix profile install`. Publishes (`cargo publish`, `npm publish`, `dotnet nuget push`) prompt.
 - **Network fetches.** Bytes in, no execution. `curl wget http httpie`, `gh api glab api`, `ping traceroute mtr`, `dig host nslookup whois`, `ssh-keyscan`, `git fetch`.
 - **Local VCS.** Additive or reversible. `git status|log|diff|show|blame|branch|tag|remote|config --get|reflog|ls-files|worktree|help|version`, `git add`, `git rm --cached`, `git mv`, `git commit` (no `--amend`), `git checkout -b`, `git switch -c`, `git stash|apply|pop`, `git tag`, `git init`, `git revert`, `git merge` (no force), `git rebase` (no force). `git push`, `git reset --hard`, `git clean -fd`, `git branch -D` prompt.
-- **Filesystem adds.** Within cwd only. `mkdir -p`, `touch`, `cp ln mv install rsync truncate tee`, `tar -c zip -r gzip bzip2 xz zstd`, `git init`. Writes outside cwd prompt.
+- **Filesystem adds.** Within cwd, `$TMPDIR`, or `/tmp`. `mkdir -p`, `touch`, `cp ln mv install rsync truncate tee`, `tar -c zip -r gzip bzip2 xz zstd`, `git init`. Writes outside these prompt.
+
+  `/tmp` and `$TMPDIR` are Tier 1 by design — every major coding agent (Codex, Cursor, Claude Code, Gemini CLI, Aider, Devin, OpenHands) allows writes to `/tmp` by default, and toolchains (cargo, go, npm, vitest, wrangler, sccache, v8, gcc) reach for it with hard-coded paths the agent can't redirect. The guardrail list still blocks writes to system roots (`/etc`, `/usr`, `/System`, `/private/etc`, `/boot`) and protected-path writes still protect `$PATH`, `.ssh`, `.git/hooks`, and shell startup files wherever they live — adding `/tmp` to Tier 1 doesn't punch through anything the floor is supposed to catch. Sticky-bit semantics on `/tmp` already prevent cross-user stomping. Multi-agent collision is handled by the per-session tmpdir below, not by restricting `/tmp`.
 - **System read-only.** `ps top -l pgrep -l`, `lsof netstat ss ifconfig ip`, `mount` (no args), `diskutil list|info|apfs list`, `sysctl -n iostat vm_stat`, `uptime launchctl list` (read-only).
 - **Dev helpers.** `docker ps|images|logs|inspect|version|info`, `docker compose build|up|down|ps|logs|config`, `kubectl get|describe|logs|version|config view`, `nix build|develop|run|flake update`, `make -n`.
 
@@ -86,6 +88,12 @@ Symlinks are checked: a write whose destination or any path component resolves i
 
 Subprocess env vars are scrubbed before each command: provider credentials (`ANTHROPIC_*`, `OPENAI_*`, `GITHUB_TOKEN`) and anything matching `*_TOKEN`, `*_KEY`, `*_SECRET`, `*_PASSWORD` is unset. `printenv` and `env` output is filtered so the agent can't read what was scrubbed. This is the cheapest credential-exfiltration channel in the design — no static evasion needed; scrubbing is deterministic, zero-prompt, and composes with the exfil guardrails.
 
+## Per-session tmpdir
+
+Each session creates a private scratch directory under the host's `$TMPDIR` (falling back to `/tmp`), formatted `atom-<session-id>-<rand>` with `0700` perms, and exports `$TMPDIR`, `$TMP`, and `$TEMP` pointing at it for every spawned command. The host's `$TMPDIR` value is honored as the parent so multi-user systems get per-user isolation under `$TMPDIR/atom-…` rather than colliding on a single `/tmp/atom-…` namespace, and the sandboxed env overrides the host value atomically in `spawn_*` so tools that read `$TMPDIR` (cargo, go, sccache, mktemp, vitest, wrangler, ImageMagick, …) Just Work without configuration. The directory is removed at session end.
+
+The system prompt (or `AGENTS.md`) tells the model to use `$TMPDIR` for transient files and prefer it over hard-coded `/tmp/foo` paths; both are Tier 1, but `$TMPDIR` gives the session isolation and avoids cross-session name collisions on a shared box. If `/tmp` is mounted `noexec` on a host, atom falls back to `${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/atom-<session>` and emits a one-time warning — same parent naming, same env vars, same cleanup.
+
 ## Compound commands
 
 Segment on top-level `&&`, `||`, `;`, `|`. Each segment is classified independently; the command runs only if every segment clears, and the highest tier among segments wins. A Tier 1 + Tier 2 mix prompts once for the whole line.
@@ -113,7 +121,7 @@ Wrappers (`bash sh zsh -c env nice timeout nohup` and bare `xargs`) are unwrappe
 ## What changes in code
 
 - **`atom-sandbox`**: drop `seatbelt.rs` and the `confined` field on `ExecOutcome`. `policy.rs` becomes `SandboxConfig { rules: { allow, deny } }`. `rules.rs` widens the Allow table to the eight categories. Arg-veto lists drop matched-flag commands to the prompt tier.
-- **`atom-sandbox/exec.rs`**: pipeline becomes `analyze → guardrail floor → approval gate → spawn`. Seatbelt paths deleted. Environment scrubbing lives in `spawn_*` helpers.
+- **`atom-sandbox/exec.rs`**: pipeline becomes `analyze → guardrail floor → approval gate → spawn`. Seatbelt paths deleted. Environment scrubbing lives in `spawn_*` helpers. Each spawn creates the per-session tmpdir (see *Per-session tmpdir* below) before exec and removes it at session end.
 - **`atom-sandbox/approvals.rs`**: `Decision` loses `AllowSession`; becomes `AllowOnce`/`AllowAll`/`DenyOnce`/`DenyAll`. Global grants are the only persisted state, written through the same lock as config rules.
 - **`atom-tui`**: `approval_buttons()` switches to `[y]/[a]/[n]/[d]` + Esc. Prefix-rule preview and help line are new blocks in the approval render path. Verdict display notes the matched rule id and tier origin.
 - **`atom-server`**: `approval_request_event` carries an `origin` field. The decision router accepts the four-button decision set.

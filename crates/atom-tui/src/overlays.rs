@@ -49,6 +49,9 @@ pub enum PickerKind {
 pub struct PickerItem {
     pub title: String,
     pub meta: String,
+    /// Set for MCP rows so Enter on an auth-required server can trigger
+    /// the OAuth flow instead of just inserting the slash text.
+    pub mcp_server: Option<String>,
 }
 
 /// command is a slash command the user can type in the chat.

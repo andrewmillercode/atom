@@ -37,7 +37,11 @@ const RESET: &str = "\x1b[0m";
 /// renderMarkdown renders CommonMark (plus GFM tables) for assistant
 /// and compaction text, trimmed of trailing whitespace like the Go
 /// version.
-pub fn render_markdown(text: &str, width: usize) -> String {
+///
+/// `cwd` is the base for resolving relative file paths referenced
+/// in assistant prose (e.g. `crates/foo.rs:42`); empty falls back
+/// to the process cwd.
+pub fn render_markdown(text: &str, width: usize, cwd: &str) -> String {
     if text.is_empty() {
         return String::new();
     }
@@ -49,7 +53,7 @@ pub fn render_markdown(text: &str, width: usize) -> String {
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_MATH);
     opts.insert(Options::ENABLE_TASKLISTS);
-    let mut r = Renderer::new(&prepared, width);
+    let mut r = Renderer::new(&prepared, width, cwd);
     for (event, span) in Parser::new_ext(&prepared, opts).into_offset_iter() {
         r.event(event, span);
     }
@@ -267,10 +271,14 @@ struct Renderer<'a> {
     heading: Option<u8>,
     code: Option<CodeAcc>,
     table: Option<TableAcc>,
+    /// Base for resolving relative file paths in prose so the OSC 8
+    /// URI is the absolute one the OS will open. Borrowed from the
+    /// caller; lives for the render duration.
+    cwd: &'a str,
 }
 
 impl<'a> Renderer<'a> {
-    fn new(src: &'a str, width: usize) -> Self {
+    fn new(src: &'a str, width: usize, cwd: &'a str) -> Self {
         Renderer {
             width,
             src,
@@ -281,6 +289,7 @@ impl<'a> Renderer<'a> {
             heading: None,
             code: None,
             table: None,
+            cwd,
         }
     }
 
@@ -292,13 +301,27 @@ impl<'a> Renderer<'a> {
                 if let Some(code) = self.code.as_mut() {
                     code.buf.push_str(&t);
                 } else {
-                    self.sink().push_str(&t);
+                    // Wrap file paths and bare URLs in OSC 8 so
+                    // assistant prose exposes clickable regions.
+                    // Markdown-style `[label](url)` links are handled
+                    // by the Tag::Link branch — linkify here only sees
+                    // the label, never the dest URL, so there's no
+                    // double-wrapping. The cwd borrow is detached to
+                    // a local first so the sink() mutable borrow
+                    // doesn't conflict with it.
+                    let cwd = self.cwd;
+                    self.sink()
+                        .push_str(&super::links::linkify(&t, "", "", cwd));
                 }
             }
             Event::Code(t) => {
+                let cwd = self.cwd;
                 let sink = self.sink();
                 sink.push_str(&ansi_fg(COLOR_SYNTAX_STRING));
-                sink.push_str(&t);
+                // Paths inside ``code`` are clickable too: the OSC 8
+                // wrap is invisible to the syntax color and the link
+                // region is still extracted by ansi_to_lines_linked.
+                sink.push_str(&super::links::linkify(&t, "", "", cwd));
                 sink.push_str(RESET);
                 let reopened: Vec<String> = self.spans.iter().map(Active::open_repr).collect();
                 self.sink().push_str(&reopened.concat());
@@ -983,19 +1006,19 @@ mod tests {
 
     #[test]
     fn empty_text_renders_empty() {
-        assert_eq!(render_markdown("", 80), "");
+        assert_eq!(render_markdown("", 80, ""), "");
     }
 
     #[test]
     fn heading_contains_title() {
-        let rendered = render_markdown("# Title", 80);
+        let rendered = render_markdown("# Title", 80, "");
         assert_eq!(strip(&rendered), "Title");
         assert!(!rendered.contains(&ansi_fg(COLOR_PRIMARY)));
     }
 
     #[test]
     fn bold_keeps_word() {
-        let rendered = render_markdown("this is **bold** text", 80);
+        let rendered = render_markdown("this is **bold** text", 80, "");
         let got = strip(&rendered);
         assert!(got.contains("bold"), "{}", got);
         assert!(!rendered.contains(&ansi_fg(COLOR_PRIMARY)));
@@ -1003,13 +1026,13 @@ mod tests {
 
     #[test]
     fn code_fence_keeps_code() {
-        let got = strip(&render_markdown("```go\nfmt.Println(\"hi\")\n```", 80));
+        let got = strip(&render_markdown("```go\nfmt.Println(\"hi\")\n```", 80, ""));
         assert!(got.contains("fmt.Println"), "{}", got);
     }
 
     #[test]
     fn fence_delegates_to_highlighter_colors() {
-        let got = render_markdown("```go\nfunc main() {}\n```", 80);
+        let got = render_markdown("```go\nfunc main() {}\n```", 80, "");
         assert!(strip(&got).contains("func main"), "{}", got);
         assert!(
             got.contains(&ansi_fg(crate::render::colors::COLOR_PRIMARY)),
@@ -1020,33 +1043,33 @@ mod tests {
 
     #[test]
     fn link_label_rendered() {
-        let got = strip(&render_markdown("[label](https://example.com)", 80));
+        let got = strip(&render_markdown("[label](https://example.com)", 80, ""));
         assert!(got.contains("label"), "{}", got);
     }
 
     #[test]
     fn links_carry_osc8_targets() {
-        let got = render_markdown("[label](https://example.com)", 80);
+        let got = render_markdown("[label](https://example.com)", 80, "");
         assert!(
             got.contains("\x1b]8;;https://example.com\x07"),
             "missing OSC 8 open: {got:?}"
         );
         assert!(got.contains(crate::render::links::osc8_close()));
 
-        let got = render_markdown("<https://example.com/a>", 80);
+        let got = render_markdown("<https://example.com/a>", 80, "");
         assert!(
             got.contains("\x1b]8;;https://example.com/a\x07"),
             "missing OSC 8 open for autolink: {got:?}"
         );
 
         // Plain text never gains hyperlink wrappers.
-        let got = render_markdown("no links here", 80);
+        let got = render_markdown("no links here", 80, "");
         assert!(!got.contains("\x1b]8;;"), "{got:?}");
     }
 
     #[test]
     fn paragraph_stays_visible() {
-        let got = strip(&render_markdown("plain words stay visible", 80));
+        let got = strip(&render_markdown("plain words stay visible", 80, ""));
         assert!(got.contains("plain words stay visible"), "{}", got);
     }
 
@@ -1058,7 +1081,7 @@ mod tests {
             "word ".repeat(40),
             "x".repeat(WIDTH * 3 + 7)
         );
-        let got = strip(&render_markdown(&src, WIDTH));
+        let got = strip(&render_markdown(&src, WIDTH, ""));
         for (i, line) in got.split('\n').enumerate() {
             let w = visible_width(line);
             assert!(
@@ -1074,14 +1097,18 @@ mod tests {
 
     #[test]
     fn fenced_code_preserves_blank_lines_when_wrapped() {
-        let got = strip(&render_markdown("```\nabcdefghijk\n\nsecond line\n```", 6));
+        let got = strip(&render_markdown(
+            "```\nabcdefghijk\n\nsecond line\n```",
+            6,
+            "",
+        ));
 
         assert_eq!(got, "abcdef\nghijk\n\nsecond\nline");
     }
 
     #[test]
     fn inline_code_has_warm_foreground_without_background() {
-        let got = render_markdown("run `make all` now", 80);
+        let got = render_markdown("run `make all` now", 80, "");
         assert!(got.contains(&ansi_fg(COLOR_SYNTAX_STRING)));
         assert!(!got.contains("\x1b[48;"), "{got:?}");
         assert!(got.contains("make all"));
@@ -1089,7 +1116,11 @@ mod tests {
 
     #[test]
     fn lists_use_bullets_and_hanging_indent() {
-        let got = strip(&render_markdown("- alpha\n- beta\ndelta\n- third\n", 80));
+        let got = strip(&render_markdown(
+            "- alpha\n- beta\ndelta\n- third\n",
+            80,
+            "",
+        ));
         assert!(got.contains("• alpha"), "{}", got);
         // Lazy continuation folds the unindented line into the item.
         assert!(got.contains("• beta delta"), "{}", got);
@@ -1101,6 +1132,7 @@ mod tests {
         let got = strip(&render_markdown(
             "- one two three four five six seven eight nine ten eleven twelve\n",
             20,
+            "",
         ));
         assert!(
             got.lines().any(|l| l.starts_with("  ")),
@@ -1111,14 +1143,14 @@ mod tests {
 
     #[test]
     fn ordered_lists_number_from_start() {
-        let got = strip(&render_markdown("3. three\n4. four\n", 80));
+        let got = strip(&render_markdown("3. three\n4. four\n", 80, ""));
         assert!(got.contains("3. three"), "{}", got);
         assert!(got.contains("4. four"), "{}", got);
     }
 
     #[test]
     fn blockquotes_render_as_normal_content() {
-        let got = strip(&render_markdown("> quoted line\n> more\n", 80));
+        let got = strip(&render_markdown("> quoted line\n> more\n", 80, ""));
         // Consecutive "> " lines form one paragraph.
         assert_eq!(got, "quoted line more");
         assert!(!got.contains('|'));
@@ -1126,7 +1158,7 @@ mod tests {
 
     #[test]
     fn fenced_code_inside_a_quote_keeps_syntax_colors() {
-        let got = render_markdown("> ```rust\n> fn main() {}\n> ```\n", 80);
+        let got = render_markdown("> ```rust\n> fn main() {}\n> ```\n", 80, "");
 
         assert!(strip(&got).contains("fn main"), "{got:?}");
         assert!(got.contains(&ansi_fg(COLOR_PRIMARY)), "{got:?}");
@@ -1135,27 +1167,27 @@ mod tests {
 
     #[test]
     fn horizontal_rule_dashes_muted() {
-        let got = render_markdown("---\n", 80);
+        let got = render_markdown("---\n", 80, "");
         assert!(got.contains(&ansi_fg(COLOR_MUTED)), "{:?}", got);
         assert!(got.contains("--------"));
     }
 
     #[test]
     fn images_show_alt_muted() {
-        let got = render_markdown("![alt text](https://x/y.png)", 80);
+        let got = render_markdown("![alt text](https://x/y.png)", 80, "");
         assert!(got.contains(&ansi_fg(COLOR_MUTED)), "{:?}", got);
         assert!(got.contains("alt text"));
     }
 
     #[test]
     fn hard_break_survives() {
-        let got = strip(&render_markdown("one  \ntwo", 80));
+        let got = strip(&render_markdown("one  \ntwo", 80, ""));
         assert!(got.contains("one\ntwo"), "{:?}", got);
     }
 
     #[test]
     fn fallback_foreground_on_plain_text() {
-        let got = render_markdown("just words here", 80);
+        let got = render_markdown("just words here", 80, "");
         assert!(got.contains(&ansi_fg(COLOR_FOREGROUND)), "{:?}", got);
     }
 
@@ -1164,7 +1196,7 @@ mod tests {
     #[test]
     fn table_renders_box_grid() {
         let md = "| Method | Size |\n|---|---|\n| GET | 212 |\n| POST | 1024 |\n";
-        let got = strip(&render_markdown(md, 80));
+        let got = strip(&render_markdown(md, 80, ""));
         assert!(got.contains('┌') && got.contains('┐'), "{got:?}");
         assert!(got.contains('├') && got.contains('┼'), "{got:?}");
         assert!(got.contains('└') && got.contains('┴'), "{got:?}");
@@ -1172,13 +1204,13 @@ mod tests {
             assert!(got.contains(cell), "missing {cell}: {got:?}");
         }
         // Borders are muted.
-        assert!(render_markdown(md, 80).contains(&ansi_fg(COLOR_MUTED)));
+        assert!(render_markdown(md, 80, "").contains(&ansi_fg(COLOR_MUTED)));
     }
 
     #[test]
     fn table_honors_alignment() {
         let md = "| left | center | right |\n|:-----|:------:|------:|\n| a | bb | ccc |\n";
-        let got = strip(&render_markdown(md, 80));
+        let got = strip(&render_markdown(md, 80, ""));
         let line = got.lines().find(|l| l.contains("ccc")).expect("row line");
         let cells: Vec<&str> = line.split('│').filter(|c| !c.trim().is_empty()).collect();
         assert_eq!(cells.len(), 3, "{line:?}");
@@ -1200,7 +1232,7 @@ mod tests {
     #[test]
     fn table_escaped_pipe_stays_in_cell() {
         let md = "| expr | ok |\n|---|---|\n| `a\\|b` | yes |\n";
-        let got = strip(&render_markdown(md, 80));
+        let got = strip(&render_markdown(md, 80, ""));
         assert!(got.contains("a|b"), "escaped pipe lost: {got:?}");
         let widths: Vec<usize> = got
             .lines()
@@ -1214,7 +1246,7 @@ mod tests {
     #[test]
     fn table_wraps_narrow_cells_instead_of_overflowing() {
         let md = "| col |\n|---|\n| one two three four five six |\n";
-        let got = strip(&render_markdown(md, 20));
+        let got = strip(&render_markdown(md, 20, ""));
         for line in got.lines() {
             assert!(visible_width(line) <= 20, "too wide: {line:?}");
         }
@@ -1225,7 +1257,7 @@ mod tests {
     #[test]
     fn table_inline_styling_survives() {
         let md = "| name | note |\n|---|---|\n| **big** | `code` |\n";
-        let got = render_markdown(md, 80);
+        let got = render_markdown(md, 80, "");
         assert!(got.contains(&ansi_fg(COLOR_SYNTAX_STRING)), "{got:?}");
         assert!(got.contains(&BOLD), "{got:?}");
     }
@@ -1233,7 +1265,7 @@ mod tests {
     #[test]
     fn table_inside_list_indents() {
         let md = "- item\n\n  | a |\n  |---|\n  | b |\n";
-        let got = strip(&render_markdown(md, 40));
+        let got = strip(&render_markdown(md, 40, ""));
         let row = got.lines().find(|l| l.contains('┌')).unwrap();
         assert!(
             row.starts_with("  "),
@@ -1244,12 +1276,12 @@ mod tests {
 
     #[test]
     fn loose_list_gets_blank_lines_between_items() {
-        let got = strip(&render_markdown("- one\n\n- two\n", 80));
+        let got = strip(&render_markdown("- one\n\n- two\n", 80, ""));
         assert!(
             got.contains("• one\n\n• two"),
             "loose list should separate items: {got:?}"
         );
-        let tight = strip(&render_markdown("- one\n- two\n", 80));
+        let tight = strip(&render_markdown("- one\n- two\n", 80, ""));
         assert!(tight.contains("• one\n• two"), "{tight:?}");
     }
 }

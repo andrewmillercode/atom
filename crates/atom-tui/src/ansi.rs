@@ -669,6 +669,7 @@ mod tests {
             24,
             "",
             "",
+            "",
         );
         let linked = ansi_to_lines_linked(&body);
         let hits: Vec<String> = linked

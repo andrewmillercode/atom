@@ -33,6 +33,33 @@ pub struct MCPServerConfig {
     pub typ: String,
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
+    /// Statically registered OAuth client id; skips dynamic client
+    /// registration when the remote server requires OAuth.
+    #[serde(default)]
+    pub client_id: String,
+    /// "oauth" opts this server into the interactive browser sign-in on
+    /// 401. Stored tokens are always used when present; without this the
+    /// server must be authorized by other means (headers/env).
+    #[serde(default)]
+    pub auth: String,
+    /// defer: true always defers this server's tools behind find_tool;
+    /// false never defers; unset defers automatically when the server
+    /// exposes more than AUTO_DEFER_TOOLS. Deferred tools are invisible
+    /// until the model discovers them via find_tool.
+    #[serde(default)]
+    pub defer: Option<bool>,
+}
+
+/// Servers above this tool count defer their tools to find_tool by
+/// default; the per-server `defer` config overrides the heuristic.
+pub const AUTO_DEFER_TOOLS: usize = 20;
+
+fn server_deferred(cfg: &MCPServerConfig, tool_count: usize) -> bool {
+    match cfg.defer {
+        Some(true) => true,
+        Some(false) => false,
+        None => tool_count > AUTO_DEFER_TOOLS,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -304,6 +331,10 @@ impl Transport {
         )
         .await
         .map(|_| ())
+    }
+
+    fn is_http(&self) -> bool {
+        matches!(self, Transport::Http(_))
     }
 
     async fn list_tools(&mut self) -> Result<Vec<McpTool>, String> {
@@ -593,6 +624,13 @@ impl HttpSession {
             .await?;
         Ok(parse_call_result(&res))
     }
+
+    /// Attaches an OAuth bearer used on subsequent requests (after a 401
+    /// retry the header is stored here rather than baked into the client).
+    fn set_bearer(&mut self, token: &str) {
+        self.extra_headers
+            .insert("Authorization".to_string(), format!("Bearer {token}"));
+    }
 }
 
 /// Pulls the JSON payload whose id matches from an SSE body.
@@ -617,7 +655,7 @@ fn extract_sse_data(text: &str, id: u64) -> Result<String, String> {
 }
 
 async fn connect_transport(
-    _name: &str,
+    name: &str,
     cwd: &str,
     cfg: &MCPServerConfig,
 ) -> Result<Transport, String> {
@@ -649,6 +687,21 @@ async fn connect_transport(
                 let value =
                     reqwest::header::HeaderValue::from_str(&v).map_err(|e| e.to_string())?;
                 header_map.insert(name, value);
+            }
+            // Attach a cached OAuth bearer up front when one is stored;
+            // the 401 retry below handles the interactive sign-in.
+            if !header_map.contains_key(reqwest::header::AUTHORIZATION) {
+                match crate::mcp_oauth::bearer_token(name, &cfg.url, &cfg.client_id, false).await {
+                    Ok(Some(token)) => {
+                        if let Ok(v) =
+                            reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                        {
+                            header_map.insert(reqwest::header::AUTHORIZATION, v);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(_) => {}
+                }
             }
             let client = reqwest::Client::builder()
                 .timeout(MCP_CALL_TIMEOUT)
@@ -702,26 +755,55 @@ async fn connect_and_list(
     cwd: &str,
     cfg: &MCPServerConfig,
 ) -> Result<(Arc<tokio::sync::Mutex<Transport>>, Vec<McpTool>), String> {
-    let transport = Arc::new(tokio::sync::Mutex::new(
+    let mut transport =
         match tokio::time::timeout(MCP_CONNECT_TIMEOUT, connect_transport(name, cwd, cfg)).await {
             Ok(r) => r?,
             Err(_) => return Err("connect timed out".to_string()),
-        },
-    ));
-    let mut guard = transport.lock().await;
-    if let Err(_e) = tokio::time::timeout(MCP_CONNECT_TIMEOUT, guard.initialize()).await {
-        return Err("initialize failed: timed out".to_string());
+        };
+    let tools = match initialize_and_list(&mut transport).await {
+        Ok(t) => t,
+        Err(e) if e.contains("HTTP 401") && transport.is_http() => {
+            if cfg
+                .headers
+                .keys()
+                .any(|k| k.eq_ignore_ascii_case("authorization"))
+                || !cfg.auth.eq_ignore_ascii_case("oauth")
+                || cfg!(test)
+            {
+                return Err(e);
+            }
+            // Server demands authorization: run the OAuth flow (cached
+            // token was already tried at connect). Opens a browser for
+            // first-time sign-in; tokens persist and refresh afterwards.
+            eprintln!("mcp: server \"{name}\" requires authorization, starting OAuth sign-in…");
+            let token = crate::mcp_oauth::bearer_token(name, &cfg.url, &cfg.client_id, true)
+                .await
+                .map_err(|e| format!("oauth: {e}"))?
+                .ok_or_else(|| "server requires authorization".to_string())?;
+            if let Transport::Http(s) = &mut transport {
+                s.set_bearer(&token);
+            }
+            initialize_and_list(&mut transport).await?
+        }
+        Err(e) => return Err(e),
+    };
+    Ok((Arc::new(tokio::sync::Mutex::new(transport)), tools))
+}
+
+async fn initialize_and_list(transport: &mut Transport) -> Result<Vec<McpTool>, String> {
+    match tokio::time::timeout(MCP_CONNECT_TIMEOUT, transport.initialize()).await {
+        Err(_) => return Err("initialize failed: timed out".to_string()),
+        Ok(Err(e)) => return Err(e),
+        Ok(Ok(())) => {}
     }
-    if let Transport::Stdio(s) = &mut *guard {
+    if let Transport::Stdio(s) = transport {
         let _ = s.notify_initialized().await;
     }
-    let tools = match tokio::time::timeout(MCP_CONNECT_TIMEOUT, guard.list_tools()).await {
-        Ok(Ok(t)) => t,
-        Ok(Err(e)) => return Err(format!("list tools: {e}")),
-        Err(_) => return Err("list tools timed out".to_string()),
-    };
-    drop(guard);
-    Ok((transport, tools))
+    match tokio::time::timeout(MCP_CONNECT_TIMEOUT, transport.list_tools()).await {
+        Ok(Ok(t)) => Ok(t),
+        Ok(Err(e)) => Err(format!("list tools: {e}")),
+        Err(_) => Err("list tools timed out".to_string()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -734,11 +816,18 @@ struct McpConn {
     session: Option<Arc<tokio::sync::Mutex<Transport>>>,
     tools: Vec<ToolDef>,
     mapping: HashMap<String, McpToolRef>,
+    /// All of this server's tools are hidden from the model until found
+    /// via find_tool (expanded for the session).
+    deferred: bool,
 }
 
 pub struct McpHub {
     #[allow(clippy::type_complexity)]
     conns: Mutex<HashMap<String, McpConn>>,
+    /// Deferred tool names (sanitized) discovered via find_tool or called
+    /// directly, per cwd: they stay in the model's tool list for the rest
+    /// of the session, mirroring Anthropic's inline tool_reference model.
+    expanded: Mutex<HashMap<String, std::collections::HashSet<String>>>,
 }
 
 static DEFAULT_HUB: Lazy<McpHub> = Lazy::new(McpHub::default);
@@ -751,6 +840,7 @@ impl Default for McpHub {
     fn default() -> Self {
         McpHub {
             conns: Mutex::new(HashMap::new()),
+            expanded: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -805,6 +895,7 @@ impl McpHub {
                         session: None,
                         tools: Vec::new(),
                         mapping: HashMap::new(),
+                        deferred: false,
                     });
                 }
                 false
@@ -812,6 +903,7 @@ impl McpHub {
             Ok((session, tools)) => {
                 let mut used = self.used_names_locked(cwd);
                 let (td, mapping) = convert_mcp_tools(name, &tools, &mut used);
+                let deferred = server_deferred(cfg, td.len());
                 if let Ok(mut conns) = self.conns.lock() {
                     let key = cache_key(name, cwd);
                     if let Some(existing) = conns.get(&key) {
@@ -827,6 +919,7 @@ impl McpHub {
                             session: Some(session),
                             tools: td,
                             mapping,
+                            deferred,
                         },
                     );
                 }
@@ -835,16 +928,28 @@ impl McpHub {
         }
     }
 
+    /// Tools the model sees this session: everything from non-deferred
+    /// servers, plus deferred tools previously expanded via find_tool or
+    /// direct call. Connection setup happens here too, so callers that
+    /// only need exposure still warm the hub.
     pub async fn tools_for(&self, cwd: &str) -> Vec<ToolDef> {
         let cfgs = load_mcp_configs(cwd);
         let mut seen = std::collections::BTreeSet::new();
         let mut out = Vec::new();
+        let expanded: std::collections::HashSet<String> = match self.expanded.lock() {
+            Ok(ex) => ex.get(cwd).cloned().unwrap_or_default(),
+            Err(_) => Default::default(),
+        };
         for (name, cfg) in &cfgs {
             if self.ensure(name, cwd, cfg).await {
                 seen.insert(name.clone());
                 if let Ok(conns) = self.conns.lock() {
                     if let Some(c) = conns.get(&cache_key(name, cwd)) {
-                        out.extend(c.tools.iter().cloned());
+                        for t in &c.tools {
+                            if !c.deferred || expanded.contains(&t.function.name) {
+                                out.push(t.clone());
+                            }
+                        }
                     }
                 }
             }
@@ -857,11 +962,72 @@ impl McpHub {
                     && c.cwd == cwd
                     && !seen.contains(&c.name)
                 {
-                    out.extend(c.tools.iter().cloned());
+                    for t in &c.tools {
+                        if !c.deferred || expanded.contains(&t.function.name) {
+                            out.push(t.clone());
+                        }
+                    }
                 }
             }
         }
         out
+    }
+
+    /// True when any server for this cwd defers tools, so the model
+    /// should be given the find_tool entry point.
+    pub async fn has_deferred(&self, cwd: &str) -> bool {
+        let cfgs = load_mcp_configs(cwd);
+        for (name, cfg) in &cfgs {
+            if self.ensure(name, cwd, cfg).await {
+                if let Ok(conns) = self.conns.lock() {
+                    if let Some(c) = conns.get(&cache_key(name, cwd)) {
+                        if c.deferred {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Search deferred tools for this cwd; matches are expanded for the
+    /// rest of the session. Returns matched defs plus the total number
+    /// of deferred tools available (for no-match hints), 0 when none.
+    pub async fn find_deferred(&self, cwd: &str, query: &str) -> (Vec<ToolDef>, usize) {
+        self.tools_for(cwd).await; // warm connections for all servers
+        let mut scored: Vec<(i64, String, ToolDef)> = Vec::new();
+        let mut total = 0usize;
+        if let Ok(conns) = self.conns.lock() {
+            for c in conns.values() {
+                if c.cwd != cwd || !c.deferred {
+                    continue;
+                }
+                total += c.tools.len();
+                for t in &c.tools {
+                    let s = score_tool(query, t);
+                    if s > 0 {
+                        scored.push((s, t.function.name.clone(), t.clone()));
+                    }
+                }
+            }
+        }
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+        scored.truncate(FIND_RESULT_LIMIT);
+        if let Ok(mut ex) = self.expanded.lock() {
+            let entry = ex.entry(cwd.to_string()).or_default();
+            for (_, _, t) in &scored {
+                entry.insert(t.function.name.clone());
+            }
+        }
+        (scored.into_iter().map(|(_, _, t)| t).collect(), total)
+    }
+
+    /// mark_expanded pins a deferred tool as exposed after a direct call.
+    pub fn mark_expanded(&self, cwd: &str, name: &str) {
+        if let Ok(mut ex) = self.expanded.lock() {
+            ex.entry(cwd.to_string()).or_default().insert(name.into());
+        }
     }
 
     pub(crate) fn lookup(
@@ -898,6 +1064,94 @@ pub async fn mcp_tools_for(cwd: &Path) -> Vec<ToolDef> {
     mcp_default_hub()
         .tools_for(&cwd.display().to_string())
         .await
+}
+
+/// True when any server for this cwd defers tools behind find_tool.
+pub async fn has_deferred_tools(cwd: &Path) -> bool {
+    mcp_default_hub()
+        .has_deferred(&cwd.display().to_string())
+        .await
+}
+
+/// Max tools a single find_tool call loads into the session.
+const FIND_RESULT_LIMIT: usize = 5;
+
+/// tokenizeQuery lowercases and splits on non-alphanumeric characters,
+/// dropping short tokens that add more noise than signal.
+fn query_tokens(query: &str) -> Vec<String> {
+    query
+        .to_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| t.len() >= 3)
+        .map(|t| t.to_string())
+        .collect()
+}
+
+/// scoreTool ranks one deferred tool against the query. Name matches
+/// count most (mcp_meta-ads_get_campaigns carries its own keywords),
+/// description matches second, parameter names last. Zero means no
+/// signal; caller drops those.
+fn score_tool(query: &str, tool: &ToolDef) -> i64 {
+    let name_lower = tool.function.name.to_lowercase();
+    let name_words: Vec<String> = name_lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .map(str::to_string)
+        .collect();
+    let desc_lower = tool.function.description.to_lowercase();
+    let params_lower = tool.function.parameters.to_string().to_lowercase();
+    let mut score = 0i64;
+    for tok in query_tokens(query) {
+        if name_words.contains(&tok) {
+            score += 3;
+        }
+        if desc_lower.contains(&tok) {
+            score += 1;
+        }
+        if params_lower.contains(&tok) {
+            score += 1;
+        }
+    }
+    score
+}
+
+/// find_tool executes the deferred-tool search for the model: renders
+/// matches as full tool definitions and pins them for the session.
+pub async fn execute_find_tool(args_json: &str, cwd: &Path) -> String {
+    #[derive(serde::Deserialize)]
+    struct Args {
+        #[serde(default)]
+        query: String,
+    }
+    let args: Args = match serde_json::from_str(args_json) {
+        Ok(a) => a,
+        Err(e) => return format!("error parsing arguments: {e}"),
+    };
+    let cwd_str = cwd.display().to_string();
+    let (matches, total) = mcp_default_hub().find_deferred(&cwd_str, &args.query).await;
+    if total == 0 {
+        return "no deferred tools: all MCP servers expose their tools directly".into();
+    }
+    if matches.is_empty() {
+        return format!(
+            "no tools matched \"{}\". {total} deferred tools exist; retry with \
+             different keywords (server name or capability, e.g. \"campaigns\", \
+             \"github pull request\", \"linear issue\").",
+            args.query
+        );
+    }
+    let defs: Vec<serde_json::Value> = matches
+        .iter()
+        .map(|t| serde_json::to_value(t).unwrap_or(serde_json::Value::Null))
+        .collect();
+    let out = serde_json::json!({
+        "matches": defs,
+        "note": format!(
+            "{} of {total} deferred tools matched. They are now loaded for this \
+             session — call the chosen tool directly next.",
+            defs.len()
+        ),
+    });
+    out.to_string()
 }
 
 /// Used by execute_tool's default arm: does a bare (non-mcp_-prefixed)
@@ -949,6 +1203,9 @@ pub async fn execute_mcp_tool(name: &str, arguments: &str, cwd: &Path) -> String
     let Some((session, ref_)) = mcp_default_hub().lookup(name, &cwd_str) else {
         return format!("error: unknown MCP tool \"{name}\"");
     };
+    // Directly calling a deferred tool expands it for this session so it
+    // stays in the model's tool list on later rounds.
+    mcp_default_hub().mark_expanded(&cwd_str, name);
     let args: serde_json::Value = if arguments.trim().is_empty() {
         serde_json::json!({})
     } else {
@@ -1281,6 +1538,117 @@ done
 
         let unknown = execute_mcp_tool("mcp_nope_nope", "{}", Path::new(&cwd)).await;
         assert!(unknown.starts_with("error:"), "{unknown}");
+
+        hub.close_all();
+    }
+
+    #[test]
+    fn defer_heuristic_and_overrides() {
+        let cfg = MCPServerConfig::default();
+        assert!(!server_deferred(&cfg, 5));
+        assert!(server_deferred(&cfg, AUTO_DEFER_TOOLS + 1));
+        // Explicit config beats the count heuristic.
+        let on = MCPServerConfig {
+            defer: Some(true),
+            ..Default::default()
+        };
+        assert!(server_deferred(&on, 1));
+        let off = MCPServerConfig {
+            defer: Some(false),
+            ..Default::default()
+        };
+        assert!(!server_deferred(&off, AUTO_DEFER_TOOLS + 50));
+    }
+
+    #[tokio::test]
+    async fn deferred_server_hides_tools_until_find_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tools = Vec::new();
+        for i in 1..=21 {
+            tools.push(serde_json::json!({
+                "name": format!("alpha{i}"),
+                "description": format!("capability number {i}"),
+            }));
+        }
+        let init_line = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"big","version":"1"}}}"#;
+        let list_line = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {"tools": tools},
+        })
+        .to_string();
+        let script = dir.path().join("big-mcp.sh");
+        std::fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *initialize*)
+      printf '%s\n' '{init_line}'
+      ;;
+    *tools/list*)
+      printf '%s\n' '{list_line}'
+      ;;
+  esac
+done
+"#
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let hub = mcp_default_hub();
+        let cwd = dir.path().display().to_string();
+        // Register through a project config so has_deferred/find_deferred
+        // (which scan load_mcp_configs) see the server like production.
+        let cfg_dir = dir.path().join(".atom");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(
+            cfg_dir.join("mcp.json"),
+            serde_json::json!({
+                "mcpServers": {
+                    "bigserver": {"command": script.display().to_string()}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        // 21 tools with no defer override: auto-defers above AUTO_DEFER_TOOLS.
+        let visible = hub.tools_for(&cwd).await;
+        assert!(
+            visible
+                .iter()
+                .all(|t| !t.function.name.starts_with("mcp_bigserver_")),
+            "visible = {:?}",
+            visible.iter().map(|t| &t.function.name).collect::<Vec<_>>()
+        );
+        assert!(hub.has_deferred(&cwd).await);
+
+        // find_tool surfaces the match and pins it for the session.
+        let (matches, total) = hub.find_deferred(&cwd, "alpha7").await;
+        assert_eq!(total, 21);
+        assert_eq!(
+            matches
+                .iter()
+                .map(|t| t.function.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mcp_bigserver_alpha7"]
+        );
+        let after = hub.tools_for(&cwd).await;
+        assert!(after
+            .iter()
+            .any(|t| t.function.name == "mcp_bigserver_alpha7"));
+        // The other 20 stay hidden.
+        assert!(after
+            .iter()
+            .all(|t| t.function.name == "mcp_bigserver_alpha7"
+                || !t.function.name.starts_with("mcp_bigserver_")));
 
         hub.close_all();
     }

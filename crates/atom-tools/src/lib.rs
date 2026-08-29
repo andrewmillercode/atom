@@ -11,6 +11,7 @@ pub mod dispatch;
 pub mod exec;
 pub mod file_edit;
 pub mod mcp;
+pub mod mcp_oauth;
 pub mod read_file;
 pub mod search;
 pub mod skills;
@@ -21,7 +22,7 @@ pub mod web_search;
 pub use dispatch::{is_dispatch_session_id, parse_dispatch_session_id, DispatchPlan};
 pub use exec::{execute_tool, SubagentHandle, ToolCtx, ToolOutcome};
 pub use file_edit::FileSeen;
-pub use mcp::close_all_mcp;
+pub use mcp::{close_all_mcp, has_deferred_tools};
 
 use atom_core::types::ToolDef;
 use std::path::Path;

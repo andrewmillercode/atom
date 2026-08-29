@@ -622,10 +622,7 @@ impl AppState {
 
     /// Takes (checks and clears) the user-stop mark for a session.
     pub fn take_user_stop(&self, session_id: &str) -> bool {
-        self.user_stops
-            .lock()
-            .unwrap()
-            .remove(session_id)
+        self.user_stops.lock().unwrap().remove(session_id)
     }
 }
 

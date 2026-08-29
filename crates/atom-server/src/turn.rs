@@ -691,6 +691,11 @@ pub async fn run_session_turn(
 
     let cwd = PathBuf::from(sess.cwd.clone());
     let mut tools = atom_tools::tool_definitions_with_mcp(&cwd).await;
+    // Deferred MCP catalogs surface a single search entry point instead
+    // of flooding the context with every server tool.
+    if atom_tools::has_deferred_tools(&cwd).await {
+        tools.push(atom_tools::defs::find_tool_def());
+    }
     if !parent_id.is_empty() {
         tools = without_tool(&tools, "dispatch");
     }

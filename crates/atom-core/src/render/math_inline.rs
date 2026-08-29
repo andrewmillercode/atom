@@ -5,8 +5,8 @@
 //! rasterizes the latter into row-block images. It has no inline-math
 //! segment at all, and its row×column image model could not sit inside
 //! a wrapped text line anyway. So inline `$…$` reaches the plain
-//! markdown path as raw LaTeX. This module closes that gap for
-//! `render::markdown::render_inlines`: it detects paired inline
+//! markdown path as raw LaTeX (as pulldown-cmark `InlineMath` events
+//! in render::markdown). This module closes that gap: paired
 //! delimiters and converts the LaTeX to terminal-safe Unicode (Greek
 //! letters, super/subscripts, operators), styled with italics.
 //!

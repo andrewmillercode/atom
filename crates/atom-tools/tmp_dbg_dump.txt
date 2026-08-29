@@ -1,0 +1,11 @@
+#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *initialize*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"big","version":"1"}}}'
+      ;;
+    *tools/list*)
+      printf '%s\n' '[{"description":"capability number 1","name":"alpha1"},{"description":"capability number 2","name":"alpha2"},{"description":"capability number 3","name":"alpha3"},{"description":"capability number 4","name":"alpha4"},{"description":"capability number 5","name":"alpha5"},{"description":"capability number 6","name":"alpha6"},{"description":"capability number 7","name":"alpha7"},{"description":"capability number 8","name":"alpha8"},{"description":"capability number 9","name":"alpha9"},{"description":"capability number 10","name":"alpha10"},{"description":"capability number 11","name":"alpha11"},{"description":"capability number 12","name":"alpha12"},{"description":"capability number 13","name":"alpha13"},{"description":"capability number 14","name":"alpha14"},{"description":"capability number 15","name":"alpha15"},{"description":"capability number 16","name":"alpha16"},{"description":"capability number 17","name":"alpha17"},{"description":"capability number 18","name":"alpha18"},{"description":"capability number 19","name":"alpha19"},{"description":"capability number 20","name":"alpha20"},{"description":"capability number 21","name":"alpha21"}]'
+      ;;
+  esac
+done

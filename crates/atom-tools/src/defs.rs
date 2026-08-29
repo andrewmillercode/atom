@@ -110,6 +110,17 @@ pub fn skill_def() -> ToolDef {
     )
 }
 
+/// findToolDef is the entry point for deferred MCP tool catalogs.
+/// Included only when at least one configured server defers its tools;
+/// large MCP servers (100+ tools) would otherwise flood the context.
+pub fn find_tool_def() -> ToolDef {
+    def(
+        "find_tool",
+        "Search hidden MCP tool catalogs. Large MCP servers hide their tool definitions behind this: their tools are not in your tool list until found. Use only when no already-visible tool fits. Query with a server or capability keyword (\"campaigns\", \"github pull request\"). Full schemas of matching tools are returned and stay loaded for the session — then call the chosen tool directly. Matched tool names are prefixed mcp_<server>_.",
+        r#"{"type":"object","properties":{"query":{"type":"string","description":"Server or capability keywords, e.g. 'campaigns', 'github pull request'"}},"required":["query"]}"#,
+    )
+}
+
 /// withoutTool returns a copy of tools with the named function removed.
 pub fn without_tool(tools: &[ToolDef], name: &str) -> Vec<ToolDef> {
     tools

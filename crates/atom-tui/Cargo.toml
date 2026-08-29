@@ -24,7 +24,6 @@ libc = { workspace = true }
 regex = { workspace = true }
 notify = { workspace = true }
 resvg = { workspace = true }
-portable-pty = "0.9"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

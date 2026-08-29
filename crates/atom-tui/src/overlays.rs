@@ -213,11 +213,14 @@ pub fn discover_commands(cwd: &str) -> Vec<DynamicCommand> {
         cfgs.iter()
             .filter(|(name, _)| name.as_str() != selected.server)
             .map(|(name, cfg)| {
-                let meta = if !cfg.command.trim().is_empty() {
-                    cfg.command.trim().to_string()
-                } else {
-                    cfg.url.trim().to_string()
-                };
+                let meta =
+                    atom_tools::mcp_oauth::mcp_auth_display(cfg, name).unwrap_or_else(|| {
+                        if !cfg.command.trim().is_empty() {
+                            cfg.command.trim().to_string()
+                        } else {
+                            cfg.url.trim().to_string()
+                        }
+                    });
                 command_from(format!("/{name}"), meta, "mcp")
             }),
     );

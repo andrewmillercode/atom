@@ -1430,14 +1430,6 @@ fn render_tool_block_linked(b: &mut Block, width: usize, spinner_frame: &str) ->
             if !summary.is_empty() && !file_change_byte_summary(&name, &summary) {
                 let rendered = if name == "read_file" {
                     atom_core::render::highlight::highlight_code(&summary, &b.text, inner)
-                } else if name == "shell" {
-                    // Shell mode output is raw PTY bytes — child programs
-                    // emit their own SGR sequences, and `wrap_linked`
-                    // would re-wrap AND re-color the text, stripping
-                    // everything but fg/bg and mangling escape mid-byte.
-                    // `ansi_wrap` wraps to the inner width while
-                    // preserving the child's SGR verbatim.
-                    atom_core::render::links::ansi_wrap(&summary, inner)
                 } else {
                     atom_core::render::links::wrap_linked(
                         &summary,
@@ -2930,45 +2922,5 @@ mod render_tests {
             .flat_map(|b| b.images.iter().map(|i| i.num))
             .collect();
         assert_eq!(nums, vec![1, 7, 3]);
-    }
-
-    #[test]
-    fn shell_block_preserves_child_sgr_through_ansi_wrap() {
-        // PTY-fed child output arrives as raw SGR strings (e.g. ls
-        // --color, cargo's ANSI). The shell tool block must NOT re-color
-        // the text — the child's SGR sequences round-trip through the
-        // wrap step and arrive at the parser unchanged.
-        let mut block = Block {
-            kind: BlockKind::Tool,
-            title: "! ls".into(),
-            tool_name: "shell".into(),
-            tool_done: true,
-            expanded: true,
-            result: "\x1b[1;31mCargo.toml\x1b[0m\n".into(),
-            ..Default::default()
-        };
-        let width = 60;
-        let lines = render_block(&mut block, width, true, "*");
-        // Body rows are the title + body lines; find a row that holds
-        // the file name and assert its span carries the child's red fg.
-        let red_span = lines
-            .iter()
-            .flat_map(|line| line.spans.iter())
-            .find(|s| s.content.contains("Cargo.toml"))
-            .expect("rendered block lost the file name");
-        assert_eq!(
-            red_span.style.fg,
-            Some(ratatui::style::Color::Rgb(0xcd, 0x00, 0x00)),
-            "shell block dropped the child's red SGR: {:?}",
-            red_span.style
-        );
-        assert!(
-            red_span
-                .style
-                .add_modifier
-                .contains(ratatui::style::Modifier::BOLD),
-            "shell block dropped the child's bold: {:?}",
-            red_span.style
-        );
     }
 }

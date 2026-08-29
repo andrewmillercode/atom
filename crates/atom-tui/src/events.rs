@@ -204,14 +204,10 @@ pub enum Effect {
         uri: String,
     },
     /// Shell mode: run a user-typed command from the session cwd. The
-    /// result comes back as AppMsg::ShellDone. `cols`/`rows` size the
-    /// PTY so child programs format output for the same viewport the
-    /// user is reading.
+    /// result comes back as AppMsg::ShellDone.
     RunShell {
         cmd: String,
         cwd: String,
-        cols: u16,
-        rows: u16,
     },
     /// Shell mode `cd`: persist the new working directory on the session
     /// so the agent's tools follow the shell.

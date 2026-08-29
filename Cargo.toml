@@ -57,7 +57,6 @@ toml = "0.9"
 rusqlite = "0.32"
 ratatex = { version = "=0.1.0", default-features = false }
 pulldown-cmark = { version = "0.13", default-features = false }
-portable-pty = "0.9"
 
 [profile.release]
 codegen-units = 1

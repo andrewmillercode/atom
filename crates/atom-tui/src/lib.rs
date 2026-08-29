@@ -926,15 +926,10 @@ async fn run_effects(
             Effect::OpenLink { uri } => {
                 atom_core::util::open_url(&uri);
             }
-            Effect::RunShell {
-                cmd,
-                cwd,
-                cols,
-                rows,
-            } => {
+            Effect::RunShell { cmd, cwd } => {
                 let tx = tx.clone();
                 tokio::spawn(async move {
-                    let (output, code, new_cwd) = run_user_shell(&cmd, &cwd, cols, rows, &tx).await;
+                    let (output, code, new_cwd) = run_user_shell(&cmd, &cwd, &tx).await;
                     let _ = tx.send(AppMsg::ShellDone {
                         cmd,
                         cwd,
@@ -1161,187 +1156,76 @@ fn user_shell() -> String {
 /// final $PWD, which shell mode uses to follow `cd`.
 const SHELL_PWD_MARKER: &str = "__ATOM_PWD__";
 
-/// Runs `cmd` from `cwd` in the user's shell, inside a PTY so color and
-/// other terminal-aware behavior work as they do in the user's real
-/// terminal. Returns (output, exit code, new $PWD). The code is None
-/// when killed via the armed kill switch (Ctrl+C in shell mode).
-///
-/// Claude Code–style heuristic: a small blocking reader thread pulls
-/// bytes off the PTY master as fast as the kernel hands them out and
-/// pushes them into an mpsc; we treat "process exited OR 75 ms of
-/// silence after the child already wrote something and then exited" as
-/// "done". For an interactive prompt (`npm install` y/N) that hangs
-/// forever, the silence timer never fires and the kill switch (Ctrl+C)
-/// is the way out — same as Claude Code.
+/// Runs `cmd` from `cwd` in the user's shell. Returns (output, exit code,
+/// new $PWD). The code is None when the command was killed via the armed
+/// kill switch (Ctrl+C in shell mode).
 async fn run_user_shell(
     cmd: &str,
     cwd: &str,
-    cols: u16,
-    rows: u16,
     tx: &tokio::sync::mpsc::UnboundedSender<AppMsg>,
 ) -> (String, Option<i32>, String) {
-    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-
-    let shell = user_shell();
-    let mut builder = CommandBuilder::new(&shell);
-    // OMZ and bash-interactive setups only load their rc files when
-    // the shell is interactive (the `[[ -o interactive ]]` gate at
-    // the top of `~/.zshrc`, and bash's `[ -z "$PS1" ]` guard at the
-    // top of `~/.bashrc`). For `zsh -c` / `bash -c` both bail out,
-    // which means OMZ plugins (`git`, `colorize`, `zsh-autosuggestions`)
-    // never register their aliases and color helpers — `gst` is
-    // "command not found" and `git status` renders with vanilla
-    // git's defaults instead of OMZ's themed prompt helpers.
-    //
-    // Sourcing the rc here would *not* help: those plugins gate on
-    // `interactive` themselves and would still refuse to load. The
-    // tradeoff is intentional — we run bare for predictable output.
-    // Tools that color on their own (`git`, `ls --color`, `cargo`,
-    // `rg`, `diff`) emit SGR over our PTY exactly as they would in
-    // iTerm, since `TERM=xterm-256color` is set below.
-    builder.arg("-c");
-    builder.arg(format!(
-        "eval \"$ATOM_SHELL_CMD\"; __atom_ec=$?; printf '\\n{SHELL_PWD_MARKER}%s' \"$PWD\" >&2; exit $__atom_ec"
-    ));
-    builder.env("ATOM_SHELL_CMD", cmd);
-    // Children believe they're on a real terminal, so they emit color
-    // and respect width-aware formatters.
-    builder.env("TERM", "xterm-256color");
-    builder.env("COLORTERM", "truecolor");
-    builder.env("COLUMNS", cols.to_string());
-    builder.env("LINES", rows.to_string());
-    // OMZ's auto-update kicks off a background `git pull` of itself on
-    // startup if it sees a stale install marker, which would race the
-    // user's command and pollute captured output. Setting the env var
-    // OMZ checks skips that path.
-    builder.env("DISABLE_AUTO_UPDATE", "true");
-    if let Some(home) = std::env::var_os("HOME") {
-        builder.env("HOME", home);
-    }
-    if let Some(user) = std::env::var_os("USER") {
-        builder.env("USER", user);
-    }
-    builder.cwd(cwd);
-
-    let pty_system = native_pty_system();
-    let pair = match pty_system.openpty(PtySize {
-        rows,
-        cols,
-        pixel_width: 0,
-        pixel_height: 0,
-    }) {
-        Ok(p) => p,
+    let mut command = tokio::process::Command::new(user_shell());
+    // eval keeps the user's quoting intact while letting the wrapper print
+    // its marker afterwards, even when the command `cd`s mid-way.
+    command
+        .arg("-c")
+        .arg(format!(
+            "eval \"$ATOM_SHELL_CMD\"; __atom_ec=$?; printf '\\n{SHELL_PWD_MARKER}%s' \"$PWD\" >&2; exit $__atom_ec"
+        ))
+        .env("ATOM_SHELL_CMD", cmd)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = match command.spawn() {
+        Ok(child) => child,
         Err(e) => return (format!("error: {e}"), Some(127), String::new()),
     };
-    let mut child = match pair.slave.spawn_command(builder) {
-        Ok(c) => c,
-        Err(e) => return (format!("error: {e}"), Some(127), String::new()),
-    };
-    drop(pair.slave);
-
     let (kill_tx, mut kill_rx) = tokio::sync::oneshot::channel::<()>();
+    // The App stores kill_tx so Ctrl+C can abort the command while it runs.
     let _ = tx.send(AppMsg::ShellKillArmed(kill_tx));
 
-    // Reading the PTY master is synchronous; do it on a blocking
-    // thread so we don't park the runtime. Each chunk is forwarded
-    // over a small mpsc into the async task below.
-    let (byte_tx, mut byte_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-    let reader = match pair.master.try_clone_reader() {
-        Ok(r) => r,
-        Err(e) => return (format!("error: {e}"), Some(127), String::new()),
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let (mut out, mut err) = (String::new(), String::new());
+    let status = tokio::select! {
+        _ = async {
+            if let Some(s) = stdout.as_mut() {
+                let _ = tokio::io::AsyncReadExt::read_to_string(s, &mut out).await;
+            }
+            if let Some(s) = stderr.as_mut() {
+                let _ = tokio::io::AsyncReadExt::read_to_string(s, &mut err).await;
+            }
+        } => {
+            // Both pipes closed; reap the exit status.
+            child.wait().await.ok().and_then(|st| st.code())
+        }
+        _ = &mut kill_rx => {
+            let _ = child.start_kill();
+            // Reap so the child doesn't linger as a zombie.
+            let _ = child.wait().await;
+            None
+        }
     };
-    let reader_thread = std::thread::spawn(move || {
-        use std::io::Read;
-        let mut reader = reader;
-        let mut buf = [0u8; 4096];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if byte_tx.send(buf[..n].to_vec()).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
 
-    // Stream PTY bytes into the output string. We stop accumulating
-    // either when the child exits, or when 75 ms passes without new
-    // bytes AFTER the child has already exited (the trailing silence
-    // the kernel inserts while flushing the PTY). If the child is
-    // still running, the timer resets on every chunk — that's how we
-    // capture long-running programs without prematurely truncating.
-    const SILENT_FLUSH_MS: u64 = 75;
-    let mut output = String::new();
-    let mut exited = false;
-    let mut exit_code: Option<i32> = None;
-    let mut silence: Option<tokio::time::Instant> = None;
-    loop {
-        // Once we've armed the silence timer, stop polling the byte
-        // channel and the kill switch: a closed receiver would
-        // otherwise resolve with `None` every iteration and starve
-        // the timer, and an already-exited child can't be killed.
-        if silence.is_some() {
-            tokio::time::sleep_until(
-                silence.unwrap() + tokio::time::Duration::from_millis(SILENT_FLUSH_MS),
-            )
-            .await;
-            break;
-        }
-        tokio::select! {
-            biased;
-            _ = &mut kill_rx, if !exited => {
-                let _ = child.kill();
-                let _ = child.wait();
-                exited = true;
-                exit_code = None;
-                if silence.is_none() {
-                    silence = Some(tokio::time::Instant::now());
-                }
-            }
-            chunk = byte_rx.recv(), if !exited => {
-                match chunk {
-                    Some(bytes) => {
-                        output.push_str(&String::from_utf8_lossy(&bytes));
-                    }
-                    None => {
-                        // Reader thread closed: child has exited (or
-                        // its pipes were reaped).
-                        exited = true;
-                        match child.wait() {
-                            Ok(status) => {
-                                exit_code = Some(status.exit_code() as i32);
-                                if silence.is_none() {
-                                    silence = Some(tokio::time::Instant::now());
-                                }
-                            }
-                            Err(_) => return (output, None, String::new()),
-                        }
-                    }
-                }
-            }
-        }
-    }
-    let _ = reader_thread.join();
-
-    // Strip the trailing $PWD marker from the displayed output. The
-    // PTY folds stderr into the same stream, so the marker sits in
-    // `output` rather than a separate string.
-    let new_cwd = match output.rfind(SHELL_PWD_MARKER) {
+    // Strip the trailing $PWD marker from the displayed stderr.
+    let new_cwd = match err.rfind(SHELL_PWD_MARKER) {
         Some(i) => {
-            let pwd = output[i + SHELL_PWD_MARKER.len()..].trim().to_string();
-            // Marker line is "MARKER<pwd>"; also strip the newline
-            // that precedes the marker so we don't leave a blank line.
-            let cut = output[..i].trim_end_matches('\n').len();
-            output.truncate(cut);
+            let pwd = err[i + SHELL_PWD_MARKER.len()..].trim().to_string();
+            err.truncate(i);
             pwd
         }
         None => String::new(),
     };
 
-    (output, exit_code, new_cwd)
+    let mut output = out;
+    if !err.trim().is_empty() {
+        if !output.is_empty() && !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push_str(&err);
+    }
+    (output, status, new_cwd)
 }
 
 // ---------------------------------------------------------------------------
@@ -1390,89 +1274,5 @@ mod tests {
         let app = App::new_test(80, 24);
 
         assert!(initial_effects(&app, false).is_empty());
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn shell_mode_pty_captures_child_color() {
-        // Smoke test: a child that prints SGR over a PTY gets captured
-        // verbatim by run_user_shell, so the renderer's ANSI parser
-        // sees the child's fg color intact. This is the contract the
-        // shell-block render test exercises downstream.
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<AppMsg>();
-        let tmp = tempfile::tempdir().unwrap();
-        let cmd = r#"printf '\x1b[31mRED\x1b[0m\n'"#;
-        let (out, code, _cwd) =
-            run_user_shell(cmd, tmp.path().to_str().unwrap(), 80, 24, &tx).await;
-        // Sandboxed CI may deny openpty (seccomp/AppArmor); skip rather
-        // than fail in that case. The actual test asserts the contract
-        // that an `error:` prefix from run_user_shell would also satisfy.
-        if let Some(127) = code {
-            if out.starts_with("error:") {
-                eprintln!("PTY unavailable in this environment; skipping: {out}");
-                return;
-            }
-        }
-        assert_eq!(code, Some(0), "child exited non-zero: {out:?}");
-        assert!(
-            out.contains("\x1b[31m") && out.contains("RED") && out.contains("\x1b[0m"),
-            "PTY output lost SGR: {out:?}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn shell_mode_pty_does_not_busy_loop_after_eof() {
-        // Regression: an earlier select! loop armed the silence timer
-        // every time byte_rx returned None, then re-entered the
-        // select! which immediately resolved again, starving the
-        // timer and pegging the runtime. The contract is: once the
-        // child has exited, run_user_shell returns within ~150 ms
-        // even if the channel closed long before the timer fired.
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<AppMsg>();
-        let tmp = tempfile::tempdir().unwrap();
-        let start = std::time::Instant::now();
-        let (_out, code, _cwd) = run_user_shell(
-            "true",
-            tmp.path().to_str().unwrap(),
-            80,
-            24,
-            &tx,
-        )
-        .await;
-        if let Some(127) = code {
-            // PTY unavailable in this environment; skip.
-            return;
-        }
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed < std::time::Duration::from_millis(500),
-            "run_user_shell took {elapsed:?} after a clean exit (likely a busy loop)"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn shell_mode_pty_reports_cd_via_marker() {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<AppMsg>();
-        let tmp = tempfile::tempdir().unwrap();
-        let (out, code, new_cwd) = run_user_shell(
-            &format!("cd '{}' && pwd", tmp.path().display()),
-            "/tmp",
-            80,
-            24,
-            &tx,
-        )
-        .await;
-        if let Some(127) = code {
-            if out.starts_with("error:") {
-                eprintln!("PTY unavailable in this environment; skipping: {out}");
-                return;
-            }
-        }
-        assert_eq!(code, Some(0), "child failed: {out:?}");
-        assert_eq!(new_cwd, tmp.path().to_str().unwrap());
-        // The marker line itself is stripped from the displayed output.
-        assert!(!out.contains(SHELL_PWD_MARKER));
     }
 }

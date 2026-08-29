@@ -14,6 +14,8 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::mcp::MCPServerConfig;
+
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(180);
 /// Refresh when the access token has less than this much life left.
@@ -503,6 +505,40 @@ pub fn forget(server: &str) {
     let _ = atom_core::providers::auth::remove_auth(&auth_key(server));
 }
 
+/// Returns the human-readable auth state for an OAuth-configured MCP
+/// server, or `None` when `cfg` does not opt into OAuth — callers
+/// should then fall back to displaying the command or URL.
+///
+/// States returned for OAuth servers:
+/// - `"auth required"` — no usable entry in the auth store
+/// - `"auth expired"` — entry exists, but the access token is past
+///   expiry and there is no refresh token to recover
+/// - `"authenticated"` — fresh access token, or a refresh token that
+///   can recover an expired access token
+pub fn mcp_auth_display(cfg: &MCPServerConfig, server: &str) -> Option<String> {
+    if !cfg.auth.eq_ignore_ascii_case("oauth") {
+        return None;
+    }
+    let store = load_auth_store();
+    let entry = match store.get(&auth_key(server)) {
+        Some(e) => e,
+        None => return Some("auth required".into()),
+    };
+    if entry.r#type != "oauth" {
+        // Non-OAuth entry under an OAuth key is a misconfiguration; treat
+        // it as not logged in so the user re-runs the flow.
+        return Some("auth required".into());
+    }
+    if entry.access.is_empty() && entry.refresh.is_empty() {
+        return Some("auth required".into());
+    }
+    let expired = entry.expires > 0 && entry.expires <= now_ms() + EXPIRY_SLACK_MS;
+    if expired && entry.refresh.is_empty() {
+        return Some("auth expired".into());
+    }
+    Some("authenticated".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,6 +570,110 @@ mod tests {
     #[test]
     fn auth_keys_are_namespaced_per_server() {
         assert_eq!(auth_key("meta-ads"), "mcp-meta-ads");
+    }
+
+    #[test]
+    fn mcp_auth_display_reflects_oauth_state() {
+        use atom_core::providers::auth::{set_auth, AuthEntry};
+
+        // Use an isolated key so the test cannot clobber a real entry.
+        let server = "auth-display-isolated";
+        let key = auth_key(server);
+        let prior = atom_core::providers::auth::load_auth_store()
+            .get(&key)
+            .cloned();
+        struct Restore {
+            key: String,
+            prior: Option<AuthEntry>,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.prior.take() {
+                    Some(e) => {
+                        set_auth(&self.key, e).ok();
+                    }
+                    None => {
+                        atom_core::providers::auth::remove_auth(&self.key).ok();
+                    }
+                }
+            }
+        }
+        let _restore = Restore {
+            key: key.clone(),
+            prior,
+        };
+
+        let oauth_cfg = MCPServerConfig {
+            auth: "oauth".into(),
+            url: "https://mcp.facebook.com/ads".into(),
+            ..Default::default()
+        };
+        let stdio_cfg = MCPServerConfig {
+            command: "npx".into(),
+            ..Default::default()
+        };
+
+        // No entry yet: auth required.
+        atom_core::providers::auth::remove_auth(&key).ok();
+        assert_eq!(
+            mcp_auth_display(&oauth_cfg, server).as_deref(),
+            Some("auth required")
+        );
+
+        // Empty oauth entry: auth required.
+        let empty = AuthEntry {
+            r#type: "oauth".into(),
+            ..Default::default()
+        };
+        set_auth(&key, empty).unwrap();
+        assert_eq!(
+            mcp_auth_display(&oauth_cfg, server).as_deref(),
+            Some("auth required")
+        );
+
+        // Fresh access + refresh: authenticated.
+        let fresh = AuthEntry {
+            r#type: "oauth".into(),
+            access: "tok".into(),
+            refresh: "ref".into(),
+            ..Default::default()
+        };
+        set_auth(&key, fresh).unwrap();
+        assert_eq!(
+            mcp_auth_display(&oauth_cfg, server).as_deref(),
+            Some("authenticated")
+        );
+
+        // Expired access, no refresh: auth expired.
+        let stale = AuthEntry {
+            r#type: "oauth".into(),
+            access: "tok".into(),
+            expires: 1,
+            ..Default::default()
+        };
+        set_auth(&key, stale).unwrap();
+        assert_eq!(
+            mcp_auth_display(&oauth_cfg, server).as_deref(),
+            Some("auth expired")
+        );
+
+        // Expired access, but refresh present: still authenticated
+        // because the refresh path will recover.
+        let refreshable = AuthEntry {
+            r#type: "oauth".into(),
+            access: "tok".into(),
+            refresh: "ref".into(),
+            expires: 1,
+            ..Default::default()
+        };
+        set_auth(&key, refreshable).unwrap();
+        assert_eq!(
+            mcp_auth_display(&oauth_cfg, server).as_deref(),
+            Some("authenticated")
+        );
+
+        // Non-OAuth config: helper returns None (caller shows URL).
+        assert_eq!(mcp_auth_display(&stdio_cfg, server), None);
     }
 
     /// Fake authorization server exercising the full login: discovery,

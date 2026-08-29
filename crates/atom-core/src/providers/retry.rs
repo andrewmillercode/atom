@@ -24,6 +24,26 @@ pub fn provider_retry_delays() -> &'static [Duration] {
 /// tool call was emitted.
 pub const MAX_EMPTY_RESPONSE_RETRIES: usize = 3;
 
+/// EMPTY_RESPONSE_RETRY_DELAYS_MS spaces out empty-stream retries much
+/// wider than the HTTP retry table. Motivating case: the OpenCode Zen
+/// free tier sheds load by answering HTTP 200 with an empty
+/// event-stream body for a few seconds to a minute (a silent
+/// rate-limit), while single spaced-out requests succeed. Retries at
+/// HTTP-retry speed (0.67s/1.2s/1.4s) all land inside the cooldown and
+/// the turn dies after ~3s; spreading them over ~15s rides out the
+/// short windows instead.
+pub const EMPTY_RESPONSE_RETRY_DELAYS_MS: &[u64] = &[1000, 4000, 10000];
+
+pub fn empty_response_retry_delays() -> &'static [Duration] {
+    static DELAYS: once_cell::sync::Lazy<Vec<Duration>> = once_cell::sync::Lazy::new(|| {
+        EMPTY_RESPONSE_RETRY_DELAYS_MS
+            .iter()
+            .map(|ms| Duration::from_millis(*ms))
+            .collect()
+    });
+    &DELAYS
+}
+
 /// maxReasoningNudges is how many times a turn will continue after a
 /// stream that died during thinking (no content, no tool calls). Same
 /// delay table as HTTP retries, but capped so a model that only thinks

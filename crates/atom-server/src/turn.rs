@@ -1291,7 +1291,7 @@ pub async fn run_session_turn(
 
         if empty_response(&result) {
             if empty_response_attempt < atom_core::providers::MAX_EMPTY_RESPONSE_RETRIES {
-                let delays = atom_core::providers::retry::provider_retry_delays();
+                let delays = atom_core::providers::retry::empty_response_retry_delays();
                 let delay = delays
                     .get(empty_response_attempt)
                     .copied()
@@ -1311,7 +1311,9 @@ pub async fn run_session_turn(
                 continue 'rounds;
             }
             let msg = format!(
-                "provider returned an empty response after {} attempts",
+                "provider returned an empty response after {} attempts \
+                 (some free tiers, like OpenCode Zen, rate-limit by silently \
+                 returning empty streams; wait a moment and retry)",
                 empty_response_attempt + 1
             );
             let ev = event(vec![

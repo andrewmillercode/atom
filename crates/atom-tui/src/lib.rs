@@ -13,6 +13,7 @@ pub mod api;
 pub mod app;
 pub mod blocks;
 pub mod events;
+pub mod fullscreen_view;
 pub mod hot;
 pub mod math;
 pub mod outputtest;
@@ -758,6 +759,41 @@ async fn run_effects(
                         }
                     };
                     let _ = tx.send(AppMsg::ContextLoaded(rows));
+                });
+            }
+            Effect::LoadForkSource { id } => {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    match api::get_session(&id).await {
+                        Ok(sess) => {
+                            let _ = tx.send(AppMsg::ForkSourceLoaded {
+                                id,
+                                sess: Box::new(sess),
+                            });
+                        }
+                        Err(e) => {
+                            let _ = tx.send(AppMsg::Errored(e.to_string()));
+                        }
+                    }
+                });
+            }
+            Effect::ForkSession {
+                source_id,
+                position,
+            } => {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    match api::fork_session(&source_id, position).await {
+                        Ok(forked) => {
+                            let _ = tx.send(AppMsg::ForkedSession {
+                                info: Box::new(forked.info),
+                                draft: forked.draft,
+                            });
+                        }
+                        Err(e) => {
+                            let _ = tx.send(AppMsg::Errored(e.to_string()));
+                        }
+                    }
                 });
             }
             Effect::CreateSession {

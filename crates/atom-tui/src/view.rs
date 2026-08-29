@@ -12,6 +12,7 @@ use ratatui::widgets::{Block as RtBlock, Borders, Clear};
 
 use crate::ansi;
 use crate::app::{App, ApprovalPrompt};
+use crate::fullscreen_view;
 use crate::overlays::{self, OverlayKind, PickerKind};
 use crate::preview;
 use crate::prompt::wrap_plain;
@@ -958,7 +959,7 @@ fn approval_body(req: &ApprovalPrompt, width: usize) -> Vec<Line<'static>> {
         width,
     );
     approval_field(&mut body, "reason  ", &req.reason, width);
-    for row in wrap_approval_text("a allow · s this session · g always · d/Esc deny", width) {
+    for row in wrap_approval_text("y once · a always · n no · d never · esc cancel", width) {
         body.push(Line::from(Span::styled(row, ansi::style_reasoning())));
     }
     body
@@ -1060,6 +1061,7 @@ fn render_overlay(app: &mut App, kind: OverlayKind) -> Vec<Line<'static>> {
         OverlayKind::Settings => render_settings_overlay(app),
         OverlayKind::WebSearch => render_web_search_overlay(app),
         OverlayKind::Theme => render_theme_overlay(app),
+        OverlayKind::Fork => render_fork_overlay(app),
     }
 }
 
@@ -1433,6 +1435,76 @@ fn render_web_search_overlay(app: &App) -> Vec<Line<'static>> {
     out
 }
 
+/// renderForkOverlay: /fork picker. Uses the reusable fullscreen-view
+/// template (title, description, search box, list, footer) so future
+/// overlays can share the same chrome — see [`crate::fullscreen_view`].
+/// Each ForkRow is translated into a `ViewRow`: Headers as section
+/// labels, the SessionLatest sentinel as a `ViewItem` with `id=None`,
+/// and UserMessage rows as `ViewItem`s keyed by `position`.
+fn render_fork_overlay(app: &App) -> Vec<Line<'static>> {
+    let width = app.width.max(1) as usize;
+    let source_rows = overlays::fork_rows(app);
+    let mut rows: Vec<fullscreen_view::ViewRow> = Vec::with_capacity(source_rows.len());
+    for row in &source_rows {
+        match row.kind {
+            overlays::ForkRowKind::Header => {
+                rows.push(fullscreen_view::ViewRow::Header(row.label.clone()));
+            }
+            overlays::ForkRowKind::SessionLatest => {
+                rows.push(fullscreen_view::ViewRow::Item(fullscreen_view::ViewItem {
+                    id: None,
+                    label: row.label.clone(),
+                    trailing: row.timestamp.clone(),
+                    meta: String::new(),
+                }));
+            }
+            overlays::ForkRowKind::UserMessage => {
+                rows.push(fullscreen_view::ViewRow::Item(fullscreen_view::ViewItem {
+                    id: Some(row.position.unwrap_or(-1).to_string()),
+                    label: row.label.clone(),
+                    trailing: row.timestamp.clone(),
+                    meta: String::new(),
+                }));
+            }
+        }
+    }
+    let footer = if app.overlay_fork_user_messages.is_empty() {
+        String::new()
+    } else {
+        // Filter-aware footer: visible (matching) user-message rows vs
+        // total. The SessionLatest row is always present so we count
+        // items, not all rows.
+        let visible = rows
+            .iter()
+            .filter(|r| matches!(r, fullscreen_view::ViewRow::Item(item) if item.id.is_some()))
+            .count();
+        let total = app.overlay_fork_user_messages.len();
+        if visible == total {
+            format!("{visible}/{total} user messages")
+        } else {
+            format!("{visible}/{total} user messages match")
+        }
+    };
+    let loading = if !app.working_msg.is_empty() {
+        Some(app.working_msg.as_str())
+    } else {
+        None
+    };
+    let spec = fullscreen_view::ViewSpec {
+        title: "Fork session",
+        description: "type to filter, ↑↓ to navigate, Enter to fork, Esc to cancel",
+        search_placeholder: "Search",
+        search_query: app.overlay_q.as_str(),
+        search_selected: app.overlay_q_sel,
+        rows: &rows,
+        selected: app.overlay_sel.min(rows.len().saturating_sub(1)),
+        footer: footer.as_str(),
+        loading,
+        spinner_frame: app.spinner_frame,
+    };
+    fullscreen_view::render_view(&spec, width)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1534,6 +1606,8 @@ mod tests {
                 reason: "ask network".into(),
                 from_subagent: false,
                 child_title: String::new(),
+                origin: "self".into(),
+                accept_all_preview: Some("curl *".into()),
             }),
             expanded: true,
             ..Default::default()
@@ -1544,7 +1618,11 @@ mod tests {
         let s = text(&term);
         assert!(s.contains("Sandbox"), "title visible: {s}");
         assert!(s.contains("curl https://x.co"), "command visible: {s}");
-        assert!(s.contains("[a] allow"), "buttons visible: {s}");
+        assert!(s.contains("[a] always"), "buttons visible: {s}");
+        assert!(
+            s.contains("accept-all would let: curl *"),
+            "prefix preview visible: {s}"
+        );
     }
 
     #[test]
@@ -1574,6 +1652,8 @@ mod tests {
                 reason: "push to remote".into(),
                 from_subagent: true,
                 child_title: "push the release".into(),
+                origin: "child".into(),
+                accept_all_preview: None,
             }),
             expanded: true,
             ..Default::default()
@@ -1583,11 +1663,11 @@ mod tests {
         let term = frame(&mut app, 90, 30);
         let s = text(&term);
         assert!(
-            s.contains("push the release") && s.contains("needs permission"),
-            "subagent hint visible: {s}"
+            s.contains("from subagent: push the release"),
+            "subagent header visible: {s}"
         );
         assert!(s.contains("git push"), "command visible: {s}");
-        assert!(s.contains("[a] allow"), "buttons visible: {s}");
+        assert!(s.contains("[a] always"), "buttons visible: {s}");
     }
 
     #[test]
@@ -1617,6 +1697,8 @@ mod tests {
                 reason: "run workspace tests".into(),
                 from_subagent: false,
                 child_title: String::new(),
+                origin: "self".into(),
+                accept_all_preview: None,
             }),
             expanded: true,
             ..Default::default()
@@ -1626,7 +1708,7 @@ mod tests {
         let term = frame(&mut app, 40, 24);
         let s = text(&term);
         assert!(s.contains("Sandbox"), "title visible: {s}");
-        assert!(s.contains("[a] allow"), "buttons visible: {s}");
+        assert!(s.contains("[a] always"), "buttons visible: {s}");
     }
 
     #[test]

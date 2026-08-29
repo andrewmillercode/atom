@@ -10,10 +10,13 @@ use crate::turn::{self, EventOut, TurnOpts};
 use atom_core::session::compaction::{
     compact_session, compact_span, compaction_target, is_nothing_to_compact,
 };
-use atom_core::session::store::{data_dir, socket_path, SessionStore};
+use atom_core::session::store::{
+    data_dir, new_session_id, socket_path, DelegateStatus, Session, SessionStore,
+};
 use atom_core::types::{ImageData, MAX_IMAGE_BASE64_BYTES};
 use atom_sandbox::approvals::Decision;
 use bytes::Bytes;
+use chrono::Utc;
 use futures::StreamExt;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, StreamBody};
@@ -145,6 +148,18 @@ struct CompactBody {
 }
 
 #[derive(serde::Deserialize, Default)]
+struct ForkBody {
+    /// Position (0-based index) of the user message in the source
+    /// session's `messages` array; the new session's transcript is
+    /// truncated to `messages[..position]` (exclusive of position
+    /// itself) and `messages[position].content` is returned as the
+    /// draft. `None` means "fork from latest": copy the full transcript
+    /// and return an empty draft.
+    #[serde(default)]
+    position: Option<i64>,
+}
+
+#[derive(serde::Deserialize, Default)]
 struct ApprovalBody {
     #[serde(default)]
     id: String,
@@ -267,6 +282,15 @@ async fn route(
                         error_resp(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
                     } else {
                         let r = handle_compact(state, req, id).await;
+                        drop(guard);
+                        r
+                    }
+                }
+                "fork" => {
+                    if method != "POST" {
+                        error_resp(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
+                    } else {
+                        let r = handle_fork(state, req, id).await;
                         drop(guard);
                         r
                     }
@@ -470,15 +494,11 @@ async fn handle_approval(state: &Arc<AppState>, req: &mut Request<Incoming>, sid
     };
     let decision = match body.decision.as_str() {
         "allow_once" => Decision::AllowOnce,
-        "allow_session" => Decision::AllowSession,
-        "allow_global" => Decision::AllowGlobal,
-        "deny" => Decision::Deny,
-        other => {
-            return error_resp(
-                StatusCode::BAD_REQUEST,
-                &format!("invalid decision: {other}"),
-            )
-        }
+        "allow_session" => Decision::AllowOnce,
+        "allow_global" | "allow_always" | "allow_all" => Decision::AllowAll,
+        "deny" | "deny_once" => Decision::DenyOnce,
+        "deny_always" | "deny_all" => Decision::DenyAll,
+        _ => return error_resp(StatusCode::BAD_REQUEST, "invalid decision"),
     };
     if state.approvals.complete(sid, &body.id, decision) {
         no_content()
@@ -777,6 +797,96 @@ async fn handle_compact(state: &Arc<AppState>, req: &mut Request<Incoming>, id: 
     full_body(json!({
         "summary": sess.compaction_summary,
         "compacted_through": sess.compacted_through,
+    }))
+}
+
+/// POST /api/sessions/{id}/fork — create a child session whose
+/// transcript is the source session up to (and excluding) the chosen
+/// user message, plus a draft pre-filled with that message's content.
+/// `body.position` is the index in `source.messages`; passing `None`
+/// forks from latest (full transcript, empty draft). Subagent sessions
+/// cannot be forked.
+async fn handle_fork(state: &Arc<AppState>, req: &mut Request<Incoming>, id: &str) -> Resp {
+    let load_id = id.to_string();
+    let Some(source) = state.store_call(move |store| store.get(&load_id)).await else {
+        return error_resp(StatusCode::NOT_FOUND, "session not found");
+    };
+    if !source.parent_id.is_empty() {
+        return error_resp(
+            StatusCode::CONFLICT,
+            "subagent sessions are managed by their parent",
+        );
+    }
+    let body: ForkBody = decode(req).await.unwrap_or_default();
+
+    // Truncate the transcript up to (but excluding) the picked message.
+    // `position = n` means: copy messages[0..n] into the child, and use
+    // messages[n] as the draft. `position = None` is "fork from latest"
+    // (no draft, copy everything).
+    let (truncated, draft) = match body.position {
+        None => (source.messages.clone(), String::new()),
+        Some(pos) => {
+            if pos < 0 || (pos as usize) >= source.messages.len() {
+                return error_resp(
+                    StatusCode::BAD_REQUEST,
+                    "position is out of range for the source session",
+                );
+            }
+            let picked = &source.messages[pos as usize];
+            if picked.role != "user" {
+                return error_resp(
+                    StatusCode::BAD_REQUEST,
+                    "position must point to a user message",
+                );
+            }
+            let draft = picked.content.clone();
+            let truncated = source.messages[..pos as usize].to_vec();
+            (truncated, draft)
+        }
+    };
+
+    // Build the child session. Same model/provider/cwd/thinking as the
+    // parent; lineage comes from parent_id. Title gets a (fork #N)
+    // suffix to disambiguate — known wart shared with OpenCode; sibling
+    // counting is a separate concern.
+    let now = Utc::now();
+    let mut child = Session {
+        id: new_session_id(),
+        title: format!("{} (fork #1)", source.title),
+        title_generated: source.title_generated,
+        messages: truncated,
+        model: source.model.clone(),
+        provider: source.provider.clone(),
+        cwd: source.cwd.clone(),
+        instructions: source.instructions.clone(),
+        usage: None,
+        compaction_summary: source.compaction_summary.clone(),
+        compacted_through: source.compacted_through,
+        parent_id: source.id.clone(),
+        thinking: source.thinking.clone(),
+        cancelled: false,
+        status: DelegateStatus::Done,
+        batch_id: String::new(),
+        batch_index: 0,
+        created_at: now,
+        updated_at: now,
+    };
+    // Stamp every newly-copied message so /fork timestamps in the
+    // *child* show when it was forked, not the original write time.
+    for message in &mut child.messages {
+        message.created_at = Some(now);
+    }
+    // Persist + index.
+    let child_id = child.id.clone();
+    state
+        .store_call(move |store| {
+            store.save_with_index(&child);
+        })
+        .await;
+
+    full_body(json!({
+        "info": serde_json::to_value(state.store.get_info(&child_id)).unwrap_or(Value::Null),
+        "draft": draft,
     }))
 }
 

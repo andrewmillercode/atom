@@ -25,6 +25,30 @@ pub async fn get_session(id: &str) -> Result<Session> {
     Ok(serde_json::from_value(v)?)
 }
 
+/// Result of a successful fork: the new child session plus the draft
+/// prompt the TUI pre-fills (empty for fork-from-latest).
+#[derive(Debug, Clone)]
+pub struct ForkedSession {
+    pub info: SessionInfo,
+    pub draft: String,
+}
+
+/// forkSession POSTs /api/sessions/{source_id}/fork and decodes the
+/// response into the new session + draft. `position = None` means
+/// "fork from latest" (full transcript, empty draft). `Some(n)`
+/// truncates the transcript to the first n messages.
+pub async fn fork_session(source_id: &str, position: Option<i64>) -> Result<ForkedSession> {
+    let body = json!({ "position": position });
+    let v = atom_server::client::post(&format!("/api/sessions/{source_id}/fork"), &body).await?;
+    let info: SessionInfo = serde_json::from_value(v.clone())?;
+    let draft = v
+        .get("draft")
+        .and_then(|d| d.as_str())
+        .unwrap_or("")
+        .to_string();
+    Ok(ForkedSession { info, draft })
+}
+
 /// listChildren fetches child sessions of a dispatch parent.
 pub async fn list_children(id: &str) -> Result<Vec<SessionInfo>> {
     let v = atom_server::client::get(&format!("/api/sessions/{id}/children")).await?;

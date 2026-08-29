@@ -73,6 +73,10 @@ pub struct Message {
     pub duration_ms: i64,
     /// Token count of the request that produced this message.
     pub usage: Option<StreamUsage>,
+    /// When the message was written; absent for transcripts persisted
+    /// before this field existed. The /fork overlay uses it to render
+    /// the HH:MM trailing tag on each user-message row.
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 fn message_plain_fields(m: &Message) -> serde_json::Value {
@@ -114,6 +118,9 @@ fn message_plain_fields(m: &Message) -> serde_json::Value {
     }
     if let Some(u) = &m.usage {
         obj.insert("usage".into(), serde_json::to_value(u).unwrap());
+    }
+    if let Some(ts) = m.created_at {
+        obj.insert("created_at".into(), json!(ts.to_rfc3339()));
     }
     v
 }
@@ -168,8 +175,15 @@ impl<'de> Deserialize<'de> for Message {
             duration_ms: i64,
             #[serde(default)]
             usage: Option<StreamUsage>,
+            #[serde(default)]
+            created_at: Option<String>,
         }
         let mut raw = Raw::deserialize(d)?;
+        let created_at = raw
+            .created_at
+            .take()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+            .map(|t| t.with_timezone(&chrono::Utc));
         let mut msg = Message {
             role: raw.role,
             content: String::new(),
@@ -184,6 +198,7 @@ impl<'de> Deserialize<'de> for Message {
             model: std::mem::take(&mut raw.model),
             duration_ms: raw.duration_ms,
             usage: raw.usage.take(),
+            created_at,
         };
         match &raw.content {
             serde_json::Value::Null => {}

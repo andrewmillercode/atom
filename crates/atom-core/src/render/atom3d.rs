@@ -534,12 +534,12 @@ mod tests {
     fn nucleus_muted_and_orbits_muted_extra() {
         let got = render_atom3d(80, 24, 0.0);
         assert!(
-            got.contains(&ansi_fg(COLOR_MUTED)),
-            "expected muted nucleus in atom3d output"
-        );
-        assert!(
             got.contains(&ansi_fg(COLOR_MUTED_EXTRA)),
             "expected muted-extra orbits in atom3d output"
+        );
+        assert!(
+            got.contains(&ansi_fg(COLOR_MUTED)),
+            "expected muted nucleus in atom3d output"
         );
     }
 }

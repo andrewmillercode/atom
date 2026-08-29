@@ -64,6 +64,15 @@ pub struct InlineApproval {
     pub reason: String,
     pub from_subagent: bool,
     pub child_title: String,
+    /// v2 origin tag: "self" for the current session, "child" when
+    /// surfaced via a dispatched subagent. Mirrors `from_subagent`
+    /// for the renderer — kept separate because the wire name is
+    /// `origin` and we want the block to be readable without joining.
+    pub origin: String,
+    /// Prefix-rule preview for `[a] accept-all` (e.g. `"cargo test *"`).
+    /// Pre-computed by the server; rendered as a dim hint under the
+    /// command details.
+    pub accept_all_preview: Option<String>,
 }
 
 /// Button regions (col_start..col_end) within the rendered approval block,
@@ -1412,6 +1421,10 @@ fn render_tool_block_linked(
         let btn_line = approval_button_line();
         body.push(btn_line);
         body_links.push(Vec::new());
+        // Help line (v2 spec: dim list of every binding under the
+        // buttons, with a "press ? for details" pointer).
+        body.push(approval_help_line(inner));
+        body_links.push(Vec::new());
     } else if !b.tool_done && b.tool_name == "sandbox" {
         // Still pending but somehow approval was removed — shouldn't happen
     } else {
@@ -1547,16 +1560,19 @@ fn render_tool_block_linked(
 /// Build the body lines for a pending approval block (details).
 fn approval_block_body(appr: &InlineApproval, width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    if appr.from_subagent {
-        let who = if appr.child_title.is_empty() {
-            "a subagent".to_string()
+    // Subagent prompts surface a small header above the command so the
+    // user knows which dispatched child is asking. Driven by the v2
+    // `origin` tag, with `from_subagent` as a back-compat fallback for
+    // older payloads that only set the bool.
+    let is_child = appr.origin == "child" || appr.from_subagent;
+    if is_child {
+        let header = if appr.child_title.is_empty() {
+            "from subagent: (unnamed)".to_string()
         } else {
-            format!("subagent \"{}\"", appr.child_title)
+            format!("from subagent: {}", appr.child_title)
         };
-        lines.push(Line::from(Span::styled(
-            format!("{who} needs permission"),
-            ansi::style_reasoning(),
-        )));
+        let truncated = atom_core::render::highlight::truncate_width(&header, width);
+        lines.push(Line::from(Span::styled(truncated, ansi::style_reasoning())));
     }
     let fields = [
         ("rule    ", &appr.rule_id),
@@ -1571,7 +1587,28 @@ fn approval_block_body(appr: &InlineApproval, width: usize) -> Vec<Line<'static>
         let truncated = atom_core::render::highlight::truncate_width(&text, width);
         lines.push(Line::from(Span::styled(truncated, ansi::style_dim())));
     }
+    // Prefix-rule preview: when the server sent an `accept_all_preview`
+    // (e.g. "cargo test *"), show the rule `[a]` would save. This is the
+    // v2 "this would let all `cargo test` invocations run unprompted"
+    // affordance from the spec.
+    if let Some(preview) = appr.accept_all_preview.as_deref() {
+        if !preview.is_empty() {
+            let text = format!("accept-all would let: {preview}");
+            let truncated = atom_core::render::highlight::truncate_width(&text, width);
+            lines.push(Line::from(Span::styled(truncated, ansi::style_dim())));
+        }
+    }
     lines
+}
+
+/// Help line under the buttons. Lists every binding on one row at the
+/// current content width, truncating if the terminal is too narrow to
+/// fit the full sentence. Matches the v2 spec's "dim line under the
+/// buttons" requirement.
+fn approval_help_line(width: usize) -> Line<'static> {
+    let text = "y once · a always · n no · d never · esc cancel — press ? for details";
+    let truncated = atom_core::render::highlight::truncate_width(text, width);
+    Line::from(Span::styled(truncated, ansi::style_dim()))
 }
 
 /// Produce the clickable button line for an approval block.
@@ -1590,12 +1627,15 @@ fn approval_button_line() -> Line<'static> {
 /// Button layout constants for approval blocks. Column offsets are relative
 /// to the content area (after left pad).
 pub fn approval_buttons() -> Vec<ApprovalButton> {
-    // Layout: "[a] allow  [s] session  [g] always  [d] deny"
+    // v2 spec: four buttons, no session-scoped grant.
+    //   [y] once   [a] always   [n] deny   [d] never
+    // Each maps to one of the v2 Decision wire names
+    // (allow_once / allow_always / deny_once / deny_always).
     let labels: &[(&str, &str)] = &[
-        ("[a] allow", "allow_once"),
-        ("[s] session", "allow_session"),
-        ("[g] always", "allow_global"),
-        ("[d] deny", "deny"),
+        ("[y] once", "allow_once"),
+        ("[a] always", "allow_always"),
+        ("[n] deny", "deny_once"),
+        ("[d] never", "deny_always"),
     ];
     let gap = 2usize;
     let mut col = 0;

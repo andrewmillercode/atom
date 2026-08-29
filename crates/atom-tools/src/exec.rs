@@ -198,10 +198,7 @@ pub(crate) mod test_support {
     static ALLOW_ONCE: Lazy<AutoApprover> = Lazy::new(|| AutoApprover(Decision::AllowOnce));
 
     pub fn off_cfg() -> SandboxConfig {
-        SandboxConfig {
-            mode: atom_sandbox::policy::SandboxMode::Off,
-            ..Default::default()
-        }
+        SandboxConfig::default()
     }
 
     /// A ctx with no seen-file cache, Off sandbox, auto-approving.
@@ -365,7 +362,7 @@ mod tests {
         let pjson = serde_json::json!({"path": path.display().to_string()});
 
         let ctx = env.ctx_with(&atom_sandbox::approvals::AutoApprover(
-            atom_sandbox::approvals::Decision::AllowSession,
+            atom_sandbox::approvals::Decision::AllowOnce,
         ));
         // Write to a not-yet-seen existing file errors first.
         std::fs::write(&path, "old\n").unwrap();
@@ -405,7 +402,7 @@ mod tests {
         let path = env.ws.path().join("relative.txt");
         std::fs::write(&path, "old\n").unwrap();
         let ctx = env.ctx_with(&atom_sandbox::approvals::AutoApprover(
-            atom_sandbox::approvals::Decision::AllowSession,
+            atom_sandbox::approvals::Decision::AllowOnce,
         ));
 
         let read = execute_tool(&ctx, "read_file", r#"{"path":"relative.txt"}"#).await;
@@ -426,10 +423,17 @@ mod tests {
 
     #[tokio::test]
     async fn skill_unknown_lists_nothing_without_catalog() {
-        let dir = tempfile::tempdir().unwrap(); // empty cwd → no skills
+        let dir = tempfile::tempdir().unwrap(); // empty cwd → no project skills
         let ctx = test_ctx(dir.path());
         let out = execute_tool(&ctx, "skill", r#"{"name":"nope"}"#).await;
-        assert_eq!(out.text, "error: unknown skill \"nope\"");
+        // Prefix check: user-level skill catalogs (~/.agents/skills etc.)
+        // legitimately exist on dev machines, so the "(known: …)" suffix
+        // may be non-empty — but the unknown-name error must always lead.
+        assert!(
+            out.text.starts_with("error: unknown skill \"nope\""),
+            "{}",
+            out.text
+        );
     }
 
     #[tokio::test]

@@ -70,6 +70,10 @@ pub fn style_user() -> Style {
 pub fn style_foreground() -> Style {
     Style::new()
 }
+/// Bold title style for fullscreen overlay headers.
+pub fn style_title() -> Style {
+    Style::new().fg(c_foreground()).add_modifier(Modifier::BOLD)
+}
 pub fn style_primary() -> Style {
     Style::new().fg(c_primary())
 }

@@ -8,20 +8,16 @@ fn probe_real_discovery_at_cwd() {
     eprintln!("cwd={cwd}");
     eprintln!("config_dir={config:?}");
     eprintln!("home={home:?}");
-    eprintln!("XDG_CONFIG_HOME={:?}", std::env::var("XDG_CONFIG_HOME").ok());
     eprintln!(
-        "dir_leaf={:?}",
-        atom_core::build::dir_leaf()
+        "XDG_CONFIG_HOME={:?}",
+        std::env::var("XDG_CONFIG_HOME").ok()
     );
+    eprintln!("dir_leaf={:?}", atom_core::build::dir_leaf());
     eprintln!("is_dev={:?}", atom_core::build::is_dev());
     let skills = atom_tools::skills::discover_skills_in(cwd, config.as_deref(), home.as_deref());
     eprintln!("discovered {} skill(s):", skills.len());
     for (name, s) in &skills {
-        eprintln!(
-            "  {name}: {} chars body, dir={}",
-            s.body.len(),
-            s.dir
-        );
+        eprintln!("  {name}: {} chars body, dir={}", s.body.len(), s.dir);
     }
     let msg = atom_tools::skills::skills_catalog_message(cwd);
     eprintln!("catalog message ({} chars):", msg.len());

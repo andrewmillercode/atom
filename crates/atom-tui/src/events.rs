@@ -41,6 +41,14 @@ pub struct StreamEvent {
     /// Non-empty when the request comes from a dispatched subagent.
     pub child_title: String,
     pub from_subagent: bool,
+    /// v2 origin tag: "self" when the prompt is for the current
+    /// session, "child" when it surfaced via a dispatched subagent.
+    /// Mirrors `from_subagent` but is the wire-level name the server
+    /// uses (defaults to "self" when missing for back-compat with v1).
+    pub origin: String,
+    /// Prefix-rule preview for `[a] accept-all` (e.g. `"cargo test *"`).
+    /// Pre-computed by the server; the TUI just renders it.
+    pub accept_all_preview: Option<String>,
 }
 
 fn jstr(v: &Value, key: &str) -> String {
@@ -72,6 +80,28 @@ pub fn parse_stream_event(v: &Value) -> StreamEvent {
             .get("from_subagent")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        // v2 server emits an explicit "origin" tag ("self" | "child").
+        // Older payloads only carry from_subagent; fall back to a
+        // best-effort derived value so the renderer doesn't have to
+        // special-case missing keys.
+        origin: {
+            let raw = jstr(v, "origin");
+            if !raw.is_empty() {
+                raw
+            } else if v
+                .get("from_subagent")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                "child".to_string()
+            } else {
+                "self".to_string()
+            }
+        },
+        accept_all_preview: v
+            .get("accept_all_preview")
+            .and_then(Value::as_str)
+            .map(|s| s.to_string()),
         ..Default::default()
     };
     let ms = jstr(v, "duration_ms").parse::<f64>().ok();
@@ -149,6 +179,19 @@ pub enum Effect {
     },
     FetchContext {
         id: String,
+    },
+    /// /fork: fetch the source session's messages so we can build the
+    /// picker rows. The result comes back as AppMsg::ForkSourceLoaded.
+    LoadForkSource {
+        id: String,
+    },
+    /// /fork confirm: POST /api/sessions/{source_id}/fork with the
+    /// optional position of the row the user picked. The server
+    /// returns `{ info, draft }`; the App then subscribes to the new
+    /// session and pre-fills the prompt.
+    ForkSession {
+        source_id: String,
+        position: Option<i64>,
     },
     Subscribe {
         id: String,
@@ -243,6 +286,19 @@ pub enum AppMsg {
         agents: Vec<SessionInfo>,
     },
     SessionLoaded(Box<Session>),
+    /// /fork: the source session loaded. The App filters the user
+    /// messages into picker rows and clears the loading spinner.
+    ForkSourceLoaded {
+        id: String,
+        sess: Box<Session>,
+    },
+    /// /fork: server created the child session. `info` is the new
+    /// session summary; `draft` is the pre-filled prompt text (empty
+    /// when the user picked the SessionLatest row).
+    ForkedSession {
+        info: Box<SessionInfo>,
+        draft: String,
+    },
     CreatedSession(Box<SessionInfo>),
     ProvidersRebuilt(Vec<atom_core::providers::providers::Provider>),
     ContextLoaded(Vec<ContextRow>),
@@ -334,6 +390,15 @@ impl std::fmt::Debug for AppMsg {
                 write!(f, "ChildrenLoaded({id}, {n})", n = agents.len())
             }
             AppMsg::SessionLoaded(s) => write!(f, "SessionLoaded({})", s.id),
+            AppMsg::ForkSourceLoaded { id, sess } => {
+                write!(f, "ForkSourceLoaded({id}, {} msgs)", sess.messages.len())
+            }
+            AppMsg::ForkedSession { info, draft } => write!(
+                f,
+                "ForkedSession({}, draft {} chars)",
+                info.id,
+                draft.chars().count()
+            ),
             AppMsg::CreatedSession(s) => write!(f, "CreatedSession({})", s.id),
             AppMsg::ProvidersRebuilt(n) => write!(f, "ProvidersRebuilt({n})", n = n.len()),
             AppMsg::ContextLoaded(n) => write!(f, "ContextLoaded({n})", n = n.len()),

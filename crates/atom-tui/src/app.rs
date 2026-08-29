@@ -83,6 +83,21 @@ pub struct ApprovalPrompt {
     pub from_subagent: bool,
 }
 
+/// One user message in the /fork overlay: a one-line preview plus the
+/// timestamp tag rendered on the right edge. The server uses
+/// `position` to truncate the transcript (the position is the index
+/// into the source session's `messages` array); the client uses
+/// `preview` to filter the picker.
+#[derive(Debug, Clone)]
+pub struct ForkUserMessage {
+    pub position: i64,
+    /// Single-line preview of the user message, already trimmed.
+    pub preview: String,
+    /// Local-time HH:MM formatted timestamp; falls back to "—" when
+    /// the server didn't record `created_at` (older sessions).
+    pub timestamp: String,
+}
+
 pub struct App {
     // session and provider state
     pub providers: Vec<Provider>,
@@ -166,6 +181,17 @@ pub struct App {
     pub model_picker_purpose: overlays::ModelPickerPurpose,
     pub settings_onboarding: bool,
     pub pending_model_provider: String,
+
+    /// /fork overlay: user messages from the source session, used to
+    /// build picker rows. The SessionLatest sentinel row is computed on
+    /// the fly from `self.session`. Empty until the user opens `/fork`
+    /// and the source loads via `Effect::LoadForkSource`.
+    pub overlay_fork_user_messages: Vec<ForkUserMessage>,
+    /// /fork overlay: id of the session being forked (always equal to
+    /// `self.session.id` while the overlay is open, but cached so we
+    /// don't have to remember which entry was loaded if the user
+    /// navigates around before confirming).
+    pub overlay_fork_source: String,
 
     // terminal dimensions
     pub width: u16,
@@ -299,6 +325,8 @@ impl App {
             model_picker_purpose: overlays::ModelPickerPurpose::Chat,
             settings_onboarding: false,
             pending_model_provider: String::new(),
+            overlay_fork_user_messages: Vec::new(),
+            overlay_fork_source: String::new(),
             width: 80,
             height: 24,
             err_msg: String::new(),
@@ -1001,6 +1029,11 @@ impl App {
                         reason: ev.reason.clone(),
                         from_subagent: ev.from_subagent,
                         child_title: ev.child_title.clone(),
+                        // v2: forward the origin tag (defaults to "self"
+                        // when the server didn't set one) and the
+                        // accept-all prefix preview for `[a]`.
+                        origin: ev.origin.clone(),
+                        accept_all_preview: ev.accept_all_preview.clone(),
                     }),
                     expanded: true,
                     ..Default::default()
@@ -1473,6 +1506,31 @@ impl App {
                 self.working_msg = "loading sessions...".into();
                 vec![Effect::FetchSessions]
             }
+            "/fork" => {
+                if self.streaming || self.remote_working {
+                    self.err_msg = "wait for the current turn to finish before forking".into();
+                    return Vec::new();
+                }
+                if self.session.id.is_empty() {
+                    self.err_msg = "no session to fork".into();
+                    return Vec::new();
+                }
+                if self.read_only_view() {
+                    self.err_msg = "cannot fork a subagent session".into();
+                    return Vec::new();
+                }
+                self.overlay = Some(OverlayKind::Fork);
+                self.overlay_q.clear();
+                self.overlay_q_sel = false;
+                self.overlay_sel = overlays::first_fork_row();
+                self.overlay_scroll = 0;
+                self.overlay_fork_user_messages.clear();
+                self.overlay_fork_source = self.session.id.clone();
+                self.working_msg = "loading session...".into();
+                vec![Effect::LoadForkSource {
+                    id: self.session.id.clone(),
+                }]
+            }
             "/thinking" => {
                 self.show_reasoning = !self.show_reasoning;
                 for block in &mut self.blocks {
@@ -1785,6 +1843,8 @@ impl App {
             AppMsg::ProvidersRebuilt(providers) => self.providers_rebuilt(providers),
             AppMsg::CreatedSession(info) => self.created_session(*info),
             AppMsg::SessionLoaded(sess) => self.session_loaded(*sess),
+            AppMsg::ForkSourceLoaded { id, sess } => self.fork_source_loaded(id, *sess),
+            AppMsg::ForkedSession { info, draft } => self.forked_session(*info, draft),
             AppMsg::ClipboardText(text) => {
                 if self.overlay.is_some() {
                     if overlays::overlay_has_query(Some(self.overlay.unwrap())) && !text.is_empty()
@@ -2018,6 +2078,77 @@ impl App {
             fx.push(Effect::PaintPreviews);
         }
         fx
+    }
+
+    /// fork_source_loaded: the /fork overlay's source-session fetch
+    /// resolved. Filter user messages into picker rows, install them on
+    /// the App, and clear the loading spinner.
+    ///
+    /// Race: the user may have navigated to a different session while
+    /// the request was in flight; if so, drop the response.
+    fn fork_source_loaded(
+        &mut self,
+        id: String,
+        sess: atom_core::session::store::Session,
+    ) -> Vec<Effect> {
+        if self.overlay != Some(OverlayKind::Fork) || id != self.overlay_fork_source {
+            return Vec::new();
+        }
+        let mut user_messages: Vec<ForkUserMessage> = sess
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message.role == "user")
+            .map(|(idx, message)| {
+                let preview = first_line(&message.content);
+                ForkUserMessage {
+                    position: idx as i64,
+                    preview,
+                    timestamp: fork_format_timestamp(None),
+                }
+            })
+            .collect();
+        // Drop empty user messages (a forked session can have a placeholder
+        // user turn); they're not useful fork points.
+        user_messages.retain(|msg| !msg.preview.is_empty());
+        self.overlay_fork_user_messages = user_messages;
+        self.overlay_sel = overlays::first_fork_row();
+        self.overlay_scroll = 0;
+        self.working_msg.clear();
+        Vec::new()
+    }
+
+    /// forked_session: the server confirmed the fork. Switch into the
+    /// child session (same as a /new, but with a pre-filled prompt and
+    /// a `parent_id` lineage marker already set server-side) and write
+    /// the chosen message's text into the prompt.
+    fn forked_session(&mut self, info: SessionInfo, draft: String) -> Vec<Effect> {
+        self.manage_restore_from.clear();
+        self.hide_manage_menu();
+        self.manage_agents.clear();
+        self.manage_sel = 0;
+        self.close_picker();
+        self.close_context_menu();
+        self.pending.clear();
+        self.input.set_value(&draft);
+        self.last_picker_insert.clear();
+        self.session = info;
+        self.apply_thinking(&self.session.thinking.clone());
+        self.persist_defaults();
+        self.blocks.clear();
+        self.streaming = false;
+        self.paused = false;
+        self.following = true;
+        self.interrupting = false;
+        self.overlay = None;
+        self.overlay_q.clear();
+        self.overlay_fork_user_messages.clear();
+        self.overlay_fork_source.clear();
+        self.working_msg.clear();
+        self.refresh_viewport();
+        vec![Effect::Subscribe {
+            id: self.session.id.clone(),
+        }]
     }
 
     /// sessionLoaded: switching sessions resets paused/following; the
@@ -3007,6 +3138,16 @@ impl App {
                         self.accept_settings_defaults();
                         self.overlay = None;
                     }
+                    OverlayKind::Fork => {
+                        // Drop the picker state so reopening /fork reloads
+                        // the source session from scratch — the user
+                        // might have added a message in the meantime.
+                        self.overlay_fork_user_messages.clear();
+                        self.overlay_fork_source.clear();
+                        self.overlay = None;
+                        self.overlay_q.clear();
+                        self.working_msg.clear();
+                    }
                     _ => {
                         self.overlay = None;
                         self.overlay_q.clear();
@@ -3025,6 +3166,11 @@ impl App {
                     }
                     OverlayKind::Session => overlays::move_session_sel(self, -1),
                     OverlayKind::Model => overlays::move_model_sel(self, -1),
+                    OverlayKind::Fork => {
+                        let rows = overlays::fork_rows(self);
+                        let new_sel = overlays::move_fork_sel(&rows, self.overlay_sel, -1);
+                        self.overlay_sel = new_sel;
+                    }
                     OverlayKind::ProviderKey => {}
                     _ => {
                         if self.overlay_sel > 0 {
@@ -3044,6 +3190,11 @@ impl App {
                     }
                     OverlayKind::Session => overlays::move_session_sel(self, 1),
                     OverlayKind::Model => overlays::move_model_sel(self, 1),
+                    OverlayKind::Fork => {
+                        let rows = overlays::fork_rows(self);
+                        let new_sel = overlays::move_fork_sel(&rows, self.overlay_sel, 1);
+                        self.overlay_sel = new_sel;
+                    }
                     OverlayKind::ProviderKey => {}
                     _ => {
                         let cnt = overlays::overlay_count(self);
@@ -3100,6 +3251,19 @@ impl App {
             self.overlay_sel = overlays::first_model_row(self);
             self.overlay_scroll = 0;
             overlays::sync_model_scroll(self);
+        } else if self.overlay == Some(OverlayKind::Fork) {
+            // Typing in the search box always lands the selection on
+            // the SessionLatest sentinel when no filter matches, or
+            // the first matching user message otherwise. This mirrors
+            // the behavior of /sessions: the picker resets to the top.
+            let rows = overlays::fork_rows(self);
+            // Find the first non-Header row.
+            let first_pick = rows
+                .iter()
+                .position(|r| r.kind != overlays::ForkRowKind::Header)
+                .unwrap_or(0);
+            self.overlay_sel = first_pick;
+            self.overlay_scroll = 0;
         } else if self.overlay != Some(OverlayKind::ProviderKey) {
             self.overlay_sel = 0;
         }
@@ -3481,17 +3645,42 @@ impl App {
                 self.preview_dirty = true;
                 vec![Effect::PaintPreviews]
             }
+            OverlayKind::Fork => {
+                let rows = overlays::fork_rows(self);
+                if self.overlay_sel >= rows.len() {
+                    return Vec::new();
+                }
+                let row = &rows[self.overlay_sel];
+                if row.kind == overlays::ForkRowKind::Header {
+                    return Vec::new();
+                }
+                let source_id = self.overlay_fork_source.clone();
+                let position = match row.kind {
+                    overlays::ForkRowKind::SessionLatest => None,
+                    overlays::ForkRowKind::UserMessage => row.position,
+                    overlays::ForkRowKind::Header => return Vec::new(),
+                };
+                self.working_msg = "forking session...".into();
+                vec![Effect::ForkSession {
+                    source_id,
+                    position,
+                }]
+            }
         }
     }
 
     // -- approval ----------------------------------------------------------
 
     fn approval_key(&mut self, k: KeyEvent, req: ApprovalPrompt) -> Vec<Effect> {
+        // v2 spec: four buttons, no session-scoped grant.
+        //   y → allow_once, a → allow_always, n → deny_once,
+        //   d / Esc → deny_once.
         let decision = match k.code {
-            KeyCode::Char('a') => Some(("allow_once", "allow once")),
-            KeyCode::Char('s') => Some(("allow_session", "allowed this session")),
-            KeyCode::Char('g') => Some(("allow_global", "always allowed")),
-            KeyCode::Char('d') | KeyCode::Esc => Some(("deny", "denied")),
+            KeyCode::Char('y') => Some(("allow_once", "allowed once")),
+            KeyCode::Char('a') => Some(("allow_always", "always allowed")),
+            KeyCode::Char('n') => Some(("deny_once", "denied")),
+            KeyCode::Char('d') => Some(("deny_always", "denied, rule saved")),
+            KeyCode::Esc => Some(("deny_once", "denied")),
             KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.quitting = true;
                 return vec![Effect::Quit];
@@ -3563,16 +3752,17 @@ impl App {
     /// Check if a click at (content_row, col) falls on an approval button in
     /// block `bi`. Returns the decision string ("allow_once" etc.) or None.
     fn approval_button_hit(&self, bi: usize, content_row: usize, col: usize) -> Option<String> {
-        // The buttons are on the last rendered line of the block.
-        // Determine which content line the buttons are on by finding the
-        // block start + offset.
+        // The buttons are on the rendered line just above the help row,
+        // which is itself above the bottom pad row. With the v2 layout:
+        //   ... body rows ... [buttons] [help] [pad]
+        // so the buttons live three lines from the end (antepenultimate).
         let block_start = *self.block_start.get(bi)?;
         let block_lines = self.blocks[bi].lines.as_ref()?;
-        let button_row = block_start + block_lines.len().saturating_sub(2); // penultimate = buttons row
+        let button_row = block_start + block_lines.len().saturating_sub(3);
         if content_row != button_row {
             return None;
         }
-        // Button layout: "  [a] allow   [s] session   [g] always   [d] deny  "
+        // Button layout: "  [y] once   [a] always   [n] deny   [d] never  "
         let buttons = blocks::approval_buttons();
         for btn in &buttons {
             if col >= btn.col_start && col < btn.col_end {
@@ -3591,9 +3781,9 @@ impl App {
         };
         let note = match decision {
             "allow_once" => "allow once",
-            "allow_session" => "allowed this session",
-            "allow_global" => "always allowed",
-            "deny" => "denied",
+            "allow_always" => "always allowed",
+            "deny_once" => "denied",
+            "deny_always" => "denied",
             _ => "denied",
         };
         self.blocks[bi].tool_done = true;
@@ -4154,6 +4344,38 @@ fn chrono_now() -> chrono::DateTime<chrono::Utc> {
     chrono::Utc::now()
 }
 
+/// Returns the first non-empty line of `text`, trimmed and clipped to
+/// a friendly preview length. Used for /fork row labels and similar
+/// one-line title summaries.
+fn first_line(text: &str) -> String {
+    let mut iter = text.lines();
+    let mut line = iter.next().unwrap_or("").trim().to_string();
+    // Skip leading blank lines.
+    while line.is_empty() {
+        line = iter.next().unwrap_or("").trim().to_string();
+    }
+    // Collapse internal whitespace so a wrapped preview fits one visual line.
+    let collapsed: String = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    const MAX: usize = 80;
+    if collapsed.chars().count() > MAX {
+        let mut out: String = collapsed.chars().take(MAX - 1).collect();
+        out.push('…');
+        out
+    } else {
+        collapsed
+    }
+}
+
+/// Formats a DateTime as a local HH:MM stamp for the /fork picker.
+/// Returns "—" when the timestamp is missing or unparseable.
+fn fork_format_timestamp(created_at: Option<chrono::DateTime<chrono::Utc>>) -> String {
+    let Some(ts) = created_at else {
+        return "—".into();
+    };
+    let local: chrono::DateTime<chrono::Local> = ts.with_timezone(&chrono::Local);
+    local.format("%H:%M").to_string()
+}
+
 fn picker_items(commands: &[DynamicCommand], kind: &str) -> Vec<PickerItem> {
     commands
         .iter()
@@ -4249,11 +4471,13 @@ mod tests {
     #[test]
     fn approval_keys_map_to_wire_decisions() {
         let cases = [
-            (KeyCode::Char('a'), "allow_once"),
-            (KeyCode::Char('s'), "allow_session"),
-            (KeyCode::Char('g'), "allow_global"),
-            (KeyCode::Char('d'), "deny"),
-            (KeyCode::Esc, "deny"),
+            // v2 spec: y/a/n/d map to the four decisions; Esc cancels
+            // into deny_once. The session/global keys are gone.
+            (KeyCode::Char('y'), "allow_once"),
+            (KeyCode::Char('a'), "allow_always"),
+            (KeyCode::Char('n'), "deny_once"),
+            (KeyCode::Char('d'), "deny_always"),
+            (KeyCode::Esc, "deny_once"),
         ];
         for (code, wire) in cases {
             let mut app = approval_app();
@@ -4685,7 +4909,8 @@ mod tests {
         let matches = overlays::match_commands(&app.menu_typed(), &app.slash_commands);
         assert_eq!(matches[0].name, "/new");
         assert_eq!(matches[1].name, "/sessions");
-        assert_eq!(matches[2].name, "/settings");
+        assert_eq!(matches[2].name, "/fork");
+        assert_eq!(matches[3].name, "/settings");
         // Enter runs the highlighted row (/new); the prompt is cleared
         // as with any submitted command.
         let fx = app.key(key(KeyCode::Enter, KeyModifiers::NONE));

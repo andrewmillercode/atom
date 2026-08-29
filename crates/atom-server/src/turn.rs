@@ -24,7 +24,7 @@ use atom_core::types::{
     ChatRequest, Message, StreamOptions, StreamResult, StreamToolCallDelta, ToolCall,
 };
 use atom_tools::defs::without_tool;
-use chrono::Local;
+use chrono::{Local, Utc};
 use futures::{FutureExt, Stream, StreamExt};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -668,6 +668,7 @@ pub async fn run_session_turn(
             role: "user".into(),
             content: opts.message.clone(),
             images: opts.images.clone(),
+            created_at: Some(Utc::now()),
             ..Default::default()
         });
         // Persist the session log now so the user message is on the
@@ -1982,7 +1983,6 @@ mod tests {
         let state = Arc::new(AppState::new(
             store,
             SandboxConfig {
-                mode: atom_sandbox::policy::SandboxMode::Off,
                 ..Default::default()
             },
             Arc::new(ConnTracker::new()),
@@ -2041,7 +2041,6 @@ mod tests {
         let state = Arc::new(AppState::new(
             store,
             SandboxConfig {
-                mode: atom_sandbox::policy::SandboxMode::Off,
                 ..Default::default()
             },
             Arc::new(ConnTracker::new()),
@@ -2097,7 +2096,6 @@ mod tests {
         let state = AppState::new(
             store,
             SandboxConfig {
-                mode: atom_sandbox::policy::SandboxMode::Off,
                 ..Default::default()
             },
             Arc::new(ConnTracker::new()),
@@ -2146,14 +2144,13 @@ mod tests {
     #[tokio::test]
     async fn user_stop_marks_child_stopped_with_marker() {
         use crate::state::ConnTracker;
-        use atom_sandbox::policy::{SandboxConfig, SandboxMode};
+        use atom_sandbox::policy::SandboxConfig;
         let dir = tempfile::tempdir().unwrap();
         let store =
             Arc::new(atom_core::session::store::SessionStore::open_in_dir(dir.path()).unwrap());
         let state = Arc::new(AppState::new(
             store.clone(),
             SandboxConfig {
-                mode: SandboxMode::Off,
                 ..Default::default()
             },
             Arc::new(ConnTracker::new()),

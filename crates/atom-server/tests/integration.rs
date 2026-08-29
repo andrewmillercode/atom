@@ -5,7 +5,7 @@
 
 use atom_core::session::store::SessionStore;
 use atom_sandbox::approvals::{ApprovalRequest, Approver, Decision};
-use atom_sandbox::policy::{NetPolicy, SandboxConfig, SandboxMode};
+use atom_sandbox::policy::SandboxConfig;
 use atom_server::client;
 use atom_server::dispatch::{DispatchBridge, ServerApprover};
 use atom_server::state::{AppState, ConnTracker};
@@ -70,18 +70,11 @@ impl Drop for TestEnv {
 }
 
 fn off_cfg() -> SandboxConfig {
-    SandboxConfig {
-        mode: SandboxMode::Off,
-        ..Default::default()
-    }
+    SandboxConfig::default()
 }
 
 fn workspace_cfg() -> SandboxConfig {
-    SandboxConfig {
-        mode: SandboxMode::Workspace,
-        network: NetPolicy::Deny,
-        ..Default::default()
-    }
+    SandboxConfig::default()
 }
 
 /// Spawns the server stack on the isolated data dir's socket path.
@@ -514,6 +507,7 @@ async fn approval_flow_round_trip_and_timeout() {
         cwd: std::path::PathBuf::from("/tmp"),
         rule_id: "curl".into(),
         reason: "network tool".into(),
+        accept_all_preview: None,
     };
     let waiter = {
         let approver = ServerApprover::new(state.clone(), sid.clone());
@@ -547,9 +541,10 @@ async fn approval_flow_round_trip_and_timeout() {
             cwd: std::path::PathBuf::from("/tmp"),
             rule_id: "wget".into(),
             reason: "r".into(),
+            accept_all_preview: None,
         })
         .await;
-    assert_eq!(denied, Decision::Deny);
+    assert_eq!(denied, Decision::DenyOnce);
 
     // Unknown approval ids 404.
     assert!(client::respond_approval(&sid, "doesnotexist0000", "deny")

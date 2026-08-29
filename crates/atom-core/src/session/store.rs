@@ -859,8 +859,20 @@ impl SessionStore {
 
     /// save replaces all persisted session state atomically. Callers hold the
     /// index lock to keep SQLite and metadata updates ordered.
-    fn save(&self, sess: &Session) {
+    pub fn save(&self, sess: &Session) {
         let _ = self.save_result(sess);
+    }
+
+    /// save_with_index persists a new session and installs its index
+    /// entry in one shot. Used by /fork where the caller is creating a
+    /// brand-new session with custom messages and needs the listing
+    /// metadata available immediately.
+    pub fn save_with_index(&self, sess: &Session) {
+        self.save(sess);
+        self.index
+            .write()
+            .unwrap()
+            .insert(sess.id.clone(), sess.info());
     }
 
     fn save_result(&self, sess: &Session) -> anyhow::Result<()> {

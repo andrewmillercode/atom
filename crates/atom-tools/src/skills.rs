@@ -411,7 +411,8 @@ Do the thing.
         let s = parse_skill_markdown(raw, "fallback", "/tmp/meta-ads").unwrap();
         assert_eq!(s.name, "meta-ads");
         assert!(
-            s.description.starts_with("Read and manage Meta Ads campaigns"),
+            s.description
+                .starts_with("Read and manage Meta Ads campaigns"),
             "{}",
             s.description
         );
@@ -421,7 +422,8 @@ Do the thing.
             s.description
         );
         assert!(
-            s.description.contains("~/.local/share/atom-dev/meta-ads/token"),
+            s.description
+                .contains("~/.local/share/atom-dev/meta-ads/token"),
             "continuation lines must be folded: {}",
             s.description
         );

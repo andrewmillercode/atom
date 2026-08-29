@@ -152,14 +152,21 @@ pub struct ServerApprover {
 
 /// Builds the `approval_request` event for one pending prompt. When the
 /// session is a dispatched subagent, the event carries the child's
-/// identity (`from_subagent`, `child_title`) so the parent view can
-/// surface the prompt and answer it without navigating into the child.
+/// identity (`from_subagent`, `child_title`, `origin = "child"`) so the
+/// parent view can surface the prompt and answer it without navigating
+/// into the child. The v2 `origin` tag is the wire-level name; existing
+/// `from_subagent` is kept for back-compat with older TUI consumers.
 pub fn approval_request_event(
     state: &AppState,
     session_id: &str,
     id: &str,
     req: &ApprovalRequest,
 ) -> serde_json::Value {
+    let is_child = state
+        .store
+        .get_info(session_id)
+        .map(|c| !c.parent_id.is_empty())
+        .unwrap_or(false);
     let mut ev = json!({
         "type": "approval_request",
         "id": id,
@@ -168,6 +175,10 @@ pub fn approval_request_event(
         "cwd": req.cwd.display().to_string(),
         "rule_id": req.rule_id,
         "reason": req.reason,
+        // v2 origin tag: "self" for the current session, "child" when
+        // the prompt surfaced via a dispatched subagent. Drives the
+        // "from subagent: <title>" header in the TUI approval block.
+        "origin": if is_child { "child" } else { "self" },
     });
     if let Some(child) = state.store.get_info(session_id) {
         if !child.parent_id.is_empty() {
@@ -181,6 +192,13 @@ pub fn approval_request_event(
                 short
             };
             ev["child_title"] = json!(title);
+        }
+    }
+    // Forward the server-computed prefix-rule preview for `[a]`. The
+    // TUI renders it as a dim hint under the command details.
+    if let Some(preview) = req.accept_all_preview.as_deref() {
+        if !preview.is_empty() {
+            ev["accept_all_preview"] = json!(preview);
         }
     }
     ev
@@ -263,14 +281,14 @@ impl Approver for ServerApprover {
         let decision = match &self.cancel {
             Some(cancel) => {
                 tokio::select! {
-                    res = rx => res.unwrap_or(Decision::Deny),
-                    _ = cancel.cancelled() => Decision::Deny,
+                    res = rx => res.unwrap_or(Decision::DenyOnce),
+                    _ = cancel.cancelled() => Decision::DenyOnce,
                 }
             }
             None => {
                 // No cancel token: block indefinitely until user responds
                 // or the oneshot sender is dropped (session cleanup).
-                rx.await.unwrap_or(Decision::Deny)
+                rx.await.unwrap_or(Decision::DenyOnce)
             }
         };
         self.state.approvals.remove(&self.session_id, &id);
@@ -1093,12 +1111,17 @@ mod tests {
             cwd: "/repo".into(),
             rule_id: "git-push".into(),
             reason: "push to remote".into(),
+            accept_all_preview: Some("git push *".into()),
         };
 
         // A plain session's event carries no subagent identity.
         let plain = approval_request_event(&state, &parent.id, "a1", &req);
         assert_eq!(plain["session_id"], parent.id);
         assert_ne!(plain.get("from_subagent"), Some(&json!(true)));
+        // v2 origin tag defaults to "self" for non-subagent sessions.
+        assert_eq!(plain["origin"], "self");
+        // Prefix preview rides through when the server populated it.
+        assert_eq!(plain["accept_all_preview"], "git push *");
 
         // A dispatch child's event names it so the parent view can
         // surface the prompt.
@@ -1108,6 +1131,8 @@ mod tests {
         assert_eq!(ev["child_title"], "verify build");
         assert_eq!(ev["command"], "git push");
         assert_eq!(ev["id"], "a2");
+        // v2 origin tag flips to "child" for dispatched subagents.
+        assert_eq!(ev["origin"], "child");
     }
 
     #[tokio::test]
@@ -1124,6 +1149,7 @@ mod tests {
             cwd: "/work".into(),
             rule_id: "rm-rf".into(),
             reason: "clean build dir".into(),
+            accept_all_preview: None,
         };
         let (tx, _rx) = tokio::sync::oneshot::channel();
         state

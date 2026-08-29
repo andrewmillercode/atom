@@ -186,6 +186,14 @@ fn js_string(s: &str) -> String {
         .replace("</", "<\\/")
 }
 
+/// Embedded at compile time; see `templates/visualize-viewer.{html,js}`.
+/// Substitution tokens are `__NAME__` so they don't collide with CSS or
+/// JS brace syntax. Keep both files in sync — the HTML expects the JS
+/// template to provide `setSvg`, `fit`, `zoomBy`, `reset`, and
+/// `downloadSvg`.
+const VIEWER_HTML: &str = include_str!("../templates/visualize-viewer.html");
+const VIEWER_JS: &str = include_str!("../templates/visualize-viewer.js");
+
 /// viewer_html builds the self-contained browser viewer. Dark theme with
 /// dot grid background, pan/zoom via pointer drag and wheel.
 /// Colors sourced from atom's palette (colors.rs constants).
@@ -199,160 +207,24 @@ fn viewer_html(title: &str, slug: &str, svg: &str, code: &str) -> String {
     let muted = COLOR_MUTED; // #666666
     let fg = COLOR_FOREGROUND; // #ced5d9
 
-    format!(
-        r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title}</title>
-<style>
-  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-  html, body {{ height: 100%; overflow: hidden; background: {bg}; color: {fg}; }}
-  body {{ display: flex; flex-direction: column; font: 13px/1.4 -apple-system, "Segoe UI", sans-serif; }}
-  header {{ display: flex; align-items: center; gap: 12px; padding: 8px 14px;
-    border-bottom: 1px solid {border}; user-select: none; z-index: 10; }}
-  header .title {{ font-weight: 600; flex: 1; overflow: hidden;
-    text-overflow: ellipsis; white-space: nowrap; }}
-  header button {{ font: inherit; border: 1px solid {border};
-    background: {card}; color: {fg}; border-radius: 6px;
-    padding: 3px 10px; cursor: pointer; }}
-  header button:hover {{ background: {border}; }}
-  #viewport {{ flex: 1; position: relative; overflow: hidden; cursor: grab;
-    touch-action: none; user-select: none;
-    background-color: {bg};
-    background-image: radial-gradient(circle, {muted_extra} 1px, transparent 1px);
-    background-size: 24px 24px; }}
-  #stage {{ position: absolute; left: 0; top: 0; transform-origin: 0 0; }}
-  #stage svg {{ display: block; max-width: none; }}
-  details {{ position: fixed; right: 12px; bottom: 12px; max-width: min(640px, 80vw);
-    background: {card}; border: 1px solid {border};
-    border-radius: 8px; padding: 8px 12px; font: 12px ui-monospace, monospace;
-    box-shadow: 0 4px 16px rgba(0,0,0,.4); z-index: 10; }}
-  details pre {{ max-height: 40vh; overflow: auto; white-space: pre-wrap; color: {muted}; }}
-  summary {{ cursor: pointer; color: {muted}; }}
-</style>
-</head>
-<body>
-<header>
-  <div class="title">{title_html}</div>
-  <button onclick="fit()">Fit</button>
-  <button onclick="zoomBy(1.25)">+</button>
-  <button onclick="zoomBy(0.8)">&minus;</button>
-  <button onclick="reset()">100%</button>
-  <button onclick="downloadSvg()">SVG</button>
-  <span id="pct" style="min-width:3em;text-align:right;color:{muted}"></span>
-</header>
-<div id="viewport"><div id="stage"></div></div>
-<details><summary>&#9654; Mermaid source</summary><pre>{code_html}</pre></details>
-<script>
-"use strict";
-const viewport = document.getElementById("viewport");
-const stage = document.getElementById("stage");
-let scale = 1, tx = 0, ty = 0, natW = 800, natH = 600;
+    // Fill the JS template first so its `__BORDER__` is gone before the
+    // HTML pass runs (the HTML also has a `__BORDER__` for the CSS).
+    let viewer_js = VIEWER_JS
+        .replace("__BORDER__", border)
+        .replace("__CODE_JS__", &js_string(code))
+        .replace("__SVG_JS__", &js_string(svg))
+        .replace("__SLUG__", slug);
 
-function setSvg(svg) {{
-  stage.innerHTML = svg;
-  const el = stage.querySelector("svg");
-  if (!el) return;
-  const vb = el.viewBox && el.viewBox.baseVal;
-  if (vb && vb.width > 0 && vb.height > 0) {{ natW = vb.width; natH = vb.height; }}
-  else {{
-    const w = el.width && el.width.baseVal.value;
-    const h = el.height && el.height.baseVal.value;
-    if (w > 0 && h > 0) {{ natW = w; natH = h; }}
-  }}
-  el.removeAttribute("width"); el.removeAttribute("height");
-  el.style.width = natW + "px"; el.style.height = natH + "px";
-  stage.style.width = natW + "px"; stage.style.height = natH + "px";
-  fit();
-}}
-
-setSvg({svg_js});
-
-const MERMAID_CDN = "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js";
-function renderWithMermaid() {{
-  if (typeof mermaid === "undefined") return;
-  mermaid.initialize({{ startOnLoad: false, theme: "dark", securityLevel: "loose", themeVariables: {{ clusterBkg: "transparent", clusterBorder: "{border}" }} }});
-  mermaid.render("mmd-" + Date.now(), {code_js})
-    .then(({{ svg }}) => setSvg(svg))
-    .catch(() => {{}});
-}}
-const s = document.createElement("script");
-s.src = MERMAID_CDN; s.onload = renderWithMermaid;
-document.head.appendChild(s);
-
-new ResizeObserver(() => fit()).observe(viewport);
-
-function apply() {{
-  stage.style.transform = `translate(${{tx}}px,${{ty}}px) scale(${{scale}})`;
-  document.getElementById("pct").textContent = Math.round(scale * 100) + "%";
-}}
-function zoomBy(f, cx, cy) {{
-  const r = viewport.getBoundingClientRect();
-  cx = cx === undefined ? r.width / 2 : cx - r.left;
-  cy = cy === undefined ? r.height / 2 : cy - r.top;
-  const ns = Math.min(20, Math.max(0.02, scale * f));
-  const k = ns / scale;
-  tx = cx - (cx - tx) * k; ty = cy - (cy - ty) * k; scale = ns;
-  apply();
-}}
-function fit() {{
-  const r = viewport.getBoundingClientRect();
-  if (r.width < 1 || r.height < 1 || natW < 1 || natH < 1) return;
-  scale = Math.min((r.width - 64) / natW, (r.height - 64) / natH, 4);
-  scale = Math.max(0.02, scale);
-  tx = (r.width - natW * scale) / 2;
-  ty = (r.height - natH * scale) / 2;
-  apply();
-}}
-function reset() {{
-  const r = viewport.getBoundingClientRect();
-  scale = 1;
-  tx = (r.width - natW) / 2; ty = (r.height - natH) / 2;
-  apply();
-}}
-function downloadSvg() {{
-  const el = stage.querySelector("svg");
-  if (!el) return;
-  const blob = new Blob([new XMLSerializer().serializeToString(el)], {{type:"image/svg+xml"}});
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob); a.download = "{slug}.svg"; a.click();
-}}
-let px=0, py=0, down=false;
-viewport.addEventListener("pointerdown", e => {{
-  if (e.button !== 0) return;
-  down = true; px = e.clientX; py = e.clientY;
-  viewport.style.cursor = "grabbing"; viewport.setPointerCapture(e.pointerId);
-}});
-viewport.addEventListener("pointermove", e => {{
-  if (!down) return;
-  tx += e.clientX - px; ty += e.clientY - py;
-  px = e.clientX; py = e.clientY; apply();
-}});
-window.addEventListener("pointerup", () => {{ down = false; viewport.style.cursor = "grab"; }});
-viewport.addEventListener("wheel", e => {{
-  e.preventDefault();
-  zoomBy(e.deltaY < 0 ? 1.15 : 0.87, e.clientX, e.clientY);
-}}, {{passive:false}});
-viewport.addEventListener("dblclick", fit);
-window.addEventListener("keydown", e => {{
-  if (e.key === "+" || e.key === "=") zoomBy(1.25);
-  else if (e.key === "-") zoomBy(0.8);
-  else if (e.key === "0") reset();
-  else if (e.key === "f") fit();
-}});
-</script>
-</body>
-</html>
-"#,
-        title = escape_html(title),
-        title_html = escape_html(title),
-        code_html = escape_html(code),
-        code_js = js_string(code),
-        svg_js = js_string(svg),
-        slug = slug,
-    )
+    VIEWER_HTML
+        .replace("__TITLE__", &escape_html(title))
+        .replace("__BG__", bg)
+        .replace("__CARD__", card)
+        .replace("__BORDER__", border)
+        .replace("__MUTED_EXTRA__", muted_extra)
+        .replace("__MUTED__", muted)
+        .replace("__FG__", fg)
+        .replace("__CODE_HTML__", &escape_html(code))
+        .replace("__VIEWER_JS__", &viewer_js)
 }
 
 /// execute_visualize renders a Mermaid diagram. On success the result

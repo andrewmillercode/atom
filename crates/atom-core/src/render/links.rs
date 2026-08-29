@@ -319,7 +319,15 @@ fn lexical_abs(p: &str, cwd: &str) -> String {
             other => parts.push(other),
         }
     }
-    format!("/{}", parts.join("/"))
+    // A trailing slash is a directory marker (e.g. "`~/Library/.../`");
+    // lexical normalization must not eat it or the file:// URI silently
+    // points at the parent path. Root "/" stays exactly "/".
+    let trailing_slash = joined.ends_with('/') && joined.len() > 1;
+    let mut out = format!("/{}", parts.join("/"));
+    if trailing_slash && out.len() > 1 {
+        out.push('/');
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -614,6 +622,7 @@ mod tests {
         let home = dirs::home_dir().unwrap().display().to_string();
         let out = linkify(in_text, "", "", "");
         // The full path — space included — becomes the URI, escaped.
+        // The trailing slash is a real directory marker and survives.
         assert!(out.contains(&osc8_open(&file_uri(&format!(
             "{home}/Library/Application Support/atom/diagrams/"
         )))));

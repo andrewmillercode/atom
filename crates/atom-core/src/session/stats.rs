@@ -252,7 +252,7 @@ fn hex_rgb(hex: &str) -> (u8, u8, u8) {
     )
 }
 
-fn style_render(fg: &str, bg: Option<&str>, s: &str) -> String {
+fn style_render(fg: &str, s: &str) -> String {
     use crate::render::colors::{theme_color, ThemeColor};
     let color = theme_color(match fg {
         "dim" => ThemeColor::Muted,
@@ -260,24 +260,15 @@ fn style_render(fg: &str, bg: Option<&str>, s: &str) -> String {
         _ => ThemeColor::Foreground,
     });
     let (r, g, b) = hex_rgb(&color);
-    let mut params = format!("38;2;{r};{g};{b}");
-    if bg == Some("tool") {
-        let (br, bgc, bb) = hex_rgb(&theme_color(ThemeColor::CardDark));
-        params.push_str(&format!(";48;2;{br};{bgc};{bb}"));
-    }
-    format!("\x1b[{params}m{s}\x1b[0m")
+    format!("\x1b[38;2;{r};{g};{b}m{s}\x1b[0m")
 }
 
 fn style_dim(s: &str) -> String {
-    style_render("dim", None, s)
-}
-
-fn style_inactive(s: &str) -> String {
-    style_render("inactive", None, s)
+    style_render("dim", s)
 }
 
 fn style_tool(s: &str) -> String {
-    style_render("foreground", Some("tool"), s)
+    style_render("foreground", s)
 }
 
 /// renderStats renders the report as a boxed table like opencode's stats
@@ -289,40 +280,56 @@ pub fn render_stats(report: &StatsReport, width: i32, color: bool) -> Vec<String
     if width <= 0 {
         width = 56;
     }
-    width = width.clamp(34, 64);
+    // 36 leaves room for the fixed tool-name gutter plus a 1-cell bar.
+    width = width.clamp(36, 64);
 
-    let box_line = |corner: &str| -> String {
-        let line = format!("{}{}{}", corner, "─".repeat((width - 2) as usize), corner);
+    let box_line = |open: &str, close: &str| -> String {
+        let line = format!("{open}{}{close}", "─".repeat((width - 2) as usize));
         if color {
             style_dim(&line)
         } else {
             line
         }
     };
+    // Table side borders render dim; cell text keeps its own color so
+    // the sides read as a uniform table frame, not per-row highlights.
+    let tbl_open = if color {
+        style_dim("│")
+    } else {
+        "│".to_string()
+    };
+    let tbl_close = tbl_open.clone();
     let title = |s: &str| -> String {
-        let line = pad_box_line(&format!(" {s}"), width);
+        let body = pad_inner(&format!(" {s}"), width);
         if color {
-            style_inactive(&line)
+            format!(
+                "{}{}{}",
+                tbl_open,
+                style_render("foreground", &body),
+                tbl_close
+            )
         } else {
-            line
+            format!("│{}│", body)
         }
     };
     let row = |label: &str, value: &str| -> String {
         let inner = width - 2;
         let mut label = label.to_string();
-        let mut gap = inner - cell_width(&label) - cell_width(value) - 1;
+        let mut gap = inner - cell_width(&label) - cell_width(value) - 2;
         if gap < 1 {
-            let max_label = (inner - cell_width(value) - 2).max(0);
+            let max_label = (inner - cell_width(value) - 4).max(0);
             label = truncate(&label, max_label);
-            gap = inner - cell_width(&label) - cell_width(value) - 1;
+            gap = inner - cell_width(&label) - cell_width(value) - 2;
             if gap < 1 {
                 gap = 1;
             }
         }
-        pad_box_line(
-            &format!("{}{}{} ", label, " ".repeat(gap as usize), value),
-            width,
-        )
+        let body = format!(" {}{}{} ", label, " ".repeat(gap as usize), value);
+        if color {
+            format!("{tbl_open}{}{tbl_close}", pad_inner(&body, width))
+        } else {
+            format!("│{}│", pad_inner(&body, width))
+        }
     };
 
     if report.total_sessions == 0 {
@@ -336,25 +343,25 @@ pub fn render_stats(report: &StatsReport, width: i32, color: bool) -> Vec<String
 
     let mut lines: Vec<String> = vec![
         // Overview: session and message counts plus the span in days.
-        box_line("┌"),
-        title("OVERVIEW"),
-        box_line("├"),
+        box_line("┌", "┐"),
+        title("Overview"),
+        box_line("├", "┤"),
         row("Sessions", &report.total_sessions.to_string()),
         row("Messages", &report.total_messages.to_string()),
         row("Days", &report.days.to_string()),
-        box_line("└"),
+        box_line("└", "┘"),
         String::new(),
     ];
 
     // Tokens (and cost, when any provider reported it).
     let heading = if report.total_cost > 0.0 {
-        "COST & TOKENS"
+        "Cost & Tokens"
     } else {
-        "TOKENS"
+        "Tokens"
     };
-    lines.push(box_line("┌"));
+    lines.push(box_line("┌", "┐"));
     lines.push(title(heading));
-    lines.push(box_line("├"));
+    lines.push(box_line("├", "┤"));
     if report.total_cost > 0.0 {
         lines.push(row("Total Cost", &format!("${:.2}", report.total_cost)));
         lines.push(row("Avg Cost/Day", &format!("${:.2}", report.cost_per_day)));
@@ -387,14 +394,14 @@ pub fn render_stats(report: &StatsReport, width: i32, color: bool) -> Vec<String
             &format_tokens(report.total_tokens.cache.write),
         ));
     }
-    lines.push(box_line("└"));
+    lines.push(box_line("└", "┘"));
     lines.push(String::new());
 
     // Per-model breakdown, biggest consumers first.
     if !report.model_usage.is_empty() {
-        lines.push(box_line("┌"));
-        lines.push(title("MODEL USAGE"));
-        lines.push(box_line("├"));
+        lines.push(box_line("┌", "┐"));
+        lines.push(title("Model Usage"));
+        lines.push(box_line("├", "┤"));
         let models = sorted_models(&report.model_usage);
         for (i, key) in models.iter().enumerate() {
             let mu = &report.model_usage[key];
@@ -417,18 +424,21 @@ pub fn render_stats(report: &StatsReport, width: i32, color: bool) -> Vec<String
                 lines.push(row("  Cost", &format!("${:.4}", mu.cost)));
             }
             if i < models.len() - 1 {
-                lines.push(box_line("├"));
+                lines.push(box_line("├", "┤"));
             }
         }
-        lines.push(box_line("└"));
+        lines.push(box_line("└", "┘"));
         lines.push(String::new());
     }
 
-    // Tool usage as a bar chart, most-used first.
+    // Tool usage as a bar chart, most-used first. Names render
+    // normal-cased in the theme's foreground color; a fixed-width name
+    // gutter keeps every bar starting at the same column, and names too
+    // long for the gutter wrap onto their own continuation lines.
     if !report.tool_usage.is_empty() {
-        lines.push(box_line("┌"));
-        lines.push(title("TOOL USAGE"));
-        lines.push(box_line("├"));
+        lines.push(box_line("┌", "┐"));
+        lines.push(title("Tool Usage"));
+        lines.push(box_line("├", "┤"));
         let tools = sorted_tools(&report.tool_usage);
         let mut max_count = 0i64;
         let mut total_calls = 0i64;
@@ -439,25 +449,25 @@ pub fn render_stats(report: &StatsReport, width: i32, color: bool) -> Vec<String
             }
             total_calls += count;
         }
+        let name_cols = 16i32;
+        let gutter = name_cols as usize + 2;
+        let inner_max = (width - 2).max(0) as usize;
+        // Bars are comparable across rows: size them against the
+        // widest possible count suffix, not each row's own.
+        let suffix_w = cell_width(&format!(" {max_count} (100.0%)")) as usize;
+        let max_bar = inner_max.saturating_sub(1 + gutter + suffix_w);
         for t in &tools {
             let count = report.tool_usage[t];
             let pct = format!(" ({:.1}%)", count as f64 / total_calls as f64 * 100.0);
-            let suffix = format!(" {}{}", count, pct);
-            let inner = width - 2;
-            let mut name_cols = 16i32;
-            let mut prefix;
-            let mut max_bar;
-            loop {
-                prefix = format!(" {} ", truncate(t, name_cols));
-                max_bar = inner - cell_width(&prefix) - cell_width(&suffix);
-                if max_bar >= 1 || name_cols <= 1 {
-                    break;
-                }
-                name_cols -= 1;
+            let suffix = format!(" {count}{pct}");
+            let name = normalize_tool_name(t);
+            let chunks = wrap_name_cols(&name, name_cols);
+            // Continuation lines before the bar line keep the gutter.
+            for chunk in &chunks[..chunks.len() - 1] {
+                let line = pad_box_line(chunk, width);
+                lines.push(if color { style_dim(&line) } else { line });
             }
-            if max_bar < 1 {
-                max_bar = 0;
-            }
+            let last = chunks.last().cloned().unwrap_or_default();
             let mut bar_len = 0usize;
             if max_bar >= 1 {
                 bar_len = (count * max_bar as i64 / max_count) as usize;
@@ -465,12 +475,23 @@ pub fn render_stats(report: &StatsReport, width: i32, color: bool) -> Vec<String
                     bar_len = 1;
                 }
             }
-            let content = format!("{}{}{}", prefix, "█".repeat(bar_len), suffix);
-            let line = pad_box_line(&content, width);
-            let line = if color { style_tool(&line) } else { line };
+            let body = format!(
+                " {}  {}{}",
+                pad_end(&last, name_cols as usize),
+                "█".repeat(bar_len),
+                suffix
+            );
+            let line = if color {
+                format!(
+                    "{tbl_open}{}{tbl_close}",
+                    style_tool(&pad_inner(&body, width))
+                )
+            } else {
+                format!("│{}│", pad_inner(&body, width))
+            };
             lines.push(line);
         }
-        lines.push(box_line("└"));
+        lines.push(box_line("└", "┘"));
         lines.push(String::new());
     }
 
@@ -513,13 +534,79 @@ pub fn cell_width(s: &str) -> i32 {
 /// columns. Callers must size inner to fit; leftover space goes before
 /// the right border.
 pub fn pad_box_line(inner: &str, width: i32) -> String {
+    format!("│{}│", pad_inner(inner, width))
+}
+
+/// padInner pads inner (with trailing spaces) to the table's inner
+/// width — the space between the │ side borders. No borders are added.
+pub fn pad_inner(inner: &str, width: i32) -> String {
     let max_inner = (width - 2).max(0);
     let mut inner = inner.to_string();
     if cell_width(&inner) > max_inner {
         inner = truncate(&inner, max_inner);
     }
     let pad = (max_inner - cell_width(&inner)).max(0) as usize;
-    format!("│{}{}│", inner, " ".repeat(pad))
+    format!("{inner}{}", " ".repeat(pad))
+}
+
+/// padEnd right-pads s with spaces to exactly cols cells.
+fn pad_end(s: &str, cols: usize) -> String {
+    let w = cell_width(s) as usize;
+    if w >= cols {
+        s.to_string()
+    } else {
+        format!("{s}{}", " ".repeat(cols - w))
+    }
+}
+
+/// wrapNameCols breaks a display name into chunks of at most `cols`
+/// cells, preferring word boundaries and hard-breaking words that are
+/// longer than the column. Used by the tool-usage gutter so every bar
+/// starts at the same column.
+fn wrap_name_cols(s: &str, cols: i32) -> Vec<String> {
+    let cols = cols.max(1) as usize;
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for word in s.split(' ') {
+        let mut chars: Vec<char> = word.chars().collect();
+        while chars.len() > cols {
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+            out.push(chars[..cols].iter().collect());
+            chars = chars[cols..].to_vec();
+        }
+        let word: String = chars.iter().collect();
+        if cur.is_empty() {
+            cur = word;
+        } else if cur.chars().count() + 1 + word.chars().count() <= cols {
+            cur.push(' ');
+            cur.push_str(&word);
+        } else {
+            out.push(std::mem::take(&mut cur));
+            cur = word;
+        }
+    }
+    if !cur.is_empty() || out.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// normalizeToolName turns a tool id like "read_file" or "web_search"
+/// into normal casing ("Read File") for display.
+fn normalize_tool_name(id: &str) -> String {
+    id.split(['_', '-'])
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let mut cs = w.chars();
+            match cs.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + cs.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// truncate shortens s to n runes, appending ".." when it had to cut.
@@ -752,6 +839,28 @@ mod tests {
     }
 
     #[test]
+    fn render_stats_box_corners() {
+        let r = StatsReport {
+            total_sessions: 1,
+            tool_usage: HashMap::from([("bash".to_string(), 2)]),
+            ..Default::default()
+        };
+        let lines = render_stats(&r, 56, false);
+        assert!(
+            lines.iter().any(|l| l.starts_with('┌') && l.ends_with('┐')),
+            "top corner closes with ┐: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.starts_with('├') && l.ends_with('┤')),
+            "mid divider closes with ┤: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.starts_with('└') && l.ends_with('┘')),
+            "bottom corner closes with ┘: {lines:?}"
+        );
+    }
+
+    #[test]
     fn render_stats_sections() {
         let mut r = StatsReport {
             total_sessions: 2,
@@ -779,13 +888,13 @@ mod tests {
         };
         let out = render_stats(&r, 0, false).join("\n");
         for want in [
-            "OVERVIEW",
+            "Overview",
             "Sessions",
-            "TOKENS",
-            "MODEL USAGE",
+            "Tokens",
+            "Model Usage",
             "deepseek-v4-flash:cloud",
-            "TOOL USAGE",
-            "web_search",
+            "Tool Usage",
+            "Web Search",
         ] {
             assert!(out.contains(want), "missing {want}:\n{out}");
         }
@@ -794,7 +903,7 @@ mod tests {
         r.total_cost = 1.5;
         r.cost_per_day = 0.5;
         let out = render_stats(&r, 0, false).join("\n");
-        assert!(out.contains("COST & TOKENS"), "{out}");
+        assert!(out.contains("Cost & Tokens"), "{out}");
         assert!(out.contains("$1.50"), "{out}");
 
         let got = render_stats(&StatsReport::default(), 0, false).join("\n");
@@ -828,7 +937,6 @@ mod tests {
                 }
                 assert_eq!(cell_width(line), width, "width {width}: {line:?}");
                 let runes: Vec<char> = line.chars().collect();
-                assert!(!runes.is_empty(), "width {width}: empty box line");
                 if runes[0] == '│' {
                     assert_eq!(
                         *runes.last().unwrap(),
@@ -836,7 +944,7 @@ mod tests {
                         "width {width}: right border missing: {line:?}"
                     );
                 }
-                if line.contains("web_search") || line.contains('█') {
+                if line.contains("Read File") || line.contains('█') {
                     saw_tool = true;
                 }
             }
@@ -845,10 +953,53 @@ mod tests {
     }
 
     #[test]
+    fn tool_bars_share_a_start_column_and_names_are_normal_cased() {
+        let r = StatsReport {
+            total_sessions: 1,
+            total_messages: 2,
+            days: 1,
+            tool_usage: HashMap::from([
+                ("web_search".to_string(), 12),
+                ("read_file".to_string(), 3),
+                ("very_long_tool_name_that_needs_wrapping".to_string(), 1),
+            ]),
+            ..Default::default()
+        };
+        for width in [40, 56] {
+            let lines = render_stats(&r, width, false);
+            let bar_cols: Vec<usize> = lines.iter().filter_map(|l| l.find('█')).collect();
+            assert!(bar_cols.len() >= 3, "expected bar rows: {lines:?}");
+            assert!(
+                bar_cols.iter().all(|c| *c == bar_cols[0]),
+                "bars must start at the same column: {lines:?}"
+            );
+            assert!(
+                lines.iter().any(|l| l.contains("Web Search")),
+                "tool names normal-cased: {lines:?}"
+            );
+            // The over-long name wraps onto its own line instead of
+            // pushing into (or past) the bar gutter.
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains("Very Long Tool") && !l.contains('█')),
+                "long name wraps on its own lines: {lines:?}"
+            );
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains("Wrapping") && l.contains('█')),
+                "bar rows follow the wrapped name: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
     fn helpers_match_go() {
         assert_eq!(truncate("hello world", 8), "hello ..");
         assert_eq!(truncate("hi", 5), "hi");
         assert_eq!(pad_box_line("ab", 6), "│ab  │");
+        assert_eq!(pad_inner("ab", 6), "ab  ");
         assert_eq!(format_tokens(1300), "1.3K");
         assert_eq!(format_tokens(999), "999");
         assert_eq!(

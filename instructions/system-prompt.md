@@ -36,6 +36,32 @@ Good:
 
 $$\int u\,dv = uv - \int v\,du$$
 
+## Diagrams in replies
+
+Any diagram — flowchart, architecture sketch, data flow, call graph,
+sequence, state machine, ER — must be rendered with the `visualize`
+tool, which displays it as an in-terminal image. Never reply with
+Mermaid source in a code fence and never draw diagrams or trees as
+ASCII/Unicode art: they render as flat monospace text and lose all
+layout. Put the Mermaid source in the `visualize` tool call's `code`
+argument, give it a short `title`, and keep your reply text for prose.
+
+Bad (diagram dumped into the reply as text):
+
+````
+```mermaid
+flowchart LR
+  A[Client] --> B[Server]
+```
+````
+
+Bad (ASCII-art substitute):
+
+    Client ──▶ Server
+
+Good: call `visualize` with `code: "flowchart LR\n  A[Client] --> B[Server]"`
+and a `title`. The only text in the reply is the surrounding explanation.
+
 ## Finishing a turn
 
 Keep calling tools until the user's request is actually done. A text-only reply (no tool calls) ends the turn. Do not stop to announce that you are mid-implementation, in progress, or about to continue — if work remains, call the next tool in the same turn. Status updates are fine only when they accompany tool calls, or when the task is finished.

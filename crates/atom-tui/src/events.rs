@@ -271,6 +271,14 @@ pub enum Effect {
         cwd: String,
     },
     PaintPreviews,
+    /// Normalize, encode and base64 a freshly pasted image on the blocking
+    /// pool. The marker is in the prompt already; this just fills the
+    /// pending slot with the heavy bytes later via `AppMsg::PendingImageReady`.
+    PreparePendingImage {
+        num: usize,
+        name: String,
+        data: Vec<u8>,
+    },
 }
 
 /// AppMsg is everything the main select! loop feeds into the App.
@@ -310,6 +318,13 @@ pub enum AppMsg {
     ClipboardImage {
         name: String,
         data: Vec<u8>,
+    },
+    /// Background image normalization completed. The App swaps the
+    /// PreparedImage into the matching pending slot (or drops the slot on
+    /// Err) and repaints the previews.
+    PendingImageReady {
+        num: usize,
+        result: Result<crate::preview::PreparedImage, String>,
     },
     Errored(String),
     CompactDone(Result<(), String>),
@@ -406,6 +421,13 @@ impl std::fmt::Debug for AppMsg {
             AppMsg::ClipboardText(_) => write!(f, "ClipboardText(..)"),
             AppMsg::ClipboardImage { name, data } => {
                 write!(f, "ClipboardImage({name}, {} bytes)", data.len())
+            }
+            AppMsg::PendingImageReady { num, result } => {
+                write!(
+                    f,
+                    "PendingImageReady({num}, {})",
+                    if result.is_ok() { "ok" } else { "err" }
+                )
             }
             AppMsg::Errored(e) => write!(f, "Errored({e})"),
             AppMsg::CompactDone(r) => write!(f, "CompactDone({r:?})"),

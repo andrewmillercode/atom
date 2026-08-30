@@ -34,6 +34,7 @@ pub const COLOR_BACKGROUND: &str = "#111112";
 pub const COLOR_FOREGROUND: &str = "#ced5d9";
 pub const COLOR_MUTED: &str = "#666666";
 pub const COLOR_MUTED_EXTRA: &str = "#3d3d3d";
+pub const COLOR_MUTED_DEEPEST: &str = "#272728";
 pub const COLOR_DIFF_ADD: &str = "#032615";
 pub const COLOR_DIFF_DEL: &str = "#260307";
 pub const COLOR_DIFF_ADD_BG: &str = "#10241d";
@@ -54,6 +55,7 @@ pub enum ThemeColor {
     Foreground,
     Muted,
     MutedExtra,
+    MutedDeepest,
     DiffAdd,
     DiffDel,
     DiffAddBg,
@@ -76,6 +78,7 @@ pub struct Theme {
     pub foreground: String,
     pub muted: String,
     pub muted_extra: String,
+    pub muted_deepest: String,
     pub diff_add: String,
     pub diff_del: String,
     pub diff_add_bg: String,
@@ -98,6 +101,7 @@ impl Default for Theme {
             foreground: COLOR_FOREGROUND.into(),
             muted: COLOR_MUTED.into(),
             muted_extra: COLOR_MUTED_EXTRA.into(),
+            muted_deepest: COLOR_MUTED_DEEPEST.into(),
             diff_add: COLOR_DIFF_ADD.into(),
             diff_del: COLOR_DIFF_DEL.into(),
             diff_add_bg: COLOR_DIFF_ADD_BG.into(),
@@ -125,6 +129,7 @@ struct ThemeFile {
     foreground: Option<String>,
     muted: Option<String>,
     muted_extra: Option<String>,
+    muted_deepest: Option<String>,
     diff_add: Option<String>,
     diff_del: Option<String>,
     diff_add_bg: Option<String>,
@@ -158,6 +163,7 @@ pub fn theme_color(role: ThemeColor) -> String {
         ThemeColor::Foreground => &theme.foreground,
         ThemeColor::Muted => &theme.muted,
         ThemeColor::MutedExtra => &theme.muted_extra,
+        ThemeColor::MutedDeepest => &theme.muted_deepest,
         ThemeColor::DiffAdd => &theme.diff_add,
         ThemeColor::DiffDel => &theme.diff_del,
         ThemeColor::DiffAddBg => &theme.diff_add_bg,
@@ -199,6 +205,7 @@ fn theme_from_file(file: ThemeFile) -> Result<Theme, String> {
     apply!(foreground);
     apply!(muted);
     apply!(muted_extra);
+    apply!(muted_deepest);
     apply!(diff_add);
     apply!(diff_del);
     apply!(diff_add_bg);
@@ -340,6 +347,7 @@ fn resolve_color(hex: &str) -> String {
         COLOR_FOREGROUND => ThemeColor::Foreground,
         COLOR_MUTED => ThemeColor::Muted,
         COLOR_MUTED_EXTRA => ThemeColor::MutedExtra,
+        COLOR_MUTED_DEEPEST => ThemeColor::MutedDeepest,
         COLOR_DIFF_ADD => ThemeColor::DiffAdd,
         COLOR_DIFF_DEL => ThemeColor::DiffDel,
         COLOR_DIFF_ADD_BG => ThemeColor::DiffAddBg,

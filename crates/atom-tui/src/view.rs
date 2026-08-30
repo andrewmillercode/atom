@@ -103,8 +103,7 @@ pub fn draw(app: &mut App, area: Rect, buf: &mut Buffer) -> Option<(u16, u16)> {
     }
 
     if let Some(kind) = app.overlay {
-        draw_overlay(app, kind, area, buf);
-        return None;
+        return draw_overlay(app, kind, area, buf);
     }
 
     let geo = Layout::compute(app);
@@ -1000,7 +999,16 @@ fn wrap_approval_text(text: &str, width: usize) -> Vec<String> {
 // Full-screen overlays.
 // ---------------------------------------------------------------------------
 
-fn draw_overlay(app: &mut App, kind: OverlayKind, area: Rect, buf: &mut Buffer) {
+fn draw_overlay(
+    app: &mut App,
+    kind: OverlayKind,
+    area: Rect,
+    buf: &mut Buffer,
+) -> Option<(u16, u16)> {
+    // Fullscreen views draw inset by one tile on every side so the
+    // content never touches the terminal edge.
+    let area = crate::fullscreen_view::padded_rect(area);
+    let caret = overlay_caret_pos(app, kind, area);
     let lines = render_overlay(app, kind);
     for (i, line) in lines.iter().enumerate() {
         if i >= area.height as usize {
@@ -1008,250 +1016,47 @@ fn draw_overlay(app: &mut App, kind: OverlayKind, area: Rect, buf: &mut Buffer) 
         }
         write_line(buf, area.x, area.y + i as u16, area.width as usize, line);
     }
+    caret
 }
 
-fn overlay_query_lines(app: &App, placeholder: bool, width: usize) -> Vec<Line<'static>> {
-    let value = if app.overlay_q.is_empty() && placeholder {
-        "search"
-    } else {
-        &app.overlay_q
-    };
-    let text = format!("> {value}");
-    let style = if app.overlay_q.is_empty() && placeholder {
-        ansi::style_dim()
-    } else if app.overlay_q_sel {
-        ansi::style_query_sel()
-    } else {
-        ratatui::style::Style::default()
-    };
-    wrap_plain(&text, width.max(1))
-        .into_iter()
-        .map(|row| Line::from(Span::styled(row, style)))
-        .collect()
+/// Position of the native (blinking) terminal caret in a fullscreen
+/// overlay's search input, so it behaves like a normal text field.
+/// Returns None when the caret should be hidden (no query on this
+/// overlay, no caret state, or Cmd+A selection).
+fn overlay_caret_pos(app: &App, kind: OverlayKind, area: Rect) -> Option<(u16, u16)> {
+    if !overlays::overlay_has_query(Some(kind)) || app.overlay_q_sel {
+        return None;
+    }
+    let caret_char = app.overlay_q_cursor?;
+    let width = crate::fullscreen_view::content_width(app.width.max(1) as usize);
+    let data = overlays::overlay_view_data(app, kind);
+    let spec = overlays::overlay_spec(app, kind, &data);
+    // An empty query renders the placeholder; search_caret_col places
+    // the caret on the first text cell either way.
+    let col = crate::fullscreen_view::search_caret_col(&app.overlay_q, Some(caret_char))?;
+    // No padding on the input: the caret column is also the text cell
+    // it overlays, and it sits directly on the search row.
+    let row = crate::fullscreen_view::search_row_top(&spec, width);
+    let x = area.x + col.min(width.saturating_sub(1)) as u16;
+    let y = area.y + row as u16;
+    if y >= area.bottom() {
+        return None;
+    }
+    Some((x, y))
 }
 
-fn header_line(text: &str) -> Line<'static> {
-    Line::from(Span::styled(text.to_string(), ansi::style_dim()))
-}
-
-fn wrapped_header(text: &str, width: usize) -> Vec<Line<'static>> {
-    wrap_plain(text, width.max(1))
-        .into_iter()
-        .map(|row| header_line(&row))
-        .collect()
-}
-
-fn blank() -> Line<'static> {
-    Line::from("")
-}
-
-fn render_overlay(app: &mut App, kind: OverlayKind) -> Vec<Line<'static>> {
-    if !app.working_msg.is_empty() {
-        let frame =
-            crate::app::MINIDOT_FRAMES[app.spinner_frame % crate::app::MINIDOT_FRAMES.len()];
-        return vec![header_line(&format!("{frame} {}", app.working_msg))];
-    }
-    match kind {
-        OverlayKind::Model => render_model_selector(app),
-        OverlayKind::Session => render_session_selector(app),
-        OverlayKind::Stats => render_stats_overlay(app),
-        OverlayKind::Providers => render_providers_overlay(app),
-        OverlayKind::ProviderMethod => render_provider_method_overlay(app),
-        OverlayKind::ProviderKey => render_provider_key_overlay(app),
-        OverlayKind::Settings => render_settings_overlay(app),
-        OverlayKind::WebSearch => render_web_search_overlay(app),
-        OverlayKind::Theme => render_theme_overlay(app),
-        OverlayKind::Fork => render_fork_overlay(app),
-    }
-}
-
-fn render_model_selector(app: &App) -> Vec<Line<'static>> {
-    let filtered = overlays::filter_entries(&app.overlay_entries, &app.overlay_q);
-    let rows = overlays::model_rows(app);
-    let width = app.width.max(1) as usize;
-    let mut out = wrapped_header(&overlays::overlay_title(app, OverlayKind::Model), width);
-    out.push(blank());
-    out.extend(overlay_query_lines(app, false, width));
-    out.push(blank());
-    if filtered.is_empty() {
-        out.push(header_line("no matches"));
-        return out;
-    }
-    let counts: Vec<usize> = rows
-        .iter()
-        .enumerate()
-        .map(|(i, row)| match &row.entry {
-            Some(entry) => {
-                let label = format!("{}  {}", entry.provider.name, entry.model);
-                let display = if i == app.overlay_sel {
-                    format!("▸ {label}")
-                } else {
-                    label
-                };
-                wrap_plain(&display, width).len().max(1)
-            }
-            None => wrap_plain(&row.label, width).len().max(1),
-        })
-        .collect();
-    let mut rendered = vec![false; rows.len()];
-    overlays::overlay_for_each_visible(
-        app.overlay_scroll,
-        app.overlay_sel,
-        overlays::overlay_list_max_lines(app),
-        rows.len(),
-        |i| counts.get(i).copied().unwrap_or(1),
-        |i| rendered[i] = true,
-    );
-    for (i, row) in rows.iter().enumerate() {
-        if !rendered[i] {
-            continue;
-        }
-        let Some(entry) = &row.entry else {
-            out.extend(wrapped_header(&row.label, width));
-            continue;
-        };
-        let label = format!("{}  {}", entry.provider.name, entry.model);
-        let (label, style) = if i == app.overlay_sel {
-            (format!("▸ {label}"), ansi::style_selected())
-        } else {
-            (label, ansi::style_inactive())
-        };
-        for row in wrap_plain(&label, width) {
-            out.push(Line::from(Span::styled(row, style)));
-        }
-    }
-    let selected = rows
-        .iter()
-        .take(app.overlay_sel.saturating_add(1))
-        .filter(|row| row.entry.is_some())
-        .count();
-    out.push(blank());
-    out.push(header_line(&format!(
-        "{}/{} models",
-        selected,
-        filtered.len()
-    )));
-    out
-}
-
-fn render_session_selector(app: &mut App) -> Vec<Line<'static>> {
-    let rows = overlays::session_rows(app);
-    let width = app.width.max(1) as usize;
-    let mut out = wrapped_header(&overlays::overlay_title(app, OverlayKind::Session), width);
-    out.push(blank());
-    out.extend(overlay_query_lines(app, true, width));
-    out.push(blank());
-    if rows.is_empty() {
-        out.push(header_line("no matches"));
-        return out;
-    }
-    let counts: Vec<usize> = overlays::session_row_line_counts(app);
-    let max_items = overlays::overlay_list_max_lines(app);
-    let mut rendered = vec![false; rows.len()];
-    overlays::overlay_for_each_visible(
-        app.overlay_scroll,
-        app.overlay_sel,
-        max_items,
-        rows.len(),
-        |i| counts.get(i).copied().unwrap_or(1),
-        |i| {
-            rendered[i] = true;
-        },
-    );
-    for (i, r) in rows.iter().enumerate() {
-        if !rendered[i] {
-            continue;
-        }
-        if r.date {
-            out.push(header_line(&r.label));
-            continue;
-        }
-        let marker = if r
-            .sess
-            .as_ref()
-            .map(|s| s.id == app.session.id)
-            .unwrap_or(false)
-        {
-            "→ "
-        } else {
-            "  "
-        };
-        let is_sub = r.sess.as_ref().is_some_and(|s| !s.parent_id.is_empty());
-        let avail = if is_sub {
-            width.saturating_sub(overlays::SUBAGENT_TAG_WIDTH)
-        } else {
-            width
-        };
-        let style = if i == app.overlay_sel {
-            ansi::style_selected()
-        } else {
-            ansi::style_inactive()
-        };
-        let label = if i == app.overlay_sel {
-            format!("▸ {marker}{}", r.label)
-        } else {
-            format!("{marker}{}", r.label)
-        };
-        for (li, row) in wrap_plain(&label, avail).into_iter().enumerate() {
-            if li == 0 && is_sub {
-                // Right-align the muted Subagent tag on the first line.
-                let used = ansi::line_width(&Line::from(row.as_str()));
-                let gap = avail.saturating_sub(used);
-                out.push(Line::from(vec![
-                    Span::styled(row, style),
-                    Span::raw(" ".repeat(gap + 2)),
-                    Span::styled(overlays::SUBAGENT_TAG.to_string(), ansi::style_dim()),
-                ]));
-            } else {
-                out.push(Line::from(Span::styled(row, style)));
-            }
-        }
-    }
-    // Footer counts selectable sessions.
-    let mut sel_count = 0usize;
-    let mut total = 0usize;
-    for (i, r) in rows.iter().enumerate() {
-        if r.date {
-            continue;
-        }
-        total += 1;
-        if i <= app.overlay_sel {
-            sel_count += 1;
-        }
-    }
-    out.push(blank());
-    out.push(header_line(&format!("{sel_count}/{total} sessions")));
-    out
-}
-
-fn render_stats_overlay(app: &App) -> Vec<Line<'static>> {
-    let width = app.width.max(1) as i32;
-    let mut out = wrapped_header(
-        &overlays::overlay_title(app, OverlayKind::Stats),
-        width as usize,
-    );
-    out.push(blank());
-    let Some(report) = &app.overlay_stats else {
-        out.push(header_line("loading stats..."));
-        return out;
-    };
-    let lines = atom_core::session::stats::render_stats(report, width - 4, true);
-    let visible = ((app.height as i32) - 6).clamp(3, i32::MAX) as usize;
-    let scroll = app.overlay_sel.min(lines.len().saturating_sub(visible));
-    let end = (scroll + visible).min(lines.len());
-    for line in &lines[scroll..end] {
-        out.push(ansi::ansi_to_line(line));
-    }
-    if lines.len() > visible {
-        out.push(blank());
-        out.push(header_line(&format!(
-            "{}–{} of {} lines",
-            scroll + 1,
-            end,
-            lines.len()
-        )));
-    }
-    out
+fn render_overlay(app: &App, kind: OverlayKind) -> Vec<Line<'static>> {
+    // Every fullscreen overlay renders through the shared template in
+    // [`crate::fullscreen_view`]: title + esc hint, description, inline
+    // search input, scrolling list, footer — chrome, search rendering,
+    // scroll math and click hit-testing all live there. The rows /
+    // footer / chrome spec comes from [`overlays::overlay_view_data`]
+    // and [`overlays::overlay_spec`], which the click/hover hit-test
+    // paths share so render and hit geometry can never drift.
+    let width = crate::fullscreen_view::content_width(app.width.max(1) as usize);
+    let data = overlays::overlay_view_data(app, kind);
+    let spec = overlays::overlay_spec(app, kind, &data);
+    fullscreen_view::render_view(&spec, width)
 }
 
 fn render_reasoning_menu(app: &App) -> Vec<Line<'static>> {
@@ -1284,225 +1089,6 @@ fn render_reasoning_menu(app: &App) -> Vec<Line<'static>> {
         out.push(Line::from(Span::styled(label, name_style)));
     }
     out
-}
-
-fn render_providers_overlay(app: &App) -> Vec<Line<'static>> {
-    let filtered = atom_core::providers::providers::filter_provider_entries(
-        &app.overlay_providers,
-        &app.overlay_q,
-    );
-    let width = app.width.max(1) as usize;
-    let mut out = wrapped_header(&overlays::overlay_title(app, OverlayKind::Providers), width);
-    out.push(blank());
-    out.extend(overlay_query_lines(app, false, width));
-    out.push(blank());
-    if filtered.is_empty() {
-        out.push(header_line("no matches"));
-        return out;
-    }
-    let max_items = overlays::overlay_list_max_lines(app);
-    let scroll = overlays::overlay_list_scroll(app.overlay_sel, max_items, filtered.len());
-    let end = (scroll + max_items).min(filtered.len());
-    for (i, e) in filtered.iter().enumerate().take(end).skip(scroll) {
-        let label = if e.status.is_empty() {
-            e.label.clone()
-        } else {
-            format!("{}  {}", e.label, e.status)
-        };
-        let style = if i == app.overlay_sel {
-            ansi::style_selected()
-        } else {
-            ansi::style_inactive()
-        };
-        let marker = if i == app.overlay_sel { "▸ " } else { "  " };
-        for row in wrap_plain(&format!("{marker}{label}"), width) {
-            out.push(Line::from(Span::styled(row, style)));
-        }
-    }
-    out.push(blank());
-    out.push(header_line(&format!(
-        "{}/{} providers",
-        app.overlay_sel + 1,
-        filtered.len()
-    )));
-    out
-}
-
-fn render_provider_method_overlay(app: &App) -> Vec<Line<'static>> {
-    let mut out = wrapped_header(
-        &overlays::overlay_title(app, OverlayKind::ProviderMethod),
-        app.width.max(1) as usize,
-    );
-    out.push(blank());
-    for (i, label) in ["API Key", "OAuth"].iter().enumerate() {
-        if i == app.overlay_sel {
-            out.push(Line::from(Span::styled(
-                format!("▸ {label}"),
-                ansi::style_selected(),
-            )));
-        } else {
-            out.push(Line::from(Span::styled(
-                format!("  {label}"),
-                ansi::style_inactive(),
-            )));
-        }
-    }
-    out
-}
-
-fn render_provider_key_overlay(app: &App) -> Vec<Line<'static>> {
-    let width = app.width.max(1) as usize;
-    let mut out = wrapped_header(
-        &overlays::overlay_title(app, OverlayKind::ProviderKey),
-        width,
-    );
-    out.push(blank());
-    out.extend(overlay_query_lines(app, false, width));
-    out
-}
-
-fn render_settings_overlay(app: &App) -> Vec<Line<'static>> {
-    let width = app.width.max(1) as usize;
-    let mut out = wrapped_header(&overlays::overlay_title(app, OverlayKind::Settings), width);
-    out.push(blank());
-    let rows = overlays::settings_labels(app);
-    for (index, label) in rows.into_iter().enumerate() {
-        let (prefix, style) = if index == app.overlay_sel {
-            ("▸ ", ansi::style_selected())
-        } else {
-            ("  ", ansi::style_inactive())
-        };
-        for row in wrap_plain(&format!("{prefix}{label}"), width) {
-            out.push(Line::from(Span::styled(row, style)));
-        }
-    }
-    out
-}
-
-/// renderThemeOverlay lists selectable themes with color swatches.
-/// The active theme is marked; Enter applies and persists the selection.
-fn render_theme_overlay(app: &App) -> Vec<Line<'static>> {
-    let width = app.width.max(1) as usize;
-    let mut out = wrapped_header(&overlays::overlay_title(app, OverlayKind::Theme), width);
-    out.push(blank());
-    let active = atom_core::render::colors::active_theme_name();
-    for (index, entry) in overlays::theme_rows().into_iter().enumerate() {
-        let (prefix, style) = if index == app.overlay_sel {
-            ("▸ ", ansi::style_selected())
-        } else {
-            ("  ", ansi::style_inactive())
-        };
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        spans.push(Span::styled(prefix.to_string(), style));
-        let marker = if entry.id == active { "● " } else { "" };
-        spans.push(Span::styled(format!("{marker}{}", entry.name), style));
-        // Swatches: background, primary, secondary, foreground chips.
-        for role in [
-            entry.theme.background.as_str(),
-            entry.theme.primary.as_str(),
-            entry.theme.secondary.as_str(),
-            entry.theme.foreground.as_str(),
-        ] {
-            let (r, g, b) = atom_core::render::colors::hex_to_rgb(role);
-            spans.push(Span::styled(
-                "   ".to_string(),
-                Style::default().bg(Color::Rgb(r, g, b)),
-            ));
-            spans.push(Span::raw(" "));
-        }
-        let source = if entry.builtin { "built-in" } else { "custom" };
-        spans.push(Span::styled(source.to_string(), ansi::style_dim()));
-        out.push(Line::from(spans));
-    }
-    out
-}
-
-fn render_web_search_overlay(app: &App) -> Vec<Line<'static>> {
-    let width = app.width.max(1) as usize;
-    let mut out = wrapped_header(&overlays::overlay_title(app, OverlayKind::WebSearch), width);
-    out.push(blank());
-    for (index, (_, name, meta)) in overlays::web_search_rows(app).into_iter().enumerate() {
-        let label = format!("{name}  {meta}");
-        let (prefix, style) = if index == app.overlay_sel {
-            ("▸ ", ansi::style_selected())
-        } else {
-            ("  ", ansi::style_inactive())
-        };
-        for row in wrap_plain(&format!("{prefix}{label}"), width) {
-            out.push(Line::from(Span::styled(row, style)));
-        }
-    }
-    out
-}
-
-/// renderForkOverlay: /fork picker. Uses the reusable fullscreen-view
-/// template (title, description, search box, list, footer) so future
-/// overlays can share the same chrome — see [`crate::fullscreen_view`].
-/// Each ForkRow is translated into a `ViewRow`: Headers as section
-/// labels, the SessionLatest sentinel as a `ViewItem` with `id=None`,
-/// and UserMessage rows as `ViewItem`s keyed by `position`.
-fn render_fork_overlay(app: &App) -> Vec<Line<'static>> {
-    let width = app.width.max(1) as usize;
-    let source_rows = overlays::fork_rows(app);
-    let mut rows: Vec<fullscreen_view::ViewRow> = Vec::with_capacity(source_rows.len());
-    for row in &source_rows {
-        match row.kind {
-            overlays::ForkRowKind::Header => {
-                rows.push(fullscreen_view::ViewRow::Header(row.label.clone()));
-            }
-            overlays::ForkRowKind::SessionLatest => {
-                rows.push(fullscreen_view::ViewRow::Item(fullscreen_view::ViewItem {
-                    id: None,
-                    label: row.label.clone(),
-                    trailing: row.timestamp.clone(),
-                    meta: String::new(),
-                }));
-            }
-            overlays::ForkRowKind::UserMessage => {
-                rows.push(fullscreen_view::ViewRow::Item(fullscreen_view::ViewItem {
-                    id: Some(row.position.unwrap_or(-1).to_string()),
-                    label: row.label.clone(),
-                    trailing: row.timestamp.clone(),
-                    meta: String::new(),
-                }));
-            }
-        }
-    }
-    let footer = if app.overlay_fork_user_messages.is_empty() {
-        String::new()
-    } else {
-        // Filter-aware footer: visible (matching) user-message rows vs
-        // total. The SessionLatest row is always present so we count
-        // items, not all rows.
-        let visible = rows
-            .iter()
-            .filter(|r| matches!(r, fullscreen_view::ViewRow::Item(item) if item.id.is_some()))
-            .count();
-        let total = app.overlay_fork_user_messages.len();
-        if visible == total {
-            format!("{visible}/{total} user messages")
-        } else {
-            format!("{visible}/{total} user messages match")
-        }
-    };
-    let loading = if !app.working_msg.is_empty() {
-        Some(app.working_msg.as_str())
-    } else {
-        None
-    };
-    let spec = fullscreen_view::ViewSpec {
-        title: "Fork session",
-        description: "type to filter, ↑↓ to navigate, Enter to fork, Esc to cancel",
-        search_placeholder: "Search",
-        search_query: app.overlay_q.as_str(),
-        search_selected: app.overlay_q_sel,
-        rows: &rows,
-        selected: app.overlay_sel.min(rows.len().saturating_sub(1)),
-        footer: footer.as_str(),
-        loading,
-        spinner_frame: app.spinner_frame,
-    };
-    fullscreen_view::render_view(&spec, width)
 }
 
 #[cfg(test)]
@@ -1770,8 +1356,9 @@ mod tests {
             plain.contains("Esc to\ncancel"),
             "header tail was clipped: {plain}"
         );
-        assert!(plain.contains("Pinned - None"));
-        assert!(plain.contains("Recent - None"));
+        assert!(plain.contains("Models"));
+        assert!(!plain.contains("Pinned"));
+        assert!(!plain.contains("Recent"));
     }
 
     #[test]
@@ -2326,5 +1913,58 @@ mod tests {
             row_text(&term, 18).trim().is_empty(),
             "last viewport row 18"
         );
+    }
+
+    #[test]
+    fn fork_view_draws_with_one_tile_edge_padding() {
+        let mut app = App::new_test(80, 24);
+        app.overlay = Some(OverlayKind::Fork);
+        let term = frame(&mut app, 80, 24);
+        // The corner tile is untouched frame background (edge padding).
+        assert_eq!(cell(&term, 0, 0).symbol(), " ");
+        // Title row lives at the content origin (1, 1): "Fork"
+        // left, `esc` dismiss hint right-aligned.
+        assert_eq!(first_char_x(&term, 1), Some(1));
+        let title = row_text(&term, 1);
+        assert!(title.trim().starts_with("Fork"), "{title:?}");
+        assert!(title.trim().ends_with("esc"), "{title:?}");
+    }
+
+    #[test]
+    fn fork_view_positions_a_native_search_caret() {
+        let mut app = App::new_test(80, 24);
+        app.overlay = Some(OverlayKind::Fork);
+        app.overlay_q = "ab".into();
+        app.overlay_q_cursor = Some(1);
+
+        let mut cursor = None;
+        let backend = TestBackend::new(80, 24);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            cursor = draw(&mut app, f.area(), f.buffer_mut());
+        })
+        .unwrap();
+
+        // Caret before "b" → text cell 1 + edge pad column (1) = 2, on
+        // the search row (content origin + search_row_top); the caret
+        // overlays text cells directly (no input padding).
+        let (cx, cy) = cursor.expect("caret position");
+        assert_eq!(cx, 2);
+        let data = overlays::fork_view_data(&app);
+        let spec = overlays::overlay_spec(&app, OverlayKind::Fork, &data);
+        assert_eq!(
+            cy as usize,
+            1 + fullscreen_view::search_row_top(&spec, 78),
+            "caret sits on the search row"
+        );
+
+        // Cmd+A selection hides the caret.
+        app.overlay_q_sel = true;
+        let mut cursor_sel = None;
+        term.draw(|f| {
+            cursor_sel = draw(&mut app, f.area(), f.buffer_mut());
+        })
+        .unwrap();
+        assert!(cursor_sel.is_none(), "selection suppresses the caret");
     }
 }

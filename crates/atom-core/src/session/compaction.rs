@@ -13,13 +13,13 @@ use std::time::{Duration, Instant};
 /// triggers a compact. Equal to the threshold is not enough: we wait until
 /// the session has clearly grown past it. Small-window models compact
 /// earlier: see compactionThreshold.
-pub const COMPACTION_TOKEN_THRESHOLD: i64 = 150_000;
+pub const COMPACTION_TOKEN_THRESHOLD: i64 = 256_000;
 
 /// compactionHeadroomTokens is kept below the model's context window when
 /// the auto-compact threshold is derived from it, so the summarizer round
 /// (prompt plus summary output) still fits before the provider starts
 /// rejecting requests.
-pub const COMPACTION_HEADROOM_TOKENS: i64 = 20_000;
+pub const COMPACTION_HEADROOM_TOKENS: i64 = 18_000;
 
 /// compactionThreshold is the prompt size that triggers an auto-compact
 /// for a model whose context window holds window tokens: the smaller of

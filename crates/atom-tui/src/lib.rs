@@ -1107,6 +1107,19 @@ async fn run_effects(
                     preview::paint_kitty_previews(&entries);
                 });
             }
+            Effect::PreparePendingImage { num, name, data } => {
+                // Heavy normalize/encode/base64 work — full PNG decode,
+                // optional resize, fdeflate encode, base64 of the
+                // normalized bytes. A 4K screenshot blocks the main
+                // event loop for hundreds of ms; the marker is already in
+                // the prompt, so this work belongs on the blocking pool
+                // and the slot fills in via AppMsg::PendingImageReady.
+                let tx = tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let result = preview::prepare_pending_image(&name, &data);
+                    let _ = tx.send(AppMsg::PendingImageReady { num, result });
+                });
+            }
         }
     }
 }
@@ -1148,6 +1161,7 @@ fn apply_hot_state(app: &mut App, path: &std::path::Path) {
     }
     app.overlay = state.overlay;
     app.overlay_q = state.overlay_q;
+    app.overlay_q_cursor = state.overlay_q_cursor;
     app.overlay_q_sel = state.overlay_q_sel;
     app.overlay_sel = state.overlay_sel;
     app.overlay_scroll = state.overlay_scroll;
@@ -1188,6 +1202,7 @@ fn hot_handoff(app: &mut App, build: &hot::HotBuild, path: &std::path::Path) -> 
         thinking_pref: app.thinking_pref.clone(),
         overlay: app.overlay,
         overlay_q: app.overlay_q.clone(),
+        overlay_q_cursor: app.overlay_q_cursor,
         overlay_q_sel: app.overlay_q_sel,
         overlay_sel: app.overlay_sel,
         overlay_scroll: app.overlay_scroll,

@@ -40,7 +40,11 @@ pub struct ForkedSession {
 pub async fn fork_session(source_id: &str, position: Option<i64>) -> Result<ForkedSession> {
     let body = json!({ "position": position });
     let v = atom_server::client::post(&format!("/api/sessions/{source_id}/fork"), &body).await?;
-    let info: SessionInfo = serde_json::from_value(v.clone())?;
+    // The server wraps the child SessionInfo as `{"info": ..., "draft": ...}`.
+    // Deserialize `info` rather than the whole envelope, otherwise the
+    // SessionInfo's required `created_at`/`updated_at` fields are missing
+    // and serde fails with "missing field created_at".
+    let info: SessionInfo = serde_json::from_value(v.get("info").cloned().unwrap_or(Value::Null))?;
     let draft = v
         .get("draft")
         .and_then(|d| d.as_str())

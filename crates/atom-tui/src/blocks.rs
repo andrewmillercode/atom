@@ -902,15 +902,15 @@ pub fn file_path_tool(name: &str) -> bool {
 ///
 /// `cwd` flows into the path linkifier so paths inside the wrapped
 /// text resolve against the session cwd; empty falls back to the
-/// process cwd.
+/// process cwd. `cwd` is currently unused but kept on the signature
+/// for caller compat.
+#[allow(unused_variables)]
 pub fn wrapped_line_count(s: &str, width: usize, cwd: &str) -> usize {
     if s.is_empty() {
         return 0;
     }
     let width = width.max(1);
-    display_line_count(&atom_core::render::links::wrap_linked(
-        s, width, "", "", cwd,
-    ))
+    display_line_count(&atom_core::render::links::wrap_linked(s, width, "", ""))
 }
 
 pub fn display_line_count(s: &str) -> usize {
@@ -1091,7 +1091,6 @@ pub fn render_block_linked(
                     width.max(1),
                     atom_core::render::colors::COLOR_MUTED,
                     "",
-                    cwd,
                 );
                 let styled = format!(
                     "{}{}\x1b[39m",
@@ -1130,7 +1129,6 @@ pub fn render_block_linked(
                 width.max(1),
                 atom_core::render::colors::COLOR_SECONDARY,
                 "",
-                cwd,
             );
             let styled = format!(
                 "{}{}\x1b[39m",
@@ -1214,7 +1212,7 @@ fn render_user_body_linked(
     images: &[PendingImage],
     inner: usize,
     preview: Option<usize>,
-    cwd: &str,
+    #[allow(unused_variables)] cwd: &str,
 ) -> UserBody {
     let segments = split_user_segments(text);
     if segments.is_empty() {
@@ -1237,7 +1235,6 @@ fn render_user_body_linked(
                     inner,
                     atom_core::render::colors::COLOR_FOREGROUND,
                     atom_core::render::colors::COLOR_CARD_LIGHT,
-                    cwd,
                 );
                 let parsed = ansi::ansi_to_lines_linked(&body);
                 if parsed.lines.is_empty() {
@@ -1454,7 +1451,6 @@ fn render_tool_block_linked(
                             inner,
                             atom_core::render::colors::COLOR_FOREGROUND,
                             atom_core::render::colors::COLOR_CARD_DARK,
-                            cwd,
                         );
                         let parsed = ansi::ansi_to_lines_linked(&w);
                         body.extend(parsed.lines);
@@ -1492,7 +1488,6 @@ fn render_tool_block_linked(
                         inner,
                         atom_core::render::colors::COLOR_FOREGROUND,
                         atom_core::render::colors::COLOR_CARD_DARK,
-                        cwd,
                     )
                 };
                 let parsed = ansi::ansi_to_lines_linked(&rendered);
@@ -1601,12 +1596,12 @@ fn approval_block_body(appr: &InlineApproval, width: usize) -> Vec<Line<'static>
     lines
 }
 
-/// Help line under the buttons. Lists every binding on one row at the
-/// current content width, truncating if the terminal is too narrow to
-/// fit the full sentence. Matches the v2 spec's "dim line under the
-/// buttons" requirement.
+/// Help line under the buttons. The buttons above already enumerate
+/// `y` / `a` / `n` / `d`; this line only carries the keys that aren't
+/// buttons — `esc` to cancel, and the width is just enough that a
+/// truncated terminal still shows the most important escape hatch.
 fn approval_help_line(width: usize) -> Line<'static> {
-    let text = "y once · a always · n no · d never · esc cancel — press ? for details";
+    let text = "esc cancel";
     let truncated = atom_core::render::highlight::truncate_width(text, width);
     Line::from(Span::styled(truncated, ansi::style_dim()))
 }
@@ -1783,7 +1778,11 @@ mod tests {
     }
 
     #[test]
-    fn user_bare_url_regions_account_for_box_pad() {
+    fn user_bare_url_stays_plain_in_user_body() {
+        // Bare URLs in user prose are intentionally not auto-linked;
+        // only markdown `[label](url)` syntax is. The user block is
+        // plain text, so the URL renders as plain characters with
+        // no OSC 8 region anywhere on the row.
         let mut b = Block {
             kind: BlockKind::User,
             text: "look at https://example.com/x please".into(),
@@ -1794,14 +1793,12 @@ mod tests {
             .lines
             .iter()
             .position(|l| ansi::line_plain(l).contains("https://example.com/x"))
-            .expect("url rendered");
-        let r = &out.links[idx][0];
-        assert_eq!(r.uri, "https://example.com/x");
-        assert_eq!(
-            ansi::cut_line_range(&out.lines[idx], r.c0, r.c1),
-            "https://example.com/x"
+            .expect("url rendered as plain text");
+        assert!(
+            out.links[idx].is_empty(),
+            "bare URL leaked an OSC 8 region in user prose: {:?}",
+            out.links[idx]
         );
-        assert_eq!(r.c0, PAD_CELL + "look at ".len());
     }
 
     #[test]
@@ -2888,7 +2885,6 @@ mod render_tests {
             inner,
             atom_core::render::colors::COLOR_FOREGROUND,
             atom_core::render::colors::COLOR_CARD_LIGHT,
-            "",
         );
         assert_eq!(lines.len(), ansi::ansi_to_lines(&full).len() + 2);
         for line in &lines {

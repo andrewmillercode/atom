@@ -35,6 +35,9 @@ pub fn c_muted() -> Color {
 pub fn c_muted_extra() -> Color {
     theme_color(atom_core::render::colors::ThemeColor::MutedExtra)
 }
+pub fn c_muted_deepest() -> Color {
+    theme_color(atom_core::render::colors::ThemeColor::MutedDeepest)
+}
 pub fn c_foreground() -> Color {
     theme_color(atom_core::render::colors::ThemeColor::Foreground)
 }
@@ -667,28 +670,36 @@ mod tests {
 
     #[test]
     fn wrapped_link_is_clickable_on_every_row() {
+        // Bare URLs in prose are not auto-linked under the new policy
+        // (only markdown `[label](url)` and `<url>` autolinks are).
+        // The markdown layer produces OSC 8; covered by
+        // `markdown::tests::links_carry_osc8_targets`. This test
+        // asserts that bare URLs flowing through `wrap_linked` stay
+        // plain text on every wrapped row.
         use atom_core::render::links::wrap_linked;
         let body = wrap_linked(
             "prose before and then https://example.com/very/long/url and some prose after",
             24,
             "",
             "",
-            "",
         );
         let linked = ansi_to_lines_linked(&body);
-        let hits: Vec<String> = linked
-            .lines
-            .iter()
-            .zip(&linked.links)
-            .filter_map(|(line, regions)| regions.first().map(|r| cut_line_range(line, r.c0, r.c1)))
-            .collect();
-        assert!(!hits.is_empty(), "wrapped link produced no regions");
-        for frag in &hits {
+        for row_links in &linked.links {
             assert!(
-                "https://example.com/very/long/url".contains(frag.as_str()),
-                "fragment {frag:?} is not part of the link"
+                row_links.is_empty(),
+                "wrap_linked leaked an OSC 8 region into wrapped prose: {row_links:?}"
             );
         }
+        let plain: String = linked
+            .lines
+            .iter()
+            .map(|l| line_plain(l).to_string())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            plain.contains("https://example.com/very/long/url"),
+            "URL dropped from visible output: {plain:?}"
+        );
     }
 
     #[test]

@@ -458,30 +458,6 @@ pub fn web_search_rows(app: &App) -> Vec<(String, String, String)> {
 // Scroll math (direct ports).
 // ---------------------------------------------------------------------------
 
-pub fn overlay_list_max_items(height: u16) -> usize {
-    let n = height as i32 - 6;
-    n.max(3) as usize
-}
-
-pub fn overlay_list_max_lines(app: &App) -> usize {
-    (app.height as usize)
-        .saturating_sub(overlay_header_rows(app))
-        .saturating_sub(2)
-        .max(3)
-}
-
-pub fn overlay_list_scroll(sel: usize, max_items: usize, n: usize) -> usize {
-    let sel = sel.min(n.saturating_sub(1));
-    if max_items == 0 || n == 0 {
-        return 0;
-    }
-    if sel >= max_items {
-        sel - max_items + 1
-    } else {
-        0
-    }
-}
-
 /// overlayKeepVisible returns a new start index so row `sel` is fully
 /// visible within maxLines visual lines (sticky scrolling).
 pub fn overlay_keep_visible(
@@ -526,63 +502,6 @@ pub fn overlay_keep_visible(
         scroll -= 1;
     }
     scroll.min(sel)
-}
-
-/// overlayForEachVisible paints list rows from scroll until the budget
-/// is spent, always including sel even when taller than maxLines.
-pub fn overlay_for_each_visible(
-    scroll: usize,
-    sel: usize,
-    max_lines: usize,
-    n: usize,
-    line_count: impl Fn(usize) -> usize,
-    mut f: impl FnMut(usize),
-) {
-    if n == 0 || scroll >= n {
-        return;
-    }
-    let max_lines = max_lines.max(1);
-    let mut used = 0usize;
-    for i in scroll..n {
-        let mut h = line_count(i);
-        if h < 1 {
-            h = 1;
-        }
-        if used > 0 && used + h > max_lines && i != sel {
-            break;
-        }
-        f(i);
-        used += h;
-        if used >= max_lines {
-            break;
-        }
-    }
-}
-
-pub fn overlay_hit_index(
-    rel: usize,
-    sel: usize,
-    max_items: usize,
-    n: usize,
-    lines: impl Fn(usize) -> usize,
-) -> Option<usize> {
-    if n == 0 {
-        return None;
-    }
-    let scroll = overlay_list_scroll(sel, max_items, n);
-    let end = (scroll + max_items).min(n);
-    let mut row = 0usize;
-    for i in scroll..end {
-        let mut h = lines(i);
-        if h < 1 {
-            h = 1;
-        }
-        if rel >= row && rel < row + h {
-            return Some(i);
-        }
-        row += h;
-    }
-    None
 }
 
 pub fn visual_line_count(s: &str) -> usize {
@@ -631,18 +550,16 @@ pub fn model_rows(app: &App) -> Vec<ModelRow> {
             pinned.push(entry.clone());
         }
     }
-    rows.push(ModelRow {
-        label: if pinned.is_empty() {
-            "Pinned - None".to_string()
-        } else {
-            "Pinned".to_string()
-        },
-        entry: None,
-    });
-    rows.extend(pinned.into_iter().map(|entry| ModelRow {
-        label: String::new(),
-        entry: Some(entry),
-    }));
+    if !pinned.is_empty() {
+        rows.push(ModelRow {
+            label: "Pinned".to_string(),
+            entry: None,
+        });
+        rows.extend(pinned.into_iter().map(|entry| ModelRow {
+            label: String::new(),
+            entry: Some(entry),
+        }));
+    }
 
     let mut recent = Vec::new();
     for wanted in &app.picker_settings.recents {
@@ -655,18 +572,16 @@ pub fn model_rows(app: &App) -> Vec<ModelRow> {
             recent.push(entry.clone());
         }
     }
-    rows.push(ModelRow {
-        label: if recent.is_empty() {
-            "Recent - None".to_string()
-        } else {
-            "Recent".to_string()
-        },
-        entry: None,
-    });
-    rows.extend(recent.into_iter().map(|entry| ModelRow {
-        label: String::new(),
-        entry: Some(entry),
-    }));
+    if !recent.is_empty() {
+        rows.push(ModelRow {
+            label: "Recent".to_string(),
+            entry: None,
+        });
+        rows.extend(recent.into_iter().map(|entry| ModelRow {
+            label: String::new(),
+            entry: Some(entry),
+        }));
+    }
 
     let remaining: Vec<ModelEntry> = filtered
         .into_iter()
@@ -711,43 +626,8 @@ pub fn move_model_sel(app: &mut App, dir: i32) {
     }
 }
 
-fn model_row_line_counts(app: &App) -> Vec<usize> {
-    let width = app.width.max(1) as usize;
-    model_rows(app)
-        .iter()
-        .enumerate()
-        .map(|(i, row)| match &row.entry {
-            Some(entry) => wrapped_label_line_count(
-                &format!("{}  {}", entry.provider.name, entry.model),
-                width,
-                i == app.overlay_sel,
-                "",
-            ),
-            None => wrap_plain(&row.label, width).len().max(1),
-        })
-        .collect()
-}
-
 pub fn sync_model_scroll(app: &mut App) {
-    let counts = model_row_line_counts(app);
-    app.overlay_scroll = overlay_keep_visible(
-        app.overlay_scroll,
-        app.overlay_sel,
-        overlay_list_max_lines(app),
-        counts.len(),
-        |i| counts.get(i).copied().unwrap_or(1),
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Session picker rows.
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone)]
-pub struct SessionRow {
-    pub date: bool,
-    pub label: String,
-    pub sess: Option<SessionInfo>,
+    sync_overlay_scroll(app);
 }
 
 // ---------------------------------------------------------------------------
@@ -786,7 +666,7 @@ pub fn fork_rows(app: &App) -> Vec<ForkRow> {
     let mut rows: Vec<ForkRow> = Vec::new();
     rows.push(ForkRow {
         kind: ForkRowKind::Header,
-        label: "Session".into(),
+        label: "Entire Session".into(),
         timestamp: String::new(),
         position: None,
     });
@@ -800,7 +680,7 @@ pub fn fork_rows(app: &App) -> Vec<ForkRow> {
     if user_count > 0 {
         rows.push(ForkRow {
             kind: ForkRowKind::Header,
-            label: "User messages".into(),
+            label: "From Message".into(),
             timestamp: String::new(),
             position: None,
         });
@@ -857,7 +737,7 @@ fn fork_session_latest_trailing(app: &App) -> String {
         app.session.model.clone()
     };
     let count = app.session.message_count;
-    let msg = if count == 1 { "msg" } else { "msg" };
+    let msg = if count == 1 { "msg" } else { "msgs" };
     if model.is_empty() {
         format!("{count} {msg}")
     } else {
@@ -870,18 +750,6 @@ pub const SUBAGENT_TAG: &str = "Subagent";
 /// Columns the tag occupies: the tag plus the gap before it.
 pub const SUBAGENT_TAG_WIDTH: usize = SUBAGENT_TAG.len() + 2;
 
-/// Wrap width for a session row's label; subagent rows reserve space so
-/// the tag can sit flush right on the first visual line.
-fn session_label_width(width: usize, row: &SessionRow) -> usize {
-    let is_sub = row.sess.as_ref().is_some_and(|s| !s.parent_id.is_empty());
-    if is_sub {
-        width.saturating_sub(SUBAGENT_TAG_WIDTH)
-    } else {
-        width
-    }
-}
-
-/// dayLabel groups sessions under Today/Yesterday/date headers.
 pub fn day_label(t: chrono::DateTime<chrono::Utc>) -> String {
     use chrono::{Duration, Local, TimeZone};
     let local = Local.from_utc_datetime(&t.naive_utc());
@@ -895,6 +763,13 @@ pub fn day_label(t: chrono::DateTime<chrono::Utc>) -> String {
         return "Yesterday".to_string();
     }
     local.format("%A, %b %-d").to_string()
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionRow {
+    pub date: bool,
+    pub label: String,
+    pub sess: Option<SessionInfo>,
 }
 
 /// sessionRows flattens filtered sessions into picker rows with date
@@ -971,51 +846,20 @@ pub fn move_session_sel(app: &mut App, dir: i32) {
 
 /// Per-row visual line counts for the session picker; shared by the
 /// scroll math and the renderer so wrapping stays in sync.
-pub fn session_row_line_counts(app: &App) -> Vec<usize> {
-    let rows = session_rows(app);
-    let width = app.width.max(1) as usize;
-    rows.iter()
-        .enumerate()
-        .map(|(i, r)| {
-            if r.date {
-                return 1;
-            }
-            let marker = if r
-                .sess
-                .as_ref()
-                .map(|s| s.id == app.session.id)
-                .unwrap_or(false)
-            {
-                "→ "
-            } else {
-                "  "
-            };
-            wrapped_label_line_count(
-                &r.label,
-                session_label_width(width, r),
-                i == app.overlay_sel,
-                marker,
-            )
-        })
-        .collect()
-}
-
 pub fn sync_session_scroll(app: &mut App) {
-    let counts = session_row_line_counts(app);
-    let n = counts.len();
-    let max_items = overlay_list_max_lines(app);
-    app.overlay_scroll =
-        overlay_keep_visible(app.overlay_scroll, app.overlay_sel, max_items, n, |i| {
-            counts.get(i).copied().unwrap_or(1)
-        });
+    sync_overlay_scroll(app);
 }
 
 pub fn stats_scroll_max(app: &App) -> usize {
     let Some(report) = &app.overlay_stats else {
         return 0;
     };
-    let lines = atom_core::session::stats::render_stats(report, app.width as i32 - 4, true);
-    let visible = (app.height as i32 - 6).max(3) as usize;
+    let width = crate::fullscreen_view::content_width(app.width.max(1) as usize);
+    let height = crate::fullscreen_view::content_height(app.height.max(1) as usize);
+    let data = overlay_view_data(app, OverlayKind::Stats);
+    let spec = overlay_spec(app, OverlayKind::Stats, &data);
+    let lines = atom_core::session::stats::render_stats(report, width as i32, true);
+    let visible = crate::fullscreen_view::list_visible_rows(&spec, width, height);
     lines.len().saturating_sub(visible)
 }
 
@@ -1242,22 +1086,313 @@ pub fn at_menu_row_at_y(app: &App, y: usize) -> Option<usize> {
 // Full-screen overlay hit testing.
 // ---------------------------------------------------------------------------
 
-pub fn overlay_title(app: &App, kind: OverlayKind) -> String {
+pub fn hover_overlay_row(app: &mut App, y: usize) {
+    let Some(kind) = app.overlay else {
+        return;
+    };
+    // All fullscreen overlays render through the shared template, so a
+    // single spec-based hit-test covers hover as well as click.
+    let (width, height, data) = overlay_hit_geometry(app);
+    let spec = overlay_spec(app, kind, &data);
+    // Raw screen Y → content-space Y (inside EDGE_PAD padding).
+    let y = y.saturating_sub(crate::fullscreen_view::EDGE_PAD);
+    if let Some(idx) = crate::fullscreen_view::hit_test(&spec, y, width, height) {
+        if matches!(data.rows[idx], crate::fullscreen_view::ViewRow::Item(_)) {
+            app.overlay_sel = idx;
+            sync_overlay_scroll(app);
+        }
+    }
+}
+
+pub fn click_overlay(app: &mut App, y: usize) -> Vec<crate::events::Effect> {
+    let Some(kind) = app.overlay else {
+        return Vec::new();
+    };
+    let (width, height, data) = overlay_hit_geometry(app);
+    let spec = overlay_spec(app, kind, &data);
+    // Raw screen Y → content-space Y (inside EDGE_PAD padding).
+    let y = y.saturating_sub(crate::fullscreen_view::EDGE_PAD);
+    if let Some(idx) = crate::fullscreen_view::hit_test(&spec, y, width, height) {
+        // Only selectable Item rows confirm; headers and raw display
+        // rows (e.g. the /stats report body) are inert.
+        if matches!(data.rows[idx], crate::fullscreen_view::ViewRow::Item(_)) {
+            app.overlay_sel = idx;
+            sync_overlay_scroll(app);
+            return app.confirm_overlay();
+        }
+    }
+    Vec::new()
+}
+
+/// Rows + footer for a fullscreen overlay view, shared by the renderer
+/// and the click/hover hit-test paths so both always agree on geometry.
+pub struct OverlayViewData {
+    pub rows: Vec<crate::fullscreen_view::ViewRow>,
+    pub footer: String,
+}
+
+impl OverlayViewData {
+    fn new(rows: Vec<crate::fullscreen_view::ViewRow>, footer: String) -> Self {
+        Self { rows, footer }
+    }
+}
+
+/// Alias kept from the days when only /fork used the template.
+pub type ForkViewData = OverlayViewData;
+
+/// Rows + footer for any fullscreen overlay view (same builder backs
+/// the renderer and the click/hover hit-test so the geometry can never
+/// drift apart).
+pub fn overlay_view_data(app: &App, kind: OverlayKind) -> OverlayViewData {
+    let width = crate::fullscreen_view::content_width(app.width.max(1) as usize);
+    use crate::fullscreen_view::{ViewItem, ViewRow};
     match kind {
-        OverlayKind::Model => "Select a model — type to search, ↑↓ to navigate, Enter to select, Ctrl+P to pin, Esc to cancel".to_string(),
-        OverlayKind::Session => "Switch session — type to search, ↑↓ to navigate, Enter to select, Ctrl+P to pin, Ctrl+D to delete, Esc to cancel".to_string(),
+        OverlayKind::Fork => {
+            let data = fork_view_rows(app);
+            OverlayViewData::new(data.rows, data.footer)
+        }
+        OverlayKind::Model => {
+            let filtered_count = filter_entries(&app.overlay_entries, &app.overlay_q).len();
+            let rows = model_rows(app)
+                .iter()
+                .map(|row| match &row.entry {
+                    Some(entry) => ViewRow::Item(ViewItem {
+                        id: Some(format!("{}/{}", entry.provider.name, entry.model)),
+                        label: entry.model.clone(),
+                        trailing: entry.provider.name.clone(),
+                        meta: String::new(),
+                        marker: String::new(),
+                        swatch: Vec::new(),
+                    }),
+                    None => ViewRow::Header(row.label.clone()),
+                })
+                .collect();
+            // Footer counts selectable models up to and including the
+            // selection against the pre-grouping filtered count.
+            let selected = model_rows(app)
+                .iter()
+                .take(app.overlay_sel.saturating_add(1))
+                .filter(|row| row.entry.is_some())
+                .count();
+            let footer = if filtered_count > 0 {
+                format!("{selected}/{filtered_count} models")
+            } else {
+                String::new()
+            };
+            OverlayViewData::new(rows, footer)
+        }
+        OverlayKind::Session => {
+            let rows = session_rows(app)
+                .iter()
+                .map(|r| {
+                    if r.date {
+                        return ViewRow::Header(r.label.clone());
+                    }
+                    let mut item = ViewItem::new(r.label.clone());
+                    item.id = r.sess.as_ref().map(|s| s.id.clone());
+                    item.marker = if r.sess.as_ref().is_some_and(|s| s.id == app.session.id) {
+                        "→ ".to_string()
+                    } else {
+                        String::new()
+                    };
+                    item.trailing = if r.sess.as_ref().is_some_and(|s| !s.parent_id.is_empty()) {
+                        SUBAGENT_TAG.to_string()
+                    } else {
+                        String::new()
+                    };
+                    ViewRow::Item(item)
+                })
+                .collect();
+            // Footer counts selectable sessions.
+            let mut sel_count = 0usize;
+            let mut total = 0usize;
+            for (i, r) in session_rows(app).iter().enumerate() {
+                if r.date {
+                    continue;
+                }
+                total += 1;
+                if i <= app.overlay_sel {
+                    sel_count += 1;
+                }
+            }
+            let footer = if total > 0 {
+                format!("{sel_count}/{total} sessions")
+            } else {
+                String::new()
+            };
+            OverlayViewData::new(rows, footer)
+        }
+        OverlayKind::Stats => {
+            let Some(report) = &app.overlay_stats else {
+                return OverlayViewData::new(Vec::new(), String::new());
+            };
+            // Render at content width (the template already insets the
+            // view by EDGE_PAD on every side).
+            let lines = atom_core::session::stats::render_stats(report, width as i32, true);
+            let rows = lines
+                .into_iter()
+                .map(|line| ViewRow::Raw(crate::ansi::ansi_to_line(&line).spans))
+                .collect();
+            OverlayViewData::new(rows, String::new())
+        }
+        OverlayKind::Providers => {
+            let filtered = atom_core::providers::providers::filter_provider_entries(
+                &app.overlay_providers,
+                &app.overlay_q,
+            );
+            let rows = filtered
+                .iter()
+                .map(|e| {
+                    ViewRow::Item(ViewItem {
+                        id: Some(e.id.clone()),
+                        label: e.label.clone(),
+                        trailing: e.status.clone(),
+                        meta: String::new(),
+                        marker: String::new(),
+                        swatch: Vec::new(),
+                    })
+                })
+                .collect();
+            let footer = if filtered.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "{}/{} providers",
+                    app.overlay_sel.min(filtered.len().saturating_sub(1)) + 1,
+                    filtered.len()
+                )
+            };
+            OverlayViewData::new(rows, footer)
+        }
+        OverlayKind::ProviderMethod => {
+            let rows = ["API Key", "OAuth"]
+                .iter()
+                .map(|label| ViewRow::Item(ViewItem::new((*label).to_string())))
+                .collect();
+            OverlayViewData::new(rows, String::new())
+        }
+        OverlayKind::ProviderKey => OverlayViewData::new(Vec::new(), String::new()),
+        OverlayKind::Settings => {
+            let rows = settings_labels(app)
+                .into_iter()
+                .map(|label| ViewRow::Item(ViewItem::new(label)))
+                .collect::<Vec<_>>();
+            OverlayViewData::new(rows, String::new())
+        }
+        OverlayKind::WebSearch => {
+            let rows = web_search_rows(app)
+                .iter()
+                .map(|(_, name, meta)| {
+                    ViewRow::Item(ViewItem {
+                        id: None,
+                        label: name.clone(),
+                        trailing: meta.clone(),
+                        meta: String::new(),
+                        marker: String::new(),
+                        swatch: Vec::new(),
+                    })
+                })
+                .collect();
+            OverlayViewData::new(rows, String::new())
+        }
+        OverlayKind::Theme => {
+            let active = atom_core::render::colors::active_theme_name();
+            let rows = theme_rows()
+                .iter()
+                .map(|entry| {
+                    ViewRow::Item(ViewItem {
+                        id: Some(entry.id.clone()),
+                        label: entry.name.clone(),
+                        trailing: if entry.builtin {
+                            "built-in".to_string()
+                        } else {
+                            "custom".to_string()
+                        },
+                        meta: String::new(),
+                        marker: if entry.id == active {
+                            "● ".to_string()
+                        } else {
+                            String::new()
+                        },
+                        swatch: vec![
+                            entry.theme.background.clone(),
+                            entry.theme.primary.clone(),
+                            entry.theme.secondary.clone(),
+                            entry.theme.foreground.clone(),
+                        ],
+                    })
+                })
+                .collect();
+            OverlayViewData::new(rows, String::new())
+        }
+    }
+}
+
+pub fn fork_view_data(app: &App) -> ForkViewData {
+    fork_view_rows(app)
+}
+
+fn fork_view_rows(app: &App) -> OverlayViewData {
+    let rows = fork_rows(app);
+    let view_rows: Vec<crate::fullscreen_view::ViewRow> = rows
+        .iter()
+        .map(|r| match r.kind {
+            ForkRowKind::Header => crate::fullscreen_view::ViewRow::Header(r.label.clone()),
+            ForkRowKind::SessionLatest | ForkRowKind::UserMessage => {
+                crate::fullscreen_view::ViewRow::Item(crate::fullscreen_view::ViewItem {
+                    id: r.position.map(|p| p.to_string()),
+                    label: r.label.clone(),
+                    trailing: r.timestamp.clone(),
+                    meta: String::new(),
+                    marker: String::new(),
+                    swatch: Vec::new(),
+                })
+            }
+        })
+        .collect();
+    let footer = fork_footer(app, &view_rows);
+    OverlayViewData::new(view_rows, footer)
+}
+
+/// Title / description / search placeholder chrome for an overlay. Render
+/// and hit-test both go through this so chrome row counts (title,
+/// description, search) can never drift apart. An empty placeholder
+/// hides the search row entirely.
+pub fn overlay_chrome(app: &App, kind: OverlayKind) -> (String, String, String) {
+    let query_hint = "type to search, ↑↓ to navigate, Enter to select, ";
+    let (title, description, placeholder) = match kind {
+        OverlayKind::Model => (
+            "Select model".to_string(),
+            format!("{query_hint}Ctrl+P to pin, Esc to cancel"),
+            "Search".to_string(),
+        ),
+        OverlayKind::Session => (
+            "Sessions".to_string(),
+            format!("{query_hint}Ctrl+P to pin, Ctrl+D to delete, Esc to cancel"),
+            "Search".to_string(),
+        ),
         OverlayKind::Stats => {
             let window = if app.stats_days > 0 {
                 format!("last {} days", app.stats_days)
             } else {
                 "all time".to_string()
             };
-            format!("Token usage ({window}) — ↑↓ to scroll, Esc to close")
+            (
+                "Stats".to_string(),
+                format!("token usage ({window}) — ↑↓ to scroll, Esc to close"),
+                String::new(),
+            )
         }
-        OverlayKind::Providers => "Providers — type to search, ↑↓ to navigate, Enter to add/update, Ctrl+D to disconnect, Esc to cancel".to_string(),
-        OverlayKind::ProviderMethod => format!(
-            "Auth for {} — ↑↓ to navigate, Enter to select, Esc to go back",
-            app.overlay_auth_id
+        OverlayKind::Providers => (
+            "Providers".to_string(),
+            "type to search, ↑↓ to navigate, Enter to add/update, Ctrl+D to disconnect, Esc to cancel"
+                .to_string(),
+            "Search".to_string(),
+        ),
+        OverlayKind::ProviderMethod => (
+            format!("Auth for {}", app.overlay_auth_id),
+            "↑↓ to navigate, Enter to select, Esc to go back".to_string(),
+            String::new(),
         ),
         OverlayKind::ProviderKey => {
             let secret = if app.overlay_auth_type == "oauth" {
@@ -1265,274 +1400,145 @@ pub fn overlay_title(app: &App, kind: OverlayKind) -> String {
             } else {
                 "API key"
             };
-            format!(
-                "Enter {secret} for {} — Enter to save, Esc to go back",
-                app.overlay_auth_id
+            (
+                format!("Auth for {}", app.overlay_auth_id),
+                format!("enter {secret} — Enter to save, Esc to go back"),
+                secret.to_string(),
             )
         }
-        OverlayKind::Settings =>
-            "Settings — ↑↓ to navigate, Enter to change, Esc to close".to_string(),
-        OverlayKind::WebSearch =>
-            "Web search provider — ↑↓ to navigate, Enter to select, Esc to settings".to_string(),
-        OverlayKind::Theme =>
-            "Theme — ↑↓ to navigate, Enter to apply, Esc to cancel".to_string(),
-        OverlayKind::Fork => String::new(),
-    }
-}
-
-pub fn overlay_header_rows(app: &App) -> usize {
-    let Some(kind) = app.overlay else {
-        return 0;
+        OverlayKind::Settings => (
+            "Settings".to_string(),
+            "↑↓ to navigate, Enter to change, Esc to close".to_string(),
+            String::new(),
+        ),
+        OverlayKind::WebSearch => (
+            "Web search provider".to_string(),
+            "↑↓ to navigate, Enter to select, Esc to settings".to_string(),
+            String::new(),
+        ),
+        OverlayKind::Theme => (
+            "Theme".to_string(),
+            "↑↓ to navigate, Enter to apply, Esc to cancel".to_string(),
+            String::new(),
+        ),
+        OverlayKind::Fork => (
+            "Fork".to_string(),
+            "type to filter, ↑↓ to navigate, Enter to fork".to_string(),
+            "Search".to_string(),
+        ),
     };
-    let width = app.width.max(1) as usize;
-    let title_rows = wrap_plain(&overlay_title(app, kind), width).len().max(1);
-    match kind {
-        OverlayKind::Model | OverlayKind::Session | OverlayKind::Providers => {
-            let query = if app.overlay_q.is_empty() && kind == OverlayKind::Session {
-                "> search".to_string()
-            } else {
-                format!("> {}", app.overlay_q)
-            };
-            title_rows + wrap_plain(&query, width).len().max(1) + 2
-        }
-        OverlayKind::ProviderMethod
-        | OverlayKind::Settings
-        | OverlayKind::WebSearch
-        | OverlayKind::Theme => title_rows + 1,
-        _ => 0,
+    (title, description, placeholder)
+}
+
+/// The ViewSpec for any fullscreen overlay. Render and hit-test both
+/// go through this so chrome row counts (title, description, search)
+/// can never drift apart.
+pub fn overlay_spec<'a>(
+    app: &'a App,
+    kind: OverlayKind,
+    data: &'a OverlayViewData,
+) -> crate::fullscreen_view::ViewSpec<'a> {
+    let (title, description, placeholder) = overlay_chrome(app, kind);
+    let loading = if app.working_msg.is_empty() {
+        None
+    } else {
+        Some(app.working_msg.as_str())
+    };
+    crate::fullscreen_view::ViewSpec {
+        title,
+        description,
+        search_placeholder: placeholder,
+        search_query: app.overlay_q.as_str(),
+        search_selected: app.overlay_q_sel,
+        search_style: crate::fullscreen_view::SearchStyle::Inline,
+        rows: &data.rows,
+        selected: app.overlay_sel.min(data.rows.len().saturating_sub(1)),
+        scroll: app.overlay_scroll,
+        footer: data.footer.as_str(),
+        loading,
+        spinner_frame: app.spinner_frame,
     }
 }
 
-pub fn overlay_row_at_y(app: &App, y: usize) -> Option<usize> {
-    if !app.working_msg.is_empty() {
-        return None;
-    }
-    let header = overlay_header_rows(app);
-    if header == 0 || y < header {
-        return None;
-    }
-    let rel = y - header;
-    let width = app.width.max(1) as usize;
-    let max_items = overlay_list_max_lines(app);
-    match app.overlay {
-        Some(OverlayKind::Model) => {
-            let rows = model_rows(app);
-            let counts = model_row_line_counts(app);
-            let mut hit = None;
-            let mut row = 0usize;
-            overlay_for_each_visible(
-                app.overlay_scroll,
-                app.overlay_sel,
-                max_items,
-                rows.len(),
-                |i| counts.get(i).copied().unwrap_or(1),
-                |i| {
-                    if hit.is_some() {
-                        return;
-                    }
-                    let h = counts.get(i).copied().unwrap_or(1).max(1);
-                    if rel >= row && rel < row + h {
-                        hit = Some(i);
-                    }
-                    row += h;
-                },
-            );
-            hit
-        }
-        Some(OverlayKind::Providers) => {
-            let filtered = atom_core::providers::providers::filter_provider_entries(
-                &app.overlay_providers,
-                &app.overlay_q,
-            );
-            overlay_hit_index(rel, app.overlay_sel, max_items, filtered.len(), |i| {
-                let e = &filtered[i];
-                let label = if e.status.is_empty() {
-                    e.label.clone()
-                } else {
-                    format!("{}  {}", e.label, e.status)
-                };
-                wrapped_label_line_count(&label, width, i == app.overlay_sel, "")
-            })
-        }
-        Some(OverlayKind::Session) => {
-            let rows = session_rows(app);
-            let counts = session_row_line_counts(app);
-            let n = rows.len();
-            if n == 0 {
-                return None;
-            }
-            let mut hit = None;
-            let mut row = 0usize;
-            overlay_for_each_visible(
-                app.overlay_scroll,
-                app.overlay_sel,
-                max_items,
-                n,
-                |i| counts.get(i).copied().unwrap_or(1),
-                |i| {
-                    if hit.is_some() {
-                        return;
-                    }
-                    let h = counts.get(i).copied().unwrap_or(1).max(1);
-                    if rel >= row && rel < row + h {
-                        hit = Some(i);
-                    }
-                    row += h;
-                },
-            );
-            hit
-        }
-        Some(OverlayKind::ProviderMethod) => {
-            if rel < 2 {
-                Some(rel)
-            } else {
-                None
-            }
-        }
-        Some(OverlayKind::Settings) => {
-            let labels = settings_labels(app);
-            overlay_hit_index(rel, app.overlay_sel, max_items, labels.len(), |index| {
-                wrapped_label_line_count(&labels[index], width, index == app.overlay_sel, "")
-            })
-        }
-        Some(OverlayKind::WebSearch) => {
-            let rows = web_search_rows(app);
-            overlay_hit_index(rel, app.overlay_sel, max_items, rows.len(), |index| {
-                let (_, name, meta) = &rows[index];
-                wrapped_label_line_count(
-                    &format!("{name}  {meta}"),
-                    width,
-                    index == app.overlay_sel,
-                    "",
-                )
-            })
-        }
-        _ => None,
-    }
+/// Hit-test geometry for any fullscreen overlay: (content width,
+/// content height, data). Mouse Ys arrive in raw terminal rows; the
+/// view is drawn inside `EDGE_PAD` padding, so hit-testers translate
+/// the raw screen Y into content space by subtracting
+/// [`crate::fullscreen_view::EDGE_PAD`].
+fn overlay_hit_geometry(app: &App) -> (usize, usize, OverlayViewData) {
+    let width = crate::fullscreen_view::content_width(app.width.max(1) as usize);
+    let height = crate::fullscreen_view::content_height(app.height.max(1) as usize);
+    let kind = app.overlay.unwrap_or(OverlayKind::Fork);
+    (width, height, overlay_view_data(app, kind))
 }
 
-pub fn hover_overlay_row(app: &mut App, y: usize) {
-    // The /fork picker uses the generic fullscreen-view template with
-    // its own hit-test; the other overlays share the legacy geometry.
-    if app.overlay == Some(OverlayKind::Fork) {
-        let width = app.width.max(1) as usize;
-        let height = app.height.max(1) as usize;
-        let rows = fork_rows(app);
-        let view_rows: Vec<crate::fullscreen_view::ViewRow> = rows
-            .iter()
-            .map(|r| match r.kind {
-                ForkRowKind::Header => crate::fullscreen_view::ViewRow::Header(r.label.clone()),
-                ForkRowKind::SessionLatest | ForkRowKind::UserMessage => {
-                    crate::fullscreen_view::ViewRow::Item(crate::fullscreen_view::ViewItem {
-                        id: r.position.map(|p| p.to_string()),
-                        label: r.label.clone(),
-                        trailing: r.timestamp.clone(),
-                        meta: String::new(),
-                    })
-                }
-            })
-            .collect();
-        let footer = fork_footer(app, &view_rows);
-        let spec = crate::fullscreen_view::ViewSpec {
-            title: "Fork session",
-            description: "",
-            search_placeholder: "Search",
-            search_query: app.overlay_q.as_str(),
-            search_selected: app.overlay_q_sel,
-            rows: &view_rows,
-            selected: app.overlay_sel.min(view_rows.len().saturating_sub(1)),
-            footer: footer.as_str(),
-            loading: None,
-            spinner_frame: app.spinner_frame,
-        };
-        if let Some(idx) = crate::fullscreen_view::hit_test(&spec, y, width, height) {
-            if idx < view_rows.len() {
-                if !matches!(view_rows[idx], crate::fullscreen_view::ViewRow::Header(_)) {
-                    app.overlay_sel = idx;
-                    app.overlay_scroll = 0;
-                }
-            }
-        }
+/// True when a raw screen coordinate lands on the overlay title row's
+/// right-aligned `esc` dismiss hint, so clicking it closes the overlay.
+pub fn overlay_esc_hint_hit(app: &App, x_raw: usize, y_raw: usize) -> bool {
+    let Some(kind) = app.overlay else {
+        return false;
+    };
+    let width = crate::fullscreen_view::content_width(app.width.max(1) as usize);
+    let x = x_raw.saturating_sub(crate::fullscreen_view::EDGE_PAD);
+    let y = y_raw.saturating_sub(crate::fullscreen_view::EDGE_PAD);
+    let data = overlay_view_data(app, kind);
+    let spec = overlay_spec(app, kind, &data);
+    crate::fullscreen_view::esc_hint_hit(&spec, x, y, width)
+}
+
+/// Click-to-place the caret in a fullscreen overlay's search input,
+/// like a normal text field. Returns true when the click landed on the
+/// search row and was consumed.
+pub fn overlay_click_search(app: &mut App, x_raw: usize, y_raw: usize) -> bool {
+    let Some(kind) = app.overlay else {
+        return false;
+    };
+    if !overlay_has_query(Some(kind)) {
+        return false;
+    }
+    let width = crate::fullscreen_view::content_width(app.width.max(1) as usize);
+    let x = x_raw.saturating_sub(crate::fullscreen_view::EDGE_PAD);
+    let y = y_raw.saturating_sub(crate::fullscreen_view::EDGE_PAD);
+    let data = overlay_view_data(app, kind);
+    let spec = overlay_spec(app, kind, &data);
+    // Clicks on the search row (and only it) place the caret on that
+    // cell.
+    if y != crate::fullscreen_view::search_row_top(&spec, width) {
+        return false;
+    }
+    // Place the caret at the char boundary at (or left of) the click
+    // column; past the end of the query it lands at the end.
+    let caret = crate::fullscreen_view::search_caret_char_at(&app.overlay_q, x);
+    app.overlay_q_cursor = Some(caret);
+    app.overlay_q_sel = false;
+    true
+}
+
+/// Keep the current selection visible using the shared template's
+/// geometry, so render and scroll math agree everywhere.
+pub fn sync_overlay_scroll(app: &mut App) {
+    let Some(kind) = app.overlay else {
+        return;
+    };
+    if !matches!(
+        kind,
+        OverlayKind::Model | OverlayKind::Session | OverlayKind::Providers | OverlayKind::Fork
+    ) {
         return;
     }
-    if let Some(idx) = overlay_row_at_y(app, y) {
-        let is_session_header = app.overlay == Some(OverlayKind::Session) && {
-            let rows = session_rows(app);
-            rows.get(idx).map(|r| r.date).unwrap_or(false)
-        };
-        let is_model_header = app.overlay == Some(OverlayKind::Model)
-            && model_rows(app)
-                .get(idx)
-                .is_none_or(|row| row.entry.is_none());
-        if !is_session_header && !is_model_header {
-            app.overlay_sel = idx;
-            if app.overlay == Some(OverlayKind::Session) {
-                sync_session_scroll(app);
-            } else if app.overlay == Some(OverlayKind::Model) {
-                sync_model_scroll(app);
-            }
-        }
-    }
-}
-
-pub fn click_overlay(app: &mut App, y: usize) -> Vec<crate::events::Effect> {
-    // The /fork picker uses the generic fullscreen-view template.
-    if app.overlay == Some(OverlayKind::Fork) {
-        let width = app.width.max(1) as usize;
-        let height = app.height.max(1) as usize;
-        let rows = fork_rows(app);
-        let view_rows: Vec<crate::fullscreen_view::ViewRow> = rows
-            .iter()
-            .map(|r| match r.kind {
-                ForkRowKind::Header => crate::fullscreen_view::ViewRow::Header(r.label.clone()),
-                ForkRowKind::SessionLatest | ForkRowKind::UserMessage => {
-                    crate::fullscreen_view::ViewRow::Item(crate::fullscreen_view::ViewItem {
-                        id: r.position.map(|p| p.to_string()),
-                        label: r.label.clone(),
-                        trailing: r.timestamp.clone(),
-                        meta: String::new(),
-                    })
-                }
-            })
-            .collect();
-        let footer = fork_footer(app, &view_rows);
-        let spec = crate::fullscreen_view::ViewSpec {
-            title: "Fork session",
-            description: "",
-            search_placeholder: "Search",
-            search_query: app.overlay_q.as_str(),
-            search_selected: app.overlay_q_sel,
-            rows: &view_rows,
-            selected: app.overlay_sel.min(view_rows.len().saturating_sub(1)),
-            footer: footer.as_str(),
-            loading: None,
-            spinner_frame: app.spinner_frame,
-        };
-        if let Some(idx) = crate::fullscreen_view::hit_test(&spec, y, width, height) {
-            if !matches!(view_rows[idx], crate::fullscreen_view::ViewRow::Header(_)) {
-                app.overlay_sel = idx;
-                return app.confirm_overlay();
-            }
-        }
-        return Vec::new();
-    }
-    let Some(idx) = overlay_row_at_y(app, y) else {
-        return Vec::new();
-    };
-    if app.overlay == Some(OverlayKind::Session) {
-        let rows = session_rows(app);
-        if rows.get(idx).map(|r| r.date).unwrap_or(true) {
-            return Vec::new();
-        }
-    } else if app.overlay == Some(OverlayKind::Model)
-        && model_rows(app)
-            .get(idx)
-            .is_none_or(|row| row.entry.is_none())
-    {
-        return Vec::new();
-    }
-    app.overlay_sel = idx;
-    app.confirm_overlay()
+    let width = crate::fullscreen_view::content_width(app.width.max(1) as usize);
+    let height = crate::fullscreen_view::content_height(app.height.max(1) as usize);
+    let data = overlay_view_data(app, kind);
+    let counts = crate::fullscreen_view::row_line_counts(&data.rows, width);
+    let spec = overlay_spec(app, kind, &data);
+    let visible = crate::fullscreen_view::list_visible_rows(&spec, width, height);
+    app.overlay_scroll = overlay_keep_visible(
+        app.overlay_scroll,
+        app.overlay_sel,
+        visible,
+        counts.len(),
+        |i| counts.get(i).copied().unwrap_or(1),
+    );
 }
 
 /// Shared footer helper used by both the renderer and the click/hover
@@ -1547,9 +1553,9 @@ fn fork_footer(app: &App, view_rows: &[crate::fullscreen_view::ViewRow]) -> Stri
         .count();
     let total = app.overlay_fork_user_messages.len();
     if visible == total {
-        format!("{visible}/{total} user messages")
+        format!("{visible}/{total} from message")
     } else {
-        format!("{visible}/{total} user messages match")
+        format!("{visible}/{total} from message match")
     }
 }
 
@@ -1659,13 +1665,6 @@ mod tests {
     }
 
     #[test]
-    fn list_scroll_windows_forward_only() {
-        assert_eq!(overlay_list_scroll(0, 5, 100), 0);
-        assert_eq!(overlay_list_scroll(7, 5, 100), 3);
-        assert_eq!(overlay_list_scroll(99, 5, 100), 95);
-    }
-
-    #[test]
     fn footer_window_clips_and_pins_title() {
         // small menu fits whole
         let (start, vis, pin, item_start) = footer_menu_window(4, 10, 2, 1);
@@ -1731,7 +1730,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_picker_groups_show_none() {
+    fn model_picker_hides_empty_groups() {
         let mut app = App::new_test(80, 24);
         app.overlay_entries = vec![ModelEntry {
             provider: atom_core::providers::providers::Provider {
@@ -1740,9 +1739,48 @@ mod tests {
             },
             model: "gpt-5".into(),
         }];
-        assert_eq!(model_rows(&app)[0].label, "Pinned - None");
-        assert_eq!(model_rows(&app)[1].label, "Recent - None");
+        let rows = model_rows(&app);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].label, "Models");
+        assert_eq!(rows[1].entry.as_ref().unwrap().model, "gpt-5");
 
+        app.picker_settings
+            .favorites
+            .push(crate::settings::PickerSettings::model_ref(
+                "openai", "gpt-5",
+            ));
+        let rows = model_rows(&app);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].label, "Pinned");
+        assert_eq!(rows[1].entry.as_ref().unwrap().model, "gpt-5");
+        app.picker_settings
+            .recents
+            .push(crate::settings::PickerSettings::model_ref(
+                "openai", "gpt-5",
+            ));
+        // Recent dedupes against pinned, so the section stays hidden.
+        assert_eq!(model_rows(&app).len(), 2);
+        app.overlay_entries.push(ModelEntry {
+            provider: atom_core::providers::providers::Provider {
+                name: "openai".into(),
+                ..Default::default()
+            },
+            model: "gpt-4".into(),
+        });
+        app.picker_settings.recents.insert(
+            0,
+            crate::settings::PickerSettings::model_ref("openai", "gpt-4"),
+        );
+        let rows = model_rows(&app);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].label, "Pinned");
+        assert_eq!(rows[2].label, "Recent");
+        assert_eq!(rows[3].entry.as_ref().unwrap().model, "gpt-4");
+    }
+
+    #[test]
+    fn session_picker_keeps_pinned_none_placeholder() {
+        let mut app = App::new_test(80, 24);
         app.overlay_sessions = vec![SessionInfo {
             id: "s1".into(),
             title: "chat".into(),
@@ -1869,5 +1907,37 @@ mod tests {
             ForkRowKind::Header => None,
         };
         assert_eq!(position, Some(0));
+    }
+
+    #[test]
+    fn fork_click_on_search_row_places_caret() {
+        // A click on the search row places the caret on the clicked
+        // text cell; clicks above (title) and below (list) are passed
+        // through.
+        let mut app = App::new_test(80, 24);
+        app.overlay = Some(OverlayKind::Fork);
+        app.overlay_q = "abc".into();
+
+        let width = crate::fullscreen_view::content_width(80);
+        let data = overlay_view_data(&app, OverlayKind::Fork);
+        let spec = overlay_spec(&app, OverlayKind::Fork, &data);
+        let search_row =
+            crate::fullscreen_view::search_row_top(&spec, width) + crate::fullscreen_view::EDGE_PAD;
+
+        // Click on the row's first text cell → caret at char 0.
+        assert!(overlay_click_search(&mut app, 1, search_row));
+        assert_eq!(app.overlay_q_cursor, Some(0));
+
+        // Click on the third text cell → caret at char 2.
+        assert!(overlay_click_search(&mut app, 1 + 2, search_row));
+        assert_eq!(app.overlay_q_cursor, Some(2));
+
+        // Above the input (title row): not consumed (caret unchanged).
+        assert!(!overlay_click_search(&mut app, 1, search_row - 1));
+        assert_eq!(app.overlay_q_cursor, Some(2));
+
+        // Below the input (list area): not consumed (caret unchanged).
+        assert!(!overlay_click_search(&mut app, 1, search_row + 1));
+        assert_eq!(app.overlay_q_cursor, Some(2));
     }
 }

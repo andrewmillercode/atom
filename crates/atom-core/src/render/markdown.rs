@@ -273,7 +273,10 @@ struct Renderer<'a> {
     table: Option<TableAcc>,
     /// Base for resolving relative file paths in prose so the OSC 8
     /// URI is the absolute one the OS will open. Borrowed from the
-    /// caller; lives for the render duration.
+    /// caller; lives for the render duration. Currently unused
+    /// because prose path/URL detection was removed, but kept on
+    /// the public `render_markdown` API for forward compat.
+    #[allow(dead_code)]
     cwd: &'a str,
 }
 
@@ -301,27 +304,20 @@ impl<'a> Renderer<'a> {
                 if let Some(code) = self.code.as_mut() {
                     code.buf.push_str(&t);
                 } else {
-                    // Wrap file paths and bare URLs in OSC 8 so
-                    // assistant prose exposes clickable regions.
-                    // Markdown-style `[label](url)` links are handled
-                    // by the Tag::Link branch — linkify here only sees
-                    // the label, never the dest URL, so there's no
-                    // double-wrapping. The cwd borrow is detached to
-                    // a local first so the sink() mutable borrow
-                    // doesn't conflict with it.
-                    let cwd = self.cwd;
-                    self.sink()
-                        .push_str(&super::links::linkify(&t, "", "", cwd));
+                    // Plain prose is emitted as-is. Markdown-style
+                    // `[label](url)` links are handled structurally by
+                    // the Tag::Link branch; bare URLs and paths in
+                    // prose are intentionally not auto-linked (see the
+                    // module doc on `render::links`).
+                    self.sink().push_str(&t);
                 }
             }
             Event::Code(t) => {
-                let cwd = self.cwd;
                 let sink = self.sink();
                 sink.push_str(&ansi_fg(COLOR_SYNTAX_STRING));
-                // Paths inside ``code`` are clickable too: the OSC 8
-                // wrap is invisible to the syntax color and the link
-                // region is still extracted by ansi_to_lines_linked.
-                sink.push_str(&super::links::linkify(&t, "", "", cwd));
+                // ``code`` spans are emitted verbatim — no prose
+                // path/URL detection.
+                sink.push_str(&t);
                 sink.push_str(RESET);
                 let reopened: Vec<String> = self.spans.iter().map(Active::open_repr).collect();
                 self.sink().push_str(&reopened.concat());

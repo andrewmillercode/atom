@@ -1004,17 +1004,19 @@ pub async fn run_session_turn(
                     return;
                 }
             }
-        } else if api_protocol_for(&provider, &sess.model) == APIProtocol::OpenAIResponses {
-            // OpenAI Responses API: POST {base}/responses. Picked for
-            // opencode-hosted models with models.dev npm =
-            // "@ai-sdk/openai" — most visibly
-            // muse-spark-1.2-contributor-free on OpenCode's Zen tier
-            // (https://opencode.ai/zen/v1). Chat Completions on the
-            // same base URL answers with a generic Internal server
-            // error and drops the request, so the protocol routing
-            // here is what makes those models reachable from atom at
-            // all. Driven entirely by models.dev metadata
-            // (api_protocol_for) — no provider hardcoding.
+        } else if api_protocol_for(&provider, &sess.model) == APIProtocol::OpenAIResponses
+            // ChatGPT-Plan OAuth tokens issued by the openai oauth
+            // flow (openai_oauth.rs) only carry ChatGPT-Plan scopes
+            // (openid/profile/email/offline_access) and are rejected
+            // by api.openai.com/v1/responses with "Missing scopes:
+            // api.responses.write". They are authorized for the
+            // chatgpt.com/backend-api/codex/responses endpoint, so
+            // route them through the codex branch below instead.
+            // Real OPENAI_API_KEYs and any other token that doesn't
+            // match a stored ChatGPT oauth entry keep going to the
+            // Responses API (muse-spark on opencode Zen, etc.).
+            && openai_codex_auth_for_key(&key).is_none()
+        {
             let opened = await_round(
                 stream_responses(&base_url, &key, &sess.model, &msgs, &tools, &opts.thinking),
                 &turn_cancel,
@@ -2191,6 +2193,136 @@ mod tests {
         assert_eq!(
             store.get_info(&sibling.id).unwrap().status,
             atom_core::session::store::DelegateStatus::Done
+        );
+    }
+
+    /// Isolates the atom data dir for one test (XDG_DATA_HOME is
+    /// process-global, so a mutex guards concurrent runs). Mirrors
+    /// crates/atom-server/tests/integration.rs.
+    struct DispatchTestEnv {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prev_xdg: Option<std::ffi::OsString>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl DispatchTestEnv {
+        fn new() -> Self {
+            static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let lock = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let prev_xdg = std::env::var_os("XDG_DATA_HOME");
+            std::env::set_var("XDG_DATA_HOME", dir.path());
+            DispatchTestEnv {
+                _lock: lock,
+                prev_xdg,
+                _dir: dir,
+            }
+        }
+    }
+
+    impl Drop for DispatchTestEnv {
+        fn drop(&mut self) {
+            match &self.prev_xdg {
+                Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+                None => std::env::remove_var("XDG_DATA_HOME"),
+            }
+        }
+    }
+
+    /// Regression: v0.1.2 added an OpenAIResponses dispatch branch
+    /// ahead of the chatgpt-backend (codex) branch, but the Responses
+    /// branch had no guard against ChatGPT-Plan OAuth tokens. Those
+    /// tokens (issued by atom's openai oauth flow with scopes
+    /// "openid profile email offline_access") are only authorized for
+    /// chatgpt.com/backend-api/codex/responses — not
+    /// api.openai.com/v1/responses, which requires the
+    /// `api.responses.write` scope. Without the guard, every ChatGPT
+    /// subscriber running an openai/gpt-5+ model hit the upstream 401
+    /// "Missing scopes: api.responses.write". The Responses branch must
+    /// yield to the codex branch whenever the bearer resolves to a
+    /// stored ChatGPT-Plan OAuth entry.
+    #[test]
+    fn dispatch_skips_responses_branch_for_chatgpt_oauth() {
+        let _env = DispatchTestEnv::new();
+
+        // The test env has no models.dev catalog on disk; inject a
+        // minimal one so api_protocol_for resolves npm correctly.
+        // Without this, every model falls through to ChatCompletions
+        // and the regression isn't observable.
+        let catalog: atom_core::providers::ModelsDevCatalog = std::collections::HashMap::from([(
+            "openai".into(),
+            atom_core::providers::ModelsDevProvider {
+                name: "openai".into(),
+                npm: "@ai-sdk/openai".into(),
+                api: "https://api.openai.com/v1".into(),
+                env: vec!["OPENAI_API_KEY".into()],
+                doc: String::new(),
+                models: [(
+                    "gpt-5".into(),
+                    atom_core::providers::ModelsDevModel {
+                        reasoning: false,
+                        ..Default::default()
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            },
+        )]);
+        atom_core::providers::set_models_dev_catalog_for_test(Some(catalog));
+
+        let bearer = "codex-bearer-xyz";
+        atom_core::providers::auth::set_auth(
+            "openai",
+            atom_core::providers::AuthEntry {
+                r#type: "oauth".into(),
+                access: bearer.into(),
+                refresh: "refresh-token".into(),
+                expires: i64::MAX, // not expired
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // The codex branch is reachable for this key.
+        assert!(
+            openai_codex_auth_for_key(bearer).is_some(),
+            "ChatGPT-Plan OAuth entry should resolve via openai_codex_auth_for_key"
+        );
+
+        // The model picked (gpt-5) is otherwise labelled as
+        // Responses-API (npm = "@ai-sdk/openai") by models.dev, which
+        // is what used to route the bearer to
+        // api.openai.com/v1/responses before the guard was added.
+        assert_eq!(
+            api_protocol_for("openai", "gpt-5"),
+            atom_core::providers::APIProtocol::OpenAIResponses,
+            "gpt-5 should still resolve to OpenAIResponses for non-oauth auth"
+        );
+
+        // Mirror the dispatch predicate at turn.rs: the Responses
+        // branch must be skipped for this key, so the codex branch
+        // handles it.
+        let responses_branch_taken = api_protocol_for("openai", "gpt-5")
+            == atom_core::providers::APIProtocol::OpenAIResponses
+            && openai_codex_auth_for_key(bearer).is_none();
+        assert!(
+            !responses_branch_taken,
+            "ChatGPT-Plan OAuth must not enter the Responses API branch"
+        );
+
+        // Sanity: a non-matching bearer (e.g. an OPENAI_API_KEY) keeps
+        // the Responses branch available — that's the path that makes
+        // muse-spark reachable on opencode's Zen tier.
+        assert!(
+            openai_codex_auth_for_key("sk-not-a-chatgpt-token").is_none(),
+            "non-oauth bearer must not resolve via openai_codex_auth_for_key"
+        );
+        let responses_branch_for_api_key = api_protocol_for("openai", "gpt-5")
+            == atom_core::providers::APIProtocol::OpenAIResponses
+            && openai_codex_auth_for_key("sk-not-a-chatgpt-token").is_none();
+        assert!(
+            responses_branch_for_api_key,
+            "Responses branch must remain reachable for non-oauth keys"
         );
     }
 }

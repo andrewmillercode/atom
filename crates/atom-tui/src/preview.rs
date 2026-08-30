@@ -316,28 +316,68 @@ pub fn image_size(data: &[u8]) -> Option<(u32, u32)> {
 
 /// normalizeImage scales/recompresses an attachment to fit within the
 /// OpenCode-style limits. Returns (bytes, mime).
+///
+/// Fast path: when the source's header-only dimensions fit within
+/// MAX_IMAGE_DIM and its size fits within MAX_IMAGE_BASE64_BYTES, the
+/// original bytes pass through untouched — no pixel decode, no
+/// re-encode. This is the common case for a clipboard screenshot and
+/// collapses the paste work from seconds to microseconds.
+///
+/// Slow path: when a resize is unavoidable, the encoded output uses
+/// `PngEncoder` with `CompressionType::Fast` + `FilterType::NoFilter`.
+/// `Fast` is already the default in `image 0.25` (it maps to `png`'s
+/// `fdeflate` backend); `NoFilter` skips the per-row adaptive filter
+/// trial that dominates encode time on large images. The output is
+/// typically ~10% larger than the adaptive-filter version but encodes
+/// roughly 5x faster — a worthwhile trade for a paste path that blocks
+/// on it before the user can type.
 pub fn normalize_image(data: &[u8]) -> anyhow::Result<(Vec<u8>, String)> {
     use base64::engine::general_purpose::STANDARD;
     let mime = sniff_image_mime(data);
     if mime.is_empty() {
         anyhow::bail!("unrecognized image format");
     }
+    if data.len() > atom_core::types::MAX_IMAGE_SOURCE_BYTES {
+        anyhow::bail!(
+            "image too large: {} bytes (limit {})",
+            data.len(),
+            atom_core::types::MAX_IMAGE_SOURCE_BYTES
+        );
+    }
+
+    // Cheap pre-check: read dimensions from the header (no pixel decode)
+    // and use a length-only bound on the base64 size. If both fit, the
+    // source bytes are already good enough — pass them straight through.
+    let dims_ok = image_dimensions(data)
+        .map(|(w, h)| w <= atom_core::types::MAX_IMAGE_DIM && h <= atom_core::types::MAX_IMAGE_DIM)
+        .unwrap_or(false);
+    let size_ok = base64_max_len(data.len()) <= atom_core::types::MAX_IMAGE_BASE64_BYTES;
+    if dims_ok && size_ok {
+        return Ok((data.to_vec(), mime.to_string()));
+    }
+
+    // Slow path: actually decode (so we can resize if dimensions are
+    // the limit, or otherwise fall through to the encode loop below).
     let src = match image::load_from_memory(data) {
         Ok(img) => img,
         Err(_) => {
-            if STANDARD.encode(data).len() <= atom_core::types::MAX_IMAGE_BASE64_BYTES {
+            // Header-decode failed but data fits the size budget. We
+            // can't resize what we can't decode, but the bytes are
+            // usable as-is.
+            if size_ok {
                 return Ok((data.to_vec(), mime.to_string()));
             }
             anyhow::bail!("undecodable oversized image");
         }
     };
     let (w, h) = (src.width(), src.height());
-    if w <= atom_core::types::MAX_IMAGE_DIM
-        && h <= atom_core::types::MAX_IMAGE_DIM
-        && STANDARD.encode(data).len() <= atom_core::types::MAX_IMAGE_BASE64_BYTES
-    {
+    // Dimensions check was optimistic from the header; the full decode
+    // could still reveal an image that doesn't need resizing. The size
+    // budget is the real gate when dims are within MAX_IMAGE_DIM.
+    if w <= atom_core::types::MAX_IMAGE_DIM && h <= atom_core::types::MAX_IMAGE_DIM && size_ok {
         return Ok((data.to_vec(), mime.to_string()));
     }
+
     let mut scale = 1.0f64;
     if w > atom_core::types::MAX_IMAGE_DIM || h > atom_core::types::MAX_IMAGE_DIM {
         let sw = atom_core::types::MAX_IMAGE_DIM as f64 / w as f64;
@@ -353,14 +393,11 @@ pub fn normalize_image(data: &[u8]) -> anyhow::Result<(Vec<u8>, String)> {
         } else {
             src.clone()
         };
-        let mut png = std::io::Cursor::new(Vec::new());
-        dst.write_to(&mut png, image::ImageFormat::Png).ok();
-        let mut out = png.into_inner();
-        let mut mime_out = "image/png".to_string();
+        let (mut out, mut mime_out) = encode_png_fast(&dst);
         if STANDARD.encode(&out).len() > atom_core::types::MAX_IMAGE_BASE64_BYTES {
-            let mut jpg = std::io::Cursor::new(Vec::new());
-            if dst.write_to(&mut jpg, image::ImageFormat::Jpeg).is_ok() {
-                out = jpg.into_inner();
+            let mut jpg_buf = std::io::Cursor::new(Vec::new());
+            if dst.write_to(&mut jpg_buf, image::ImageFormat::Jpeg).is_ok() {
+                out = jpg_buf.into_inner();
                 mime_out = "image/jpeg".to_string();
             }
         }
@@ -372,6 +409,50 @@ pub fn normalize_image(data: &[u8]) -> anyhow::Result<(Vec<u8>, String)> {
             anyhow::bail!("image too large after resize");
         }
     }
+}
+
+/// Upper bound on the length of a base64-encoded buffer of length `n`,
+/// without allocating. Standard base64 expands every 3 bytes into 4,
+/// rounded up, plus the trailing `=` padding (0..=2 bytes). Used in
+/// the cheap pass-through check to avoid measuring the encoded form.
+fn base64_max_len(n: usize) -> usize {
+    n.saturating_mul(4).div_ceil(3) + 4
+}
+
+/// imageDimensions returns the (width, height) of an image without
+/// decoding its pixels. Header-only: works for PNG, JPEG, GIF, WebP,
+/// and BMP via `image`'s built-in format detectors.
+fn image_dimensions(data: &[u8]) -> image::ImageResult<(u32, u32)> {
+    image::ImageReader::new(std::io::Cursor::new(data))
+        .with_guessed_format()?
+        .into_dimensions()
+}
+
+/// encodePngFast runs the PNG encoder with `Fast` compression and
+/// `NoFilter`, which is dramatically faster than the default
+/// `Fast + Adaptive` combination on large images (skips the per-row
+/// filter trial). Output size is typically within ~10% of the adaptive
+/// version.
+fn encode_png_fast(dst: &image::DynamicImage) -> (Vec<u8>, String) {
+    use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+    use image::ImageEncoder;
+    let rgba = dst.to_rgba8();
+    let (w, h) = (rgba.width(), rgba.height());
+    let buf = rgba.into_raw();
+    let mut out: Vec<u8> = Vec::new();
+    {
+        let mut cursor = std::io::Cursor::new(&mut out);
+        let encoder =
+            PngEncoder::new_with_quality(&mut cursor, CompressionType::Fast, FilterType::NoFilter);
+        if encoder
+            .write_image(&buf, w, h, image::ExtendedColorType::Rgba8)
+            .is_err()
+        {
+            // Last-resort fall back to image's stock write_to path.
+            let _ = dst.write_to(&mut cursor, image::ImageFormat::Png);
+        }
+    }
+    (out, "image/png".to_string())
 }
 
 /// makePreviewPNG builds a square object-cover thumbnail with a hairline
@@ -495,14 +576,138 @@ pub fn sync_pending_from_input(app: &mut App) -> bool {
     false
 }
 
-/// addImage appends a pasted image to the prompt set.
-pub fn add_image(app: &mut App, name: &str, data: &[u8]) -> anyhow::Result<()> {
+/// preparedImage is the result of background-normalizing a pasted image
+/// on the blocking pool. The marker appears in the prompt immediately;
+/// this struct is delivered later via AppMsg::PendingImageReady and the
+/// App swaps it into the matching pending slot.
+#[derive(Debug, Clone)]
+pub struct PreparedImage {
+    pub name: String,
+    pub mime: String,
+    /// Base64 of the normalized image bytes.
+    pub data_b64: String,
+    pub cols: usize,
+    pub rows: usize,
+}
+
+/// addImagePending allocates the pending slot synchronously (cheap: no
+/// decode, no encode, no base64). Returns the [IMG n] num the marker
+/// should reference. The actual image bytes are filled in later by
+/// finalizePendingImage once the spawn_blocking task returns. While the
+/// data is missing the slot stays visible (name, num, cols=0, rows=0) so
+/// the [IMG n] chip still renders and submit knows to wait.
+pub fn add_image_pending(app: &mut App, name: &str, mime: &str) -> anyhow::Result<usize> {
     if app.pending.len() >= atom_core::types::MAX_PENDING_IMAGES {
         anyhow::bail!(
             "at most {} images per prompt",
             atom_core::types::MAX_PENDING_IMAGES
         );
     }
+    let mut reserved: Vec<usize> = Vec::new();
+    for block in app.blocks.iter() {
+        for img in &block.images {
+            reserved.push(img.num);
+        }
+    }
+    let num = next_image_num_excluding(&app.pending, &reserved);
+    app.pending.push(PendingImage {
+        img: ImageData {
+            mime: mime.to_string(),
+            data: String::new(),
+        },
+        name: name.to_string(),
+        cols: 0,
+        rows: 0,
+        num,
+    });
+    app.preview_dirty = true;
+    Ok(num)
+}
+
+/// insertImageMarker appends `[IMG n] ` to the prompt at the cursor.
+pub fn insert_image_marker(app: &mut App, num: usize) {
+    app.input.insert_str(&format!("{} ", image_marker(num)));
+}
+
+/// finalizePendingImage fills the slot previously allocated by
+/// add_image_pending with normalized bytes and the thumbnail geometry.
+/// Returns true when a matching slot was found.
+pub fn finalize_pending_image(app: &mut App, num: usize, prepared: PreparedImage) -> bool {
+    let PreparedImage {
+        name,
+        mime,
+        data_b64,
+        cols,
+        rows,
+    } = prepared;
+    let Some(p) = app.pending.iter_mut().find(|p| p.num == num) else {
+        return false;
+    };
+    p.img = ImageData {
+        mime,
+        data: data_b64,
+    };
+    p.cols = cols;
+    p.rows = rows;
+    if name != p.name {
+        p.name = name;
+    }
+    app.preview_dirty = true;
+    true
+}
+
+/// dropPendingImage removes the slot and strips its marker from the
+/// prompt. Used when background preparation fails.
+pub fn drop_pending_image(app: &mut App, num: usize) {
+    app.pending.retain(|p| p.num != num);
+    // Strip the marker text from the prompt. The marker is always
+    // inserted as `"[IMG n] "` (trailing space), but tolerate the
+    // boundary cases where the user deleted the space already.
+    let mark = image_marker(num);
+    let marked = format!("{mark} ");
+    if app.input.value.contains(&marked) {
+        app.input.value = app.input.value.replace(&marked, "");
+    } else if app.input.value.contains(&mark) {
+        app.input.value = app.input.value.replace(&mark, "");
+    }
+    app.preview_dirty = true;
+}
+
+/// pendingHasUnprepared reports whether any pending image slot is still
+/// awaiting its normalized bytes. Submit blocks on this so a freshly
+/// pasted image can't go out the door with an empty payload.
+pub fn pending_has_unprepared(app: &App) -> bool {
+    app.pending.iter().any(|p| p.img.data.is_empty())
+}
+
+/// preparePendingImage runs the heavy normalize/encode work for one
+/// pasted image. Designed for the blocking pool: pure (no App state),
+/// all inputs are owned slices. On success the caller swaps the
+/// PreparedImage into the matching pending slot.
+pub fn prepare_pending_image(name: &str, data: &[u8]) -> Result<PreparedImage, String> {
+    let (bytes, mime) = normalize_image(data).map_err(|e| e.to_string())?;
+    let dims = image_size(&bytes);
+    let cols = if dims.is_some() || kitty_terminal() {
+        PREVIEW_COLS
+    } else {
+        0
+    };
+    let rows = if cols > 0 { PREVIEW_ROWS } else { 0 };
+    let data_b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(PreparedImage {
+        name: name.to_string(),
+        mime,
+        data_b64,
+        cols,
+        rows,
+    })
+}
+
+/// pasteImage attaches a pasted image synchronously up to the marker
+/// point and returns the effect that schedules the heavy normalize/encode
+/// work on the blocking pool. The marker appears immediately; the
+/// thumbnail appears once the spawned task sends AppMsg::PendingImageReady.
+pub fn paste_image(app: &mut App, name: &str, data: &[u8]) -> anyhow::Result<Vec<Effect>> {
     if data.len() > atom_core::types::MAX_IMAGE_SOURCE_BYTES {
         anyhow::bail!(
             "image too large: {} bytes (limit {})",
@@ -510,66 +715,75 @@ pub fn add_image(app: &mut App, name: &str, data: &[u8]) -> anyhow::Result<()> {
             atom_core::types::MAX_IMAGE_SOURCE_BYTES
         );
     }
-    let (norm, mime) = normalize_image(data)?;
-    let mut reserved: Vec<usize> = Vec::new();
-    for block in app.blocks.iter() {
-        for img in &block.images {
-            reserved.push(img.num);
-        }
+    let mime = sniff_image_mime(data).to_string();
+    if mime.is_empty() {
+        anyhow::bail!("unrecognized image format");
     }
-    let mut p = PendingImage {
-        img: ImageData {
-            mime,
-            data: base64::engine::general_purpose::STANDARD.encode(&norm),
-        },
+    let num = add_image_pending(app, name, &mime)?;
+    insert_image_marker(app, num);
+    Ok(vec![Effect::PreparePendingImage {
+        num,
         name: name.to_string(),
-        cols: 0,
-        rows: 0,
-        num: next_image_num_excluding(&app.pending, &reserved),
-    };
-    if image_size(&norm).is_some() || kitty_terminal() {
-        p.cols = PREVIEW_COLS;
-        p.rows = PREVIEW_ROWS;
-    }
-    app.pending.push(p);
-    app.preview_dirty = true;
-    Ok(())
-}
-
-/// pasteImage attaches an image and inserts its marker at the cursor.
-pub fn paste_image(app: &mut App, name: &str, data: &[u8]) -> anyhow::Result<()> {
-    add_image(app, name, data)?;
-    let num = app.pending.last().map(|p| p.num).unwrap_or(1);
-    app.input.insert_str(&format!("{} ", image_marker(num)));
-    Ok(())
+        data: data.to_vec(),
+    }])
 }
 
 /// Mixed text+OSC1337 paste handling.
 pub fn paste_mixed_content(app: &mut App, content: &str) -> Vec<Effect> {
     let mut sb = String::new();
+    let mut effects = Vec::new();
     for (text, data) in split_paste_segments(content) {
         if let Some(data) = data {
-            if add_image(app, "", &data).is_err() {
-                continue; // the failed image contributes nothing
+            let mime = sniff_image_mime(&data).to_string();
+            if mime.is_empty() {
+                continue;
             }
-            let num = app.pending.last().map(|p| p.num).unwrap_or(1);
-            sb.push_str(&format!("{} ", image_marker(num)));
+            match add_image_pending(app, "", &mime) {
+                Ok(num) => {
+                    sb.push_str(&format!("{} ", image_marker(num)));
+                    effects.push(Effect::PreparePendingImage {
+                        num,
+                        name: String::new(),
+                        data,
+                    });
+                }
+                Err(e) => {
+                    app.err_msg = e.to_string();
+                }
+            }
         } else {
             sb.push_str(&text);
         }
     }
     app.input.insert_str(&sb);
     app.preview_dirty = true;
-    vec![Effect::PaintPreviews]
+    effects.push(Effect::PaintPreviews);
+    effects
 }
 
 pub fn paste_local_images(app: &mut App, files: Vec<LocalImageFile>) -> Vec<Effect> {
+    let mut effects = Vec::new();
     for f in files {
-        if let Err(e) = paste_image(app, &f.name, &f.data) {
-            app.err_msg = e.to_string();
+        let mime = sniff_image_mime(&f.data).to_string();
+        if mime.is_empty() {
+            continue;
+        }
+        match add_image_pending(app, &f.name, &mime) {
+            Ok(num) => {
+                app.input.insert_str(&format!("{} ", image_marker(num)));
+                effects.push(Effect::PreparePendingImage {
+                    num,
+                    name: f.name,
+                    data: f.data,
+                });
+            }
+            Err(e) => {
+                app.err_msg = e.to_string();
+            }
         }
     }
-    vec![Effect::PaintPreviews]
+    effects.push(Effect::PaintPreviews);
+    effects
 }
 
 /// previewThumbRows: thumbnail grid height (0 without kitty support).

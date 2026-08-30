@@ -14,3 +14,6 @@ vendor/
 # Local scratch
 *.log
 .clippywork/
+
+# Builds
+*.tar.gz

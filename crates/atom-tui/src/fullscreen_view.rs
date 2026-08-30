@@ -9,7 +9,7 @@
 //! consistent — and trivially extensible: add another `OverlayKind`,
 //! build a `ViewSpec`, hand it to `render_view`.
 
-use ratatui::style::Style;
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
 use crate::ansi;
@@ -22,6 +22,9 @@ use crate::prompt::wrap_plain;
 pub enum ViewRow {
     Header(String),
     Item(ViewItem),
+    /// Pre-rendered line (with its own styling) shown verbatim, e.g.
+    /// the /stats report body. Not selectable and not clickable.
+    Raw(Vec<Span<'static>>),
 }
 
 #[derive(Debug, Clone)]
@@ -36,27 +39,94 @@ pub struct ViewItem {
     pub trailing: String,
     /// Muted secondary text, e.g. a model id or timestamp.
     pub meta: String,
+    /// Glyph shown on unselected rows instead of the default two-space
+    /// indent (e.g. `"→ "` for the current session, `"● "` for the
+    /// active theme). Selected rows always use `"▸ "`.
+    pub marker: String,
+    /// Hex colors rendered as small chips after the label (theme
+    /// swatches). Each chip is two cells wide plus a one-cell gap.
+    pub swatch: Vec<String>,
+}
+
+impl ViewItem {
+    pub fn new(label: impl Into<String>) -> Self {
+        Self {
+            id: None,
+            label: label.into(),
+            trailing: String::new(),
+            meta: String::new(),
+            marker: String::new(),
+            swatch: Vec::new(),
+        }
+    }
+}
+
+/// Visual treatment for the search row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchStyle {
+    /// Three-row bordered box (legacy default). The list chrome has its
+    /// own borders and the search box used to match that aesthetic.
+    #[default]
+    Bordered,
+    /// Single inline row: no border, a muted-extra background wash
+    /// across the row, and a block cursor on the first character of
+    /// the displayed value (placeholder when empty, query otherwise).
+    /// Used by `/fork`.
+    Inline,
+}
+
+/// 1 tile of padding between the terminal edge and the view chrome
+/// (title, description, search, list, footer), on every side.
+pub const EDGE_PAD: usize = 1;
+
+/// Width of the drawable content area inside the edge padding.
+pub fn content_width(term_width: usize) -> usize {
+    term_width.saturating_sub(2 * EDGE_PAD).max(1)
+}
+
+/// Height of the drawable content area inside the edge padding.
+pub fn content_height(term_height: usize) -> usize {
+    term_height.saturating_sub(2 * EDGE_PAD).max(1)
+}
+
+/// The full-terminal rect inset by [`EDGE_PAD`] on every side. Callers
+/// draw a fullscreen view into this rect so the content never touches
+/// the terminal edge.
+pub fn padded_rect(area: ratatui::layout::Rect) -> ratatui::layout::Rect {
+    ratatui::layout::Rect {
+        x: area.x.saturating_add(EDGE_PAD as u16),
+        y: area.y.saturating_add(EDGE_PAD as u16),
+        width: area.width.saturating_sub(2 * EDGE_PAD as u16),
+        height: area.height.saturating_sub(2 * EDGE_PAD as u16),
+    }
 }
 
 /// State the renderer needs to paint one frame of a fullscreen view.
 /// Build one in `view.rs` per overlay kind.
 pub struct ViewSpec<'a> {
     /// Big bold title.
-    pub title: &'a str,
+    pub title: String,
     /// Smaller description line, drawn below the title. Empty string hides it.
-    pub description: &'a str,
+    pub description: String,
     /// Text shown in the search box when empty. Use the empty string to
     /// hide the search row (renders no border, no prompt).
-    pub search_placeholder: &'a str,
+    pub search_placeholder: String,
     /// Current search query value (managed by the App via `overlay_q`).
     pub search_query: &'a str,
-    /// True when the user has selected the search contents (Cmd+A) — the
+    /// True when the user has selected the search contents (Cmd+A); the
     /// row renders with the inverted selection style.
     pub search_selected: bool,
+    /// Visual treatment for the search row. `Bordered` keeps the legacy
+    /// 3-row boxed look; `Inline` renders a single borderless row with a
+    /// muted background and a block cursor on the first character.
+    pub search_style: SearchStyle,
     /// Already-filtered rows in display order.
     pub rows: &'a [ViewRow],
     /// Currently selected row index in `rows`. Skipped by navigation helpers.
     pub selected: usize,
+    /// Index of the first visible list row (scroll window). Rows before
+    /// it are neither rendered nor hit-tested.
+    pub scroll: usize,
     /// Footer text drawn below the list, e.g. `"4/42 user messages"`.
     /// Empty string hides the footer.
     pub footer: &'a str,
@@ -74,20 +144,26 @@ pub fn render_view(spec: &ViewSpec<'_>, width: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
 
     // --- title + description --------------------------------------------
-    out.extend(wrap_lines(spec.title, ansi::style_title(), width));
+    // Mocked chrome: title hugs the top-left, the `esc` dismiss hint is
+    // right-aligned on the title row, and the description sits directly
+    // beneath the title with a larger gap before the search bar.
+    out.extend(title_lines(&spec.title, "esc", width));
     if !spec.description.is_empty() {
-        out.push(Line::from(""));
-        out.extend(wrap_lines(spec.description, ansi::style_dim(), width));
+        out.extend(wrap_lines(&spec.description, ansi::style_dim(), width));
     }
 
     // --- search input ---------------------------------------------------
     let has_search = !spec.search_placeholder.is_empty();
     if has_search {
+        // Two blank rows between the description and the search bar —
+        // the mocked spacing leaves the input breathing room.
+        out.push(Line::from(""));
         out.push(Line::from(""));
         out.extend(render_search(
             spec.search_query,
-            spec.search_placeholder,
+            &spec.search_placeholder,
             spec.search_selected,
+            spec.search_style,
             width,
         ));
     }
@@ -104,7 +180,7 @@ pub fn render_view(spec: &ViewSpec<'_>, width: usize) -> Vec<Line<'static>> {
     // --- list ----------------------------------------------------------
     out.push(Line::from(""));
     if !spec.rows.is_empty() {
-        out.extend(render_rows(spec.rows, spec.selected, width));
+        out.extend(render_rows(spec.rows, spec.selected, width, spec.scroll));
     } else if spec.search_query.is_empty() {
         out.push(header_line("nothing here yet"));
     } else {
@@ -120,8 +196,9 @@ pub fn render_view(spec: &ViewSpec<'_>, width: usize) -> Vec<Line<'static>> {
     out
 }
 
-/// Returns the row index at the given screen Y for a view rendered into a
-/// terminal of the given width and height. Returns None when the Y lands
+/// Returns the row index at the given Y (relative to the view's
+/// content origin, i.e. already inside [`EDGE_PAD`] padding) for a view
+/// rendered into a content width/height. Returns None when the Y lands
 /// above the list (title/description/search chrome) or past the visible
 /// rows (scrolled off the bottom).
 pub fn hit_test(spec: &ViewSpec<'_>, y: usize, width: usize, height: usize) -> Option<usize> {
@@ -136,13 +213,20 @@ pub fn hit_test(spec: &ViewSpec<'_>, y: usize, width: usize, height: usize) -> O
     if list_visible == 0 {
         return None;
     }
-    let counts = row_line_counts(spec, width);
+    let counts = row_line_counts(spec.rows, width);
     let rel = y - top;
     let mut used = 0usize;
-    for (i, count) in counts.iter().enumerate() {
+    // Scroll window: rows before `scroll` are neither rendered nor
+    // hit-tested (rel is relative to the first visible row).
+    for (i, count) in counts.iter().enumerate().skip(spec.scroll) {
         let h = (*count).max(1);
         if rel >= used && rel < used + h {
-            return Some(i);
+            // Raw rows are display-only; clicking them hits nothing.
+            return if matches!(spec.rows[i], ViewRow::Raw(_)) {
+                None
+            } else {
+                Some(i)
+            };
         }
         used += h;
         if used > list_visible {
@@ -194,11 +278,82 @@ fn wrap_lines(text: &str, style: Style, width: usize) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// The title row: title on the left, `esc` dismiss hint right-aligned
+/// on the same row (the mocked chrome). When the two don't fit side by
+/// side, the hint drops to its own right-aligned row below the title.
+fn title_lines(title: &str, hint: &str, width: usize) -> Vec<Line<'static>> {
+    let title_w = unicode_width::UnicodeWidthStr::width(title);
+    let hint_w = unicode_width::UnicodeWidthStr::width(hint);
+    if title_w + hint_w < width {
+        let gap = width.saturating_sub(title_w + hint_w);
+        return vec![Line::from(vec![
+            Span::styled(title.to_string(), ansi::style_title()),
+            Span::styled(" ".repeat(gap), ansi::style_dim()),
+            Span::styled(hint.to_string(), ansi::style_dim()),
+        ])];
+    }
+    let mut out = wrap_lines(title, ansi::style_title(), width);
+    if hint_w <= width {
+        let pad = " ".repeat(width - hint_w);
+        out.push(Line::from(Span::styled(pad, ansi::style_dim())));
+        out.push(Line::from(Span::styled(
+            hint.to_string(),
+            ansi::style_dim(),
+        )));
+    }
+    out
+}
+
+/// Terminal column within the search row of a caret sitting
+/// `caret_char` chars into `query` (None = no caret). No padding: the
+/// column is also the text cell the caret overlays.
+pub fn search_caret_col(query: &str, caret_char: Option<usize>) -> Option<usize> {
+    let caret_char = caret_char?;
+    Some(
+        query
+            .chars()
+            .take(caret_char)
+            .map(unicode_width::UnicodeWidthChar::width)
+            .map(|w| w.unwrap_or(0))
+            .sum::<usize>(),
+    )
+}
+
+/// Inverse of [`search_caret_col`]: value-relative char boundary at
+/// (or left of) the given row column, for click-to-place the caret.
+pub fn search_caret_char_at(query: &str, row_col: usize) -> usize {
+    let col = row_col;
+    let mut used = 0usize;
+    for (i, c) in query.chars().enumerate() {
+        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if col < used + w {
+            return i;
+        }
+        used += w;
+    }
+    query.chars().count()
+}
+
 fn header_line(text: &str) -> Line<'static> {
     Line::from(Span::styled(text.to_string(), ansi::style_dim()))
 }
 
 fn render_search(
+    query: &str,
+    placeholder: &str,
+    selected: bool,
+    style: SearchStyle,
+    width: usize,
+) -> Vec<Line<'static>> {
+    match style {
+        SearchStyle::Bordered => render_search_bordered(query, placeholder, selected, width),
+        SearchStyle::Inline => render_search_inline(query, placeholder, selected, width),
+    }
+}
+
+/// Legacy 3-row bordered search box. Kept for `/sessions`, `/model`,
+/// etc., so they keep their existing chrome.
+fn render_search_bordered(
     query: &str,
     placeholder: &str,
     selected: bool,
@@ -241,6 +396,64 @@ fn render_search(
     ]
 }
 
+/// Borderless inline search row for `/fork`: muted-extra background
+/// across the full content width, the placeholder dimmed so it
+/// visually disappears once the user starts typing. The caret is the
+/// terminal's own (blinking) cursor — positioned by the caller via
+/// [`search_caret_col`] — so insertion, arrow-key motion and
+/// click-to-place behave like a normal input.
+fn render_search_inline(
+    query: &str,
+    placeholder: &str,
+    selected: bool,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let bg_color = ansi::c_muted_deepest();
+    let bg = Style::default().bg(bg_color);
+    // Dim placeholder text on the muted-deepest wash — fg = muted
+    // color, so the row reads as "recessed row with faint text".
+    let dim_fg = ansi::c_muted();
+    let dim = Style::default().fg(dim_fg).bg(bg_color);
+    let plain = Style::default().bg(bg_color);
+
+    let value = if query.is_empty() { placeholder } else { query };
+
+    // Selected (Cmd+A): whole value is highlighted as a single block,
+    // and the caret is suppressed (the caller hides the terminal cursor
+    // when a selection is active).
+    if selected {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        if value.is_empty() {
+            spans.push(Span::styled(" ".to_string(), ansi::style_query_sel()));
+        } else {
+            spans.push(Span::styled(value.to_string(), ansi::style_query_sel()));
+        }
+        let used: usize = spans
+            .iter()
+            .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
+            .sum();
+        if used < width {
+            spans.push(Span::styled(" ".repeat(width - used), bg));
+        }
+        return vec![Line::from(spans)];
+    }
+
+    let style = if query.is_empty() { dim } else { plain };
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    // The value renders unpadded, starting on the row's first cell —
+    // the native caret overlays text cells directly.
+    spans.push(Span::styled(value.to_string(), style));
+
+    let used: usize = spans
+        .iter()
+        .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
+        .sum();
+    if used < width {
+        spans.push(Span::styled(" ".repeat(width - used), bg));
+    }
+    vec![Line::from(spans)]
+}
+
 /// Pads the search-row width so the borders sit flush against the
 /// terminal width. `2` columns of left padding keep the box off the
 /// terminal edge.
@@ -250,34 +463,61 @@ pub fn search_border_x(width: usize) -> (usize, usize) {
     (x, w)
 }
 
-fn render_rows(rows: &[ViewRow], selected: usize, width: usize) -> Vec<Line<'static>> {
+fn render_rows(
+    rows: &[ViewRow],
+    selected: usize,
+    width: usize,
+    scroll: usize,
+) -> Vec<Line<'static>> {
     let mut out = Vec::new();
-    for (i, row) in rows.iter().enumerate() {
+    for (i, row) in rows.iter().enumerate().skip(scroll) {
         match row {
             ViewRow::Header(label) => {
+                // One blank line between sections (none before the
+                // first visible header) — e.g. between "Entire
+                // Session" and "From Message".
+                if i > scroll && i > 0 {
+                    out.push(Line::from(""));
+                }
                 out.push(header_line(label));
             }
             ViewRow::Item(item) => {
-                let marker = if i == selected { "▸ " } else { "  " };
+                let indicator = if i == selected {
+                    "▸ ".to_string()
+                } else if item.marker.is_empty() {
+                    "  ".to_string()
+                } else {
+                    item.marker.clone()
+                };
                 let style = if i == selected {
                     ansi::style_selected()
                 } else {
                     ansi::style_inactive()
                 };
+                let swatch_w = item.swatch.len() * SWATCH_CELL_W;
                 let trailing_w = unicode_width::UnicodeWidthStr::width(item.trailing.as_str());
-                let avail = width.saturating_sub(trailing_w + 1);
-                let label_with_marker = format!("{marker}{}", item.label);
+                let suffix_w = swatch_w + trailing_w;
+                let avail = width.saturating_sub(suffix_w + 1);
+                let label_with_marker = format!("{indicator}{}", item.label);
                 let wrapped = wrap_plain(&label_with_marker, avail.max(1));
                 let total_rows = wrapped.len();
                 for (li, line) in wrapped.into_iter().enumerate() {
-                    if li == 0 && !item.trailing.is_empty() {
-                        let used = unicode_width::UnicodeWidthStr::width(line.as_str());
-                        let gap = width.saturating_sub(used + trailing_w);
-                        out.push(Line::from(vec![
-                            Span::styled(line, style),
-                            Span::styled(" ".repeat(gap), style),
-                            Span::styled(item.trailing.clone(), ansi::style_dim()),
-                        ]));
+                    if li == 0 && (suffix_w > 0 && !item.trailing.is_empty() || swatch_w > 0) {
+                        // Chips (if any) hug the label; the trailing tag
+                        // is right-aligned with one cell of clearance.
+                        let mut spans = vec![Span::styled(line, style)];
+                        for hex in &item.swatch {
+                            spans.extend(swatch_spans(hex));
+                        }
+                        if !item.trailing.is_empty() {
+                            let used = unicode_width::UnicodeWidthStr::width(
+                                spans.iter().map(|s| s.content.as_ref()).collect::<String>().as_str(),
+                            );
+                            let gap = width.saturating_sub(used + trailing_w);
+                            spans.push(Span::styled(" ".repeat(gap), style));
+                            spans.push(Span::styled(item.trailing.clone(), ansi::style_dim()));
+                        }
+                        out.push(Line::from(spans));
                     } else {
                         out.push(Line::from(Span::styled(line, style)));
                     }
@@ -293,37 +533,83 @@ fn render_rows(rows: &[ViewRow], selected: usize, width: usize) -> Vec<Line<'sta
                     // the trailing already carries the secondary info.
                 }
             }
+            ViewRow::Raw(spans) => {
+                out.push(Line::from(spans.clone()));
+            }
         }
     }
     out
 }
 
-fn row_line_counts(spec: &ViewSpec<'_>, width: usize) -> Vec<usize> {
-    spec.rows
-        .iter()
-        .map(|row| match row {
-            ViewRow::Header(label) => wrap_plain(label, width.max(1)).len().max(1),
+/// Cells per swatch chip: 2 colored cells + 1 gap.
+const SWATCH_CELL_W: usize = 3;
+
+fn swatch_spans(hex: &str) -> Vec<Span<'static>> {
+    let (r, g, b) = atom_core::render::colors::hex_to_rgb(hex);
+    vec![
+        Span::styled("  ".to_string(), Style::default().bg(Color::Rgb(r, g, b))),
+        Span::raw(" "),
+    ]
+}
+
+/// Per-row visual line counts, mirroring `render_rows` (including the
+/// header separator blanks). Shared by the scroll sync math so
+/// wrapping can never drift between render and navigation.
+pub fn row_line_counts(rows: &[ViewRow], width: usize) -> Vec<usize> {
+    rows.iter()
+        .enumerate()
+        .map(|(i, row)| match row {
+            // Non-first headers get a blank separator line before them
+            // (mirrors render_rows).
+            ViewRow::Header(label) => {
+                let gap = usize::from(i > 0);
+                gap + wrap_plain(label, width.max(1)).len().max(1)
+            }
             ViewRow::Item(item) => {
+                let swatch_w = item.swatch.len() * SWATCH_CELL_W;
                 let trailing_w = unicode_width::UnicodeWidthStr::width(item.trailing.as_str());
-                let avail = width.saturating_sub(trailing_w + 1).max(1);
+                let avail = width.saturating_sub(swatch_w + trailing_w + 1).max(1);
                 let n = wrap_plain(&format!("▸ {}", item.label), avail).len();
                 let meta_extra = if item.meta.is_empty() { 0 } else { 1 };
                 n.max(1) + meta_extra
             }
+            ViewRow::Raw(_) => 1,
         })
         .collect()
 }
 
-fn header_rows(spec: &ViewSpec<'_>, width: usize) -> usize {
+/// Rows rendered above the search row: title row (+ wrapped extra),
+/// description, and the gap lines. Matches `render_view`'s layout
+/// exactly — used to place the terminal caret on (and hit-test clicks
+/// against) the search input.
+pub fn search_row_top(spec: &ViewSpec<'_>, width: usize) -> usize {
     let mut n = 0usize;
-    n += wrap_plain(spec.title, width.max(1)).len().max(1);
-    if !spec.description.is_empty() {
-        n += 1 + wrap_plain(spec.description, width.max(1)).len().max(1);
+    let title_w = unicode_width::UnicodeWidthStr::width(spec.title.as_str());
+    let hint_w = unicode_width::UnicodeWidthStr::width("esc");
+    if title_w + hint_w < width {
+        n += 1; // title + esc hint share one row
+    } else {
+        n += wrap_plain(&spec.title, width.max(1)).len().max(1);
+        if hint_w <= width {
+            n += 2; // hint pad row + hint row
+        }
     }
+    if !spec.description.is_empty() {
+        n += wrap_plain(&spec.description, width.max(1)).len().max(1);
+    }
+    if !spec.search_placeholder.is_empty() {
+        n += 2; // blank-gap rows before the search bar
+    }
+    n
+}
+
+fn header_rows(spec: &ViewSpec<'_>, width: usize) -> usize {
+    let mut n = search_row_top(spec, width);
     let has_search = !spec.search_placeholder.is_empty();
     if has_search {
-        // blank + 3-row search box.
-        n += 1 + 3;
+        // N-row search row(s). Inline adds a wash-only pad row above
+        // and below the value row; Bordered adds top/middle/bottom.
+        n += search_row_count(spec.search_style);
     }
     if spec.loading.is_some() {
         // blank + 1 loading line.
@@ -340,6 +626,16 @@ fn footer_rows(spec: &ViewSpec<'_>) -> usize {
     }
 }
 
+/// Number of terminal rows the search input occupies for `style`
+/// (Inline: value row + vertical wash pad rows; Bordered: 3 border
+/// rows). Callers use it for caret placement and click hit-testing.
+pub fn search_row_count(style: SearchStyle) -> usize {
+    match style {
+        SearchStyle::Bordered => 3,
+        SearchStyle::Inline => 1,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,6 +646,8 @@ mod tests {
             label: label.into(),
             trailing: String::new(),
             meta: String::new(),
+            marker: String::new(),
+            swatch: Vec::new(),
         })
     }
 
@@ -361,13 +659,15 @@ mod tests {
     fn renders_title_description_search_rows_footer() {
         let rows = vec![header("Session"), row("hello")];
         let spec = ViewSpec {
-            title: "Fork session",
-            description: "type to filter, Enter to fork",
-            search_placeholder: "Search",
+            title: "Fork session".to_string(),
+            description: "type to filter, Enter to fork".to_string(),
+            search_placeholder: "Search".to_string(),
             search_query: "",
             search_selected: false,
+            search_style: SearchStyle::Bordered,
             rows: &rows,
             selected: 1,
+            scroll: 0,
             footer: "1/1 user messages",
             loading: None,
             spinner_frame: 0,
@@ -388,13 +688,15 @@ mod tests {
     fn search_placeholder_appears_in_search_row() {
         let rows: Vec<ViewRow> = vec![];
         let spec = ViewSpec {
-            title: "t",
-            description: "",
-            search_placeholder: "search",
+            title: "t".to_string(),
+            description: "".to_string(),
+            search_placeholder: "search".to_string(),
             search_query: "",
             search_selected: false,
+            search_style: SearchStyle::Bordered,
             rows: &rows,
             selected: 0,
+            scroll: 0,
             footer: "",
             loading: None,
             spinner_frame: 0,
@@ -421,13 +723,15 @@ mod tests {
     fn hit_test_maps_screen_y_to_row_index() {
         let rows = vec![header("H"), row("a"), row("b")];
         let spec = ViewSpec {
-            title: "title",
-            description: "",
-            search_placeholder: "",
+            title: "title".to_string(),
+            description: "".to_string(),
+            search_placeholder: "".to_string(),
             search_query: "",
             search_selected: false,
+            search_style: SearchStyle::Bordered,
             rows: &rows,
             selected: 1,
+            scroll: 0,
             footer: "",
             loading: None,
             spinner_frame: 0,
@@ -446,13 +750,15 @@ mod tests {
     fn hit_test_returns_none_for_chrome_rows() {
         let rows = vec![row("only")];
         let spec = ViewSpec {
-            title: "title",
-            description: "",
-            search_placeholder: "",
+            title: "title".to_string(),
+            description: "".to_string(),
+            search_placeholder: "".to_string(),
             search_query: "",
             search_selected: false,
+            search_style: SearchStyle::Bordered,
             rows: &rows,
             selected: 0,
+            scroll: 0,
             footer: "",
             loading: None,
             spinner_frame: 0,
@@ -465,13 +771,15 @@ mod tests {
     fn loading_state_replaces_list_with_spinner() {
         let rows = vec![row("x")];
         let spec = ViewSpec {
-            title: "t",
-            description: "",
-            search_placeholder: "search",
+            title: "t".to_string(),
+            description: "".to_string(),
+            search_placeholder: "search".to_string(),
             search_query: "",
             search_selected: false,
+            search_style: SearchStyle::Bordered,
             rows: &rows,
             selected: 0,
+            scroll: 0,
             footer: "1/1",
             loading: Some("loading session..."),
             spinner_frame: 2,
@@ -488,13 +796,15 @@ mod tests {
     fn footer_hidden_when_empty() {
         let rows: Vec<ViewRow> = vec![];
         let spec = ViewSpec {
-            title: "t",
-            description: "",
-            search_placeholder: "",
+            title: "t".to_string(),
+            description: "".to_string(),
+            search_placeholder: "".to_string(),
             search_query: "",
             search_selected: false,
+            search_style: SearchStyle::Bordered,
             rows: &rows,
             selected: 0,
+            scroll: 0,
             footer: "",
             loading: None,
             spinner_frame: 0,
@@ -508,13 +818,15 @@ mod tests {
     fn render_search_box_borders_align_with_width() {
         let rows: Vec<ViewRow> = vec![];
         let spec = ViewSpec {
-            title: "t",
-            description: "",
-            search_placeholder: "search",
+            title: "t".to_string(),
+            description: "".to_string(),
+            search_placeholder: "search".to_string(),
             search_query: "",
             search_selected: false,
+            search_style: SearchStyle::Bordered,
             rows: &rows,
             selected: 0,
+            scroll: 0,
             footer: "",
             loading: None,
             spinner_frame: 0,
@@ -537,15 +849,19 @@ mod tests {
             label: "Convert the loader".into(),
             trailing: String::new(),
             meta: "14:02".into(),
+            marker: String::new(),
+            swatch: Vec::new(),
         })];
         let spec = ViewSpec {
-            title: "t",
-            description: "",
-            search_placeholder: "",
+            title: "t".to_string(),
+            description: "".to_string(),
+            search_placeholder: "".to_string(),
             search_query: "",
             search_selected: false,
+            search_style: SearchStyle::Bordered,
             rows: &rows,
             selected: 0,
+            scroll: 0,
             footer: "",
             loading: None,
             spinner_frame: 0,
@@ -553,5 +869,141 @@ mod tests {
         let lines = render_view(&spec, 40);
         let plain: Vec<String> = lines.iter().map(|l| crate::ansi::line_plain(l)).collect();
         assert!(plain.iter().any(|l| l.contains("14:02")));
+    }
+
+    #[test]
+    fn inline_search_renders_unpadded_input_with_placeholder() {
+        // Empty query + Inline: placeholder shown inline on one row,
+        // no border characters, no padding, no in-buffer block cursor
+        // — the caret is the terminal's own cursor (search_caret_col).
+        let spec = ViewSpec {
+            title: "Fork session".to_string(),
+            description: "".to_string(),
+            search_placeholder: "Search".to_string(),
+            search_query: "",
+            search_selected: false,
+            search_style: SearchStyle::Inline,
+            rows: &[],
+            selected: 0,
+            scroll: 0,
+            footer: "",
+            loading: None,
+            spinner_frame: 0,
+        };
+        let lines = render_view(&spec, 40);
+        // Layout: title(+esc), blank, blank, search row, blank,
+        // "nothing here yet".
+        assert!(
+            lines.len() >= 4,
+            "expected at least title + gap + search: got {:?}",
+            lines
+        );
+        let search = crate::ansi::line_plain(&lines[3]);
+        assert!(
+            !search.contains('┌') && !search.contains('└'),
+            "no border characters: {search:?}"
+        );
+        assert!(
+            search.contains('S') && search.contains("earch"),
+            "placeholder rendered inline: {search:?}"
+        );
+        // The whole value renders as one dim span — unpadded, starting
+        // on the row's first cell — on the muted-deepest wash.
+        let s_cell = &lines[3].spans[0];
+        assert_eq!(s_cell.content.as_ref(), "Search");
+        assert_eq!(
+            s_cell.style.bg,
+            Some(crate::ansi::c_muted_deepest()),
+            "placeholder sits on the muted-deepest wash: {search:?}"
+        );
+        // The caret position is exposed for the terminal cursor. No
+        // padding: the column is the text cell the caret overlays.
+        assert_eq!(search_caret_col("", Some(0)), Some(0));
+        assert_eq!(search_caret_col("abc", Some(1)), Some(1));
+        assert_eq!(search_caret_col("abc", Some(3)), Some(3));
+        assert_eq!(search_caret_col("abc", None), None);
+        assert_eq!(search_caret_char_at("abc", 2), 2);
+        assert_eq!(search_caret_char_at("abc", 0), 0);
+        assert_eq!(search_caret_char_at("abc", 99), 3);
+        // The input is a single row.
+        assert_eq!(search_row_count(SearchStyle::Inline), 1);
+    }
+
+    #[test]
+    fn inline_search_displaces_placeholder_when_typing() {
+        let spec = ViewSpec {
+            title: "t".to_string(),
+            description: "".to_string(),
+            search_placeholder: "Search".to_string(),
+            search_query: "abc",
+            search_selected: false,
+            search_style: SearchStyle::Inline,
+            rows: &[],
+            selected: 0,
+            scroll: 0,
+            footer: "",
+            loading: None,
+            spinner_frame: 0,
+        };
+        let lines = render_view(&spec, 40);
+        let search = crate::ansi::line_plain(&lines[3]);
+        assert!(search.contains("abc"), "typed query appears: {search:?}");
+        assert!(
+            !search.contains("Search"),
+            "placeholder is hidden when typing: {search:?}"
+        );
+    }
+
+    #[test]
+    fn inline_search_selection_highlights_whole_query() {
+        let spec = ViewSpec {
+            title: "t".to_string(),
+            description: "".to_string(),
+            search_placeholder: "Search".to_string(),
+            search_query: "abc",
+            search_selected: true,
+            search_style: SearchStyle::Inline,
+            rows: &[],
+            selected: 0,
+            scroll: 0,
+            footer: "",
+            loading: None,
+            spinner_frame: 0,
+        };
+        let lines = render_view(&spec, 40);
+        let search_line = &lines[3];
+        let mut highlighted = 0usize;
+        for span in &search_line.spans {
+            if span.style.bg == Some(crate::ansi::c_primary()) {
+                highlighted += unicode_width::UnicodeWidthStr::width(span.content.as_ref());
+            }
+        }
+        assert!(
+            highlighted >= 3,
+            "selected query highlights >= 3 cells (abc): got {highlighted}"
+        );
+    }
+
+    #[test]
+    fn inline_search_padding_fills_full_width() {
+        let spec = ViewSpec {
+            title: "t".to_string(),
+            description: "".to_string(),
+            search_placeholder: "Search".to_string(),
+            search_query: "",
+            search_selected: false,
+            search_style: SearchStyle::Inline,
+            rows: &[],
+            selected: 0,
+            scroll: 0,
+            footer: "",
+            loading: None,
+            spinner_frame: 0,
+        };
+        let lines = render_view(&spec, 40);
+        assert!(
+            crate::ansi::line_width(&lines[3]) == 40,
+            "search row fills terminal width"
+        );
     }
 }

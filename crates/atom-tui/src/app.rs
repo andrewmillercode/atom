@@ -167,6 +167,11 @@ pub struct App {
     pub overlay: Option<OverlayKind>,
     pub overlay_q: String,
     pub overlay_q_sel: bool,
+    /// Caret position in the overlay search input, in chars from the
+    /// start of `overlay_q`. `None` = no caret (view has no editable
+    /// input); only the /fork fullscreen view drives it today. Editing
+    /// treats `None` as end-of-query.
+    pub overlay_q_cursor: Option<usize>,
     pub overlay_sel: usize,
     pub overlay_scroll: usize,
     pub overlay_entries: Vec<atom_core::providers::providers::ModelEntry>,
@@ -311,6 +316,7 @@ impl App {
             overlay: None,
             overlay_q: String::new(),
             overlay_q_sel: false,
+            overlay_q_cursor: None,
             overlay_sel: 0,
             overlay_scroll: 0,
             overlay_entries: Vec::new(),
@@ -378,10 +384,10 @@ impl App {
         }
         // If no model was found, auto-open the provider selector.
         if m.sel_model.is_empty() && m.session.id.is_empty() {
-            m.overlay = Some(OverlayKind::Providers);
+            m.open_overlay(OverlayKind::Providers);
             m.working_msg = "loading providers...".into();
         } else if !m.atom_config.setup_complete() {
-            m.overlay = Some(OverlayKind::Settings);
+            m.open_overlay(OverlayKind::Settings);
             m.settings_onboarding = true;
             m.overlay_sel = 0;
         }
@@ -1015,29 +1021,64 @@ impl App {
                     child_title: ev.child_title.clone(),
                     from_subagent: ev.from_subagent,
                 });
-                self.blocks.push(Block {
-                    kind: BlockKind::Tool,
-                    title: "Sandbox".to_string(),
-                    tool_name: "sandbox".to_string(),
-                    text: ev.command.clone(),
-                    approval: Some(blocks::InlineApproval {
-                        id: ev.id.clone(),
-                        session_id: sid,
-                        command: ev.command.clone(),
-                        cwd: ev.cwd.clone(),
-                        rule_id: ev.rule_id.clone(),
-                        reason: ev.reason.clone(),
-                        from_subagent: ev.from_subagent,
-                        child_title: ev.child_title.clone(),
-                        // v2: forward the origin tag (defaults to "self"
-                        // when the server didn't set one) and the
-                        // accept-all prefix preview for `[a]`.
-                        origin: ev.origin.clone(),
-                        accept_all_preview: ev.accept_all_preview.clone(),
-                    }),
-                    expanded: true,
-                    ..Default::default()
+                let mut inline = Some(blocks::InlineApproval {
+                    id: ev.id.clone(),
+                    session_id: sid,
+                    command: ev.command.clone(),
+                    cwd: ev.cwd.clone(),
+                    rule_id: ev.rule_id.clone(),
+                    reason: ev.reason.clone(),
+                    from_subagent: ev.from_subagent,
+                    child_title: ev.child_title.clone(),
+                    // v2: forward the origin tag (defaults to "self"
+                    // when the server didn't set one) and the
+                    // accept-all prefix preview for `[a]`.
+                    origin: ev.origin.clone(),
+                    accept_all_preview: ev.accept_all_preview.clone(),
                 });
+                // Convert the bash tool block this approval is for in
+                // place, when one exists. The server emits the `tool`
+                // event just before requesting approval, so the most
+                // recent pending bash block with matching command text
+                // is the unambiguous target. Reusing it keeps the
+                // transcript to one block per tool call: header →
+                // sandbox approval card → sandbox result. Without the
+                // conversion we'd stack a fresh "Sandbox" block on top
+                // of the original "Bash" block, and the upcoming
+                // `tool_result` would attach to the new one (leaving
+                // the original Bash block as an empty dangling header
+                // and any later tool result overwriting the card).
+                let mut converted = false;
+                for b in self.blocks.iter_mut().rev() {
+                    if b.kind == BlockKind::Tool
+                        && b.tool_name == "bash"
+                        && b.text == ev.command
+                        && !b.tool_done
+                    {
+                        b.title = "Sandbox".to_string();
+                        b.approval = inline.take();
+                        b.expanded = true;
+                        b.lines = None;
+                        converted = true;
+                        break;
+                    }
+                }
+                if !converted {
+                    // No matching bash block — happens only on
+                    // reconnect/replay where the `tool` event landed
+                    // before the local client subscribed. Fall back to
+                    // creating a fresh Sandbox block so the prompt is
+                    // never lost.
+                    self.blocks.push(Block {
+                        kind: BlockKind::Tool,
+                        title: "Sandbox".to_string(),
+                        tool_name: "sandbox".to_string(),
+                        text: ev.command.clone(),
+                        approval: inline.take(),
+                        expanded: true,
+                        ..Default::default()
+                    });
+                }
                 self.viewport_dirty = true;
                 self.following = true;
                 self.refresh_viewport();
@@ -1262,6 +1303,15 @@ impl App {
     /// handleInput processes submitted text: slash commands run locally,
     /// regular text sends to the server.
     pub fn handle_input(&mut self, text: &str) -> Vec<Effect> {
+        // Block submit while any pasted image is still being normalized
+        // on the blocking pool — sending the prompt with an empty
+        // payload would either drop the image or ship a half-built
+        // block. The marker is in the prompt already, so the user can
+        // see what's waiting; the gate is a transient 100-300 ms.
+        if preview::pending_has_unprepared(self) {
+            self.err_msg = "preparing image…".to_string();
+            return Vec::new();
+        }
         if text == "/subagents" {
             if self.input.value.trim() == text {
                 self.input.clear();
@@ -1426,7 +1476,7 @@ impl App {
 
         if text == "/stats" || text.starts_with("/stats ") {
             let days = overlays::parse_stats_days(text);
-            self.overlay = Some(OverlayKind::Stats);
+            self.open_overlay(OverlayKind::Stats);
             self.overlay_q.clear();
             self.overlay_sel = 0;
             self.overlay_stats = None;
@@ -1443,7 +1493,7 @@ impl App {
                 fx
             }
             "/settings" => {
-                self.overlay = Some(OverlayKind::Settings);
+                self.open_overlay(OverlayKind::Settings);
                 self.overlay_sel = 0;
                 self.overlay_q.clear();
                 self.settings_onboarding = false;
@@ -1451,7 +1501,7 @@ impl App {
             }
             "/theme" => {
                 let rows = overlays::theme_rows();
-                self.overlay = Some(OverlayKind::Theme);
+                self.open_overlay(OverlayKind::Theme);
                 self.overlay_sel = rows
                     .iter()
                     .position(|entry| entry.id == atom_core::render::colors::active_theme_name())
@@ -1461,7 +1511,7 @@ impl App {
             }
             "/model" => {
                 self.model_picker_purpose = overlays::ModelPickerPurpose::Chat;
-                self.overlay = Some(OverlayKind::Model);
+                self.open_overlay(OverlayKind::Model);
                 self.overlay_q.clear();
                 self.overlay_sel = 0;
                 self.overlay_scroll = 0;
@@ -1477,7 +1527,7 @@ impl App {
                 Vec::new()
             }
             "/providers" => {
-                self.overlay = Some(OverlayKind::Providers);
+                self.open_overlay(OverlayKind::Providers);
                 self.overlay_q.clear();
                 self.overlay_sel = 0;
                 self.overlay_auth_id.clear();
@@ -1499,7 +1549,7 @@ impl App {
                 }]
             }
             "/sessions" | "/resume" => {
-                self.overlay = Some(OverlayKind::Session);
+                self.open_overlay(OverlayKind::Session);
                 self.overlay_q.clear();
                 self.overlay_sel = 0;
                 self.overlay_scroll = 0;
@@ -1519,9 +1569,10 @@ impl App {
                     self.err_msg = "cannot fork a subagent session".into();
                     return Vec::new();
                 }
-                self.overlay = Some(OverlayKind::Fork);
+                self.open_overlay(OverlayKind::Fork);
                 self.overlay_q.clear();
                 self.overlay_q_sel = false;
+                self.overlay_q_cursor = Some(0);
                 self.overlay_sel = overlays::first_fork_row();
                 self.overlay_scroll = 0;
                 self.overlay_fork_user_messages.clear();
@@ -1548,6 +1599,19 @@ impl App {
                 Vec::new()
             }
         }
+    }
+
+    /// Open a fullscreen overlay. Query overlays get their native
+    /// search caret initialized (hidden by default elsewhere), so the
+    /// terminal cursor only shows on searchable pickers.
+    pub fn open_overlay(&mut self, kind: OverlayKind) {
+        self.overlay = Some(kind);
+        self.overlay_q_sel = false;
+        self.overlay_q_cursor = if overlays::overlay_has_query(Some(kind)) {
+            Some(0)
+        } else {
+            None
+        };
     }
 
     pub fn open_picker(&mut self, kind: PickerKind) -> Vec<Effect> {
@@ -1867,10 +1931,33 @@ impl App {
                 if self.overlay.is_some() {
                     return Vec::new();
                 }
-                if let Err(e) = preview::paste_image(self, &name, &data) {
-                    self.err_msg = e.to_string();
+                match preview::paste_image(self, &name, &data) {
+                    Ok(effects) => effects,
+                    Err(e) => {
+                        self.err_msg = e.to_string();
+                        Vec::new()
+                    }
                 }
-                vec![Effect::PaintPreviews]
+            }
+            AppMsg::PendingImageReady { num, result } => {
+                // Background image normalization finished. The marker
+                // has been in the prompt since paste time; this just
+                // fills the slot (or drops it on failure) and asks the
+                // kitty layer to repaint.
+                match result {
+                    Ok(prepared) => {
+                        preview::finalize_pending_image(self, num, prepared);
+                    }
+                    Err(e) => {
+                        preview::drop_pending_image(self, num);
+                        self.err_msg = format!("image prep failed: {e}");
+                    }
+                }
+                if preview::kitty_terminal() {
+                    vec![Effect::PaintPreviews]
+                } else {
+                    Vec::new()
+                }
             }
             AppMsg::SendStarted { sid } => {
                 // The runtime owns the receiver; bump our wait chain. A
@@ -2067,7 +2154,7 @@ impl App {
         self.preview_dirty = true;
         self.refresh_viewport();
         if !self.atom_config.setup_complete() {
-            self.overlay = Some(OverlayKind::Settings);
+            self.open_overlay(OverlayKind::Settings);
             self.settings_onboarding = true;
             self.overlay_sel = 0;
         }
@@ -2104,7 +2191,7 @@ impl App {
                 ForkUserMessage {
                     position: idx as i64,
                     preview,
-                    timestamp: fork_format_timestamp(None),
+                    timestamp: fork_format_timestamp(message.created_at),
                 }
             })
             .collect();
@@ -2123,30 +2210,49 @@ impl App {
     /// a `parent_id` lineage marker already set server-side) and write
     /// the chosen message's text into the prompt.
     fn forked_session(&mut self, info: SessionInfo, draft: String) -> Vec<Effect> {
+        // Adopt the new session id locally so any in-flight state keyed
+        // by the source id doesn't bleed across. session_loaded below
+        // will see same_session=true and skip its reset block, so we
+        // run the session-switch reset here too.
+        self.remote_working = false;
+        self.paused = false;
+        self.following = true;
+        self.streaming = false;
+        self.interrupting = false;
+        self.turn_id = String::new();
+        self.pending.clear();
+        self.preview_dirty = true;
+        // Drop subagent picker / manage menu state — a forked root
+        // session owns no agents.
         self.manage_restore_from.clear();
         self.hide_manage_menu();
         self.manage_agents.clear();
         self.manage_sel = 0;
         self.close_picker();
         self.close_context_menu();
-        self.pending.clear();
+        // Fork-specific: pre-fill the prompt with the picked message's
+        // content, then dismiss the /fork overlay.
         self.input.set_value(&draft);
         self.last_picker_insert.clear();
-        self.session = info;
-        self.apply_thinking(&self.session.thinking.clone());
-        self.persist_defaults();
-        self.blocks.clear();
-        self.streaming = false;
-        self.paused = false;
-        self.following = true;
-        self.interrupting = false;
         self.overlay = None;
         self.overlay_q.clear();
+        self.overlay_q_cursor = None;
         self.overlay_fork_user_messages.clear();
         self.overlay_fork_source.clear();
         self.working_msg.clear();
+        self.session = info;
+        self.apply_thinking(&self.session.thinking.clone());
+        self.persist_defaults();
+        // Clear stale blocks from the source session so the view doesn't
+        // briefly show the wrong transcript while the LoadSession below
+        // round-trips the fork child's persisted messages.
+        self.blocks.clear();
         self.refresh_viewport();
-        vec![Effect::Subscribe {
+        // Fetch the full transcript (truncated messages up to the picked
+        // message) and let session_loaded render it. Without this the
+        // view starts empty and only populates after the user submits
+        // the draft and the server pushes a `saved` event.
+        vec![Effect::LoadSession {
             id: self.session.id.clone(),
         }]
     }
@@ -2345,7 +2451,7 @@ impl App {
             Ok(entry) => {
                 if let Err(e) = auth::set_auth("openai", entry) {
                     self.err_msg = e.to_string();
-                    self.overlay = Some(OverlayKind::Providers);
+                    self.open_overlay(OverlayKind::Providers);
                     self.overlay_q.clear();
                     self.overlay_sel = 0;
                     self.overlay_providers = providers::list_addable_providers();
@@ -2355,7 +2461,7 @@ impl App {
                 return vec![Effect::ReloadProviders];
             }
         }
-        self.overlay = Some(OverlayKind::Providers);
+        self.open_overlay(OverlayKind::Providers);
         self.overlay_q.clear();
         self.overlay_sel = 0;
         self.overlay_auth_type.clear();
@@ -2364,7 +2470,7 @@ impl App {
     }
 
     fn open_models_for_provider(&mut self, id: &str) {
-        self.overlay = Some(OverlayKind::Model);
+        self.open_overlay(OverlayKind::Model);
         self.overlay_q.clear();
         self.overlay_sel = 0;
         self.overlay_scroll = 0;
@@ -3116,20 +3222,20 @@ impl App {
             KeyCode::Esc => {
                 match kind {
                     OverlayKind::ProviderMethod | OverlayKind::ProviderKey => {
-                        self.overlay = Some(OverlayKind::Providers);
+                        self.open_overlay(OverlayKind::Providers);
                         self.overlay_q.clear();
                         self.overlay_sel = 0;
                         self.overlay_providers = providers::list_addable_providers();
                     }
                     OverlayKind::WebSearch => {
-                        self.overlay = Some(OverlayKind::Settings);
+                        self.open_overlay(OverlayKind::Settings);
                         self.overlay_sel = 1;
                     }
                     OverlayKind::Model
                         if self.model_picker_purpose
                             == overlays::ModelPickerPurpose::Compaction =>
                     {
-                        self.overlay = Some(OverlayKind::Settings);
+                        self.open_overlay(OverlayKind::Settings);
                         self.overlay_sel = 0;
                         self.overlay_q.clear();
                         self.working_msg.clear();
@@ -3146,11 +3252,14 @@ impl App {
                         self.overlay_fork_source.clear();
                         self.overlay = None;
                         self.overlay_q.clear();
+                        self.overlay_q_cursor = None;
+                        self.overlay_q_cursor = None;
                         self.working_msg.clear();
                     }
                     _ => {
                         self.overlay = None;
                         self.overlay_q.clear();
+                        self.overlay_q_cursor = None;
                         self.working_msg.clear();
                     }
                 }
@@ -3170,12 +3279,14 @@ impl App {
                         let rows = overlays::fork_rows(self);
                         let new_sel = overlays::move_fork_sel(&rows, self.overlay_sel, -1);
                         self.overlay_sel = new_sel;
+                        overlays::sync_overlay_scroll(self);
                     }
                     OverlayKind::ProviderKey => {}
                     _ => {
                         if self.overlay_sel > 0 {
                             self.overlay_sel -= 1;
                         }
+                        overlays::sync_overlay_scroll(self);
                     }
                 }
                 Vec::new()
@@ -3194,6 +3305,7 @@ impl App {
                         let rows = overlays::fork_rows(self);
                         let new_sel = overlays::move_fork_sel(&rows, self.overlay_sel, 1);
                         self.overlay_sel = new_sel;
+                        overlays::sync_overlay_scroll(self);
                     }
                     OverlayKind::ProviderKey => {}
                     _ => {
@@ -3201,6 +3313,7 @@ impl App {
                         if cnt > 0 && self.overlay_sel < cnt - 1 {
                             self.overlay_sel += 1;
                         }
+                        overlays::sync_overlay_scroll(self);
                     }
                 }
                 Vec::new()
@@ -3212,12 +3325,46 @@ impl App {
                 if self.overlay_q_sel {
                     self.overlay_q.clear();
                     self.overlay_q_sel = false;
+                    self.overlay_q_cursor = Some(0);
                     self.reset_overlay_sel_after_query();
                     return Vec::new();
                 }
-                if !self.overlay_q.is_empty() {
-                    self.overlay_q.pop();
-                    self.reset_overlay_sel_after_query();
+                if overlays::overlay_has_query(Some(kind)) {
+                    // Caret-aware delete: remove the char before the
+                    // caret instead of popping the tail.
+                    self.overlay_backspace_char();
+                    return Vec::new();
+                }
+                Vec::new()
+            }
+            KeyCode::Delete => {
+                if overlays::overlay_has_query(Some(kind)) {
+                    self.overlay_delete_char();
+                }
+                Vec::new()
+            }
+            KeyCode::Left => {
+                if overlays::overlay_has_query(Some(kind)) {
+                    self.overlay_move_caret(-1);
+                }
+                Vec::new()
+            }
+            KeyCode::Right => {
+                if overlays::overlay_has_query(Some(kind)) {
+                    self.overlay_move_caret(1);
+                }
+                Vec::new()
+            }
+            KeyCode::Home => {
+                if overlays::overlay_has_query(Some(kind)) {
+                    self.overlay_q_cursor = Some(0);
+                }
+                Vec::new()
+            }
+            KeyCode::End => {
+                if overlays::overlay_has_query(Some(kind)) {
+                    let len = self.overlay_q.chars().count();
+                    self.overlay_q_cursor = Some(len);
                 }
                 Vec::new()
             }
@@ -3273,9 +3420,65 @@ impl App {
         if self.overlay_q_sel {
             self.overlay_q = text.to_string();
             self.overlay_q_sel = false;
+            self.overlay_q_cursor = Some(text.chars().count());
+            return;
+        }
+        if self.overlay_q_cursor.is_some() && overlays::overlay_has_query(self.overlay) {
+            // Caret-aware insert (also covers paste): typed/pasted text
+            // lands at the caret, which then sits at its end.
+            let caret = self.overlay_caret();
+            let inserted = text.chars().count();
+            let byte_at = self
+                .overlay_q
+                .char_indices()
+                .nth(caret)
+                .map(|(b, _)| b)
+                .unwrap_or(self.overlay_q.len());
+            self.overlay_q.insert_str(byte_at, text);
+            self.overlay_q_cursor = Some(caret + inserted);
             return;
         }
         self.overlay_q.push_str(text);
+    }
+
+    /// Caret char offset in the overlay search input, clamped to the
+    /// current query; `None` cursor state behaves as end-of-query.
+    fn overlay_caret(&self) -> usize {
+        let len = self.overlay_q.chars().count();
+        self.overlay_q_cursor.map_or(len, |c| c.min(len))
+    }
+
+    /// Delete the char before the caret in the overlay search input.
+    fn overlay_backspace_char(&mut self) {
+        let caret = self.overlay_caret();
+        if caret == 0 {
+            return;
+        }
+        let mut chars: Vec<char> = self.overlay_q.chars().collect();
+        chars.remove(caret - 1);
+        self.overlay_q = chars.into_iter().collect();
+        self.overlay_q_cursor = Some(caret - 1);
+        self.reset_overlay_sel_after_query();
+    }
+
+    /// Delete the char at the caret in the overlay search input.
+    fn overlay_delete_char(&mut self) {
+        let caret = self.overlay_caret();
+        let mut chars: Vec<char> = self.overlay_q.chars().collect();
+        if caret >= chars.len() {
+            return;
+        }
+        chars.remove(caret);
+        self.overlay_q = chars.into_iter().collect();
+        self.overlay_q_cursor = Some(caret);
+        self.reset_overlay_sel_after_query();
+    }
+
+    /// Move the caret ±1 chars, clamped to the query bounds.
+    fn overlay_move_caret(&mut self, dir: i32) {
+        let len = self.overlay_q.chars().count() as i32;
+        let caret = self.overlay_caret() as i32 + dir;
+        self.overlay_q_cursor = Some(caret.clamp(0, len) as usize);
     }
 
     fn disconnect_selected_provider(&mut self) -> Vec<Effect> {
@@ -3444,7 +3647,7 @@ impl App {
                     });
                     self.save_atom_config();
                     self.model_picker_purpose = overlays::ModelPickerPurpose::Chat;
-                    self.overlay = Some(OverlayKind::Settings);
+                    self.open_overlay(OverlayKind::Settings);
                     self.overlay_sel = 0;
                     self.overlay_q.clear();
                     self.working_msg.clear();
@@ -3477,6 +3680,7 @@ impl App {
                     self.session.model = model.clone();
                     self.overlay = None;
                     self.overlay_q.clear();
+                    self.overlay_q_cursor = None;
                     self.working_msg.clear();
                     return vec![Effect::PatchSessionModel {
                         provider,
@@ -3491,6 +3695,7 @@ impl App {
                 let thinking = self.thinking_level();
                 self.overlay = None;
                 self.overlay_q.clear();
+                self.overlay_q_cursor = None;
                 self.working_msg.clear();
                 vec![Effect::CreateSession {
                     provider,
@@ -3510,12 +3715,14 @@ impl App {
                 let picked = rows[self.overlay_sel].sess.as_ref().unwrap().id.clone();
                 self.overlay = None;
                 self.overlay_q.clear();
+                self.overlay_q_cursor = None;
                 self.working_msg.clear();
                 vec![Effect::LoadSession { id: picked }]
             }
             OverlayKind::Stats => {
                 self.overlay = None;
                 self.overlay_q.clear();
+                self.overlay_q_cursor = None;
                 self.working_msg.clear();
                 Vec::new()
             }
@@ -3532,7 +3739,7 @@ impl App {
                     return Vec::new();
                 }
                 self.overlay_auth_id = e.id.clone();
-                self.overlay = Some(OverlayKind::ProviderMethod);
+                self.open_overlay(OverlayKind::ProviderMethod);
                 self.overlay_q.clear();
                 self.overlay_sel = 0;
                 Vec::new()
@@ -3548,7 +3755,7 @@ impl App {
                     self.working_msg = "waiting for ChatGPT sign-in in the browser...".into();
                     return vec![Effect::StartOpenAIOAuth];
                 }
-                self.overlay = Some(OverlayKind::ProviderKey);
+                self.open_overlay(OverlayKind::ProviderKey);
                 self.overlay_q.clear();
                 self.overlay_sel = 0;
                 Vec::new()
@@ -3577,6 +3784,7 @@ impl App {
                     self.err_msg = err.to_string();
                     self.overlay = None;
                     self.overlay_q.clear();
+                    self.overlay_q_cursor = None;
                     self.working_msg.clear();
                     return Vec::new();
                 }
@@ -3586,7 +3794,7 @@ impl App {
             OverlayKind::Settings => match self.overlay_sel {
                 0 => {
                     self.model_picker_purpose = overlays::ModelPickerPurpose::Compaction;
-                    self.overlay = Some(OverlayKind::Model);
+                    self.open_overlay(OverlayKind::Model);
                     self.overlay_q.clear();
                     self.overlay_sel = 0;
                     self.overlay_scroll = 0;
@@ -3594,7 +3802,7 @@ impl App {
                     vec![Effect::FetchModels]
                 }
                 1 => {
-                    self.overlay = Some(OverlayKind::WebSearch);
+                    self.open_overlay(OverlayKind::WebSearch);
                     let selected = self.atom_config.resolved_web_search().server;
                     let rows = overlays::web_search_rows(self);
                     self.overlay_sel = rows.iter().position(|row| row.0 == selected).unwrap_or(0);
@@ -3617,7 +3825,7 @@ impl App {
                 self.atom_config.web_search =
                     Some(atom_core::config::WebSearchConfig { server: id, tool });
                 self.save_atom_config();
-                self.overlay = Some(OverlayKind::Settings);
+                self.open_overlay(OverlayKind::Settings);
                 self.overlay_sel = 1;
                 Vec::new()
             }
@@ -3703,13 +3911,20 @@ impl App {
         }
     }
 
-    /// Mark the inline approval block as resolved (tool_done + result text).
+    /// Clear the inline approval card (button row, help row, child
+    /// header) once the user has answered the prompt. The block stays
+    /// `tool_done = false`: the tool hasn't actually returned yet — the
+    /// server is still running the command and will send a `tool_result`
+    /// event with the real output, which `attach_tool_result` needs a
+    /// non-done tool block to land on. Marking it done here would either
+    /// orphan the real result into its own block or attach it to a
+    /// previous still-open tool block, both of which break the transcript
+    /// and confuse the model loop.
     fn resolve_approval_block(&mut self, approval_id: &str, note: &str) {
         for b in self.blocks.iter_mut().rev() {
             if b.kind == BlockKind::Tool {
                 if let Some(ref appr) = b.approval {
                     if appr.id == approval_id {
-                        b.tool_done = true;
                         b.result = format!("sandbox: {note}");
                         b.approval = None;
                         b.lines = None;
@@ -3807,7 +4022,15 @@ impl App {
         let (x, y) = (m.column as usize, m.row as usize);
         if self.overlay.is_some() {
             return match m.kind {
-                MouseEventKind::Down(MouseButton::Left) => overlays::click_overlay(self, y),
+                MouseEventKind::Down(MouseButton::Left) => {
+                    // A click on the search row places the caret
+                    // at the clicked column instead of selecting a row.
+                    if overlays::overlay_click_search(self, x, y) {
+                        Vec::new()
+                    } else {
+                        overlays::click_overlay(self, y)
+                    }
+                }
                 MouseEventKind::Drag(MouseButton::Left) => {
                     overlays::hover_overlay_row(self, y);
                     Vec::new()

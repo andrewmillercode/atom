@@ -846,9 +846,13 @@ async fn handle_fork(state: &Arc<AppState>, req: &mut Request<Incoming>, id: &st
     };
 
     // Build the child session. Same model/provider/cwd/thinking as the
-    // parent; lineage comes from parent_id. Title gets a (fork #N)
-    // suffix to disambiguate — known wart shared with OpenCode; sibling
-    // counting is a separate concern.
+    // source. parent_id stays empty: forks are independent root sessions,
+    // not subagents. The codebase overloads parent_id to mean "dispatched
+    // subagent" (turn.rs broadcasts "children" events to it, the TUI hides
+    // the prompt via read_only_view(), /fork and /compact gate on
+    // parent_id.is_empty()), so a fork child with parent_id set would be
+    // treated as a subagent and the user couldn't type into it.
+    // Lineage is conveyed by the `(fork #N)` title suffix instead.
     let now = Utc::now();
     let mut child = Session {
         id: new_session_id(),
@@ -862,7 +866,7 @@ async fn handle_fork(state: &Arc<AppState>, req: &mut Request<Incoming>, id: &st
         usage: None,
         compaction_summary: source.compaction_summary.clone(),
         compacted_through: source.compacted_through,
-        parent_id: source.id.clone(),
+        parent_id: String::new(),
         thinking: source.thinking.clone(),
         cancelled: false,
         status: DelegateStatus::Done,

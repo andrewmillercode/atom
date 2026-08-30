@@ -50,6 +50,8 @@ pub struct HotState {
     #[serde(default)]
     pub overlay_q: String,
     #[serde(default)]
+    pub overlay_q_cursor: Option<usize>,
+    #[serde(default)]
     pub overlay_q_sel: bool,
     #[serde(default)]
     pub overlay_sel: usize,

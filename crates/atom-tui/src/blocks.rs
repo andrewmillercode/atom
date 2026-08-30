@@ -1601,12 +1601,12 @@ fn approval_block_body(appr: &InlineApproval, width: usize) -> Vec<Line<'static>
     lines
 }
 
-/// Help line under the buttons. Lists every binding on one row at the
-/// current content width, truncating if the terminal is too narrow to
-/// fit the full sentence. Matches the v2 spec's "dim line under the
-/// buttons" requirement.
+/// Help line under the buttons. The buttons above already enumerate
+/// `y` / `a` / `n` / `d`; this line only carries the keys that aren't
+/// buttons — `esc` to cancel, and the width is just enough that a
+/// truncated terminal still shows the most important escape hatch.
 fn approval_help_line(width: usize) -> Line<'static> {
-    let text = "y once · a always · n no · d never · esc cancel — press ? for details";
+    let text = "esc cancel";
     let truncated = atom_core::render::highlight::truncate_width(text, width);
     Line::from(Span::styled(truncated, ansi::style_dim()))
 }

@@ -1446,8 +1446,47 @@ pub fn tokenize(cmd: &str) -> Vec<Vec<String>> {
                 flush_tok(&mut cur, &mut cur_started, &mut seg);
                 flush_seg(&mut seg, &mut segments);
             }
-            '&' | '|' => {
-                let doubled = chars.peek() == Some(&c);
+            '&' => {
+                // Don't split `&` when it's part of a shell fd-redirect
+                // (`2>&1`, `>&2`, …). Without this the `2>` flushes a
+                // token, `&` is treated as a control operator, and the
+                // trailing `1` becomes a phantom "unknown-command"
+                // segment that escalates an otherwise-Allow command to
+                // Ask. Keep the whole `2>&1` shape as one token.
+                if cur.ends_with('>') {
+                    cur.push('&');
+                    cur_started = true;
+                    continue;
+                }
+                // Bash combined redirect: `cmd &> file` puts both stdout
+                // and stderr into `file`. Treat `&>` as a single token
+                // when `&` opens a new token (cur is empty).
+                if !cur_started && chars.peek() == Some(&'>') {
+                    chars.next();
+                    cur.push('&');
+                    cur.push('>');
+                    cur_started = true;
+                    continue;
+                }
+                let doubled = chars.peek() == Some(&'&');
+                if doubled {
+                    chars.next();
+                }
+                flush_tok(&mut cur, &mut cur_started, &mut seg);
+                flush_seg(&mut seg, &mut segments);
+            }
+            '|' => {
+                // zsh's `|&` is the stderr+stdout pipe operator
+                // (`cmd1 |& cmd2` == `cmd1 2>&1 | cmd2`). Treat it as a
+                // segment separator the same way we treat `|`.
+                let next_is_amp = chars.peek() == Some(&'&');
+                if next_is_amp {
+                    chars.next();
+                    flush_tok(&mut cur, &mut cur_started, &mut seg);
+                    flush_seg(&mut seg, &mut segments);
+                    continue;
+                }
+                let doubled = chars.peek() == Some(&'|');
                 if doubled {
                     chars.next();
                 }
@@ -1556,6 +1595,68 @@ mod tests {
     #[test]
     fn tokenizer_newline_is_a_separator() {
         assert_eq!(tokenize("ls\npwd"), vec![vec!["ls"], vec!["pwd"]]);
+    }
+
+    #[test]
+    fn tokenizer_keeps_fd_redirects_as_one_token() {
+        // `2>&1` is a single fd-duplication token; the `&` must not
+        // split the segment into a phantom unknown-command argv0.
+        assert_eq!(
+            tokenize("cargo check 2>&1 | tail -30"),
+            vec![
+                vec!["cargo", "check", "2>&1"],
+                vec!["tail", "-30"],
+            ]
+        );
+        // `>&2` opens a token (no cur yet) but stays glued.
+        assert_eq!(
+            tokenize("echo hi >&2"),
+            vec![vec!["echo", "hi", ">&2"]]
+        );
+        // Bash combined redirect `&>file` is a token too.
+        assert_eq!(
+            tokenize("cargo build &> build.log"),
+            vec![vec!["cargo", "build", "&>", "build.log"]]
+        );
+        // zsh `|&` (stderr+stdout pipe) is a control operator, just
+        // like `|`, and splits the pipeline into two segments.
+        assert_eq!(
+            tokenize("cmd1 |& cmd2"),
+            vec![vec!["cmd1"], vec!["cmd2"]]
+        );
+        // Standalone `&` (background) and `&&` (logical and) still
+        // behave as control separators after the fix.
+        assert_eq!(
+            tokenize("cargo build && cargo test & echo done"),
+            vec![
+                vec!["cargo", "build"],
+                vec!["cargo", "test"],
+                vec!["echo", "done"],
+            ]
+        );
+    }
+
+    #[test]
+    fn cargo_pipeline_with_2_1_redirect_is_allow() {
+        // Regression: `2>&1` used to split into a phantom `1` segment
+        // and escalate this Tier-1 command into Ask (Tier-2 prompt).
+        let v = analyze(
+            "cargo check -p atom-tui 2>&1 | tail -30",
+            Path::new("/Users/dev/proj"),
+        );
+        assert_eq!(v.verdict, Verdict::Allow);
+        assert!(
+            v.matched_rules.contains(&"cargo-build-test".to_string()),
+            "matched_rules: {:?}",
+            v.matched_rules
+        );
+        // `unknown-command` must not appear: the `1` is no longer its
+        // own segment.
+        assert!(
+            !v.matched_rules.contains(&"unknown-command".to_string()),
+            "matched_rules: {:?}",
+            v.matched_rules
+        );
     }
 
     // ---------- rules ----------

@@ -1004,17 +1004,19 @@ pub async fn run_session_turn(
                     return;
                 }
             }
-        } else if api_protocol_for(&provider, &sess.model) == APIProtocol::OpenAIResponses {
-            // OpenAI Responses API: POST {base}/responses. Picked for
-            // opencode-hosted models with models.dev npm =
-            // "@ai-sdk/openai" — most visibly
-            // muse-spark-1.2-contributor-free on OpenCode's Zen tier
-            // (https://opencode.ai/zen/v1). Chat Completions on the
-            // same base URL answers with a generic Internal server
-            // error and drops the request, so the protocol routing
-            // here is what makes those models reachable from atom at
-            // all. Driven entirely by models.dev metadata
-            // (api_protocol_for) — no provider hardcoding.
+        } else if api_protocol_for(&provider, &sess.model) == APIProtocol::OpenAIResponses
+            // ChatGPT-Plan OAuth tokens issued by the openai oauth
+            // flow (openai_oauth.rs) only carry ChatGPT-Plan scopes
+            // (openid/profile/email/offline_access) and are rejected
+            // by api.openai.com/v1/responses with "Missing scopes:
+            // api.responses.write". They are authorized for the
+            // chatgpt.com/backend-api/codex/responses endpoint, so
+            // route them through the codex branch below instead.
+            // Real OPENAI_API_KEYs and any other token that doesn't
+            // match a stored ChatGPT oauth entry keep going to the
+            // Responses API (muse-spark on opencode Zen, etc.).
+            && openai_codex_auth_for_key(&key).is_none()
+        {
             let opened = await_round(
                 stream_responses(&base_url, &key, &sess.model, &msgs, &tools, &opts.thinking),
                 &turn_cancel,

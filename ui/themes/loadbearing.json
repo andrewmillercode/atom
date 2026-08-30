@@ -12,6 +12,7 @@
   "foreground": "#e8e6dc",
   "muted": "#b0aea5",
   "muted_extra": "#6d6c66",
+  "muted_deepest": "#40403c",
   "diff_add": "#92a87a",
   "diff_del": "#e89a7e",
   "diff_add_bg": "#14532d",

@@ -35,6 +35,9 @@ pub fn c_muted() -> Color {
 pub fn c_muted_extra() -> Color {
     theme_color(atom_core::render::colors::ThemeColor::MutedExtra)
 }
+pub fn c_muted_deepest() -> Color {
+    theme_color(atom_core::render::colors::ThemeColor::MutedDeepest)
+}
 pub fn c_foreground() -> Color {
     theme_color(atom_core::render::colors::ThemeColor::Foreground)
 }

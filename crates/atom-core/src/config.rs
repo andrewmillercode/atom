@@ -9,8 +9,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub const CONFIG_VERSION: u32 = 1;
-pub const DEFAULT_COMPACTION_PROVIDER: &str = "ollama-local";
-pub const DEFAULT_COMPACTION_MODEL: &str = "deepseek-v4-flash:0731";
+pub const DEFAULT_COMPACTION_PROVIDER: &str = "opencode-zen";
+pub const DEFAULT_COMPACTION_MODEL: &str = "mimo-v2.5-free";
 pub const DEFAULT_WEB_SEARCH_SERVER: &str = "parallel";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

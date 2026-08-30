@@ -550,18 +550,16 @@ pub fn model_rows(app: &App) -> Vec<ModelRow> {
             pinned.push(entry.clone());
         }
     }
-    rows.push(ModelRow {
-        label: if pinned.is_empty() {
-            "Pinned - None".to_string()
-        } else {
-            "Pinned".to_string()
-        },
-        entry: None,
-    });
-    rows.extend(pinned.into_iter().map(|entry| ModelRow {
-        label: String::new(),
-        entry: Some(entry),
-    }));
+    if !pinned.is_empty() {
+        rows.push(ModelRow {
+            label: "Pinned".to_string(),
+            entry: None,
+        });
+        rows.extend(pinned.into_iter().map(|entry| ModelRow {
+            label: String::new(),
+            entry: Some(entry),
+        }));
+    }
 
     let mut recent = Vec::new();
     for wanted in &app.picker_settings.recents {
@@ -574,18 +572,16 @@ pub fn model_rows(app: &App) -> Vec<ModelRow> {
             recent.push(entry.clone());
         }
     }
-    rows.push(ModelRow {
-        label: if recent.is_empty() {
-            "Recent - None".to_string()
-        } else {
-            "Recent".to_string()
-        },
-        entry: None,
-    });
-    rows.extend(recent.into_iter().map(|entry| ModelRow {
-        label: String::new(),
-        entry: Some(entry),
-    }));
+    if !recent.is_empty() {
+        rows.push(ModelRow {
+            label: "Recent".to_string(),
+            entry: None,
+        });
+        rows.extend(recent.into_iter().map(|entry| ModelRow {
+            label: String::new(),
+            entry: Some(entry),
+        }));
+    }
 
     let remaining: Vec<ModelEntry> = filtered
         .into_iter()
@@ -1136,10 +1132,7 @@ pub struct OverlayViewData {
 }
 
 impl OverlayViewData {
-    fn new(
-        rows: Vec<crate::fullscreen_view::ViewRow>,
-        footer: String,
-    ) -> Self {
+    fn new(rows: Vec<crate::fullscreen_view::ViewRow>, footer: String) -> Self {
         Self { rows, footer }
     }
 }
@@ -1164,10 +1157,7 @@ pub fn overlay_view_data(app: &App, kind: OverlayKind) -> OverlayViewData {
                 .iter()
                 .map(|row| match &row.entry {
                     Some(entry) => ViewRow::Item(ViewItem {
-                        id: Some(format!(
-                            "{}/{}",
-                            entry.provider.name, entry.model
-                        )),
+                        id: Some(format!("{}/{}", entry.provider.name, entry.model)),
                         label: entry.model.clone(),
                         trailing: entry.provider.name.clone(),
                         meta: String::new(),
@@ -1200,21 +1190,16 @@ pub fn overlay_view_data(app: &App, kind: OverlayKind) -> OverlayViewData {
                     }
                     let mut item = ViewItem::new(r.label.clone());
                     item.id = r.sess.as_ref().map(|s| s.id.clone());
-                    item.marker = if r
-                        .sess
-                        .as_ref()
-                        .is_some_and(|s| s.id == app.session.id)
-                    {
+                    item.marker = if r.sess.as_ref().is_some_and(|s| s.id == app.session.id) {
                         "→ ".to_string()
                     } else {
                         String::new()
                     };
-                    item.trailing =
-                        if r.sess.as_ref().is_some_and(|s| !s.parent_id.is_empty()) {
-                            SUBAGENT_TAG.to_string()
-                        } else {
-                            String::new()
-                        };
+                    item.trailing = if r.sess.as_ref().is_some_and(|s| !s.parent_id.is_empty()) {
+                        SUBAGENT_TAG.to_string()
+                    } else {
+                        String::new()
+                    };
                     ViewRow::Item(item)
                 })
                 .collect();
@@ -1373,10 +1358,7 @@ fn fork_view_rows(app: &App) -> OverlayViewData {
 /// and hit-test both go through this so chrome row counts (title,
 /// description, search) can never drift apart. An empty placeholder
 /// hides the search row entirely.
-pub fn overlay_chrome(
-    app: &App,
-    kind: OverlayKind,
-) -> (String, String, String) {
+pub fn overlay_chrome(app: &App, kind: OverlayKind) -> (String, String, String) {
     let query_hint = "type to search, ↑↓ to navigate, Enter to select, ";
     let (title, description, placeholder) = match kind {
         OverlayKind::Model => (
@@ -1488,6 +1470,20 @@ fn overlay_hit_geometry(app: &App) -> (usize, usize, OverlayViewData) {
     let height = crate::fullscreen_view::content_height(app.height.max(1) as usize);
     let kind = app.overlay.unwrap_or(OverlayKind::Fork);
     (width, height, overlay_view_data(app, kind))
+}
+
+/// True when a raw screen coordinate lands on the overlay title row's
+/// right-aligned `esc` dismiss hint, so clicking it closes the overlay.
+pub fn overlay_esc_hint_hit(app: &App, x_raw: usize, y_raw: usize) -> bool {
+    let Some(kind) = app.overlay else {
+        return false;
+    };
+    let width = crate::fullscreen_view::content_width(app.width.max(1) as usize);
+    let x = x_raw.saturating_sub(crate::fullscreen_view::EDGE_PAD);
+    let y = y_raw.saturating_sub(crate::fullscreen_view::EDGE_PAD);
+    let data = overlay_view_data(app, kind);
+    let spec = overlay_spec(app, kind, &data);
+    crate::fullscreen_view::esc_hint_hit(&spec, x, y, width)
 }
 
 /// Click-to-place the caret in a fullscreen overlay's search input,
@@ -1734,7 +1730,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_picker_groups_show_none() {
+    fn model_picker_hides_empty_groups() {
         let mut app = App::new_test(80, 24);
         app.overlay_entries = vec![ModelEntry {
             provider: atom_core::providers::providers::Provider {
@@ -1743,9 +1739,48 @@ mod tests {
             },
             model: "gpt-5".into(),
         }];
-        assert_eq!(model_rows(&app)[0].label, "Pinned - None");
-        assert_eq!(model_rows(&app)[1].label, "Recent - None");
+        let rows = model_rows(&app);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].label, "Models");
+        assert_eq!(rows[1].entry.as_ref().unwrap().model, "gpt-5");
 
+        app.picker_settings
+            .favorites
+            .push(crate::settings::PickerSettings::model_ref(
+                "openai", "gpt-5",
+            ));
+        let rows = model_rows(&app);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].label, "Pinned");
+        assert_eq!(rows[1].entry.as_ref().unwrap().model, "gpt-5");
+        app.picker_settings
+            .recents
+            .push(crate::settings::PickerSettings::model_ref(
+                "openai", "gpt-5",
+            ));
+        // Recent dedupes against pinned, so the section stays hidden.
+        assert_eq!(model_rows(&app).len(), 2);
+        app.overlay_entries.push(ModelEntry {
+            provider: atom_core::providers::providers::Provider {
+                name: "openai".into(),
+                ..Default::default()
+            },
+            model: "gpt-4".into(),
+        });
+        app.picker_settings.recents.insert(
+            0,
+            crate::settings::PickerSettings::model_ref("openai", "gpt-4"),
+        );
+        let rows = model_rows(&app);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].label, "Pinned");
+        assert_eq!(rows[2].label, "Recent");
+        assert_eq!(rows[3].entry.as_ref().unwrap().model, "gpt-4");
+    }
+
+    #[test]
+    fn session_picker_keeps_pinned_none_placeholder() {
+        let mut app = App::new_test(80, 24);
         app.overlay_sessions = vec![SessionInfo {
             id: "s1".into(),
             title: "chat".into(),

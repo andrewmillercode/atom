@@ -1607,6 +1607,7 @@ impl App {
     pub fn open_overlay(&mut self, kind: OverlayKind) {
         self.overlay = Some(kind);
         self.overlay_q_sel = false;
+        self.overlay_scroll = 0;
         self.overlay_q_cursor = if overlays::overlay_has_query(Some(kind)) {
             Some(0)
         } else {
@@ -3272,6 +3273,10 @@ impl App {
                         if self.overlay_sel > 0 {
                             self.overlay_sel -= 1;
                         }
+                        // Stats has no selection highlight: overlay_sel
+                        // is the scroll window's first row, so the
+                        // renderer's scroll must track it.
+                        self.overlay_scroll = self.overlay_sel;
                     }
                     OverlayKind::Session => overlays::move_session_sel(self, -1),
                     OverlayKind::Model => overlays::move_model_sel(self, -1),
@@ -3298,6 +3303,8 @@ impl App {
                         if self.overlay_sel < max {
                             self.overlay_sel += 1;
                         }
+                        // See Up: scroll tracks the selection row.
+                        self.overlay_scroll = self.overlay_sel;
                     }
                     OverlayKind::Session => overlays::move_session_sel(self, 1),
                     OverlayKind::Model => overlays::move_model_sel(self, 1),
@@ -4023,6 +4030,14 @@ impl App {
         if self.overlay.is_some() {
             return match m.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
+                    // The `esc` hint on the overlay title row dismisses
+                    // the overlay like the key.
+                    if overlays::overlay_esc_hint_hit(self, x, y) {
+                        return self.update_overlay_key(KeyEvent::new(
+                            KeyCode::Esc,
+                            KeyModifiers::empty(),
+                        ));
+                    }
                     // A click on the search row places the caret
                     // at the clicked column instead of selecting a row.
                     if overlays::overlay_click_search(self, x, y) {
@@ -5449,6 +5464,65 @@ mod tests {
                 Some(Effect::LoadSession { id }) if id == "parent-1"
             ),
             "click returned to the parent: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn click_on_overlay_esc_hint_closes_overlay() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = App::new_test(100, 40);
+        app.open_overlay(OverlayKind::Settings);
+        assert!(app.overlay.is_some());
+        // The `esc` hint sits on the title row's last three columns, at
+        // raw y = EDGE_PAD (content y 0).
+        let ev = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: (app.width - 2) as u16,
+            row: crate::fullscreen_view::EDGE_PAD as u16,
+            modifiers: KeyModifiers::empty(),
+        };
+        let _ = app.mouse(ev);
+        assert!(
+            app.overlay.is_none(),
+            "clicking the esc hint dismissed the overlay"
+        );
+    }
+
+    #[test]
+    fn stats_overlay_scroll_tracks_arrow_keys() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::new_test(100, 30);
+        app.open_overlay(OverlayKind::Stats);
+        // Enough tool rows that the report overflows a short terminal.
+        let mut tool_usage = std::collections::HashMap::new();
+        for i in 0..30 {
+            tool_usage.insert(format!("tool_{i}"), (30 - i) as i64);
+        }
+        app.overlay_stats = Some(StatsReport {
+            total_sessions: 1,
+            tool_usage,
+            ..Default::default()
+        });
+        app.overlay_sel = 0;
+        app.overlay_scroll = 0;
+        assert!(
+            overlays::stats_scroll_max(&app) > 5,
+            "report should overflow"
+        );
+        for _ in 0..3 {
+            app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()));
+        }
+        assert_eq!(app.overlay_scroll, 3, "scroll follows the Down key");
+        app.key(KeyEvent::new(KeyCode::Up, KeyModifiers::empty()));
+        assert_eq!(app.overlay_scroll, 2, "scroll follows the Up key");
+        // Clamped at the last scrollable row.
+        for _ in 0..100 {
+            app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()));
+        }
+        assert_eq!(
+            app.overlay_scroll,
+            overlays::stats_scroll_max(&app),
+            "scroll clamps at max"
         );
     }
 

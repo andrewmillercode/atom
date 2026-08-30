@@ -36,3 +36,6 @@ anyhow = { workspace = true }
 chrono = { workspace = true }
 libc = { workspace = true }
 reqwest = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

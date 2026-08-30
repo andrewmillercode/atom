@@ -1,47 +1,20 @@
-//! Ported from links.go: detects URLs and filesystem paths in
-//! conversation text and renders them as secondary-colored OSC 8
-//! hyperlinks so a supporting terminal can open them (usually click or
-//! cmd-click). Also carries a faithful port of charmbracelet/x/ansi.Wrap,
-//! the ANSI-aware word wrapper used across the renderer.
+//! Renders markdown-style `[label](url)` and `<https://…>` autolinks as
+//! OSC 8 hyperlinks (handled structurally by the markdown layer in
+//! `render::markdown`), plus an explicit `linkify_path` helper for
+//! clickable file paths in tool headers. Also carries a faithful port
+//! of charmbracelet/x/ansi.Wrap, the ANSI-aware word wrapper used
+//! across the renderer.
+//!
+//! Prose-level URL/path detection has been removed: bare URLs in
+//! prose, `~/path`, `/abs/path`, repo-relative `crates/foo.rs`, and
+//! backticked/quoted paths are intentionally **not** turned into
+//! clickable links. The only paths to an OSC 8 region are markdown
+//! syntax (`[label](url)`, `<url>`) and explicit per-element helpers
+//! like `linkify_path`.
 
-use once_cell::sync::Lazy;
-use regex::Regex;
 use unicode_width::UnicodeWidthChar;
 
 use super::colors::{ansi_bg, ansi_fg, COLOR_SECONDARY};
-
-/// linkRe matches http(s) and file URLs, home-relative paths, and
-/// absolute or repo-relative Unix paths with at least two segments
-/// (so /thinking and other slash-commands stay plain text). A
-/// backticked or double-quoted span that starts with a path prefix
-/// links in full, so paths containing spaces (`~/Library/Application
-/// Support/...` or "/Users/me/My Docs/...") aren't truncated at the
-/// space.
-///
-/// The trailing `:N[-M|,M]` line anchor is **optional** on every
-/// path-shaped alternative: prose like `bar:5` stays plain only
-/// because the leading path alternatives require at least one `/`,
-/// not because of the anchor. Without the anchor optional, plain
-/// repo-relative paths like `crates/foo.rs` inside a ``code`` span
-/// would inherit the syntax color but never get an OSC 8 click
-/// region — exactly the regression visible as green-and-not-clickable.
-static LINK_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(
-        r#"(?ix)
-    `(?:~/|/)[^`\n]+`                       # backticked ~/path or /abs/path
-  | "(?:~/|/)[^"\n]+"                       # double-quoted ~/path or /abs/path
-  | \bhttps?://[^\s<>\[\]"'`]+              # http(s) URL
-  | file://[^\s<>\[\]"'`]+                  # file URL
-  | ~/(?:[A-Za-z0-9._+-]+/)*[A-Za-z0-9._+-]+    # ~/path
-        (?::[0-9]+(?:[-,][0-9]+)*)?             # optional :N[-M|,M] line anchor
-  | /(?:[A-Za-z0-9._+-]+/){1,}[A-Za-z0-9._+-]+    # /abs/path
-        (?::[0-9]+(?:[-,][0-9]+)*)?             # optional :N[-M|,M] line anchor
-  | (?:[A-Za-z0-9._+-]+/){1,}[A-Za-z0-9._+-]+    # rel/path (needs a /)
-        (?::[0-9]+(?:[-,][0-9]+)*)?             # optional :N[-M|,M] line anchor
-"#,
-    )
-    .unwrap()
-});
 
 /// split_line_anchor peels a trailing `:N[-M|,M]` off a path-shaped
 /// match so the URI builder can preserve it. Returns (path, Some(line))
@@ -92,66 +65,33 @@ pub fn osc8_close() -> &'static str {
     "\x1b]8;;\x07"
 }
 
-/// wrapLinked wraps text to width after turning detected links into
-/// styled hyperlinks. restoreFg/restoreBg are theme hex colors written
-/// after each link so a parent renderer's colors survive; empty
-/// restoreFg returns to the default foreground.
+/// wrapLinked wraps text to `width` cells with escape sequences
+/// preserved verbatim and wide characters counted correctly. The
+/// optional `restore_fg`/`restore_bg` are prepended as SGR and re-
+/// emitted at the end so a parent renderer's colors survive; empty
+/// `restore_fg` falls back to the default foreground.
 ///
-/// `cwd` is the base for resolving repo-relative paths
-/// (e.g. `crates/foo.rs`); empty falls back to the process cwd.
-pub fn wrap_linked(
-    text: &str,
-    width: usize,
-    restore_fg: &str,
-    restore_bg: &str,
-    cwd: &str,
-) -> String {
-    ansi_wrap(&linkify(text, restore_fg, restore_bg, cwd), width)
-}
-
-pub fn linkify(text: &str, restore_fg: &str, restore_bg: &str, cwd: &str) -> String {
-    if !LINK_RE.is_match(text) {
-        return text.to_string();
+/// No hyperlink detection happens here — markdown `[label](url)`
+/// and `<url>` autolinks are produced by the markdown layer, and
+/// explicit per-element paths go through `linkify_path`. Plain text
+/// round-trips unchanged (modulo wrap + color reset).
+pub fn wrap_linked(text: &str, width: usize, restore_fg: &str, restore_bg: &str) -> String {
+    let mut sb = String::with_capacity(text.len() + 16);
+    if !restore_bg.is_empty() {
+        sb.push_str(&ansi_bg(restore_bg));
     }
-    let mut sb = String::with_capacity(text.len() + 64);
-    let mut last = 0usize;
-    for m in LINK_RE.find_iter(text) {
-        let raw = m.as_str();
-        // Backticked or double-quoted paths: the delimiter characters
-        // stay as plain text and the path inside — spaces included —
-        // becomes the hyperlink.
-        if let Some(inner) = raw
-            .strip_prefix('`')
-            .and_then(|s| s.strip_suffix('`'))
-            .or_else(|| raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
-        {
-            let delim = raw.chars().next().expect("delimited match is non-empty");
-            sb.push_str(&text[last..m.start()]);
-            sb.push(delim);
-            sb.push_str(&render_link(
-                inner,
-                &link_uri(inner, cwd),
-                restore_fg,
-                restore_bg,
-            ));
-            sb.push(delim);
-            last = m.end();
-            continue;
-        }
-        let display = trim_link(raw);
-        if display.is_empty() {
-            continue;
-        }
-        sb.push_str(&text[last..m.start()]);
-        sb.push_str(&render_link(
-            display,
-            &link_uri(display, cwd),
-            restore_fg,
-            restore_bg,
-        ));
-        last = m.start() + display.len();
+    if !restore_fg.is_empty() {
+        sb.push_str(&ansi_fg(restore_fg));
     }
-    sb.push_str(&text[last..]);
+    sb.push_str(&ansi_wrap(text, width));
+    if !restore_bg.is_empty() {
+        sb.push_str(&ansi_bg(restore_bg));
+    }
+    if !restore_fg.is_empty() {
+        sb.push_str(&ansi_fg(restore_fg));
+    } else {
+        sb.push_str(ANSI_DEFAULT_FG);
+    }
     sb
 }
 
@@ -228,37 +168,6 @@ pub fn render_link(display: &str, uri: &str, restore_fg: &str, restore_bg: &str)
     }
     sb.push_str(osc8_close());
     sb
-}
-
-pub fn trim_link(s: &str) -> &str {
-    let mut s = s.trim_end_matches(['.', ',', ';', ':', '!', '?', ']', '}', '\'', '"']);
-    while s.ends_with(')') && s.matches('(').count() < s.matches(')').count() {
-        s = &s[..s.len() - 1];
-    }
-    s
-}
-
-pub fn link_uri(display: &str, cwd: &str) -> String {
-    // Byte-wise prefix check: matched text can contain multi-byte runes
-    // (e.g. "https://" + em dash), so a p.len() byte cut may land mid-rune
-    // and slicing there panics. ASCII case-insensitive comparison on bytes
-    // is equivalent for these ASCII prefixes and never panics.
-    let lower_prefix = |p: &str| {
-        display
-            .as_bytes()
-            .get(..p.len())
-            .is_some_and(|b| b.eq_ignore_ascii_case(p.as_bytes()))
-    };
-    if lower_prefix("http://") || lower_prefix("https://") {
-        // HTTP(S) URLs: a line anchor is meaningless, keep display as-is.
-        return display.to_string();
-    }
-    if lower_prefix("file://") {
-        // Already an absolute file:// URI; just preserve any line anchor.
-        return path_file_uri(display, cwd);
-    }
-    // ~/ or relative: build an absolute file:// URI.
-    path_file_uri(display, cwd)
 }
 
 /// fileURI mirrors Go's (&url.URL{Scheme:"file", Path:path}).String():
@@ -538,117 +447,71 @@ fn flush_word(st: &mut WrapState<'_>, _limit: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::render::colors::{ansi_fg, COLOR_CARD_DARK, COLOR_FOREGROUND, COLOR_SECONDARY};
+    use crate::render::colors::{ansi_fg, COLOR_CARD_DARK, COLOR_FOREGROUND};
 
+    /// Plain prose must round-trip without gaining OSC 8 wrappers,
+    /// even when it looks like a path or URL. The policy is that
+    /// only markdown `[label](url)` syntax and explicit
+    /// `linkify_path` produce clickable regions.
     #[test]
-    fn slash_commands_stay_plain() {
-        let in_text = "run /thinking or /compact now";
-        assert_eq!(linkify(in_text, "", "", ""), in_text);
+    fn wrap_linked_emits_no_osc8_for_plain_text() {
+        for in_text in [
+            "say yes/no/maybe",
+            "and/or logic",
+            "visit https://example.com today",
+            "see crates/foo.rs for details",
+            "open ~/.config/atom/AGENTS.md",
+            "try /thinking or /compact now",
+            "use bar:5 for the config",
+        ] {
+            let out = wrap_linked(in_text, 80, "", "");
+            assert!(
+                !out.contains("\x1b]8;;"),
+                "wrap_linked({in_text:?}) leaked OSC 8: {out:?}"
+            );
+            // Visible characters survive; the input is a substring of
+            // the visible output (modulo the embedded color resets
+            // emitted by wrap_linked with empty fg/bg).
+            let visible: String = out
+                .split('\x1b')
+                .enumerate()
+                .filter_map(|(i, chunk)| if i % 2 == 0 { Some(chunk) } else { None })
+                .collect();
+            assert!(
+                visible.contains(in_text),
+                "input dropped from visible output: visible={visible:?} in={in_text:?}"
+            );
+        }
     }
 
-    /// Repo-relative paths inside a backticked code span must end up
-    /// inside an OSC 8 wrap. Visible regression: `\`crates/foo.rs\``
-    /// rendered green (syntax color) but was non-clickable because
-    /// the regex had required a trailing `:N` line anchor that bare
-    /// file references don't carry.
+    /// Wrap + color restore must not mangle embedded SGR sequences.
     #[test]
-    fn code_span_repo_relative_path_is_clickable() {
-        let in_text = "see `crates/foo.rs` for details";
-        let cwd = "/Users/andrewmiller/projects/atom";
-        let out = linkify(in_text, "", "", cwd);
-        let expected_uri = file_uri(&format!("{cwd}/crates/foo.rs"));
+    fn wrap_linked_passes_through_ansi_escapes() {
+        let in_text = "foo\x1b[31mred\x1b[0m bar";
+        let out = wrap_linked(in_text, 80, "", "");
+        assert!(out.contains("\x1b[31m"));
+        assert!(out.contains("\x1b[0m"));
+        assert!(out.contains("foo"));
+        assert!(out.contains("red"));
+        assert!(out.contains("bar"));
+        // Default-fg reset at the end (empty restore_fg).
+        assert!(out.ends_with(ANSI_DEFAULT_FG), "missing fg reset: {out:?}");
+    }
+
+    /// restore_fg is reapplied at end so a parent renderer's color
+    /// survives the wrap.
+    #[test]
+    fn wrap_linked_restores_fg_when_provided() {
+        let in_text = "hello world";
+        let out = wrap_linked(in_text, 80, COLOR_FOREGROUND, "");
         assert!(
-            out.contains(&osc8_open(&expected_uri)),
-            "missing OSC 8 wrap for crates/foo.rs: {out:?}"
+            out.starts_with(&ansi_fg(COLOR_FOREGROUND)),
+            "missing fg prefix: {out:?}"
         );
-        // The path itself stays visible as link text.
         assert!(
-            out.contains("crates/foo.rs"),
-            "link text dropped from output: {out:?}"
+            out.ends_with(&ansi_fg(COLOR_FOREGROUND)),
+            "missing fg restore at end: {out:?}"
         );
-    }
-
-    /// `bar:5` is prose — no `/` means no path-shaped match. The
-    /// optional line anchor can't drag this into a hyperlink.
-    #[test]
-    fn prose_colon_number_stays_plain() {
-        let in_text = "use bar:5 for the config version";
-        assert_eq!(linkify(in_text, "", "", ""), in_text);
-    }
-
-    #[test]
-    fn linkify_styles_and_hyperlinks() {
-        let in_text =
-            "see https://ness-health.com and /Users/andrewmiller/.config/atom/AGENTS.md please";
-        let out = linkify(in_text, COLOR_FOREGROUND, "", "");
-        assert!(out.contains(&osc8_open("https://ness-health.com")));
-        assert!(out.contains(&osc8_open(&file_uri(
-            "/Users/andrewmiller/.config/atom/AGENTS.md"
-        ))));
-        assert!(out.contains(&ansi_fg(COLOR_SECONDARY)));
-        assert!(out.contains(ANSI_UNDERLINE));
-        assert_eq!(
-            visible_width(&out),
-            visible_width(in_text),
-            "styled width must equal plain width"
-        );
-    }
-
-    #[test]
-    fn trim_link_punct_and_quotes() {
-        let out = linkify("try 'https://ness-health.com'.", "", "", "");
-        assert!(
-            out.contains(&osc8_open("https://ness-health.com")),
-            "{}",
-            out
-        );
-        assert!(!out.contains(&osc8_open("https://ness-health.com'.")));
-    }
-
-    #[test]
-    fn linkify_home_path_keeps_display() {
-        let home = dirs::home_dir().unwrap().display().to_string();
-        let out = linkify("open ~/.config/atom/AGENTS.md", "", "", "");
-        assert!(out.contains(&osc8_open(&file_uri(&format!(
-            "{}/.config/atom/AGENTS.md",
-            home
-        )))));
-        assert!(out.contains("~/.config/atom/AGENTS.md"));
-    }
-
-    #[test]
-    fn linkify_backticked_path_with_space() {
-        let in_text = "`~/Library/Application Support/atom/diagrams/`";
-        let home = dirs::home_dir().unwrap().display().to_string();
-        let out = linkify(in_text, "", "", "");
-        // The full path — space included — becomes the URI, escaped.
-        // The trailing slash is a real directory marker and survives.
-        assert!(out.contains(&osc8_open(&file_uri(&format!(
-            "{home}/Library/Application Support/atom/diagrams/"
-        )))));
-        // Backticks remain visible and no text is lost.
-        assert_eq!(visible_width(&out), visible_width(in_text));
-        // Absolute backticked paths behave the same.
-        let out = linkify("`/Users/a/My Docs/x.md`", "", "", "");
-        assert!(out.contains(&osc8_open(&file_uri("/Users/a/My Docs/x.md"))));
-    }
-
-    #[test]
-    fn linkify_double_quoted_path_with_space() {
-        // The visualize tool marker quotes artifact paths; a
-        // space-containing path must not truncate at the space.
-        let in_text = "png=\"/Users/a/My Docs/x.png\" html=\"/Users/a/My Docs/x.html\"";
-        let out = linkify(in_text, "", "", "");
-        assert!(out.contains(&osc8_open(&file_uri("/Users/a/My Docs/x.png"))));
-        assert!(out.contains(&osc8_open(&file_uri("/Users/a/My Docs/x.html"))));
-        // The full display text survives (no truncation at the space).
-        assert!(out.contains("/Users/a/My Docs/x.png"));
-        assert!(out.contains("/Users/a/My Docs/x.html"));
-        // The double quotes stay visible as plain text.
-        assert!(out.contains("png=\""));
-        assert!(out.contains("\" html=\""));
-        assert!(out.ends_with('"'));
-        assert_eq!(visible_width(&out), visible_width(in_text));
     }
 
     #[test]
@@ -667,50 +530,22 @@ mod tests {
         }
     }
 
+    /// Line anchors survive path → file:// URI conversion.
+    #[test]
+    fn linkify_path_preserves_line_anchor() {
+        let out = linkify_path("crates/foo.rs:42", COLOR_FOREGROUND, "", "");
+        assert!(
+            out.contains("crates/foo.rs:42"),
+            "anchor dropped from display: {out:?}"
+        );
+        let uri = path_file_uri("crates/foo.rs:42", "");
+        assert!(uri.contains("?line=42"), "URI missing line query: {uri:?}");
+    }
+
     #[test]
     fn file_uri_escapes_like_go_url() {
         assert_eq!(file_uri("/a b/c.md"), "file:///a%20b/c.md");
         assert_eq!(file_uri("/plain/path.txt"), "file:///plain/path.txt");
-    }
-
-    /// Regression: prefix checks in link_uri/path_file_uri used to slice at
-    /// a fixed byte offset, panicking when a multi-byte rune (em dash,
-    /// CJK, accented text) straddled that offset right after the scheme.
-    #[test]
-    fn linkify_multibyte_after_scheme_no_panic() {
-        for text in [
-            "see https://\u{2014} now",
-            "see https://\u{2014}abc end",
-            "open file://\u{2014} today",
-            "hit http://\u{4e2d}\u{6587} ok",
-            "accent \u{e9}\u{e9}\u{e9}\u{e9}\u{e9} plain",
-        ] {
-            let out = linkify(text, "", "", "");
-            assert_eq!(visible_width(&out), visible_width(text), "{text}");
-            assert!(out.contains('\u{2014}') || !text.contains('\u{2014}'));
-        }
-        // Direct calls with multi-byte leading runes must not panic either.
-        let _ = link_uri("\u{2014}\u{2014}\u{2014}", "");
-        let _ = link_uri("\u{e9}\u{e9}\u{e9}\u{e9}", "");
-        let _ = path_file_uri("\u{2014}\u{2014}\u{2014}/x", "");
-    }
-
-    /// Golden captured from charmbracelet/x/ansi v0.11.8 via the real
-    /// renderLink + Wrap pipeline in the Go build.
-    #[test]
-    fn wrap_linked_golden_matches_go() {
-        let url = "https://ness-health.com/a/very/long/path/that/will/wrap";
-        let got = wrap_linked(
-            &format!("prefix {url} suffix"),
-            20,
-            COLOR_FOREGROUND,
-            "",
-            "",
-        );
-        let want = "prefix \x1b]8;;https://ness-health.com/a/very/long/path/that/will/wrap\x07\
-\x1b[38;2;180;145;176m\x1b[4mhttps://ness-\nhealth.com/a/very/lo\nng/path/that/will/wr\nap\
-\x1b[24m\x1b[38;2;206;213;217m\x1b]8;;\x07 suffix";
-        assert_eq!(got, want, "\ngot:  {:?}\nwant: {:?}", got, want);
     }
 
     #[test]

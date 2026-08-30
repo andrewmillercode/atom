@@ -1045,10 +1045,6 @@ fn overlay_caret_pos(app: &App, kind: OverlayKind, area: Rect) -> Option<(u16, u
     Some((x, y))
 }
 
-
-
-
-
 fn render_overlay(app: &App, kind: OverlayKind) -> Vec<Line<'static>> {
     // Every fullscreen overlay renders through the shared template in
     // [`crate::fullscreen_view`]: title + esc hint, description, inline
@@ -1360,8 +1356,9 @@ mod tests {
             plain.contains("Esc to\ncancel"),
             "header tail was clipped: {plain}"
         );
-        assert!(plain.contains("Pinned - None"));
-        assert!(plain.contains("Recent - None"));
+        assert!(plain.contains("Models"));
+        assert!(!plain.contains("Pinned"));
+        assert!(!plain.contains("Recent"));
     }
 
     #[test]

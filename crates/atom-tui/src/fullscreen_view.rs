@@ -243,6 +243,26 @@ pub fn list_top(spec: &ViewSpec<'_>, width: usize) -> usize {
     header_rows(spec, width)
 }
 
+/// True when a click at `(x, y)` — in content space, i.e. already
+/// inside [`EDGE_PAD`] — lands on the right-aligned `esc` dismiss hint
+/// the title row carries. Mirrors [`title_lines`]' two layouts: the
+/// hint shares the title row when both fit, else it drops to its own
+/// right-aligned row below the wrapped title.
+pub fn esc_hint_hit(spec: &ViewSpec<'_>, x: usize, y: usize, width: usize) -> bool {
+    let hint = "esc";
+    let hint_w = unicode_width::UnicodeWidthStr::width(hint);
+    if x < width.saturating_sub(hint_w) {
+        return false;
+    }
+    let title_w = unicode_width::UnicodeWidthStr::width(spec.title.as_str());
+    if title_w + hint_w < width {
+        return y == 0;
+    }
+    // Hint moved to its own row below the wrapped title.
+    let title_rows = wrap_plain(&spec.title, width.max(1)).len();
+    y == title_rows
+}
+
 /// Returns the number of visual rows the list occupies given `width` and
 /// the available `height` after chrome and footer. Callers clamp their
 /// row count by this.
@@ -511,7 +531,11 @@ fn render_rows(
                         }
                         if !item.trailing.is_empty() {
                             let used = unicode_width::UnicodeWidthStr::width(
-                                spans.iter().map(|s| s.content.as_ref()).collect::<String>().as_str(),
+                                spans
+                                    .iter()
+                                    .map(|s| s.content.as_ref())
+                                    .collect::<String>()
+                                    .as_str(),
                             );
                             let gap = width.saturating_sub(used + trailing_w);
                             spans.push(Span::styled(" ".repeat(gap), style));

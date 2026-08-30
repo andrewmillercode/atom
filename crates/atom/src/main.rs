@@ -6,6 +6,7 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+mod uninstall;
 mod update;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -56,7 +57,9 @@ fn save_last_model_state(provider_name: &str, model: &str, thinking: &str) {
 }
 
 const USAGE: &str = "usage: atom [-model id] [-key key] [-url base] [-session id]
-                     [-stats [-stats-days N]] [--output-test] [--hot] [-no-deps]";
+                     [-stats [-stats-days N]] [--output-test] [--hot] [-no-deps]
+       atom uninstall [-y]
+                     # remove atom binaries, state, and the install.sh PATH line";
 
 fn help_text() -> String {
     format!(
@@ -142,6 +145,17 @@ async fn main() {
 }
 
 async fn run() -> Result<()> {
+    // Subcommand dispatch: `atom uninstall` removes the install without
+    // needing the TUI / server / network. Handled before the standard
+    // flag parser, the deps check, and the auto-updater — those would
+    // be wasted work, and the updater could race a fresh binary into
+    // place as we're deleting it.
+    let mut argv = std::env::args().skip(1);
+    if matches!(argv.next().as_deref(), Some("uninstall")) {
+        let yes = argv.any(|a| matches!(a.as_str(), "-y" | "--yes"));
+        return uninstall::run(yes);
+    }
+
     let args = parse_args()?;
 
     // Interactive launch (everything but stats/output-test/hot): print a
@@ -233,7 +247,18 @@ async fn run() -> Result<()> {
             }
         }
         if !defaulted {
-            return launch_tui(providers, sel_provider, sel_model, args, None).await;
+            // No saved model: fall back to mimo-v2.5 on OpenCode's
+            // keyless Zen free tier instead of forcing the provider
+            // picker, then fall through to normal session creation — the
+            // TUI only creates sessions from a picker choice or /new, so
+            // launching with a model but no session would make the
+            // first send fail with "missing session id".
+            if let Some(p) =
+                atom_core::providers::providers::provider_by_name(&providers, "opencode-zen")
+            {
+                sel_provider = p;
+                sel_model = "mimo-v2.5-free".into();
+            }
         }
     }
 

@@ -6,6 +6,7 @@
 //! else mirrors Go's model-visible strings.
 
 pub mod clipboard;
+pub mod customize;
 pub mod defs;
 pub mod dispatch;
 pub mod exec;

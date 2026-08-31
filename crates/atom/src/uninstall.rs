@@ -18,15 +18,25 @@ use std::path::{Path, PathBuf};
 const RC_FILES: &[&str] = &[".zshrc", ".bashrc", ".profile"];
 
 /// Names of every atom binary that may live next to the running
-/// executable. Release + dev pairs, since `make uninstall` removes
-/// all four from one BIN_DIR.
-const BINARIES: &[&str] = &["atom", "atoms", "atomdev", "atomsdev"];
+/// executable. Scoped to the current build flavor so `atom uninstall`
+/// (release) leaves `atomdev`/`atomsdev` alone and vice versa; the
+/// cross-flavor removal that `make uninstall` does is intentionally
+/// not replicated here.
+fn binaries_for_flavor() -> [&'static str; 2] {
+    [
+        atom_core::build::client_name(),
+        atom_core::build::server_name(),
+    ]
+}
 
-/// Computes the four state dirs that mirror the Makefile's DATA_DIR /
-/// CONFIG_DIR. Honors XDG_DATA_HOME / XDG_CONFIG_HOME, falling back to
-/// the same defaults the rest of atom uses. Both flavors are returned
-/// so a single uninstall cleans up a coexisting release + dev install.
+/// The single data dir and config dir for the current build flavor.
+/// Honors XDG_DATA_HOME / XDG_CONFIG_HOME, falling back to the same
+/// defaults the rest of atom uses. Mirrors the `data_dir()` /
+/// `config_dir()` helpers in atom-core, kept separate here so uninstall
+/// doesn't grow a transitive dependency on atom-server just to compute
+/// the path.
 fn plan_dirs() -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let leaf = atom_core::build::dir_leaf();
     let data_root = std::env::var_os("XDG_DATA_HOME")
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
@@ -37,9 +47,7 @@ fn plan_dirs() -> (Vec<PathBuf>, Vec<PathBuf>) {
         .map(PathBuf::from)
         .or_else(|| dirs_home().map(|h| h.join(".config")))
         .unwrap_or_else(|| PathBuf::from("."));
-    let data = vec![data_root.join("atom"), data_root.join("atom-dev")];
-    let cfg = vec![cfg_root.join("atom"), cfg_root.join("atom-dev")];
-    (data, cfg)
+    (vec![data_root.join(leaf)], vec![cfg_root.join(leaf)])
 }
 
 fn dirs_home() -> Option<PathBuf> {
@@ -120,7 +128,7 @@ pub fn run_with(install_dir: PathBuf, yes: bool) -> Result<()> {
 fn announce_plan(install_dir: &Path, data_dirs: &[PathBuf], cfg_dirs: &[PathBuf]) {
     eprintln!("==> uninstall plan");
     eprintln!("    install dir:    {}", install_dir.display());
-    eprintln!("    binaries:       {}", BINARIES.join(" "));
+    eprintln!("    binaries:       {}", binaries_for_flavor().join(" "));
     eprintln!("    config dirs:    {}", join_display(cfg_dirs));
     eprintln!("    data dirs:      {}", join_display(data_dirs));
     let rcs = RC_FILES
@@ -151,13 +159,14 @@ fn stop_servers(data_dirs: &[PathBuf]) {
     std::thread::sleep(std::time::Duration::from_secs(1));
 }
 
-/// Remove the four atom binaries from the install dir. POSIX `unlink`
-/// of the running executable succeeds immediately — the inode survives
-/// until the process exits, so the rest of this function finishes
-/// normally after the binary on disk is gone.
+/// Remove the atom binaries for the current build flavor from the
+/// install dir. POSIX `unlink` of the running executable succeeds
+/// immediately — the inode survives until the process exits, so the
+/// rest of this function finishes normally after the binary on disk is
+/// gone.
 fn remove_binaries(install_dir: &Path) {
     eprintln!("==> removing binaries from {}", install_dir.display());
-    for name in BINARIES {
+    for name in binaries_for_flavor() {
         let p = install_dir.join(name);
         match std::fs::remove_file(&p) {
             Ok(()) => {}
@@ -225,7 +234,12 @@ mod tests {
     use super::*;
 
     /// Build a temp install dir + a temp XDG root so the test never
-    /// touches the user's real ~/.local or ~/.config trees.
+    /// touches the user's real ~/.local or ~/.config trees. The
+    /// sandbox mirrors the current build flavor: only the dev pair of
+    /// binaries and the dev leaf under XDG are populated, since tests
+    /// run in the debug profile and `dir_leaf()` resolves to
+    /// `atom-dev`. The other flavor is left as a sentinel so the
+    /// negative-assertion tests can prove uninstall never touches it.
     fn sandbox() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
         let install = tmp.path().join("bin");
@@ -233,19 +247,29 @@ mod tests {
         let xdg_root = tmp.path().join("xdg");
         std::fs::create_dir_all(xdg_root.join("config")).unwrap();
         std::fs::create_dir_all(xdg_root.join("data")).unwrap();
-        // install_binaries() expects these as siblings — only `atom` and
-        // `atoms` are present here; uninstall should still be idempotent
-        // on the missing dev pair.
-        for name in ["atom", "atoms"] {
+        let flavor = atom_core::build::dir_leaf();
+        // Only the current-flavor binaries live in the install dir; the
+        // uninstall should target only those and leave the other pair
+        // alone.
+        for name in binaries_for_flavor() {
             std::fs::write(install.join(name), b"#!/bin/sh\n").unwrap();
         }
         // Drop a sentinel server.pid in each data dir so we can prove
-        // uninstall reads (and then removes) the right paths.
-        for flavor in ["atom", "atom-dev"] {
-            let data = xdg_root.join("data").join(flavor);
-            std::fs::create_dir_all(&data).unwrap();
-            std::fs::write(data.join("server.pid"), b"99999\n").unwrap();
-        }
+        // uninstall reads (and then removes) the current-flavor path
+        // and leaves the other untouched.
+        std::fs::create_dir_all(xdg_root.join("data").join(flavor)).unwrap();
+        std::fs::write(
+            xdg_root.join("data").join(flavor).join("server.pid"),
+            b"99999\n",
+        )
+        .unwrap();
+        let other = if flavor == "atom-dev" { "atom" } else { "atom-dev" };
+        let other_data = xdg_root.join("data").join(other);
+        std::fs::create_dir_all(&other_data).unwrap();
+        std::fs::write(other_data.join("untouched"), b"sentinel").unwrap();
+        let other_cfg = xdg_root.join("config").join(other);
+        std::fs::create_dir_all(&other_cfg).unwrap();
+        std::fs::write(other_cfg.join("untouched"), b"sentinel").unwrap();
         // XDG vars point at the sandbox so plan_dirs() builds paths
         // inside the temp tree.
         std::env::set_var("XDG_DATA_HOME", xdg_root.join("data"));
@@ -256,20 +280,35 @@ mod tests {
     #[test]
     fn yes_flag_runs_full_uninstall() {
         let (tmp, install, xdg_root) = sandbox();
+        let flavor = atom_core::build::dir_leaf();
+        let other = if flavor == "atom-dev" { "atom" } else { "atom-dev" };
         run_with(install.clone(), true).unwrap();
 
-        // All four binaries were targeted; the two that existed are gone
-        // and the two that didn't were no-ops.
-        assert!(!install.join("atom").exists());
-        assert!(!install.join("atoms").exists());
-        for name in ["atomdev", "atomsdev"] {
-            assert!(!install.join(name).exists(), "{name} should not have been created");
+        // The current-flavor binaries are gone; the other pair was
+        // never installed in the sandbox and must not have been created
+        // by uninstall either.
+        for name in binaries_for_flavor() {
+            assert!(!install.join(name).exists(), "{name} should be removed");
         }
-        // Both flavor data + config dirs are removed.
-        for leaf in ["atom", "atom-dev"] {
-            assert!(!xdg_root.join("data").join(leaf).exists());
-            assert!(!xdg_root.join("config").join(leaf).exists());
+        for name in ["atom", "atoms", "atomdev", "atomsdev"] {
+            if binaries_for_flavor().contains(&name) {
+                continue;
+            }
+            assert!(
+                !install.join(name).exists(),
+                "{name} must not have been created by uninstall"
+            );
         }
+        // Current-flavor data + config dirs are removed.
+        assert!(!xdg_root.join("data").join(flavor).exists());
+        assert!(!xdg_root.join("config").join(flavor).exists());
+        // The other flavor's dirs are untouched.
+        assert!(xdg_root.join("data").join(other).join("untouched").exists());
+        assert!(xdg_root
+            .join("config")
+            .join(other)
+            .join("untouched")
+            .exists());
         let _ = tmp;
     }
 

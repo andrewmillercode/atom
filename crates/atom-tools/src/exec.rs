@@ -6,7 +6,8 @@ use crate::dispatch::{self, DispatchPlan};
 use crate::file_edit::FileSeen;
 use crate::mcp;
 use crate::{
-    file_edit, read_file, search, skills, vector_search, visualize, web_fetch, web_search,
+    customize, file_edit, read_file, search, skills, vector_search, visualize, web_fetch,
+    web_search,
 };
 use atom_core::types::ImageData;
 use atom_sandbox::approvals::Approver;
@@ -98,6 +99,7 @@ pub async fn execute_tool(ctx: &ToolCtx<'_>, name: &str, args_json: &str) -> Too
             args_json,
             &ctx.cwd.display().to_string(),
         )),
+        "customize" => ToolOutcome::from_text(customize::execute_customize(args_json)),
         "dispatch" => ToolOutcome::from_text(dispatch::execute_dispatch(ctx, args_json).await),
         "web_search" => {
             #[derive(serde::Deserialize)]

@@ -50,6 +50,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDef> {
         ),
         dispatch_def(),
         skill_def(),
+        customize_def(),
     ]
 }
 
@@ -119,6 +120,14 @@ pub fn skill_def() -> ToolDef {
     )
 }
 
+pub fn customize_def() -> ToolDef {
+    def(
+        "customize",
+        "Inject a reference of every way to customize atom (skills, MCP servers, AGENTS.md, config, themes, bundled prompt) into the session. Call when the user asks how to customize, configure, extend, or change atom — including adding skills, wiring MCP servers, dropping project rules, picking themes, or editing the bundled prompt. Takes no arguments.",
+        r#"{"type":"object","properties":{}}"#,
+    )
+}
+
 /// findToolDef is the entry point for deferred MCP tool catalogs.
 /// Included only when at least one configured server defers its tools;
 /// large MCP servers (100+ tools) would otherwise flood the context.
@@ -164,9 +173,10 @@ mod tests {
                 "bash",
                 "dispatch",
                 "skill",
+                "customize",
             ]
         );
-        assert_eq!(crate::tool_definitions().len(), 12);
+        assert_eq!(crate::tool_definitions().len(), 13);
     }
 
     #[test]
@@ -192,7 +202,7 @@ mod tests {
         assert_eq!(without_tool(&tools, "dispatch").len(), tools.len());
         // Stripping everything but keeping order otherwise.
         let no_bash = without_tool(&crate::tool_definitions(), "bash");
-        assert_eq!(no_bash.len(), 11);
+        assert_eq!(no_bash.len(), 12);
         assert_eq!(no_bash[4].function.name, "edit_file");
     }
 }

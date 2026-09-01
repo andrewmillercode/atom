@@ -750,10 +750,17 @@ pub async fn run_session_turn(
         // Auto-compact threshold: the smaller of the fixed threshold and
         // the session model's window minus headroom, so small-context
         // models fold before the provider starts rejecting requests.
+        // The settings toggle can disable auto-compaction entirely; an
+        // explicitly requested compact still runs.
+        let auto_compaction = atom_core::config::load()
+            .resolved_compaction()
+            .resolved_enabled();
         let provider = provider_name_for_url(&base_url);
         let auto_threshold = compaction_threshold(context_window_tokens(&provider, &sess.model));
         let mut fold_now = forced.is_some()
-            || (!compact_failed && should_compact_with_threshold(sess, auto_threshold));
+            || (auto_compaction
+                && !compact_failed
+                && should_compact_with_threshold(sess, auto_threshold));
         if fold_now && forced.is_none() {
             fold_now = compact_span(sess).is_some();
         }

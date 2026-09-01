@@ -160,6 +160,41 @@ pub fn reasoning_field_for_url(url: &str) -> String {
     }
 }
 
+/// isVercelAiGateway reports whether a base URL is Vercel's AI Gateway
+/// (models.dev id "vercel", fallback host ai-gateway.vercel.sh/v1).
+pub fn is_vercel_ai_gateway(url: &str) -> bool {
+    url.contains("ai-gateway.vercel.sh")
+}
+
+/// applyGatewayProviderRouting adapts a serialized ChatRequest body for
+/// the Vercel AI Gateway Chat Completions API:
+/// - injects the top-level `provider` routing shorthand
+///   (providerOptions.gateway) with `sort: "tps"`, ranking the gateway's
+///   upstream providers for the model by median tokens-per-second
+///   (highest first) and falling through the sorted list on failure;
+/// - remaps `reasoning_effort` to `reasoning.effort`, the gateway's
+///   provider-agnostic reasoning-level form, which it bridges to the
+///   target model's native configuration (effort levels or token
+///   budgets).
+/// Other providers reject the unknown top-level `provider` key, so the
+/// body is only touched for the gateway host.
+pub fn apply_gateway_provider_routing(url: &str, body: &mut serde_json::Value) {
+    if !is_vercel_ai_gateway(url) {
+        return;
+    }
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    if !obj.contains_key("provider") {
+        obj.insert("provider".into(), serde_json::json!({ "sort": "tps" }));
+    }
+    if let Some(effort) = obj.remove("reasoning_effort") {
+        if effort.as_str().map(|s| !s.is_empty()).unwrap_or(false) {
+            obj.insert("reasoning".into(), serde_json::json!({ "effort": effort }));
+        }
+    }
+}
+
 fn get_env(name: &str) -> String {
     std::env::var(name).unwrap_or_default()
 }
@@ -668,6 +703,7 @@ pub async fn stream_chat(
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let mut body_value = serde_json::to_value(&req)?;
     strip_internal_fields(&mut body_value, reasoning_field);
+    apply_gateway_provider_routing(base_url, &mut body_value);
     let body = serde_json::to_vec(&body_value)?;
     let resp = super::retry::do_http_with_retry(|| {
         let mut builder = super::retry::long_timeout_client()
@@ -1038,6 +1074,40 @@ mod tests {
             reasoning_field_for_url("http://localhost:11434/v1"),
             "reasoning"
         );
+    }
+
+    /// Vercel AI Gateway requests carry the top-level `provider`
+    /// shorthand with sort: "tps" so routing picks the highest-throughput
+    /// upstream provider for the model, and reasoning_effort is remapped
+    /// to the gateway's reasoning.effort form; other base URLs are
+    /// untouched.
+    #[test]
+    fn gateway_provider_routing_sorted_by_tps() {
+        let mut body =
+            serde_json::json!({"model": "m", "messages": [], "reasoning_effort": "high"});
+        apply_gateway_provider_routing("https://ai-gateway.vercel.sh/v1", &mut body);
+        assert_eq!(body["provider"]["sort"], "tps");
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert!(body.get("reasoning_effort").is_none());
+
+        // Empty effort serializes as absent, so no reasoning key either.
+        let mut body = serde_json::json!({"model": "m", "messages": []});
+        apply_gateway_provider_routing("https://ai-gateway.vercel.sh/v1", &mut body);
+        assert_eq!(body["provider"]["sort"], "tps");
+        assert!(body.get("reasoning").is_none());
+
+        for url in [
+            "https://api.openai.com/v1",
+            "https://openrouter.ai/api/v1",
+            "http://localhost:11434/v1",
+        ] {
+            let mut body = serde_json::json!({"model": "m", "messages": []});
+            apply_gateway_provider_routing(url, &mut body);
+            assert!(
+                body.get("provider").is_none(),
+                "{url}: unexpected provider routing"
+            );
+        }
     }
 
     #[tokio::test]

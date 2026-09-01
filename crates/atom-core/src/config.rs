@@ -20,6 +20,17 @@ pub struct CompactionConfig {
     pub provider: String,
     #[serde(default)]
     pub model: String,
+    /// `None` means auto-compaction is enabled (the default). Set to
+    /// `false` to disable folding the conversation when it nears the
+    /// context limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+impl CompactionConfig {
+    pub fn resolved_enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -352,6 +363,19 @@ mod tests {
     }
 
     #[test]
+    fn compaction_enabled_defaults_on_and_disables_explicitly() {
+        assert!(CompactionConfig::default().resolved_enabled());
+        assert!(AtomConfig::default()
+            .resolved_compaction()
+            .resolved_enabled());
+        assert!(!CompactionConfig {
+            enabled: Some(false),
+            ..Default::default()
+        }
+        .resolved_enabled());
+    }
+
+    #[test]
     fn tinyfish_is_default_for_search_and_fetch() {
         assert_eq!(DEFAULT_WEB_SEARCH_SERVER, "tinyfish");
         assert_eq!(DEFAULT_WEB_FETCH_SERVER, "tinyfish");
@@ -395,6 +419,7 @@ mod tests {
             compaction: Some(CompactionConfig {
                 provider: DEFAULT_COMPACTION_PROVIDER.into(),
                 model: DEFAULT_COMPACTION_MODEL.into(),
+                ..Default::default()
             }),
             web_search: Some(WebSearchConfig {
                 server: "custom".into(),
@@ -426,6 +451,7 @@ mod tests {
             compaction: Some(CompactionConfig {
                 provider: "openai".into(),
                 model: "gpt-5".into(),
+                ..Default::default()
             }),
             web_search: Some(WebSearchConfig {
                 server: "exa".into(),

@@ -61,6 +61,10 @@ fn models_dev_base_url_fallback(id: &str) -> Option<&'static str> {
         "openai" => Some("https://api.openai.com/v1"),
         "anthropic" => Some("https://api.anthropic.com/v1"),
         "amazon-bedrock" => Some("https://bedrock-runtime.us-east-1.amazonaws.com"),
+        // Vercel AI Gateway: models.dev's entry has no api URL, but the
+        // gateway is OpenAI-compatible at a stable host (its REST
+        // endpoint is ai-gateway.vercel.sh/v1, chat completions + models).
+        "vercel" => Some("https://ai-gateway.vercel.sh/v1"),
         _ => None,
     }
 }
@@ -1236,7 +1240,19 @@ pub fn derive_reasoning_levels(m: &ModelsDevModel) -> Option<Vec<String>> {
         effort.insert(0, "none".into());
     }
     if effort.is_empty() {
-        return None;
+        // The model supports reasoning but the catalog left
+        // `reasoning_options` empty (common on the vercel AI Gateway,
+        // which lists every reasoning model this way). Expose the
+        // standard effort ladder so a reasoning picker still appears
+        // and a level gets sent — the gateway maps it to the model's
+        // native config. Models that do not support reasoning returned
+        // early above.
+        return Some(vec![
+            "none".into(),
+            "low".into(),
+            "medium".into(),
+            "high".into(),
+        ]);
     }
     Some(effort)
 }
@@ -1497,6 +1513,29 @@ mod tests {
         assert_eq!(reasoning_levels_for("openai", "m"), None);
     }
 
+    /// A model that supports reasoning but whose catalog entry leaves
+    /// `reasoning_options` empty (how the vercel AI Gateway lists every
+    /// reasoning model) must still get a picker. Previously this
+    /// produced no levels and no reasoning_effort was ever sent.
+    #[test]
+    fn reasoning_true_empty_options_gets_default_ladder() {
+        let _g = lock();
+        fixture_model("vercel", "deepseek/deepseek-v4-flash-0731", true, vec![]);
+        assert_eq!(
+            reasoning_levels_for("vercel", "deepseek/deepseek-v4-flash-0731"),
+            Some(vec![
+                "none".to_string(),
+                "low".to_string(),
+                "medium".to_string(),
+                "high".to_string()
+            ])
+        );
+        assert_eq!(
+            thinking_off_value("vercel", "deepseek/deepseek-v4-flash-0731"),
+            "none"
+        );
+    }
+
     #[test]
     fn default_thinking_index_is_last() {
         let levels = vec!["none".to_string(), "high".to_string(), "max".to_string()];
@@ -1664,6 +1703,16 @@ mod tests {
         ));
         assert!(is_addable_models_dev_provider(
             "openai",
+            &ModelsDevProvider::default()
+        ));
+        // Vercel AI Gateway has no catalog `api` either; the fallback
+        // keeps it addable so it shows up in the provider list.
+        assert_eq!(
+            models_dev_base_url("vercel"),
+            "https://ai-gateway.vercel.sh/v1"
+        );
+        assert!(is_addable_models_dev_provider(
+            "vercel",
             &ModelsDevProvider::default()
         ));
     }

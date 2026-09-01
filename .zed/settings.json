@@ -1,0 +1,18 @@
+// Project settings for rust-analyzer (applied when Zed opens this repo).
+//
+// `cargo.targetDir: true` makes check-on-save (and RA's build-script /
+// proc-macro runs) use `target/rust-analyzer` instead of `target/debug`,
+// so flycheck never holds the build-dir lock that `cargo build` /
+// `cargo test` wait on. First check after enabling populates the extra
+// directory once (~15s); afterwards it is incremental.
+{
+  "lsp": {
+    "rust-analyzer": {
+      "initialization_options": {
+        "cargo": {
+          "targetDir": true
+        }
+      }
+    }
+  }
+}

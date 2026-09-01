@@ -11,19 +11,12 @@ path = "src/main.rs"
 name = "atoms"
 path = "src/atoms.rs"
 
-# Dev installs (`make dev`) run under the names atomdev/atomsdev.
-# These are real cargo binaries built from the same sources — not
-# Makefile symlinks — so `cargo build` emits all four and `ps` shows the
-# dev names with no link tricks. Flavor is keyed on
-# cfg!(debug_assertions), not the name: build these in the debug profile
-# only.
-[[bin]]
-name = "atomdev"
-path = "src/main.rs"
-
-[[bin]]
-name = "atomsdev"
-path = "src/atoms.rs"
+# Dev installs (`make dev`) run under the names atomdev/atomsdev. These
+# are not separate cargo binaries: `make dev` symlinks atomdev ->
+# target/debug/atom and atomsdev -> target/debug/atoms. Flavor is keyed
+# on cfg!(debug_assertions), not the name — a dev install IS the debug
+# binary — so duplicate bin targets would only double linking on every
+# cargo build/test for no behavioral difference.
 
 [dependencies]
 atom-core = { workspace = true }

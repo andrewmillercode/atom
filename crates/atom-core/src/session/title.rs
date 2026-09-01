@@ -85,28 +85,32 @@ pub async fn generate_title(
     };
     let base_url = base_url.trim_end_matches('/');
 
-    let req_body = serde_json::to_vec(&ChatRequest {
-        model: model.into(),
-        messages: vec![
-            Message {
-                role: "system".into(),
-                content: TITLE_SYSTEM_PROMPT.into(),
-                ..Default::default()
-            },
-            Message {
-                role: "user".into(),
-                content: body,
-                ..Default::default()
-            },
-        ],
-        stream: false,
-        tools: vec![],
-        reasoning_effort: crate::session::compaction::thinking_off_value(
-            &crate::session::compaction::provider_name_for_url(base_url),
-            model,
-        ),
-        stream_options: None,
-    })?;
+    let req_body = {
+        let mut body_value = serde_json::to_value(&ChatRequest {
+            model: model.into(),
+            messages: vec![
+                Message {
+                    role: "system".into(),
+                    content: TITLE_SYSTEM_PROMPT.into(),
+                    ..Default::default()
+                },
+                Message {
+                    role: "user".into(),
+                    content: body,
+                    ..Default::default()
+                },
+            ],
+            stream: false,
+            tools: vec![],
+            reasoning_effort: crate::session::compaction::thinking_off_value(
+                &crate::session::compaction::provider_name_for_url(base_url),
+                model,
+            ),
+            stream_options: None,
+        })?;
+        crate::providers::providers::apply_gateway_provider_routing(base_url, &mut body_value);
+        serde_json::to_vec(&body_value)?
+    };
     let raw = post_chat_completion(&client, base_url, key, &req_body).await?;
 
     #[derive(serde::Deserialize)]

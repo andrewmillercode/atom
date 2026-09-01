@@ -3339,11 +3339,11 @@ impl App {
                     }
                     OverlayKind::WebSearch => {
                         self.open_overlay(OverlayKind::Settings);
-                        self.overlay_sel = 1;
+                        self.overlay_sel = 2;
                     }
                     OverlayKind::WebFetch => {
                         self.open_overlay(OverlayKind::Settings);
-                        self.overlay_sel = 2;
+                        self.overlay_sel = 3;
                     }
                     OverlayKind::Model
                         if self.model_picker_purpose
@@ -3786,6 +3786,7 @@ impl App {
                             e.provider.id.clone()
                         },
                         model: e.model.clone(),
+                        ..self.atom_config.compaction.clone().unwrap_or_default()
                     });
                     self.save_atom_config();
                     self.model_picker_purpose = overlays::ModelPickerPurpose::Chat;
@@ -3971,13 +3972,20 @@ impl App {
                     vec![Effect::FetchModels]
                 }
                 1 => {
+                    let mut compaction = self.atom_config.compaction.clone().unwrap_or_default();
+                    compaction.enabled = Some(!compaction.resolved_enabled());
+                    self.atom_config.compaction = Some(compaction);
+                    self.save_atom_config();
+                    Vec::new()
+                }
+                2 => {
                     self.open_overlay(OverlayKind::WebSearch);
                     let selected = self.atom_config.resolved_web_search().server;
                     let rows = overlays::web_search_rows(self);
                     self.overlay_sel = rows.iter().position(|row| row.0 == selected).unwrap_or(0);
                     Vec::new()
                 }
-                2 => {
+                3 => {
                     self.open_overlay(OverlayKind::WebFetch);
                     let selected = self.atom_config.resolved_web_fetch().server;
                     let rows = overlays::web_fetch_rows(self);
@@ -4002,7 +4010,7 @@ impl App {
                     Some(atom_core::config::WebSearchConfig { server: id, tool });
                 self.save_atom_config();
                 self.open_overlay(OverlayKind::Settings);
-                self.overlay_sel = 1;
+                self.overlay_sel = 2;
                 Vec::new()
             }
             OverlayKind::WebFetch => {
@@ -4017,7 +4025,7 @@ impl App {
                     Some(atom_core::config::WebFetchConfig { server: id, tool });
                 self.save_atom_config();
                 self.open_overlay(OverlayKind::Settings);
-                self.overlay_sel = 2;
+                self.overlay_sel = 3;
                 Vec::new()
             }
             OverlayKind::Theme => {
@@ -5516,15 +5524,49 @@ mod tests {
             Some(atom_core::config::CompactionConfig {
                 provider: "openai".into(),
                 model: "compact-model".into(),
+                ..Default::default()
             })
         );
+    }
+
+    #[test]
+    fn settings_toggle_disables_and_reenables_auto_compaction() {
+        let mut app = App::new_test(80, 24);
+        app.overlay = Some(OverlayKind::Settings);
+        app.overlay_sel = 1;
+        assert!(app.confirm_overlay().is_empty());
+        assert_eq!(app.overlay, Some(OverlayKind::Settings));
+        assert_eq!(
+            app.atom_config.compaction,
+            Some(atom_core::config::CompactionConfig {
+                enabled: Some(false),
+                ..Default::default()
+            })
+        );
+
+        app.confirm_overlay();
+        assert!(app.atom_config.compaction.unwrap().resolved_enabled());
+
+        // Picking a compaction model keeps the disabled flag.
+        app.atom_config.compaction = Some(atom_core::config::CompactionConfig {
+            enabled: Some(false),
+            ..Default::default()
+        });
+        app.model_picker_purpose = overlays::ModelPickerPurpose::Compaction;
+        app.overlay = Some(OverlayKind::Model);
+        app.overlay_entries = vec![model_entry("openai", "compact-model")];
+        app.overlay_sel = overlays::first_model_row(&app);
+        assert!(app.confirm_overlay().is_empty());
+        let compaction = app.atom_config.compaction.unwrap();
+        assert_eq!(compaction.model, "compact-model");
+        assert!(!compaction.resolved_enabled());
     }
 
     #[test]
     fn settings_web_search_picker_saves_bundled_tool() {
         let mut app = App::new_test(80, 24);
         app.overlay = Some(OverlayKind::Settings);
-        app.overlay_sel = 1;
+        app.overlay_sel = 2;
         assert!(app.confirm_overlay().is_empty());
         assert_eq!(app.overlay, Some(OverlayKind::WebSearch));
 
@@ -5545,7 +5587,7 @@ mod tests {
     fn settings_web_fetch_picker_saves_bundled_tool() {
         let mut app = App::new_test(80, 24);
         app.overlay = Some(OverlayKind::Settings);
-        app.overlay_sel = 2;
+        app.overlay_sel = 3;
         assert!(app.confirm_overlay().is_empty());
         assert_eq!(app.overlay, Some(OverlayKind::WebFetch));
 

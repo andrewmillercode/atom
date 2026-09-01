@@ -430,7 +430,7 @@ pub fn overlay_count(app: &App) -> usize {
         )
         .len(),
         Some(OverlayKind::ProviderMethod) => 2,
-        Some(OverlayKind::Settings) => 4,
+        Some(OverlayKind::Settings) => 5,
         Some(OverlayKind::WebSearch) => web_search_rows(app).len(),
         Some(OverlayKind::WebFetch) => web_fetch_rows(app).len(),
         Some(OverlayKind::Theme) => theme_rows()
@@ -451,6 +451,14 @@ pub fn settings_labels(app: &App) -> Vec<String> {
         format!(
             "Compaction model  {} / {}",
             compaction.provider, compaction.model
+        ),
+        format!(
+            "Auto-compaction  {}",
+            if compaction.resolved_enabled() {
+                "on"
+            } else {
+                "off"
+            }
         ),
         format!("Web search provider  {}", web.server),
         format!("Web fetch provider  {}", fetch.server),

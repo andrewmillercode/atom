@@ -1,7 +1,7 @@
 # Makefile for the `atom` / `atoms` executables
 #
-# Dev install (debug build, emitted by cargo as real atomdev/atomsdev
-# binaries and linked into ~/.local/bin):
+# Dev install (debug build, symlinked into ~/.local/bin as atomdev and
+# atomsdev):
 #   make dev
 #   make dev PREFIX=~/.local   # default
 #
@@ -38,23 +38,21 @@ CARGO_BUILD_FLAGS ?=
 
 all: build
 
-# Dev build (debug profile; also emits the atomdev/atomsdev dev aliases),
-# then link atomdev/atomsdev into $(BIN_DIR) so they're callable.
-# The dev install only needs the dev-named binaries: atomdev/atomsdev and
-# atom/atoms are built from the same sources and differ in debug-flavor
-# behavior by cfg!(debug_assertions), not by name, so compiling and
-# linking the release-named pair too doubles the final stage for nothing.
-# `make build` still emits all four.
+# Dev build (debug profile), then symlink atomdev/atomsdev into
+# $(BIN_DIR) so they're callable. Dev-vs-release flavor is keyed on
+# cfg!(debug_assertions), not the name, so the dev names are plain
+# symlinks to the debug atom/atoms artifacts — no duplicate bin targets
+# that would double linking on every cargo build/test.
 dev: dev-build
 	install -d $(BIN_DIR)
-	ln -sf $(CURDIR)/target/debug/atomdev $(BIN_DIR)/atomdev
-	ln -sf $(CURDIR)/target/debug/atomsdev $(BIN_DIR)/atomsdev
+	ln -sf $(CURDIR)/target/debug/atom $(BIN_DIR)/atomdev
+	ln -sf $(CURDIR)/target/debug/atoms $(BIN_DIR)/atomsdev
 
 build:
-	$(CARGO) build $(CARGO_BUILD_FLAGS) --bin atom --bin atoms --bin atomdev --bin atomsdev
+	$(CARGO) build $(CARGO_BUILD_FLAGS) --bin atom --bin atoms
 
 dev-build:
-	$(CARGO) build $(CARGO_BUILD_FLAGS) --bin atomdev --bin atomsdev
+	$(CARGO) build $(CARGO_BUILD_FLAGS) --bin atom --bin atoms
 
 build-release:
 	$(CARGO) build --release --bin atom --bin atoms

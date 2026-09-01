@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 /// triggers a compact. Equal to the threshold is not enough: we wait until
 /// the session has clearly grown past it. Small-window models compact
 /// earlier: see compactionThreshold.
-pub const COMPACTION_TOKEN_THRESHOLD: i64 = 256_000;
+pub const COMPACTION_TOKEN_THRESHOLD: i64 = 180_000;
 
 /// compactionHeadroomTokens is kept below the model's context window when
 /// the auto-compact threshold is derived from it, so the summarizer round
@@ -53,7 +53,7 @@ pub const COMPACTION_SUMMARY_ACK: &str = "Understood. I will continue from this 
 
 /// compactionSystemPrompt asks the summarizer for a structured brief, not
 /// a reply that continues the conversation.
-pub const COMPACTION_SYSTEM_PROMPT: &str = "You are compacting a coding-agent conversation into a structured summary. Do not continue the conversation or answer the user. Produce only the summary.\n\nUse this outline:\n\n## Goal\n## Constraints & Preferences\n## Progress (Done / In Progress / Blocked)\n## Key Decisions\n## Next Steps\n## Critical Context\n\nPreserve the user's latest intent and any critical file paths, decisions, and unfinished work. If a previous summary is included, update it rather than discarding it.";
+pub const COMPACTION_SYSTEM_PROMPT: &str = "You are compacting a coding-agent conversation into a dense, information-preserving summary. Do not continue the conversation or answer the user. Produce only the summary.\n\nThe summary is the model's ONLY memory of this work. Anything you omit is lost forever, and losing it forces the agent to redo paid work: re-running tests and builds, re-exploring files, re-deriving conclusions. Losing critical information is strictly worse than being long. Vague summaries are failures; dense, specific ones are the goal.\n\nTarget size: roughly 4000-6000 tokens. Scale detail to information density, not to length: a rich session deserves a long summary; a short one does not need padding.\n\nUse this outline:\n\n## Goal\nThe user's intent, verbatim where possible, plus constraints and preferences.\n\n## State\nCurrent ground truth: which files were changed and why, what is built/working/broken, last test and build results (pass/fail with exact failure signatures), what has been verified vs. assumed. A resuming agent must be able to trust this instead of re-running anything.\n\n## Key Discoveries\nFacts learned by exploration that are expensive to re-derive: file paths and what they contain, function/struct names, non-obvious gotchas, architecture notes, tool outputs that matter.\n\n## Key Decisions\nChoices made and why, including rejected alternatives and why they were rejected.\n\n## Next Steps\nConcrete, actionable steps in order.\n\nRules:\n- Preserve EXACT strings where they matter: file paths, command lines, identifiers, error messages, version numbers. Copy them verbatim, do not paraphrase.\n- Preserve outcomes of experiments (\"X failed with <error>\", \"Y passed\") so nothing is re-run needlessly.\n- Compress process, not facts: skip tool chatter and back-and-forth, keep every conclusion.\n- Never invent details; if something is uncertain, say so explicitly.\n- If a previous summary is included, update and merge it rather than discarding it; keep its still-relevant facts.";
 
 /// errNothingToCompact is returned when every message is already folded
 /// (or the only leftover is a trailing user turn kept for the next send).
@@ -145,6 +145,42 @@ pub fn should_compact_with_threshold(sess: &Session, threshold: i64) -> bool {
         Some(u) => u.prompt_tokens > threshold,
         None => false,
     }
+}
+
+/// compactionTailTokens is the verbatim-recency budget: recent messages,
+/// tool calls, and their results up to this many estimated tokens stay in
+/// the live context after a fold instead of being summarized. The goal is
+/// roughly 15-20k of live context after a 180k fold: a 5-6k summary plus
+/// this tail. A cut is never placed between an assistant tool call and
+/// its results, so the tail stays protocol-valid.
+pub const COMPACTION_TAIL_TOKENS: i64 = 10_000;
+
+/// tailStart returns the index in msgs[start..end] where the verbatim
+/// recent tail begins: the largest split point whose kept suffix fits
+/// within budgetTokens estimated tokens, advanced forward so it never
+/// lands between tool results and their assistant tool calls. Returns
+/// start when nothing fits (the single oldest message already exceeds
+/// the budget), so behavior degrades to folding everything.
+pub fn tail_start(msgs: &[Message], start: usize, end: usize, budget: i64) -> usize {
+    let mut acc = 0i64;
+    let mut j = end;
+    while j > start {
+        let m = &msgs[j - 1];
+        acc += crate::session::context_breakdown::estimate_tokens(
+            crate::session::context_breakdown::estimate_message_chars(m) as usize,
+        );
+        if acc > budget {
+            break;
+        }
+        j -= 1;
+    }
+    let mut split = j;
+    // Never split a tool-call turn: walk forward past tool results whose
+    // matching assistant call would be summarized away.
+    while split < end && msgs[split].role == "tool" {
+        split += 1;
+    }
+    split
 }
 
 /// clampIndex keeps i inside [0, n] so CompactedThrough cannot panic
@@ -322,6 +358,9 @@ pub async fn compact_session(
         Some(span) => span,
         None => return Err(NothingToCompact.into()),
     };
+    // Keep the most recent messages and tool traffic verbatim; only the
+    // older history is summarized.
+    let start = tail_start(&sess.messages, start, end, COMPACTION_TAIL_TOKENS);
     let mut body = serialize_conversation(&sess.messages[start..end], &sess.compaction_summary);
     let extra = extra.trim();
     if !extra.is_empty() {
@@ -338,25 +377,29 @@ pub async fn compact_session(
     };
     let base_url = base_url.trim_end_matches('/');
 
-    let req_body = serde_json::to_vec(&ChatRequest {
-        model: model.into(),
-        messages: vec![
-            Message {
-                role: "system".into(),
-                content: COMPACTION_SYSTEM_PROMPT.into(),
-                ..Default::default()
-            },
-            Message {
-                role: "user".into(),
-                content: body,
-                ..Default::default()
-            },
-        ],
-        stream: false,
-        tools: vec![],
-        reasoning_effort: thinking_off_value(&provider_name_for_url(base_url), model),
-        stream_options: None,
-    })?;
+    let req_body = {
+        let mut body_value = serde_json::to_value(&ChatRequest {
+            model: model.into(),
+            messages: vec![
+                Message {
+                    role: "system".into(),
+                    content: COMPACTION_SYSTEM_PROMPT.into(),
+                    ..Default::default()
+                },
+                Message {
+                    role: "user".into(),
+                    content: body,
+                    ..Default::default()
+                },
+            ],
+            stream: false,
+            tools: vec![],
+            reasoning_effort: thinking_off_value(&provider_name_for_url(base_url), model),
+            stream_options: None,
+        })?;
+        crate::providers::providers::apply_gateway_provider_routing(base_url, &mut body_value);
+        serde_json::to_vec(&body_value)?
+    };
     let started_at = Instant::now();
     let raw = post_chat_completion(&client, base_url, key, &req_body).await?;
     let duration_ms = started_at.elapsed().as_millis().min(i64::MAX as u128) as i64;
@@ -723,86 +766,72 @@ mod tests {
     #[test]
     fn should_compact_thresholds() {
         assert!(!should_compact(&Session::default()), "nil usage");
-        let below = Session {
+        let sess = |tokens: i64| Session {
             usage: Some(StreamUsage {
-                prompt_tokens: 1000,
+                prompt_tokens: tokens,
                 ..Default::default()
             }),
             ..Default::default()
         };
-        assert!(!should_compact(&below), "below threshold");
-        let equal = Session {
-            usage: Some(StreamUsage {
-                prompt_tokens: 150_000,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        assert!(!should_compact(&equal), "equal threshold");
-        let above = Session {
-            usage: Some(StreamUsage {
-                prompt_tokens: 150_001,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        assert!(should_compact(&above), "above threshold");
+        assert!(
+            !should_compact(&sess(COMPACTION_TOKEN_THRESHOLD)),
+            "equal threshold"
+        );
+        assert!(
+            should_compact(&sess(COMPACTION_TOKEN_THRESHOLD + 1)),
+            "above threshold"
+        );
+        assert!(
+            !should_compact(&sess(COMPACTION_TOKEN_THRESHOLD - 1)),
+            "below threshold"
+        );
     }
 
     #[test]
     fn compaction_threshold_uses_window_minus_headroom() {
         use crate::session::compaction::COMPACTION_HEADROOM_TOKENS;
 
+        // Large window: the fixed threshold wins.
         assert_eq!(
-            compaction_threshold(200_000),
-            COMPACTION_TOKEN_THRESHOLD,
-            "large window keeps the fixed threshold"
+            compaction_threshold(COMPACTION_TOKEN_THRESHOLD * 2),
+            COMPACTION_TOKEN_THRESHOLD
         );
+        // Small window compacts at window minus headroom.
+        let window = COMPACTION_HEADROOM_TOKENS * 3;
         assert_eq!(
-            compaction_threshold(150_000),
-            130_000,
-            "window below fixed threshold+headroom compacts at window-20k"
+            compaction_threshold(window),
+            window - COMPACTION_HEADROOM_TOKENS,
+            "window below fixed threshold+headroom compacts at window-headroom"
         );
-        assert_eq!(
-            compaction_threshold(128_000),
-            108_000,
-            "128k window compacts at 108k"
-        );
+        // Tiny and unknown windows fall back to the fixed threshold.
         assert_eq!(
             compaction_threshold(COMPACTION_HEADROOM_TOKENS),
-            COMPACTION_TOKEN_THRESHOLD,
-            "tiny window falls back to the fixed threshold"
+            COMPACTION_TOKEN_THRESHOLD
         );
-        assert_eq!(
-            compaction_threshold(0),
-            COMPACTION_TOKEN_THRESHOLD,
-            "unknown window falls back to the fixed threshold"
-        );
+        assert_eq!(compaction_threshold(0), COMPACTION_TOKEN_THRESHOLD);
     }
 
     #[test]
     fn should_compact_with_threshold_matches_usage() {
+        let small = compaction_threshold(COMPACTION_HEADROOM_TOKENS * 2);
         let sess = Session {
             usage: Some(StreamUsage {
-                prompt_tokens: 108_001,
+                prompt_tokens: small + 1,
                 ..Default::default()
             }),
             ..Default::default()
         };
-        assert!(should_compact_with_threshold(
-            &sess,
-            compaction_threshold(128_000)
-        ));
+        assert!(should_compact_with_threshold(&sess, small));
         assert!(!should_compact_with_threshold(
             &sess,
-            compaction_threshold(400_000)
+            compaction_threshold(COMPACTION_TOKEN_THRESHOLD * 2)
         ));
     }
 
     #[test]
     fn default_compaction_target_is_explicit() {
         let target = crate::config::AtomConfig::default().resolved_compaction();
-        assert_eq!(target.provider, "ollama-local");
+        assert_eq!(target.provider, crate::config::DEFAULT_COMPACTION_PROVIDER);
         assert_eq!(target.model, COMPACTION_MODEL_ID);
     }
 
@@ -820,6 +849,50 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(compact_span(&sess), Some((0, 2)));
+    }
+
+    #[test]
+    fn tail_start_keeps_recent_verbatim() {
+        // One message sized at the full budget (chars = 4 * tokens), so
+        // the budget holds exactly one message and excludes the rest.
+        let big = || "x".repeat(COMPACTION_TAIL_TOKENS as usize * 4);
+        let msgs = vec![
+            msg("user", &big()),
+            msg("assistant", &big()),
+            msg("user", &big()),
+        ];
+        assert_eq!(tail_start(&msgs, 0, 3, COMPACTION_TAIL_TOKENS), 2);
+        assert_eq!(tail_start(&msgs, 0, 2, COMPACTION_TAIL_TOKENS), 1);
+        assert_eq!(tail_start(&msgs, 0, 1, COMPACTION_TAIL_TOKENS), 0);
+
+        // Everything fits under the budget: nothing is summarized.
+        let tiny = vec![msg("user", "one"), msg("assistant", "two")];
+        assert_eq!(tail_start(&tiny, 0, 2, COMPACTION_TAIL_TOKENS), 0);
+
+        // The cut never lands between tool results and their calls.
+        let tc = ToolCall {
+            id: "t1".into(),
+            call_type: String::new(),
+            function: FunctionCall {
+                name: "bash".into(),
+                arguments: r#"{"command":"ls"}"#.into(),
+            },
+        };
+        let msgs = vec![
+            msg("user", "old"),
+            Message {
+                role: "assistant".into(),
+                tool_calls: vec![tc],
+                ..Default::default()
+            },
+            msg("tool", &big()),
+            msg("user", "next"),
+        ];
+        // Budget at half the tail constant: the budget-sized tool result
+        // would be the first kept message, orphaning its folded assistant
+        // call — the split must advance past it, so only the final user
+        // turn stays verbatim.
+        assert_eq!(tail_start(&msgs, 0, 4, COMPACTION_TAIL_TOKENS / 2), 3);
     }
 
     #[test]

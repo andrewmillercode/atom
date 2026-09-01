@@ -67,6 +67,11 @@ pub struct ToolOutcome {
     pub text: String,
     pub images: Vec<ImageData>,
     pub diff: String,
+    /// Which provider served this call (search/fetch only): a bundled id
+    /// ("tinyfish", "parallel", "exa", "ollama"), "direct" for the direct
+    /// webfetch fallback, or "mcp:<server>" for user-configured servers.
+    /// Empty for all other tools.
+    pub tool_provider: String,
 }
 
 impl ToolOutcome {
@@ -114,7 +119,7 @@ pub async fn execute_tool(ctx: &ToolCtx<'_>, name: &str, args_json: &str) -> Too
                 Ok(a) => a,
                 Err(e) => return ToolOutcome::from_text(format!("error parsing arguments: {e}")),
             };
-            ToolOutcome::from_text(web_search::web_search(&args.query, &ctx.cwd).await)
+            web_search::web_search(&args.query, &ctx.cwd).await
         }
         "webfetch" => web_fetch::web_fetch(args_json, ctx).await,
         "vector_search" => {

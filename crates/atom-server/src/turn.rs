@@ -1471,6 +1471,7 @@ pub async fn run_session_turn(
                 content: outcome.text.clone(),
                 images: outcome.images.clone(),
                 diff: outcome.diff.clone(),
+                tool_provider: outcome.tool_provider.clone(),
                 ..Default::default()
             });
             // Save each tool result immediately. Besides crash safety, this
@@ -1479,6 +1480,7 @@ pub async fn run_session_turn(
             let result_ev = event(vec![
                 ("type", json!("tool_result")),
                 ("text", json!(outcome.text)),
+                ("tool_provider", json!(outcome.tool_provider)),
             ]);
             emit(state, &out, id, &result_ev).await;
             // Send any file diff as its own event so the client can attach

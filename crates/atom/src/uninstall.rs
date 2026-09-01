@@ -263,7 +263,11 @@ mod tests {
             b"99999\n",
         )
         .unwrap();
-        let other = if flavor == "atom-dev" { "atom" } else { "atom-dev" };
+        let other = if flavor == "atom-dev" {
+            "atom"
+        } else {
+            "atom-dev"
+        };
         let other_data = xdg_root.join("data").join(other);
         std::fs::create_dir_all(&other_data).unwrap();
         std::fs::write(other_data.join("untouched"), b"sentinel").unwrap();
@@ -281,7 +285,11 @@ mod tests {
     fn yes_flag_runs_full_uninstall() {
         let (tmp, install, xdg_root) = sandbox();
         let flavor = atom_core::build::dir_leaf();
-        let other = if flavor == "atom-dev" { "atom" } else { "atom-dev" };
+        let other = if flavor == "atom-dev" {
+            "atom"
+        } else {
+            "atom-dev"
+        };
         run_with(install.clone(), true).unwrap();
 
         // The current-flavor binaries are gone; the other pair was
@@ -319,7 +327,10 @@ mod tests {
         // The Makefile + install.sh match the exact path of the install
         // dir, so writing the matching line and asking for its removal
         // is what we want to verify.
-        let line = format!("export PATH=\"{install_display}:$PATH\"\n", install_display = install.display());
+        let line = format!(
+            "export PATH=\"{install_display}:$PATH\"\n",
+            install_display = install.display()
+        );
         let initial = format!("# keep\n{line}# tail\n");
         std::fs::write(&rc, &initial).unwrap();
         // run_with doesn't read RC_FILES (we hard-coded .zshrc/.bashrc/.profile),

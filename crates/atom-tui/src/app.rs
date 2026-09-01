@@ -66,6 +66,20 @@ pub struct RunOptions {
     pub sel_model: String,
     pub session: SessionInfo,
     pub hot_state_path: Option<std::path::PathBuf>,
+    /// Wall-clock instant captured at the very top of `main()`. Used by
+    /// the dev-only `/profile` overlay to display when the client
+    /// started (HH:MM:SS) and how long it has been running. None in
+    /// tests, where `App::new_test` skips the field.
+    pub started_at: Option<SystemTime>,
+    /// Monotonic companion to `started_at`: same wall-clock instant
+    /// but tracked via `Instant` so the uptime math can't be fooled
+    /// by clock skew. None whenever `started_at` is None.
+    pub started_instant: Option<Instant>,
+    /// PID of the background `atoms` server the client connected to.
+    /// Read from the pid file `ensure_server` writes; None when the
+    /// server isn't reachable, so the profile overlay can show "no
+    /// server pid known" instead of crashing.
+    pub server_pid: Option<i32>,
 }
 
 #[derive(Debug, Clone)]
@@ -177,6 +191,10 @@ pub struct App {
     pub overlay_entries: Vec<atom_core::providers::providers::ModelEntry>,
     pub overlay_sessions: Vec<SessionInfo>,
     pub overlay_stats: Option<StatsReport>,
+    /// /profile: latest snapshot returned by Effect::FetchProfile.
+    /// None until the first fetch completes — the overlay shows a
+    /// spinner during that window, same as /stats.
+    pub overlay_profile: Option<crate::profile::ProfileReport>,
     pub stats_days: i64,
     pub overlay_providers: Vec<ProviderListEntry>,
     pub overlay_auth_id: String,
@@ -197,6 +215,23 @@ pub struct App {
     /// don't have to remember which entry was loaded if the user
     /// navigates around before confirming).
     pub overlay_fork_source: String,
+
+    /// Wall-clock instant from `RunOptions::started_at`. The /profile
+    /// overlay uses this to render "client started: HH:MM:SS" — the
+    /// actual launch time, not a duration. `started_instant` is the
+    /// matching monotonic instant so uptime math is skew-proof.
+    pub started_at: Option<SystemTime>,
+    pub started_instant: Option<Instant>,
+    /// Wall-clock when the TUI became ready to accept input (after
+    /// setup_terminal, before the first frame). Set once by
+    /// `event_loop`'s caller via `set_ready_at`. The /profile overlay
+    /// reports `ready_at - started_at` as "client startup" — the
+    /// hillclimb metric — and keeps using `started_at` for the live
+    /// "client uptime" ticker.
+    pub ready_at: Option<SystemTime>,
+    /// Server PID from `RunOptions::server_pid`. /profile feeds it to
+    /// `ps` for the server section; None means "server not reachable".
+    pub server_pid: Option<i32>,
 
     // terminal dimensions
     pub width: u16,
@@ -322,6 +357,7 @@ impl App {
             overlay_entries: Vec::new(),
             overlay_sessions: Vec::new(),
             overlay_stats: None,
+            overlay_profile: None,
             stats_days: 0,
             overlay_providers: Vec::new(),
             overlay_auth_id: String::new(),
@@ -333,6 +369,12 @@ impl App {
             pending_model_provider: String::new(),
             overlay_fork_user_messages: Vec::new(),
             overlay_fork_source: String::new(),
+            started_at: opts.started_at,
+            started_instant: opts.started_instant,
+            // Set by `set_ready_at` once the TUI is in raw mode and
+            // about to draw its first frame. None until then.
+            ready_at: None,
+            server_pid: opts.server_pid,
             width: 80,
             height: 24,
             err_msg: String::new(),
@@ -402,6 +444,9 @@ impl App {
             sel_model: String::new(),
             session: empty_session_info(),
             hot_state_path: None,
+            started_at: None,
+            started_instant: None,
+            server_pid: None,
         });
         app.width = width;
         app.height = height;
@@ -1171,6 +1216,15 @@ impl App {
         }
     }
 
+    /// Record the wall-clock instant the TUI became ready to accept
+    /// input (after `setup_terminal`, before the first frame).
+    /// /profile uses this as the end of its startup-time window —
+    /// `ready_at - started_at` is the static "ms to load" value that
+    /// gets hillclimbed. Called once by `event_loop`'s caller.
+    pub fn set_ready_at(&mut self, ready_at: SystemTime) {
+        self.ready_at = Some(ready_at);
+    }
+
     /// Effective typed prefix for the slash menu. A Ctrl+P-opened menu
     /// (menu_virtual) matches against "" unless the prompt itself starts
     /// with "/", so the palette shows every command without touching the
@@ -1594,6 +1648,28 @@ impl App {
                 self.refresh_viewport();
                 Vec::new()
             }
+            "/profile" if atom_core::build::is_dev() => {
+                // Dev-only diagnostic overlay: startup time + CPU/RSS
+                // for the client and the running `atoms` server. Hidden
+                // in release builds — the catalog also omits it, so a
+                // user can't reach this arm without typing the literal
+                // command, but we double-check here in case a custom
+                // hook or scripted client tries to.
+                self.open_overlay(OverlayKind::Profile);
+                self.overlay_q.clear();
+                self.overlay_sel = 0;
+                self.overlay_scroll = 0;
+                self.overlay_profile = None;
+                self.working_msg = "sampling processes...".into();
+                vec![Effect::FetchProfile {
+                    client_pid: std::process::id() as i32,
+                    server_pid: self.server_pid,
+                }]
+            }
+            "/profile" => {
+                self.err_msg = "/profile is dev-only".into();
+                Vec::new()
+            }
             other => {
                 self.err_msg = format!("unknown command: {other}");
                 Vec::new()
@@ -1877,6 +1953,21 @@ impl App {
                 match report {
                     Ok(r) => {
                         self.overlay_stats = Some(*r);
+                        self.overlay_sel = 0;
+                        self.working_msg.clear();
+                    }
+                    Err(e) => {
+                        self.err_msg = e;
+                        self.working_msg.clear();
+                        self.overlay = None;
+                    }
+                }
+                Vec::new()
+            }
+            AppMsg::ProfileLoaded(report) => {
+                match report {
+                    Ok(r) => {
+                        self.overlay_profile = Some(*r);
                         self.overlay_sel = 0;
                         self.working_msg.clear();
                     }
@@ -3219,6 +3310,24 @@ impl App {
             };
         }
 
+        // Tab re-samples the live pids in /profile so the overlay can
+        // be refreshed without leaving the view. Other overlays ignore
+        // Tab here — the menu/footer menu handlers consume it.
+        if matches!(
+            k,
+            KeyEvent {
+                code: KeyCode::Tab,
+                modifiers: KeyModifiers::NONE,
+                ..
+            }
+        ) && matches!(kind, OverlayKind::Profile)
+        {
+            return vec![Effect::FetchProfile {
+                client_pid: std::process::id() as i32,
+                server_pid: self.server_pid,
+            }];
+        }
+
         match k.code {
             KeyCode::Esc => {
                 match kind {
@@ -3231,6 +3340,10 @@ impl App {
                     OverlayKind::WebSearch => {
                         self.open_overlay(OverlayKind::Settings);
                         self.overlay_sel = 1;
+                    }
+                    OverlayKind::WebFetch => {
+                        self.open_overlay(OverlayKind::Settings);
+                        self.overlay_sel = 2;
                     }
                     OverlayKind::Model
                         if self.model_picker_purpose
@@ -3278,6 +3391,15 @@ impl App {
                         // renderer's scroll must track it.
                         self.overlay_scroll = self.overlay_sel;
                     }
+                    OverlayKind::Profile => {
+                        // Profile reuses the same scroll-as-sel trick
+                        // as /stats: overlay_sel is the first visible
+                        // row, so the renderer can just copy it.
+                        if self.overlay_sel > 0 {
+                            self.overlay_sel -= 1;
+                        }
+                        self.overlay_scroll = self.overlay_sel;
+                    }
                     OverlayKind::Session => overlays::move_session_sel(self, -1),
                     OverlayKind::Model => overlays::move_model_sel(self, -1),
                     OverlayKind::Fork => {
@@ -3306,6 +3428,13 @@ impl App {
                         // See Up: scroll tracks the selection row.
                         self.overlay_scroll = self.overlay_sel;
                     }
+                    OverlayKind::Profile => {
+                        let max = overlays::profile_scroll_max(self);
+                        if self.overlay_sel < max {
+                            self.overlay_sel += 1;
+                        }
+                        self.overlay_scroll = self.overlay_sel;
+                    }
                     OverlayKind::Session => overlays::move_session_sel(self, 1),
                     OverlayKind::Model => overlays::move_model_sel(self, 1),
                     OverlayKind::Fork => {
@@ -3326,7 +3455,10 @@ impl App {
                 Vec::new()
             }
             KeyCode::Backspace => {
-                if matches!(kind, OverlayKind::Stats | OverlayKind::ProviderMethod) {
+                if matches!(
+                    kind,
+                    OverlayKind::Stats | OverlayKind::ProviderMethod | OverlayKind::Profile
+                ) {
                     return Vec::new();
                 }
                 if self.overlay_q_sel {
@@ -3532,6 +3664,9 @@ impl App {
         if self.atom_config.web_search.is_none() {
             self.atom_config.web_search = Some(self.atom_config.resolved_web_search());
         }
+        if self.atom_config.web_fetch.is_none() {
+            self.atom_config.web_fetch = Some(self.atom_config.resolved_web_fetch());
+        }
         self.settings_onboarding = false;
         self.save_atom_config();
     }
@@ -3733,6 +3868,16 @@ impl App {
                 self.working_msg.clear();
                 Vec::new()
             }
+            OverlayKind::Profile => {
+                // /profile is read-only: Enter just closes (same shape
+                // as /stats). Tab is handled separately in the key
+                // dispatch so this path only sees Enter.
+                self.overlay = None;
+                self.overlay_q.clear();
+                self.overlay_q_cursor = None;
+                self.working_msg.clear();
+                Vec::new()
+            }
             OverlayKind::Providers => {
                 let filtered = filter_provider_entries(&self.overlay_providers, &self.overlay_q);
                 if filtered.is_empty() {
@@ -3815,6 +3960,13 @@ impl App {
                     self.overlay_sel = rows.iter().position(|row| row.0 == selected).unwrap_or(0);
                     Vec::new()
                 }
+                2 => {
+                    self.open_overlay(OverlayKind::WebFetch);
+                    let selected = self.atom_config.resolved_web_fetch().server;
+                    let rows = overlays::web_fetch_rows(self);
+                    self.overlay_sel = rows.iter().position(|row| row.0 == selected).unwrap_or(0);
+                    Vec::new()
+                }
                 _ => {
                     self.accept_settings_defaults();
                     self.overlay = None;
@@ -3834,6 +3986,21 @@ impl App {
                 self.save_atom_config();
                 self.open_overlay(OverlayKind::Settings);
                 self.overlay_sel = 1;
+                Vec::new()
+            }
+            OverlayKind::WebFetch => {
+                let rows = overlays::web_fetch_rows(self);
+                let Some((id, _, _)) = rows.get(self.overlay_sel).cloned() else {
+                    return Vec::new();
+                };
+                let tool = atom_core::config::bundled_web_fetch_profile(&id)
+                    .map(|profile| profile.tool)
+                    .unwrap_or_else(|| "web_fetch".into());
+                self.atom_config.web_fetch =
+                    Some(atom_core::config::WebFetchConfig { server: id, tool });
+                self.save_atom_config();
+                self.open_overlay(OverlayKind::Settings);
+                self.overlay_sel = 2;
                 Vec::new()
             }
             OverlayKind::Theme => {
@@ -3889,13 +4056,13 @@ impl App {
     fn approval_key(&mut self, k: KeyEvent, req: ApprovalPrompt) -> Vec<Effect> {
         // v2 spec: four buttons, no session-scoped grant.
         //   y → allow_once, a → allow_always, n → deny_once,
-        //   d / Esc → deny_once.
+        //   d → deny_once. Esc is intentionally not bound — the four
+        //   visible buttons are the only choices.
         let decision = match k.code {
             KeyCode::Char('y') => Some(("allow_once", "allowed once")),
             KeyCode::Char('a') => Some(("allow_always", "always allowed")),
             KeyCode::Char('n') => Some(("deny_once", "denied")),
             KeyCode::Char('d') => Some(("deny_always", "denied, rule saved")),
-            KeyCode::Esc => Some(("deny_once", "denied")),
             KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.quitting = true;
                 return vec![Effect::Quit];
@@ -4076,7 +4243,7 @@ impl App {
         self.link_pending = None;
         // Status-bar hints are clickable: the subagent indicator opens the
         // subagent menu (Shift+↓), "Shift ↑ to return" goes to the parent
-        // session, and "esc to close" dismisses an open footer menu.
+        // session.
         if let Some(action) = self.status_nav_hit(x, y) {
             return self.run_status_nav_action(action);
         }
@@ -4405,22 +4572,6 @@ impl App {
                     Vec::new()
                 }
             }
-            NavAction::CloseMenu => {
-                if self.context_visible {
-                    self.close_context_menu();
-                } else if self.reasoning_visible {
-                    self.close_reasoning_menu();
-                } else if !matches!(self.picker_kind, PickerKind::None) {
-                    self.close_picker();
-                } else if self.manage_visible {
-                    self.dismiss_manage_menu();
-                } else if self.menu_visible {
-                    self.set_menu_visible(false);
-                } else if self.at_menu_visible {
-                    self.close_at_menu();
-                }
-                Vec::new()
-            }
         }
     }
 
@@ -4709,13 +4860,12 @@ mod tests {
     #[test]
     fn approval_keys_map_to_wire_decisions() {
         let cases = [
-            // v2 spec: y/a/n/d map to the four decisions; Esc cancels
-            // into deny_once. The session/global keys are gone.
+            // v2 spec: y/a/n/d map to the four decisions. Esc is not
+            // bound — the four visible buttons are the only choices.
             (KeyCode::Char('y'), "allow_once"),
             (KeyCode::Char('a'), "allow_always"),
             (KeyCode::Char('n'), "deny_once"),
             (KeyCode::Char('d'), "deny_always"),
-            (KeyCode::Esc, "deny_once"),
         ];
         for (code, wire) in cases {
             let mut app = approval_app();
@@ -5303,6 +5453,27 @@ mod tests {
     }
 
     #[test]
+    fn settings_web_fetch_picker_saves_bundled_tool() {
+        let mut app = App::new_test(80, 24);
+        app.overlay = Some(OverlayKind::Settings);
+        app.overlay_sel = 2;
+        assert!(app.confirm_overlay().is_empty());
+        assert_eq!(app.overlay, Some(OverlayKind::WebFetch));
+
+        let rows = overlays::web_fetch_rows(&app);
+        app.overlay_sel = rows.iter().position(|row| row.0 == "exa").unwrap();
+        assert!(app.confirm_overlay().is_empty());
+        assert_eq!(app.overlay, Some(OverlayKind::Settings));
+        assert_eq!(
+            app.atom_config.web_fetch,
+            Some(atom_core::config::WebFetchConfig {
+                server: "exa".into(),
+                tool: "web_fetch".into(),
+            })
+        );
+    }
+
+    #[test]
     fn onboarding_escape_accepts_and_persists_defaults_in_memory() {
         let mut app = App::new_test(80, 24);
         app.overlay = Some(OverlayKind::Settings);
@@ -5524,26 +5695,6 @@ mod tests {
             overlays::stats_scroll_max(&app),
             "scroll clamps at max"
         );
-    }
-
-    #[test]
-    fn click_on_esc_hint_closes_open_menu() {
-        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
-        let mut app = App::new_test(100, 40);
-        app.context_visible = true;
-        app.refresh_viewport();
-        let geo = crate::view::Layout::compute(&app);
-        let regions = crate::statusbar::nav_hit_regions(&app);
-        let (row, c0, _, action) = regions[0];
-        assert_eq!(action, crate::statusbar::NavAction::CloseMenu);
-        let ev = MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: (TUI_HPAD + c0) as u16,
-            row: (geo.status_y + row) as u16,
-            modifiers: KeyModifiers::empty(),
-        };
-        let _ = app.mouse(ev);
-        assert!(!app.context_visible, "click closed the open menu");
     }
 
     #[test]

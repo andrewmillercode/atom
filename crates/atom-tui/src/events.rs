@@ -171,6 +171,13 @@ pub enum Effect {
     FetchStats {
         days: i64,
     },
+    /// /profile: spawn a one-shot `ps` against the client and server
+    /// pids so the overlay can show live resource utilization. The
+    /// snapshot is delivered back as AppMsg::ProfileLoaded.
+    FetchProfile {
+        client_pid: i32,
+        server_pid: Option<i32>,
+    },
     LoadSession {
         id: String,
     },
@@ -311,6 +318,10 @@ pub enum AppMsg {
     ProvidersRebuilt(Vec<atom_core::providers::providers::Provider>),
     ContextLoaded(Vec<ContextRow>),
     StatsLoaded(Result<Box<StatsReport>, String>),
+    /// /profile: snapshot of CPU/RSS/VSZ/etime for both processes,
+    /// delivered after Effect::FetchProfile finishes. The Box is a
+    /// future-proofing pun — the report itself stays small.
+    ProfileLoaded(Result<Box<crate::profile::ProfileReport>, String>),
     ClipboardText(String),
     /// Image bytes read from the OS clipboard via Ctrl/Cmd+V (mirrors the
     /// `data` half of Go's clipboardPasteMsg; text arrives separately as
@@ -418,6 +429,7 @@ impl std::fmt::Debug for AppMsg {
             AppMsg::ProvidersRebuilt(n) => write!(f, "ProvidersRebuilt({n})", n = n.len()),
             AppMsg::ContextLoaded(n) => write!(f, "ContextLoaded({n})", n = n.len()),
             AppMsg::StatsLoaded(r) => write!(f, "StatsLoaded({r:?})"),
+            AppMsg::ProfileLoaded(r) => write!(f, "ProfileLoaded({:?})", r.as_ref().map(|_| ())),
             AppMsg::ClipboardText(_) => write!(f, "ClipboardText(..)"),
             AppMsg::ClipboardImage { name, data } => {
                 write!(f, "ClipboardImage({name}, {} bytes)", data.len())

@@ -5,6 +5,7 @@
 //! The bash tool routes through [`atom_sandbox::exec::run`]; everything
 //! else mirrors Go's model-visible strings.
 
+pub mod auth_keys;
 pub mod clipboard;
 pub mod customize;
 pub mod defs;

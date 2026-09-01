@@ -565,6 +565,7 @@ fn outcome(text: String, diff: String) -> ToolOutcome {
         text: text_with_diff(text, &diff),
         images: Vec::new(),
         diff,
+        ..Default::default()
     }
 }
 

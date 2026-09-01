@@ -145,6 +145,16 @@ async fn main() {
 }
 
 async fn run() -> Result<()> {
+    // Captured at the very top of run() so the dev-only /profile overlay
+    // can report "client started: HH:MM:SS" + "client uptime: Xs".
+    // Includes the args parse, auto-updater, and deps check; users will
+    // see the full cold-start duration (typically 1-3s on warm caches,
+    // longer on cold installs when the updater has to stage a new
+    // binary). Two flavors: wall-clock for display, monotonic for
+    // uptime math that's robust to clock skew.
+    let started_at_instant = std::time::Instant::now();
+    let started_at_wall = std::time::SystemTime::now();
+
     // Subcommand dispatch: `atom uninstall` removes the install without
     // needing the TUI / server / network. Handled before the standard
     // flag parser, the deps check, and the auto-updater — those would
@@ -192,6 +202,13 @@ async fn run() -> Result<()> {
     // Hold a connection for the life of this process so the 5s idle
     // shutdown cannot fire while we sit in menus with no event stream.
     tokio::spawn(atom_server::client::hold_server_alive());
+
+    // The server writes its PID to data_dir/server.pid at startup. We
+    // don't need it for the normal client flow, but /profile uses it
+    // to show live CPU/RSS for the background process alongside the
+    // client's own stats. Optional: a missing pid file just means the
+    // server section of /profile says "no server pid known".
+    let server_pid = atom_server::client::running_server_pid();
 
     // Stats mode: aggregated token usage report, then exit.
     if args.stats {
@@ -341,7 +358,17 @@ async fn run() -> Result<()> {
         serde_json::from_value(v).context("could not parse session")?
     };
 
-    launch_tui(providers, sel_provider, sel_model, args, Some(session)).await
+    launch_tui(
+        providers,
+        sel_provider,
+        sel_model,
+        args,
+        Some(session),
+        started_at_instant,
+        started_at_wall,
+        server_pid,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -362,6 +389,9 @@ async fn launch_tui(
     sel_model: String,
     args: Args,
     session: Option<atom_core::session::store::SessionInfo>,
+    started_at_instant: std::time::Instant,
+    started_at_wall: std::time::SystemTime,
+    server_pid: Option<i32>,
 ) -> Result<()> {
     let opts = atom_tui::app::RunOptions {
         providers,
@@ -369,6 +399,14 @@ async fn launch_tui(
         sel_model,
         session: session.unwrap_or_else(zero_session),
         hot_state_path: args.hot_state.map(PathBuf::from),
+        // Wall-clock + monotonic companion. The wall value drives the
+        // "client started: HH:MM:SS" readout; the Instant is a
+        // skew-proof companion for uptime math in tests / future
+        // helpers (currently unused by the renderer but kept for
+        // symmetry with RunOptions).
+        started_at: Some(started_at_wall),
+        started_instant: Some(started_at_instant),
+        server_pid,
     };
     atom_tui::run(opts, args.hot).await
 }

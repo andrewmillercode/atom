@@ -434,11 +434,11 @@ pub fn tool_display_name(name: &str) -> String {
     tool_display_name_for(name, &atom_core::config::load().resolved_web_search())
 }
 
-fn tool_display_name_for(name: &str, selected: &atom_core::config::WebSearchConfig) -> String {
-    if let Some(profile) = atom_core::config::bundled_web_search_profile(&selected.server) {
-        if name == profile.tool {
-            return profile.name.clone();
-        }
+fn tool_display_name_for(name: &str, _selected: &atom_core::config::WebSearchConfig) -> String {
+    // The fetch tool id is a single word; keep the two-word title so it
+    // pairs with "Web Search".
+    if name == "webfetch" {
+        return "Web Fetch".into();
     }
     name.split('_')
         .filter(|p| !p.is_empty())
@@ -472,6 +472,14 @@ pub fn tool_action(name: &str, arguments: &str) -> String {
             if let Some(q) = v.get("query").and_then(|q| q.as_str()) {
                 if !q.is_empty() {
                     return q.to_string();
+                }
+            }
+        }
+        "webfetch" => {
+            let v = ok(&args);
+            if let Some(u) = v.get("url").and_then(|u| u.as_str()) {
+                if !u.is_empty() {
+                    return u.to_string();
                 }
             }
         }
@@ -1418,10 +1426,6 @@ fn render_tool_block_linked(
         let btn_line = approval_button_line();
         body.push(btn_line);
         body_links.push(Vec::new());
-        // Help line (v2 spec: dim list of every binding under the
-        // buttons, with a "press ? for details" pointer).
-        body.push(approval_help_line(inner));
-        body_links.push(Vec::new());
     } else if !b.tool_done && b.tool_name == "sandbox" {
         // Still pending but somehow approval was removed — shouldn't happen
     } else {
@@ -1594,16 +1598,6 @@ fn approval_block_body(appr: &InlineApproval, width: usize) -> Vec<Line<'static>
         }
     }
     lines
-}
-
-/// Help line under the buttons. The buttons above already enumerate
-/// `y` / `a` / `n` / `d`; this line only carries the keys that aren't
-/// buttons — `esc` to cancel, and the width is just enough that a
-/// truncated terminal still shows the most important escape hatch.
-fn approval_help_line(width: usize) -> Line<'static> {
-    let text = "esc cancel";
-    let truncated = atom_core::render::highlight::truncate_width(text, width);
-    Line::from(Span::styled(truncated, ansi::style_dim()))
 }
 
 /// Produce the clickable button line for an approval block.
@@ -1831,7 +1825,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_display_name_uses_selected_web_search_provider() {
+    fn tool_display_name_hides_provider_name() {
         use atom_core::config::WebSearchConfig;
         let config = |server: &str| WebSearchConfig {
             server: server.into(),
@@ -1839,27 +1833,29 @@ mod tests {
         };
         assert_eq!(
             tool_display_name_for("web_search", &config("parallel")),
-            "Parallel Web Search"
+            "Web Search"
         );
         assert_eq!(
             tool_display_name_for("web_search", &config("ollama")),
-            "Ollama Web Search"
+            "Web Search"
         );
-        assert_eq!(
-            tool_display_name_for("web_search_exa", &config("exa")),
-            "Exa Web Search"
-        );
-        // An exa selection does not rename the generic parallel tool id,
-        // and unrelated tools keep their snake-case titles.
         assert_eq!(
             tool_display_name_for("web_search", &config("exa")),
             "Web Search"
         );
-        assert_eq!(tool_display_name_for("bash", &config("exa")), "Bash");
         assert_eq!(
-            tool_display_name_for("web_search", &config("custom-mcp")),
+            tool_display_name_for("web_search", &config("tinyfish")),
             "Web Search"
         );
+        assert_eq!(
+            tool_display_name_for("webfetch", &config("parallel")),
+            "Web Fetch"
+        );
+        assert_eq!(
+            tool_display_name_for("webfetch", &config("tinyfish")),
+            "Web Fetch"
+        );
+        assert_eq!(tool_display_name_for("bash", &config("exa")), "Bash");
     }
 
     #[test]
@@ -1941,6 +1937,14 @@ mod tests {
         assert_eq!(
             tool_action("read_file", r#"{"path":"/tmp/x.go"}"#),
             "/tmp/x.go"
+        );
+        assert_eq!(
+            tool_action("webfetch", r#"{"url":"https://ness-health.com/"}"#),
+            "https://ness-health.com/"
+        );
+        assert_eq!(
+            tool_action("web_search", r#"{"query":"rust async traits"}"#),
+            "rust async traits"
         );
         assert_eq!(
             tool_action("dispatch", r#"{"model":"m","prompt":"Review scenes"}"#),

@@ -57,7 +57,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDef> {
 pub fn webfetch_def() -> ToolDef {
     def(
         "webfetch",
-        "Fetch a single URL and return its content. Format: markdown (default), text, or html. Use when you already have the URL and want its content; use web_search to find URLs first. Read-only. 5MB max, 30s default timeout (max 120s). Bot-challenged sites (Cloudflare, Anubis) may still block.",
+        "Fetch a single URL and return its content. Format: markdown (default), text, or html. Use when you already have the URL and want its content; use web_search to find URLs first. Read-only. 5MB max, 30s default timeout (max 120s). Bot-challenged sites (Cloudflare, Anubis) may still block. Provider selection lives in Settings; the tool always dispatches through the configured fetch provider with fallback.",
         r#"{"type":"object","properties":{"url":{"type":"string","description":"The URL to fetch (http or https)"},"format":{"type":"string","enum":["markdown","text","html"],"description":"Output format. Default markdown."},"timeout":{"type":"integer","description":"Timeout in seconds, max 120. Default 30."}},"required":["url"]}"#,
     )
 }

@@ -958,7 +958,7 @@ fn approval_body(req: &ApprovalPrompt, width: usize) -> Vec<Line<'static>> {
         width,
     );
     approval_field(&mut body, "reason  ", &req.reason, width);
-    for row in wrap_approval_text("y once · a always · n no · d never · esc cancel", width) {
+    for row in wrap_approval_text("y once · a always · n no · d never", width) {
         body.push(Line::from(Span::styled(row, ansi::style_reasoning())));
     }
     body

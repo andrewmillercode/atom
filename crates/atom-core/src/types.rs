@@ -64,6 +64,9 @@ pub struct Message {
     pub reasoning_ms: i64,
     pub tool_calls: Vec<ToolCall>,
     pub tool_call_id: String,
+    /// For tool-role messages: which provider served the call
+    /// (search/fetch only, e.g. "exa", "direct", "mcp:<server>").
+    pub tool_provider: String,
     pub diff: String,
     /// Who answered this message, so stats can attribute usage after a
     /// model switch.
@@ -103,6 +106,9 @@ fn message_plain_fields(m: &Message) -> serde_json::Value {
     }
     if !m.tool_call_id.is_empty() {
         obj.insert("tool_call_id".into(), json!(m.tool_call_id));
+    }
+    if !m.tool_provider.is_empty() {
+        obj.insert("tool_provider".into(), json!(m.tool_provider));
     }
     if !m.diff.is_empty() {
         obj.insert("diff".into(), json!(m.diff));
@@ -166,6 +172,8 @@ impl<'de> Deserialize<'de> for Message {
             #[serde(default)]
             tool_call_id: String,
             #[serde(default)]
+            tool_provider: String,
+            #[serde(default)]
             diff: String,
             #[serde(default)]
             provider: String,
@@ -193,6 +201,7 @@ impl<'de> Deserialize<'de> for Message {
             reasoning_ms: raw.reasoning_ms,
             tool_calls: std::mem::take(&mut raw.tool_calls),
             tool_call_id: std::mem::take(&mut raw.tool_call_id),
+            tool_provider: std::mem::take(&mut raw.tool_provider),
             diff: std::mem::take(&mut raw.diff),
             provider: std::mem::take(&mut raw.provider),
             model: std::mem::take(&mut raw.model),

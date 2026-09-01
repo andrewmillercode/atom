@@ -183,8 +183,6 @@ pub enum NavAction {
     OpenSubagents,
     /// Return to the parent session (mirrors Shift+↑).
     ReturnToParent,
-    /// Close the open footer menu (mirrors Esc).
-    CloseMenu,
 }
 
 /// Footer-menu and parent/child navigation hints. These used to occupy a
@@ -193,30 +191,18 @@ pub enum NavAction {
 /// Returns the hint phrases as styled segments tagged with the action a
 /// click on them triggers; empty when there is nothing to hint.
 pub fn nav_segments(app: &App) -> Vec<(NavAction, Vec<Span<'static>>)> {
-    use crate::overlays::PickerKind;
     let mut segs: Vec<(NavAction, Vec<Span<'static>>)> = Vec::new();
-    if app.manage_visible
-        || !matches!(app.picker_kind, PickerKind::None)
-        || app.context_visible
-        || app.reasoning_visible
-    {
+    let n = app.manage_agents.len();
+    if n > 0 {
+        let label = if n == 1 {
+            "(1 subagent) Shift ↓".to_string()
+        } else {
+            format!("({n} subagents) Shift ↓")
+        };
         segs.push((
-            NavAction::CloseMenu,
-            vec![Span::styled("esc to close", ansi::style_dim())],
+            NavAction::OpenSubagents,
+            vec![Span::styled(label, ansi::style_dim())],
         ));
-    } else {
-        let n = app.manage_agents.len();
-        if n > 0 {
-            let label = if n == 1 {
-                "(1 subagent) Shift ↓".to_string()
-            } else {
-                format!("({n} subagents) Shift ↓")
-            };
-            segs.push((
-                NavAction::OpenSubagents,
-                vec![Span::styled(label, ansi::style_dim())],
-            ));
-        }
     }
     if !app.session.parent_id.is_empty() {
         segs.push((
@@ -969,20 +955,7 @@ mod tests {
                     assert_eq!(text, "Shift ↑ to return", "{text:?}");
                     assert!(*row > 0, "return hint wrapped to a later row");
                 }
-                NavAction::CloseMenu => panic!("no menu open"),
             }
         }
-    }
-
-    #[test]
-    fn nav_hit_regions_when_menu_open_is_esc() {
-        let mut app = app_with_usage(StreamUsage::default(), 100);
-        app.context_visible = true;
-        let lines = status_bar_lines(&app);
-        let regions = nav_hit_regions(&app);
-        assert_eq!(regions.len(), 1);
-        assert_eq!(regions[0].3, NavAction::CloseMenu);
-        let text = line_slice(&lines[regions[0].0], regions[0].1, regions[0].2);
-        assert_eq!(text, "esc to close");
     }
 }

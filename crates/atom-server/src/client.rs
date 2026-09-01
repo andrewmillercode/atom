@@ -593,6 +593,20 @@ fn data_dir_pid_path() -> PathBuf {
     atom_core::session::store::data_dir().join("server.pid")
 }
 
+/// Read the background server's PID from the pid file the server
+/// writes on startup. Returns None when the file is missing, unreadable,
+/// or contains garbage — the caller treats that as "server pid not
+/// known" instead of crashing /profile.
+pub fn running_server_pid() -> Option<i32> {
+    let raw = std::fs::read_to_string(data_dir_pid_path()).ok()?;
+    let pid = raw.trim().parse::<i32>().ok()?;
+    if pid > 0 {
+        Some(pid)
+    } else {
+        None
+    }
+}
+
 /// Locate the `atoms` server binary (named `atomsdev` in dev builds —
 /// see atom_core::build). It lives next to the running `atom`
 /// executable (same directory), which works for both dev and release

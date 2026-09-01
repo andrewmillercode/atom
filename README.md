@@ -22,6 +22,27 @@ curl -fsSL https://raw.githubusercontent.com/andrewmillercode/atom/main/install.
 
 That installs `atom` (the TUI) and `atoms` (the session server) into `~/.local/bin`, adds them to your PATH, and checks the runtime deps (`rg`, `uv`, `merman-cli`). Then just run `atom` in a repo — it starts the server for you. To build from source instead, use `make install` (or `make dev` for a separate `atomdev`/`atomsdev` setup).
 
+## Web Fetch
+
+`webfetch` fetches a single URL and returns its content. Like `web_search`, it routes through a bundled provider with tiered fallback when the selected provider is unavailable.
+
+Providers (in fallback priority):
+
+- **TinyFish** (default): free, no card required. Set `TINYFISH_API_KEY` to lift rate limits.
+- **Parallel**: free tier; set `PARALLEL_API_KEY` for higher rate limit.
+- **Exa**: paid (key required). Set `EXA_API_KEY` or save via `auth set exa <key>`.
+- **Ollama Cloud**: paid (key required). Set `OLLAMA_API_KEY`.
+
+Fallback triggers on 401/403/402/429. Network and 5xx errors return directly — atom does not silently switch providers on transient failures.
+
+Configure via Settings > Web Fetch, or in `~/.config/atom/config.json`:
+
+```json
+{ "web_fetch": { "server": "tinyfish" } }
+```
+
+The tool name shown in TUI is "Web Fetch" regardless of the selected provider. Provider selection lives in settings, not in the tool call.
+
 ## Contributions
 
 This harness is mostly a personal project, but contributions are welcome. You are free to fork / clone / modify atom to your liking and taste, or provide feature requests/suggestions via Issues.

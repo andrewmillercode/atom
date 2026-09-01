@@ -142,6 +142,9 @@ pub fn output_test_app(hot_state_path: Option<std::path::PathBuf>) -> App {
         sel_model: "output-test".into(),
         session,
         hot_state_path,
+        started_at: None,
+        started_instant: None,
+        server_pid: None,
     });
     m.test_mode = true;
     m.test_scene = OUTPUT_TEST_SCENE_WORKING;

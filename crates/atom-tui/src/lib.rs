@@ -19,6 +19,7 @@ pub mod math;
 pub mod outputtest;
 pub mod overlays;
 pub mod preview;
+pub mod profile;
 pub mod prompt;
 pub mod settings;
 pub mod spinner;
@@ -58,6 +59,12 @@ pub async fn run(opts: RunOptions, hot: bool) -> Result<()> {
     }
 
     let mut terminal = setup_terminal().context("terminal setup")?;
+    // "Ready" = first moment the TUI could accept input. Captured
+    // here (right after the terminal is in raw mode but before any
+    // draw) so the /profile overlay can report how long startup took:
+    // `ready_at - started_at`. Millisecond precision matters here —
+    // the value is what gets hillclimbed.
+    app.set_ready_at(std::time::SystemTime::now());
     let result = event_loop(&mut app, &mut terminal, tx, rx, false, hot).await;
     restore_terminal(&mut terminal);
     result
@@ -83,6 +90,10 @@ pub async fn run_output_test(
         tokio::spawn(hot::watch_sources(tx.clone()));
     }
     let mut terminal = setup_terminal().context("terminal setup")?;
+    // Same ready-at capture as `run` — output-test mode also goes
+    // through setup_terminal + event_loop, so the hillclimb metric
+    // has a consistent meaning across modes.
+    app.set_ready_at(std::time::SystemTime::now());
     let result = event_loop(&mut app, &mut terminal, tx, rx, true, hot_enabled).await;
     restore_terminal(&mut terminal);
     result
@@ -497,6 +508,16 @@ fn initial_effects(app: &App, test_mode: bool) -> Vec<Effect> {
         Some(overlays::OverlayKind::Stats) => effects.push(Effect::FetchStats {
             days: app.stats_days,
         }),
+        Some(overlays::OverlayKind::Profile) => {
+            // /profile is the only overlay that opens already in
+            // "loading" state — the spinner runs while the worker
+            // shells out to `ps`. Re-fire the same effect so reopening
+            // the overlay after Esc gets a fresh sample.
+            effects.push(Effect::FetchProfile {
+                client_pid: std::process::id() as i32,
+                server_pid: app.server_pid,
+            });
+        }
         _ => {}
     }
     if app.manage_visible && !app.session.id.is_empty() {
@@ -719,6 +740,23 @@ async fn run_effects(
                             .map(Box::new)
                             .map_err(|e| e.to_string()),
                     ));
+                });
+            }
+            Effect::FetchProfile {
+                client_pid,
+                server_pid,
+            } => {
+                // Carry the wall-clock startup + ready instants into the spawned
+                // task so the report can compute "client startup" and
+                // the live "client uptime" / "server uptime" tickers
+                // without re-reading App state on the worker side.
+                let started_at = app.started_at;
+                let ready_at = app.ready_at;
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let report =
+                        profile::gather(client_pid, server_pid, started_at, ready_at).await;
+                    let _ = tx.send(AppMsg::ProfileLoaded(Ok(Box::new(report))));
                 });
             }
             Effect::LoadSession { id } => {

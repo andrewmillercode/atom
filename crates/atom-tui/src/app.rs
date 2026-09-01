@@ -1404,11 +1404,11 @@ impl App {
             || overlays::is_catalog_prompt(text, &self.slash_commands)
             || overlays::looks_like_file_path(text);
         if passthrough && (self.streaming || self.remote_working) {
-            // Mid-stream submit: the interruption rides in the effect.
-            // Pause the running turn via the server first, then dial the
-            // new /send stream; nothing is stored in the App. The prompt
-            // is cleared right away so the next draft can be typed while
-            // the pause/send happens in the background.
+            // Mid-turn submit: the prompt is injected into the running
+            // turn (queued server-side; the model sees it at the next
+            // round). Nothing is paused or killed, and the already-open
+            // stream keeps painting, so the App only pushes the user
+            // block optimistically and keeps its streaming state.
             let imgs: Vec<ImageData> = self.pending.iter().map(|p| p.img.clone()).collect();
             let imgs_meta = std::mem::take(&mut self.pending);
             self.preview_dirty = true;
@@ -1419,17 +1419,12 @@ impl App {
             self.close_context_menu();
             self.close_at_menu();
             self.err_msg.clear();
-            self.paused = true;
-            self.interrupting = true;
             self.blocks.push(Block {
                 kind: BlockKind::User,
                 text: text.to_string(),
                 images: imgs_meta,
                 ..Default::default()
             });
-            self.streaming = true;
-            let pause_turn_id = std::mem::take(&mut self.turn_id);
-            self.turn_id = new_turn_id();
             self.following = true;
             let req = SendRequest {
                 session_id: self.session.id.clone(),
@@ -1444,10 +1439,7 @@ impl App {
                 compact_instructions: String::new(),
             };
             return vec![
-                Effect::InterruptTurn {
-                    pause_turn_id,
-                    req: Box::new(req),
-                },
+                Effect::InjectTurn { req: Box::new(req) },
                 Effect::PaintPreviews,
             ];
         }
@@ -6754,42 +6746,38 @@ mod tests {
     }
 
     #[test]
-    fn enter_during_stream_pauses_and_sends_interruption() {
+    fn enter_during_stream_injects_without_pausing() {
         let mut app = App::new_test(90, 30);
         app.session.id = "sess1".into();
         app.sel_provider.base_url = "http://test:11434/v1".into();
         app.streaming = true;
         app.turn_id = "turn-1".into();
 
-        // While streaming, typing "interrupt" and pressing Enter pauses
-        // the running turn and sends the interruption in one effect; the
-        // prompt is cleared immediately so the next draft can start.
+        // While streaming, typing "interrupt" and pressing Enter injects
+        // the prompt into the running turn: nothing pauses, the
+        // already-open stream keeps painting, and the input is free for
+        // the next draft immediately.
         app.input.set_value("interrupt");
         let text = app.input.value.trim().to_string();
         let fx = app.handle_input(&text);
 
-        // The message is not stored in the App: it rides in the effect,
-        // and the input is already free for the next draft.
-        assert!(app.paused);
+        assert!(!app.paused);
         assert!(app.streaming);
-        assert!(app.interrupting);
+        assert!(!app.interrupting);
         assert!(app.input.value.is_empty());
         let last = app.blocks.last().expect("user block pushed");
         assert_eq!(last.kind, BlockKind::User);
         assert_eq!(last.text, "interrupt");
-        let (pause_turn_id, req) = fx
+        let req = fx
             .iter()
             .find_map(|e| match e {
-                Effect::InterruptTurn { pause_turn_id, req } => {
-                    Some((pause_turn_id.as_str(), req.message.as_str()))
-                }
+                Effect::InjectTurn { req } => Some(req),
                 _ => None,
             })
-            .expect("InterruptTurn effect");
-        // Pause targets the turn that was streaming; the request carries
-        // the fresh turn id for the interruption itself.
-        assert_eq!(pause_turn_id, "turn-1");
-        assert_eq!(req, "interrupt");
+            .expect("InjectTurn effect");
+        // The live turn keeps its id: a later Esc must still target it.
+        assert_eq!(req.turn_id, "turn-1");
+        assert_eq!(req.message, "interrupt");
         assert!(fx.iter().any(|e| matches!(e, Effect::PaintPreviews)));
     }
 
@@ -6865,90 +6853,36 @@ mod tests {
     }
 
     #[test]
-    fn stale_saved_during_interrupt_does_not_reload() {
+    fn saved_and_send_closed_reload_after_mid_turn_inject() {
         let mut app = App::new_test(90, 30);
         app.session.id = "sess1".into();
         app.sel_provider.base_url = "http://test:11434/v1".into();
         app.streaming = true;
         app.turn_id = "turn-1".into();
 
-        // Mid-stream submit arms the interruption guard.
+        // Mid-turn submit: nothing pauses, the turn keeps streaming.
         app.input.set_value("interrupt");
         let text = app.input.value.trim().to_string();
         let fx = app.handle_input(&text);
-        assert!(app.interrupting);
-        assert!(fx.iter().any(|e| matches!(e, Effect::InterruptTurn { .. })));
+        assert!(!app.paused);
+        assert!(app.streaming);
+        assert!(fx.iter().any(|e| matches!(e, Effect::InjectTurn { .. })));
         assert_eq!(
             app.blocks.last().map(|b| b.text.as_str()),
             Some("interrupt")
         );
 
-        // The paused turn persists and broadcasts "saved" while the
-        // interruption is still dialing: it must not arm a reload.
+        // The running turn persists (the injected prompt included) and
+        // broadcasts "saved" while still live: the reload is deferred.
         let fx = app.handle_msg(AppMsg::SubEvent(serde_json::json!({"type": "saved"})));
         assert!(fx.is_empty());
-        assert!(!app.pending_saved);
+        assert!(app.pending_saved);
 
-        // The old stream closing must not reload either: the server
-        // transcript doesn't contain the interruption message yet, so a
-        // reload would drop the user block from the view.
+        // When the turn finally finishes, SendClosed reloads — the
+        // transcript now contains the injected message.
         let fx = app.handle_msg(AppMsg::SendClosed);
         assert!(!app.streaming);
-        assert!(!fx.iter().any(|e| matches!(e, Effect::LoadSession { .. })));
-        assert_eq!(
-            app.blocks.last().map(|b| b.text.as_str()),
-            Some("interrupt")
-        );
-    }
-
-    #[test]
-    fn interrupt_guard_clears_when_stream_starts() {
-        let mut app = App::new_test(90, 30);
-        app.session.id = "sess1".into();
-        app.streaming = true;
-        app.turn_id = "turn-1".into();
-        app.input.set_value("interrupt");
-        let text = app.input.value.trim().to_string();
-        app.handle_input(&text);
-        assert!(app.interrupting);
-
-        // The interruption's stream is live: the guard clears, so the
-        // turn's own "saved" broadcast and SendClosed reload normally.
-        app.handle_msg(AppMsg::SendStarted {
-            sid: "sess1".into(),
-        });
-        assert!(!app.interrupting);
-        assert!(app.streaming);
-        assert!(!app.paused);
-
-        app.handle_msg(AppMsg::SubEvent(serde_json::json!({"type": "saved"})));
-        assert!(app.pending_saved);
-        let fx = app.handle_msg(AppMsg::SendClosed);
         assert!(fx.iter().any(|e| matches!(e, Effect::LoadSession { .. })));
-    }
-
-    #[test]
-    fn entering_mid_stream_without_session_still_pauses() {
-        // Even without a session id, the message should be carried in the
-        // effect and the stream paused.
-        let mut app = App::new_test(90, 30);
-        app.session.id.clear();
-        app.streaming = true;
-
-        app.input.set_value("say something");
-        let text = app.input.value.trim().to_string();
-        let fx = app.handle_input(&text);
-
-        assert!(app.paused);
-        assert!(app.input.value.is_empty());
-        let interrupt = fx
-            .iter()
-            .find_map(|e| match e {
-                Effect::InterruptTurn { req, .. } => Some(req.message.as_str()),
-                _ => None,
-            })
-            .expect("InterruptTurn effect");
-        assert_eq!(interrupt, "say something");
     }
 
     #[test]

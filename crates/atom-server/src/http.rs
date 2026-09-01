@@ -705,10 +705,41 @@ async fn handle_send(
     let base_url = base_url.trim_end_matches('/').to_string();
 
     if !state.turns.try_prepare_session_turn(id) {
-        return error_resp(
-            StatusCode::CONFLICT,
-            "session already has an active turn; pause it before sending another message",
-        );
+        // A turn is already active. The prompt must neither pause the
+        // turn nor bounce with a 409: hand it to the live turn (queued
+        // on its handle, current provider round cancelled so the model
+        // sees it next round) and acknowledge with a tiny stream.
+        let msg = atom_core::types::Message {
+            role: "user".into(),
+            content: body.message.clone(),
+            images: body.images.clone(),
+            created_at: Some(Utc::now()),
+            ..Default::default()
+        };
+        if state.turns.inject_session_message(id, msg) {
+            // Prompt acceleration: in-flight bash calls in this session
+            // stop waiting for inline results and hand back their job
+            // ids immediately. The registry is the coordination point —
+            // no token is threaded through the turn handle.
+            atom_sandbox::jobs::flush_wait(id);
+            let (resp, tx) = ndjson_response();
+            tokio::spawn(async move {
+                // Drop tx at the end of the block so the body closes.
+                let mut line =
+                    serde_json::to_string(&json!({"type": "injected"})).unwrap_or_default();
+                line.push('\n');
+                let _ = tx.send(Ok(Bytes::from(line))).await;
+            });
+            return resp;
+        }
+        // The active turn ended between the check and the injection:
+        // take the slow path and start a normal turn.
+        if !state.turns.try_prepare_session_turn(id) {
+            return error_resp(
+                StatusCode::CONFLICT,
+                "session already has an active turn; send again in a moment",
+            );
+        }
     }
 
     let (resp, tx) = ndjson_response();

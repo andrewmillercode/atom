@@ -663,7 +663,7 @@ async fn run_effects(
                 // Dial off the event loop so input/render/Esc stay live while
                 // the server warms up the stream (provider TTFB can be seconds).
                 tokio::spawn(async move {
-                    let mut resp = api::stream_send_healed(&req).await;
+                    let mut resp = api::stream_send(&req).await;
                     // The server may have shut down; restart and retry once.
                     if resp.is_err()
                         && !api::is_running().await
@@ -896,38 +896,47 @@ async fn run_effects(
                     }
                 });
             }
-            Effect::InterruptTurn { pause_turn_id, req } => {
-                // Mid-stream submit: pause the running turn via the
-                // server first, then dial the interruption stream. The
-                // message rides in the request; nothing is stored.
-                let id = req.session_id.clone();
+            Effect::InjectTurn { req } => {
+                // Mid-turn submit: the server queues the prompt on the
+                // live turn and answers with a tiny {"type":"injected"}
+                // stream that closes. The already-open event stream for
+                // the running turn keeps painting, so this response is
+                // drained, never adopted as the active stream — unless
+                // the turn had just ended, in which case the server
+                // started a real one and we adopt it like a fresh send.
                 let body = req.to_body();
+                let session_id = req.session_id.clone();
                 let tx = tx.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = api::pause_turn(&id, &pause_turn_id).await {
-                        let _ = tx.send(AppMsg::Errored(e.to_string()));
-                    }
-                    // The pause targeted the turn that was streaming, but the
-                    // server may have another registration behind it (raced
-                    // pause, stale entry): heal the same way a plain send
-                    // would instead of surfacing a 409.
-                    let mut resp = api::stream_send_healed(&req).await;
+                    let mut resp = api::stream_send(&req).await;
                     // The server may have shut down; restart and retry once.
                     if resp.is_err()
                         && !api::is_running().await
                         && api::ensure_server().await.is_ok()
                     {
-                        resp = atom_server::client::stream_send(&id, &body).await;
+                        resp = atom_server::client::stream_send(&session_id, &body).await;
                     }
                     match resp {
-                        Ok(rx) => {
-                            let _ = tx.send(AppMsg::SendReady { sid: id, rx });
-                        }
+                        Ok(mut rx) => match rx.recv().await {
+                            Some(v)
+                                if v.get("type").and_then(|t| t.as_str()) == Some("injected") =>
+                            {
+                                while rx.recv().await.is_some() {}
+                            }
+                            first => {
+                                if let Some(v) = first {
+                                    let _ = tx.send(AppMsg::SendReady {
+                                        sid: session_id.clone(),
+                                        rx,
+                                    });
+                                    let _ = tx.send(AppMsg::SendEvent(v));
+                                }
+                            }
+                        },
                         Err(e) => {
                             let _ = tx.send(AppMsg::SendEvent(
                                 serde_json::json!({"type":"error","message": e.to_string()}),
                             ));
-                            let _ = tx.send(AppMsg::SendClosed);
                         }
                     }
                 });

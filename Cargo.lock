@@ -147,6 +147,7 @@ dependencies = [
  "dirs",
  "glob",
  "hex",
+ "libc",
  "once_cell",
  "serde",
  "serde_json",

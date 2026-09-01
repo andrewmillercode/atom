@@ -501,11 +501,79 @@ pub fn kickoff_title_generation(state: &Arc<AppState>, id: String) {
 }
 
 /// finishPausedTurn ends a paused turn: it tells the client the stream
-/// stopped, persists the partial conversation, and notifies other viewers.
-async fn finish_paused_turn(state: &Arc<AppState>, sess: &Session, out: &EventOut, id: &str) {
+/// stopped, persists the partial conversation, and notifies other
+/// viewers. A prompt that landed in the pending slot right before the
+/// pause (Esc racing a mid-turn injection) is never dropped: it is run
+/// as a follow-up turn once this one has fully unwound.
+#[allow(clippy::too_many_arguments)]
+async fn finish_paused_turn(
+    state: &Arc<AppState>,
+    sess: &mut Session,
+    out: &EventOut,
+    id: &str,
+    ctx: &TurnCtx,
+    parent_id: &str,
+    opts: &TurnOpts,
+    key: &str,
+    base_url: &str,
+) {
     let ev = json!({"type": "paused"});
     emit(state, out, id, &ev).await;
+    let leftover = ctx.handle.take_pending();
     persist_session(state, sess, id).await;
+    end_of_turn(state, sess, id, &ctx.handle, parent_id).await;
+    if leftover.is_empty() {
+        return;
+    }
+    let message = leftover
+        .iter()
+        .map(|m| m.content.clone())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let images = leftover.iter().flat_map(|m| m.images.clone()).collect();
+    let follow = TurnOpts {
+        message,
+        thinking: opts.thinking.clone(),
+        key: key.to_string(),
+        base_url: base_url.to_string(),
+        reasoning_field: opts.reasoning_field.clone(),
+        turn_id: format!("{}-followup", ctx.handle.turn_id),
+        images,
+        compact: false,
+        compact_instructions: String::new(),
+        skip_append: false,
+    };
+    // Detached: the paused turn's stream is unwinding, but the follow-up
+    // shares the same EventOut, so a still-connected client keeps
+    // receiving its events on the same response body. The spawn goes
+    // through a plain fn so the Send proof for this future doesn't
+    // recurse into the follow-up's own future (a follow-up turn can
+    // itself be paused).
+    spawn_turn(
+        state.clone(),
+        sess.clone(),
+        id.to_string(),
+        follow,
+        out.clone(),
+        ctx.parent.clone(),
+    );
+}
+
+/// Spawns one turn task on the shared EventOut. A plain fn boundary:
+/// /send and the paused-turn follow-up both go through it, which keeps
+/// the follow-up recursion (paused turn → follow-up turn) out of the
+/// Send inference for run_session_turn's future.
+pub fn spawn_turn(
+    state: Arc<AppState>,
+    mut sess: Session,
+    id: String,
+    opts: TurnOpts,
+    out: EventOut,
+    parent: CancelToken,
+) {
+    tokio::spawn(async move {
+        run_session_turn_guarded(&state, &mut sess, &id, opts, out, parent).await;
+    });
 }
 
 /// foldSession summarizes older turns and notifies the client with the
@@ -741,9 +809,27 @@ pub async fn run_session_turn(
     'rounds: for _round in 0..MAX_TOOL_ROUNDS {
         // Stop immediately when the turn was paused.
         if ctx.err() {
-            finish_paused_turn(state, sess, &out, id).await;
-            end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+            finish_paused_turn(
+                state, sess, &out, id, &ctx, &parent_id, &opts, &key, &base_url,
+            )
+            .await;
             return;
+        }
+
+        // Prompts injected while the previous round's tools were
+        // running (or between rounds) land here: fold them into
+        // history so the model sees them this round. Nothing is
+        // paused or killed by an injection — this drain is what makes
+        // a mid-turn prompt reach the model at the next round.
+        let injected = ctx.handle.take_pending();
+        if !injected.is_empty() {
+            for m in injected {
+                state
+                    .subs
+                    .broadcast(id, &json!({"type": "user_message", "text": m.content}));
+                sess.messages.push(m);
+            }
+            persist_session_now(state, sess, id).await;
         }
 
         let forced = ctx.handle.take_compact();
@@ -833,8 +919,10 @@ pub async fn run_session_turn(
                 None => {
                     ctx.handle.set_round_cancel(None);
                     if ctx.err() {
-                        finish_paused_turn(state, sess, &out, id).await;
-                        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                        finish_paused_turn(
+                            state, sess, &out, id, &ctx, &parent_id, &opts, &key, &base_url,
+                        )
+                        .await;
                         return;
                     }
                     if let Some(extra) = ctx.handle.take_compact() {
@@ -849,8 +937,10 @@ pub async fn run_session_turn(
                     Err(err) => {
                         ctx.handle.set_round_cancel(None);
                         if ctx.err() {
-                            finish_paused_turn(state, sess, &out, id).await;
-                            end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                            finish_paused_turn(
+                                state, sess, &out, id, &ctx, &parent_id, &opts, &key, &base_url,
+                            )
+                            .await;
                             return;
                         }
                         if let Some(extra) = ctx.handle.take_compact() {
@@ -892,8 +982,10 @@ pub async fn run_session_turn(
                 Ok(result) => result,
                 Err(err) => {
                     if ctx.err() {
-                        finish_paused_turn(state, sess, &out, id).await;
-                        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                        finish_paused_turn(
+                            state, sess, &out, id, &ctx, &parent_id, &opts, &key, &base_url,
+                        )
+                        .await;
                         return;
                     }
                     let msg = provider_error_message(&err, &base_url);
@@ -932,8 +1024,10 @@ pub async fn run_session_turn(
                 None => {
                     ctx.handle.set_round_cancel(None);
                     if ctx.err() {
-                        finish_paused_turn(state, sess, &out, id).await;
-                        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                        finish_paused_turn(
+                            state, sess, &out, id, &ctx, &parent_id, &opts, &key, &base_url,
+                        )
+                        .await;
                         return;
                     }
                     if let Some(extra) = ctx.handle.take_compact() {
@@ -948,8 +1042,10 @@ pub async fn run_session_turn(
                     Err(err) => {
                         ctx.handle.set_round_cancel(None);
                         if ctx.err() {
-                            finish_paused_turn(state, sess, &out, id).await;
-                            end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                            finish_paused_turn(
+                                state, sess, &out, id, &ctx, &parent_id, &opts, &key, &base_url,
+                            )
+                            .await;
                             return;
                         }
                         if let Some(extra) = ctx.handle.take_compact() {
@@ -991,8 +1087,10 @@ pub async fn run_session_turn(
                 Ok(result) => result,
                 Err(err) => {
                     if ctx.err() {
-                        finish_paused_turn(state, sess, &out, id).await;
-                        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                        finish_paused_turn(
+                            state, sess, &out, id, &ctx, &parent_id, &opts, &key, &base_url,
+                        )
+                        .await;
                         return;
                     }
                     let msg = provider_error_message(&err, &base_url);
@@ -1035,8 +1133,10 @@ pub async fn run_session_turn(
                 None => {
                     ctx.handle.set_round_cancel(None);
                     if ctx.err() {
-                        finish_paused_turn(state, sess, &out, id).await;
-                        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                        finish_paused_turn(
+                            state, sess, &out, id, &ctx, &parent_id, &opts, &key, &base_url,
+                        )
+                        .await;
                         return;
                     }
                     if let Some(extra) = ctx.handle.take_compact() {
@@ -1051,8 +1151,10 @@ pub async fn run_session_turn(
                     Err(err) => {
                         ctx.handle.set_round_cancel(None);
                         if ctx.err() {
-                            finish_paused_turn(state, sess, &out, id).await;
-                            end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                            finish_paused_turn(
+                                state, sess, &out, id, &ctx, &parent_id, &opts, &key, &base_url,
+                            )
+                            .await;
                             return;
                         }
                         if let Some(extra) = ctx.handle.take_compact() {
@@ -1094,8 +1196,10 @@ pub async fn run_session_turn(
                 Ok(result) => result,
                 Err(err) => {
                     if ctx.err() {
-                        finish_paused_turn(state, sess, &out, id).await;
-                        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                        finish_paused_turn(
+                            state, sess, &out, id, &ctx, &parent_id, &opts, &key, &base_url,
+                        )
+                        .await;
                         return;
                     }
                     let msg = provider_error_message(&err, &base_url);
@@ -1147,8 +1251,10 @@ pub async fn run_session_turn(
                 None => {
                     ctx.handle.set_round_cancel(None);
                     if ctx.err() {
-                        finish_paused_turn(state, sess, &out, id).await;
-                        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                        finish_paused_turn(
+                            state, sess, &out, id, &ctx, &parent_id, &opts, &key, &base_url,
+                        )
+                        .await;
                         return;
                     }
                     if let Some(extra) = ctx.handle.take_compact() {
@@ -1168,8 +1274,10 @@ pub async fn run_session_turn(
                 Some(Err(round_err)) => {
                     ctx.handle.set_round_cancel(None);
                     if ctx.err() {
-                        finish_paused_turn(state, sess, &out, id).await;
-                        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                        finish_paused_turn(
+                            state, sess, &out, id, &ctx, &parent_id, &opts, &key, &base_url,
+                        )
+                        .await;
                         return;
                     }
                     if let Some(extra) = ctx.handle.take_compact() {
@@ -1217,8 +1325,10 @@ pub async fn run_session_turn(
                 None => {
                     ctx.handle.set_round_cancel(None);
                     if ctx.err() {
-                        finish_paused_turn(state, sess, &out, id).await;
-                        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                        finish_paused_turn(
+                            state, sess, &out, id, &ctx, &parent_id, &opts, &key, &base_url,
+                        )
+                        .await;
                         return;
                     }
                     if let Some(extra) = ctx.handle.take_compact() {
@@ -1232,8 +1342,10 @@ pub async fn run_session_turn(
                 Some(Err(err)) => {
                     ctx.handle.set_round_cancel(None);
                     if ctx.err() {
-                        finish_paused_turn(state, sess, &out, id).await;
-                        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                        finish_paused_turn(
+                            state, sess, &out, id, &ctx, &parent_id, &opts, &key, &base_url,
+                        )
+                        .await;
                         return;
                     }
                     if let Some(extra) = ctx.handle.take_compact() {
@@ -1277,8 +1389,10 @@ pub async fn run_session_turn(
                 Ok(result) => result,
                 Err(err) => {
                     if ctx.err() {
-                        finish_paused_turn(state, sess, &out, id).await;
-                        end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                        finish_paused_turn(
+                            state, sess, &out, id, &ctx, &parent_id, &opts, &key, &base_url,
+                        )
+                        .await;
                         return;
                     }
                     let msg = provider_error_message(&err, &base_url);
@@ -1314,8 +1428,10 @@ pub async fn run_session_turn(
                 ]);
                 emit(state, &out, id, &retry_ev).await;
                 if sleep_ctx(ctx.handle.cancel_token(), &ctx.parent, delay).await {
-                    finish_paused_turn(state, sess, &out, id).await;
-                    end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                    finish_paused_turn(
+                        state, sess, &out, id, &ctx, &parent_id, &opts, &key, &base_url,
+                    )
+                    .await;
                     return;
                 }
                 continue 'rounds;
@@ -1342,6 +1458,28 @@ pub async fn run_session_turn(
         }
         empty_response_attempt = 0;
 
+        // A prompt injected mid-stream cancelled this round (round
+        // cancel only — the turn and any tools are untouched). Flush
+        // the partial reply and the queued message into history, then
+        // keep going: the model sees the prompt next round.
+        if round_cancel.is_cancelled() {
+            let pending = ctx.handle.take_pending();
+            if !pending.is_empty() {
+                if !result.content.is_empty() || !result.reasoning.is_empty() {
+                    sess.messages
+                        .push(assistant_message(&sess.model, &base_url, &result, None));
+                }
+                for m in pending {
+                    state
+                        .subs
+                        .broadcast(id, &json!({"type": "user_message", "text": m.content}));
+                    sess.messages.push(m);
+                }
+                persist_session_now(state, sess, id).await;
+                continue 'rounds;
+            }
+        }
+
         // The provider's token count for this request is the current
         // context snapshot (history, instructions, and tool results).
         // Remember it on the session and tell every viewer, so the
@@ -1360,8 +1498,10 @@ pub async fn run_session_turn(
                 sess.messages
                     .push(assistant_message(&sess.model, &base_url, &result, None));
             }
-            finish_paused_turn(state, sess, &out, id).await;
-            end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+            finish_paused_turn(
+                state, sess, &out, id, &ctx, &parent_id, &opts, &key, &base_url,
+            )
+            .await;
             return;
         }
 
@@ -1399,8 +1539,10 @@ pub async fn run_session_turn(
                     .copied()
                     .unwrap_or(Duration::from_secs(15));
                 if sleep_ctx(ctx.handle.cancel_token(), &ctx.parent, delay).await {
-                    finish_paused_turn(state, sess, &out, id).await;
-                    end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                    finish_paused_turn(
+                        state, sess, &out, id, &ctx, &parent_id, &opts, &key, &base_url,
+                    )
+                    .await;
                     return;
                 }
                 nudge_attempt += 1;
@@ -1414,6 +1556,20 @@ pub async fn run_session_turn(
                 if let Err(ferr) = fold_session(state, sess, &out, id, &extra).await {
                     emit(state, &out, id, &fold_error_event(&ferr)).await;
                 }
+            }
+            // A prompt that arrived while the final answer streamed
+            // must not end the turn unanswered: keep the answer, fold
+            // the prompt into history, and answer it next round.
+            let pending = ctx.handle.take_pending();
+            if !pending.is_empty() {
+                for m in pending {
+                    state
+                        .subs
+                        .broadcast(id, &json!({"type": "user_message", "text": m.content}));
+                    sess.messages.push(m);
+                }
+                persist_session_now(state, sess, id).await;
+                continue 'rounds;
             }
             finished = true;
             break;
@@ -1456,6 +1612,9 @@ pub async fn run_session_turn(
                 opts.reasoning_field.clone(),
             );
             let seen = state.file_seen_for(id);
+            // A live token: pause/interrupt (Esc, mid-turn message)
+            // kills in-flight commands instead of waiting them out.
+            let tool_cancel = ctx.handle.cancel_token();
             let tool_ctx = atom_tools::ToolCtx {
                 cwd: cwd.clone(),
                 session_id: id.to_string(),
@@ -1466,6 +1625,7 @@ pub async fn run_session_turn(
                 approver: &approver,
                 spawner: Some(&bridge),
                 file_seen: Some(seen.as_ref()),
+                cancel: Some(&tool_cancel),
             };
             let mut outcome =
                 atom_tools::execute_tool(&tool_ctx, &tc.function.name, &tc.function.arguments)
@@ -1509,8 +1669,10 @@ pub async fn run_session_turn(
                         ..Default::default()
                     });
                 }
-                finish_paused_turn(state, sess, &out, id).await;
-                end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
+                finish_paused_turn(
+                    state, sess, &out, id, &ctx, &parent_id, &opts, &key, &base_url,
+                )
+                .await;
                 return;
             }
         }

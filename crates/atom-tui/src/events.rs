@@ -223,12 +223,12 @@ pub enum Effect {
         id: String,
     },
     PauseTurn,
-    /// Mid-stream submit: pause the running turn via the server first,
-    /// then dial the /send stream for the interruption. The message
-    /// rides in the request so the App never stores a copy of the
-    /// submitted prompt.
-    InterruptTurn {
-        pause_turn_id: String,
+    /// Mid-turn submit: the prompt is handed to the running turn
+    /// (POST /send queues it on the live turn; the server answers with
+    /// a tiny {"type":"injected"} stream and closes). Nothing is
+    /// paused and the already-open event stream keeps painting; the
+    /// App never stores a copy of the submitted prompt.
+    InjectTurn {
         req: Box<SendRequest>,
     },
     Compact {

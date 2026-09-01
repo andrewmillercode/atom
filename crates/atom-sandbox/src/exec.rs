@@ -15,20 +15,26 @@
 use crate::approvals::{ApprovalRequest, ApprovalStore, Approver};
 use crate::policy::{prefix_for_command, RuleMatch, SandboxConfig};
 use crate::rules::{self, Analysis, Verdict};
+use atom_core::cancel::CancelToken;
 use atom_core::session::store::data_dir;
 use atom_core::util::sha256_hash;
 use once_cell::sync::Lazy;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Mutex;
-use std::time::Duration;
-use tokio::process::Command;
+use std::time::{Duration, Instant};
+use tokio::process::{Child, Command};
 
 /// Hard wall-clock limit for one command. v2 has no confinement, so
 /// this is just a runaway safety net.
 pub const EXEC_TIMEOUT: Duration = Duration::from_secs(120);
 
-const BASH: &str = "/bin/bash";
+/// How long a command may run foreground before the bash tool hands it
+/// to the job registry and returns the job id (agent keeps the turn,
+/// the command keeps running, output lands in the job's log file).
+pub const HEAD_START: Duration = Duration::from_secs(10);
+
+pub(crate) const BASH: &str = "/bin/bash";
 
 /// Process-global approval store backed by sandbox.json. Held behind a
 /// `Lazy` so the disk read happens once on first use; per-process
@@ -73,6 +79,12 @@ pub struct ExecOutcome {
     /// v2: always `ConfineKind::None`. Field kept so audit log records
     /// stay well-formed and downstream code keeps compiling.
     pub confined: ConfineKind,
+    /// Set when the command outlived its foreground budget and
+    /// continued as a background job: the job id.
+    pub backgrounded: Option<String>,
+    /// Set when the command was killed because the turn was cancelled
+    /// (Esc / interruption) while it ran.
+    pub cancelled: bool,
 }
 
 impl Default for ExecOutcome {
@@ -85,6 +97,8 @@ impl Default for ExecOutcome {
             verdict: Analysis::default(),
             approved: false,
             confined: ConfineKind::None,
+            backgrounded: None,
+            cancelled: false,
         }
     }
 }
@@ -140,6 +154,69 @@ pub async fn run_with(
     cfg: &SandboxConfig,
     approver: &dyn Approver,
 ) -> ExecOutcome {
+    // 1-3. analyze → guardrail floor → approval gate.
+    let authed = match authorize(
+        data_dir_path,
+        cmd,
+        cwd,
+        workspace_root,
+        session_id,
+        cfg,
+        approver,
+    )
+    .await
+    {
+        Err(blocked) => return blocked,
+        Ok(authed) => authed,
+    };
+
+    // 4. spawn (with env scrub + per-session tmpdir).
+    let tmpdir = match setup_session_tmpdir(session_id, data_dir_path) {
+        Ok(t) => Some(t),
+        Err(e) => {
+            // tmpdir failure is non-fatal; the command still runs in the
+            // host's $TMPDIR. Audit notes the fallback.
+            eprintln!("atom: failed to create session tmpdir: {e}");
+            None
+        }
+    };
+
+    let mut outcome = spawn_and_wait(tmpdir.as_ref().map(|t| t.path()), cmd, cwd).await;
+    outcome.verdict = authed.verdict.clone();
+    outcome.approved = authed.approved;
+    outcome.confined = ConfineKind::None;
+    audit(
+        data_dir_path,
+        session_id,
+        cmd,
+        &authed.verdict,
+        authed.decision,
+        &outcome,
+        None,
+    );
+
+    if let Some(t) = tmpdir {
+        if let Err(e) = t.cleanup() {
+            eprintln!("atom: failed to remove session tmpdir: {e}");
+        }
+    }
+    outcome
+}
+
+/// The head of the pipeline shared by every execution mode: static
+/// analysis, the guardrail floor, and the approval gate. Returns the
+/// verdict + approval decision, or a fully-audited blocking
+/// ExecOutcome (deny / not approved).
+#[allow(clippy::result_large_err)]
+async fn authorize(
+    data_dir_path: &Path,
+    cmd: &str,
+    cwd: &Path,
+    workspace_root: &Path,
+    session_id: &str,
+    cfg: &SandboxConfig,
+    approver: &dyn Approver,
+) -> Result<Authed, ExecOutcome> {
     // 1. analyze
     let verdict = rules::analyze_full(cmd, workspace_root, cwd, false);
 
@@ -163,7 +240,7 @@ pub async fn run_with(
             &outcome,
             None,
         );
-        return outcome;
+        return Err(outcome);
     }
 
     // 3. approval gate: Tier 1 → Allow (no prompt), Tier 2 → prompt.
@@ -212,44 +289,300 @@ pub async fn run_with(
                         &outcome,
                         None,
                     );
-                    return outcome;
+                    return Err(outcome);
                 }
             }
         }
         Verdict::Deny => unreachable!(),
     }
+    Ok(Authed {
+        verdict,
+        approved,
+        decision,
+    })
+}
 
-    // 4. spawn (with env scrub + per-session tmpdir).
+/// Verdict + approval decision from [`authorize`].
+struct Authed {
+    verdict: Analysis,
+    approved: bool,
+    decision: &'static str,
+}
+
+/// How the bash tool wants a command to run.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BashMode {
+    /// Background by default: wait out a short head start for an
+    /// inline result; if the command is still running, hand the child
+    /// to the registry and return its job id. A mid-turn prompt
+    /// (registry flush) ends the wait early.
+    Background,
+    /// Hand the child to the registry immediately and return the job
+    /// id; the command keeps running.
+    Detach,
+    /// Block until exit (or EXEC_TIMEOUT). Ignores prompt acceleration:
+    /// the agent chose to wait on this result.
+    Block,
+}
+
+/// The bash tool's entry point: like [`run`] but with a cancellation
+/// token (turn pause/interrupt) and the background-job wait. When the
+/// wait ends without an exit, the outcome carries the job id; on
+/// cancellation the child's process group is killed and the partial
+/// output is returned.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_tool(
+    cmd: &str,
+    cwd: &Path,
+    workspace_root: &Path,
+    session_id: &str,
+    cfg: &SandboxConfig,
+    approver: &dyn Approver,
+    mode: BashMode,
+    cancel: Option<&CancelToken>,
+) -> ExecOutcome {
+    run_tool_with(
+        &data_dir(),
+        cmd,
+        cwd,
+        workspace_root,
+        session_id,
+        cfg,
+        approver,
+        mode,
+        HEAD_START,
+        cancel,
+    )
+    .await
+}
+
+/// [`run_tool`] with an explicit data dir (hermetic tests) and head
+/// start (tests don't wait out the real 10s).
+#[allow(clippy::too_many_arguments)]
+pub async fn run_tool_with(
+    data_dir_path: &Path,
+    cmd: &str,
+    cwd: &Path,
+    workspace_root: &Path,
+    session_id: &str,
+    cfg: &SandboxConfig,
+    approver: &dyn Approver,
+    mode: BashMode,
+    head_start: Duration,
+    cancel: Option<&CancelToken>,
+) -> ExecOutcome {
+    let authed = match authorize(
+        data_dir_path,
+        cmd,
+        cwd,
+        workspace_root,
+        session_id,
+        cfg,
+        approver,
+    )
+    .await
+    {
+        Err(blocked) => return blocked,
+        Ok(authed) => authed,
+    };
+
     let tmpdir = match setup_session_tmpdir(session_id, data_dir_path) {
         Ok(t) => Some(t),
         Err(e) => {
-            // tmpdir failure is non-fatal; the command still runs in the
-            // host's $TMPDIR. Audit notes the fallback.
             eprintln!("atom: failed to create session tmpdir: {e}");
             None
         }
     };
+    let tmp_path = tmpdir.as_ref().map(|t| t.path().to_path_buf());
 
-    let mut outcome = spawn_and_wait(tmpdir.as_ref().map(|t| t.path()), cmd, cwd).await;
-    outcome.verdict = verdict.clone();
-    outcome.approved = approved;
-    outcome.confined = ConfineKind::None;
-    audit(
+    // One spawn-and-register path: every command is a job from spawn
+    // time, with output streaming into its per-job log file. The child
+    // stays with the caller while the tool waits for an inline result;
+    // the registry entry is filled in (attach) or dropped (remove)
+    // depending on how the wait ends.
+    let (job_id, out_path, mut child) = match crate::jobs::spawn_registered(
         data_dir_path,
         session_id,
         cmd,
-        &verdict,
-        decision,
-        &outcome,
-        None,
-    );
+        cwd,
+        tmp_path.as_deref(),
+    ) {
+        Ok(spawned) => spawned,
+        Err(err) => {
+            let outcome = ExecOutcome {
+                exit_code: -1,
+                stderr: format!("{err}\n"),
+                approved: authed.approved,
+                verdict: authed.verdict.clone(),
+                confined: ConfineKind::None,
+                ..Default::default()
+            };
+            audit(
+                data_dir_path,
+                session_id,
+                cmd,
+                &authed.verdict,
+                authed.decision,
+                &outcome,
+                None,
+            );
+            return outcome;
+        }
+    };
 
+    // `background: true`: the job id comes back immediately, no wait.
+    if mode == BashMode::Detach {
+        crate::jobs::attach(&job_id, child);
+        let outcome = ExecOutcome {
+            exit_code: 0,
+            stdout: read_log(&out_path),
+            approved: authed.approved,
+            verdict: authed.verdict.clone(),
+            confined: ConfineKind::None,
+            backgrounded: Some(job_id),
+            ..Default::default()
+        };
+        audit(
+            data_dir_path,
+            session_id,
+            cmd,
+            &authed.verdict,
+            authed.decision,
+            &outcome,
+            Some("backgrounded"),
+        );
+        return outcome;
+    }
+
+    let started = Instant::now();
+    let mut cancelled = false;
+    let mut timed_out = false;
+    let mut handoff = false;
+    let mut status: Option<std::process::ExitStatus> = None;
+    let cancel_wait = async {
+        match cancel {
+            Some(t) => t.cancelled().await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    // The inline wait: the head start, cut short by a mid-turn prompt
+    // (registry flush). Block mode never hands off — the agent asked
+    // to wait for this result, capped at EXEC_TIMEOUT.
+    let head_start_wait = async {
+        if mode == BashMode::Block {
+            std::future::pending::<()>().await;
+        }
+        loop {
+            if crate::jobs::flushed(&job_id) || started.elapsed() >= head_start {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    tokio::select! {
+        biased;
+        _ = cancel_wait, if cancel.is_some() => {
+            kill_group(&mut child).await;
+            cancelled = true;
+        }
+        res = child.wait() => status = res.ok(),
+        _ = head_start_wait => handoff = true,
+        _ = tokio::time::sleep(EXEC_TIMEOUT), if mode == BashMode::Block => {
+            kill_group(&mut child).await;
+            timed_out = true;
+        }
+    }
+
+    if handoff {
+        // Still running when the head start ran out (or a prompt
+        // accelerated the handoff): the same child, now owned by the
+        // registry, keeps running as the job.
+        crate::jobs::attach(&job_id, child);
+        let outcome = ExecOutcome {
+            exit_code: 0,
+            stdout: read_log(&out_path),
+            approved: authed.approved,
+            verdict: authed.verdict.clone(),
+            confined: ConfineKind::None,
+            backgrounded: Some(job_id),
+            ..Default::default()
+        };
+        audit(
+            data_dir_path,
+            session_id,
+            cmd,
+            &authed.verdict,
+            authed.decision,
+            &outcome,
+            Some("backgrounded"),
+        );
+        return outcome;
+    }
+
+    // Inline result: the registry entry and log file were only
+    // scaffolding for the wait — remove both, exactly like a command
+    // that never became a job.
+    crate::jobs::remove(&job_id);
+    let output = read_log(&out_path);
+    let _ = std::fs::remove_file(&out_path);
     if let Some(t) = tmpdir {
         if let Err(e) = t.cleanup() {
             eprintln!("atom: failed to remove session tmpdir: {e}");
         }
     }
+    let exit_code = status
+        .as_ref()
+        .map(|s| s.code().unwrap_or(-1))
+        .unwrap_or(-1);
+    let outcome = ExecOutcome {
+        exit_code,
+        stdout: output,
+        stderr: String::new(),
+        timed_out,
+        cancelled,
+        approved: authed.approved,
+        verdict: authed.verdict.clone(),
+        confined: ConfineKind::None,
+        backgrounded: None,
+    };
+    let note = if cancelled {
+        Some("cancelled")
+    } else if timed_out {
+        Some("timeout")
+    } else {
+        None
+    };
+    audit(
+        data_dir_path,
+        session_id,
+        cmd,
+        &authed.verdict,
+        authed.decision,
+        &outcome,
+        note,
+    );
     outcome
+}
+
+/// SIGKILL the child's whole process group and reap it. The child was
+/// spawned with process_group(0), so its pgid == its pid.
+async fn kill_group(child: &mut Child) {
+    let pid = child.id().unwrap_or(0) as i32;
+    if pid > 0 {
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+/// Read a job/foreground log; "" if it doesn't exist yet.
+fn read_log(out_path: &Path) -> String {
+    match std::fs::read(out_path) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+        Err(_) => String::new(),
+    }
 }
 
 /// RAII guard for the per-session scratch directory under
@@ -561,6 +894,192 @@ mod tests {
         assert_eq!(out.verdict.verdict, Verdict::Allow);
     }
 
+    // ---- background jobs + cancellation ----
+
+    fn unique_session() -> String {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("jobsess-{}-{n}", std::process::id())
+    }
+
+    #[tokio::test]
+    async fn slow_command_returns_job_id_and_job_keeps_running() {
+        let e = env();
+        let sid = unique_session();
+        let out = run_tool_with(
+            e._data.path(),
+            "echo starting; sleep 5; echo done",
+            e._ws.path(),
+            e._ws.path(),
+            &sid,
+            &default_cfg(),
+            &AutoApprover(Decision::AllowOnce),
+            BashMode::Background,
+            Duration::from_millis(400),
+            None,
+        )
+        .await;
+        let job_id = out
+            .backgrounded
+            .expect("command past the head start hands off to the registry");
+        assert_eq!(out.exit_code, 0);
+        assert!(!out.cancelled && !out.timed_out);
+
+        // The job was registered at spawn and keeps running under the
+        // same id.
+        let status = crate::jobs::check(&sid, &[job_id.clone()]);
+        assert_eq!(status.len(), 1);
+        assert!(status[0].contains("running"), "{}", status[0]);
+        assert!(status[0].contains("echo starting"), "{}", status[0]);
+
+        // wait blocks for completion and reports the exit.
+        let lines = crate::jobs::wait(&sid, &[job_id.clone()], Duration::from_secs(10)).await;
+        assert!(lines[0].contains("exited 0"), "{}", lines[0]);
+        assert!(lines[0].contains("done"), "{}", lines[0]);
+        // Log files live under dataDir()/jobs/<session>/.
+        let log = e
+            ._data
+            .path()
+            .join("jobs")
+            .join(sid.trim_start_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-'))
+            .join(format!("{job_id}.log"));
+        assert!(log.exists(), "job log missing at {log:?}; lines={lines:?}");
+    }
+
+    /// A mid-turn prompt flags the registry (flush_wait); the in-flight
+    /// tool call returns its job id right away instead of waiting out
+    /// the head start.
+    #[tokio::test]
+    async fn flush_wait_returns_the_job_id_immediately() {
+        let e = env();
+        let started = std::time::Instant::now();
+        let data = e._data.path().to_path_buf();
+        let ws = e._ws.path().to_path_buf();
+        let waiter = tokio::spawn(async move {
+            run_tool_with(
+                &data,
+                "sleep 30",
+                &ws,
+                &ws,
+                "flush-sess",
+                &default_cfg(),
+                &AutoApprover(Decision::AllowOnce),
+                BashMode::Background,
+                Duration::from_secs(60),
+                None,
+            )
+            .await
+        });
+        // Land the prompt ~1s into the 30s command: the tool call must
+        // give up the wait long before its 60s head start.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        crate::jobs::flush_wait("flush-sess");
+        let out = waiter.await.unwrap();
+        let job_id = out
+            .backgrounded
+            .expect("flush should hand off the still-running command");
+        assert!(!out.cancelled);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "flush should return immediately, took {elapsed:?}"
+        );
+        // The job keeps running in the registry.
+        let status = crate::jobs::check("flush-sess", &[job_id.clone()]);
+        assert!(status[0].contains("running"), "{}", status[0]);
+        crate::jobs::kill("flush-sess", &[job_id]).await;
+    }
+
+    #[tokio::test]
+    async fn cancel_kills_foreground_command_promptly() {
+        let e = env();
+        let sid = unique_session();
+        let token = CancelToken::new();
+        let t2 = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            t2.cancel();
+        });
+        let started = std::time::Instant::now();
+        let out = run_tool_with(
+            e._data.path(),
+            "sleep 30",
+            e._ws.path(),
+            e._ws.path(),
+            &sid,
+            &default_cfg(),
+            &AutoApprover(Decision::AllowOnce),
+            BashMode::Block,
+            EXEC_TIMEOUT,
+            Some(&token),
+        )
+        .await;
+        assert!(out.cancelled, "expected a cancelled outcome");
+        assert!(out.backgrounded.is_none());
+        // Killed, not waited out: well under the 30s the command wanted.
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // The registry entry + log were scaffolding for the wait.
+        assert!(
+            crate::jobs::check(&sid, &[]).is_empty(),
+            "cancelled command leaves no job behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn detach_mode_returns_job_id_immediately_and_kill_stops_the_group() {
+        let e = env();
+        let sid = unique_session();
+        let out = run_tool_with(
+            e._data.path(),
+            "sleep 30",
+            e._ws.path(),
+            e._ws.path(),
+            &sid,
+            &default_cfg(),
+            &AutoApprover(Decision::AllowOnce),
+            BashMode::Detach,
+            HEAD_START,
+            None,
+        )
+        .await;
+        let job_id = out.backgrounded.expect("detach mode returns a job id");
+        let status = crate::jobs::check(&sid, &[]);
+        assert!(status.iter().any(|s| s.contains(&job_id)), "{status:?}");
+
+        let lines = crate::jobs::kill(&sid, &[job_id.clone()]).await;
+        assert!(lines[0].contains("killed"), "{}", lines[0]);
+        let after = crate::jobs::check(&sid, &[job_id]);
+        assert!(after[0].contains("exited"), "{}", after[0]);
+    }
+
+    #[tokio::test]
+    async fn quick_command_completes_inline_and_leaves_no_job() {
+        let e = env();
+        let sid = unique_session();
+        let out = run_tool_with(
+            e._data.path(),
+            "echo quick",
+            e._ws.path(),
+            e._ws.path(),
+            &sid,
+            &default_cfg(),
+            &AutoApprover(Decision::AllowOnce),
+            BashMode::Background,
+            Duration::from_secs(5),
+            None,
+        )
+        .await;
+        assert_eq!(out.stdout.trim_end(), "quick");
+        assert_eq!(out.exit_code, 0);
+        assert!(out.backgrounded.is_none() && !out.cancelled);
+        // Inline delivery removes the job entry (and its log file).
+        assert!(
+            crate::jobs::check(&sid, &[]).is_empty(),
+            "{:?}",
+            crate::jobs::check(&sid, &[])
+        );
+    }
+
     #[tokio::test]
     async fn deny_verdict_short_circuits_without_executing() {
         struct Panic;
@@ -725,12 +1244,10 @@ mod tests {
     #[tokio::test]
     async fn per_session_tmpdir_is_created_and_set() {
         let e = env();
-        // Use a custom TMPDIR parent so we don't litter /tmp.
-        let parent = tempfile::tempdir().unwrap();
-        // SAFETY: single-threaded test for env mutation.
-        unsafe {
-            std::env::set_var("TMPDIR", parent.path());
-        }
+        // Note: no TMPDIR mutation here — it is process-global and would
+        // make other tests' tempdirs nest inside `parent`, which this
+        // test then deletes. HOST_TMPDIR is computed once per process
+        // anyway, so the assertion below doesn't depend on it.
         let out = run_with(
             e._data.path(),
             "echo $TMPDIR",
@@ -747,9 +1264,6 @@ mod tests {
             "stdout: {}",
             out.stdout
         );
-        unsafe {
-            std::env::remove_var("TMPDIR");
-        }
     }
 
     #[test]

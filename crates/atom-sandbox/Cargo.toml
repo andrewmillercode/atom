@@ -17,6 +17,7 @@ glob = { workspace = true }
 chrono = { workspace = true }
 tempfile = { workspace = true }
 atom-core = { workspace = true }
+libc.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

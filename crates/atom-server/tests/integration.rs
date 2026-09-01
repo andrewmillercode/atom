@@ -751,22 +751,23 @@ async fn events_stream_and_last_viewer_cancels_turns() {
     assert!(cancelled, "last subscriber leaving must cancel the turn");
 }
 
-/// A stale server-side turn must never brick a session: /send answers
-/// 409 while the turn is registered, the pause endpoint clears it (and
-/// waits for the turn to unwind), and the retried /send is accepted.
-/// This is the contract the TUI relies on to self-heal a desync between
-/// its "idle" composer state and the server's active-turn table, instead
-/// of surfacing "session already has an active turn" to the user.
+/// A mid-turn prompt is injected into the live turn instead of
+/// conflicting: /send is accepted, answers with a tiny injected stream,
+/// cancels only the provider round, and queues the prompt on the turn
+/// handle. The pause route (Esc) remains the hard stop, and a send to
+/// an idle session starts a normal turn.
 #[tokio::test(flavor = "multi_thread")]
-async fn send_conflict_clears_after_pause_and_retry() {
-    let env = TestEnv::new("send-conflict");
+async fn send_mid_turn_injects_into_live_turn() {
+    let env = TestEnv::new("send-inject");
     let state = spawn_server(&env, off_cfg()).await;
     let sess = state.store.create("m", "/tmp", vec![]);
     let sid = sess.id.clone();
 
-    // A live turn the client no longer knows about: it stops (end_turn)
-    // as soon as it is paused, the way run_session_turn unwinds.
-    let handle = state.turns.start_turn(&sid, "stale");
+    // A live turn with a registered provider round. /send must hand the
+    // prompt to it: no pause, no 409, and only the round is cancelled.
+    let handle = state.turns.start_turn(&sid, "live");
+    let round = atom_server::cancel::CancelToken::new();
+    handle.set_round_cancel(Some(round.clone()));
     {
         let handle = handle.clone();
         let state = state.clone();
@@ -777,15 +778,27 @@ async fn send_conflict_clears_after_pause_and_retry() {
         });
     }
 
-    // The send is rejected with the conflict the TUI must never surface.
-    let err = client::stream_send(&sid, &json!({"message": "hello", "turn_id": "t2"}))
+    // The send is accepted: a tiny injected stream, then close.
+    let mut rx = client::stream_send(&sid, &json!({"message": "hello", "turn_id": "t2"}))
         .await
-        .expect_err("send must conflict while a turn is active");
-    assert!(err.to_string().starts_with("409: "), "got: {err}");
-    assert!(err.to_string().contains("already has an active turn"));
+        .expect("mid-turn send must be accepted, not conflict");
+    let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .expect("injected stream open");
+    assert_eq!(first["type"], "injected");
+    assert!(rx.recv().await.is_none(), "injected stream closes");
 
-    // Pause every active turn of the session (the TUI's heal path);
-    // the server waits for the turn to unwind before answering.
+    // Only the provider round was cancelled; the turn lives on and the
+    // prompt is queued for the next round.
+    assert!(round.is_cancelled());
+    assert!(!handle.is_cancelled());
+    let pending = handle.take_pending();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].content, "hello");
+
+    // Esc (the pause route) remains the hard stop; once the turn is
+    // gone, a send starts a normal turn again.
     client::post(
         &format!("/api/sessions/{sid}/pause"),
         &json!({"turn_id": ""}),
@@ -795,10 +808,9 @@ async fn send_conflict_clears_after_pause_and_retry() {
     assert!(handle.is_cancelled());
     assert!(!state.turns.session_has_active_turn(&sid));
 
-    // The retried send is accepted and streams events.
-    let mut rx = client::stream_send(&sid, &json!({"message": "hello", "turn_id": "t2"}))
+    let mut rx = client::stream_send(&sid, &json!({"message": "again", "turn_id": "t3"}))
         .await
-        .expect("send must be accepted after the pause");
+        .expect("send must be accepted once the session is idle");
     let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
         .await
         .unwrap()

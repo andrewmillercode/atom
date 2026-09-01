@@ -45,8 +45,13 @@ pub fn builtin_tool_definitions() -> Vec<ToolDef> {
         visualize_def(),
         def(
             "bash",
-            "Run commands needing shell: tests, builds, git, package managers. Last resort — only when no other builtin tool can do the job. Never use bash to search files or web: use glob and grep instead; file reads and changes belong in read_file, write_file, edit_file.",
-            r#"{"type":"object","properties":{"command":{"type":"string","description":"Command to run from session workspace"}},"required":["command"]}"#,
+            "Run commands needing shell: tests, builds, git, package managers. Last resort — only when no other builtin tool can do the job. Commands run in the background by default: the tool returns the result inline when the command finishes quickly (a ~10s head start), otherwise immediately with a job id while the command keeps running; a mid-turn user prompt accelerates the handoff. Check progress with the jobs tool, action=wait to block for completion. Pass background:false only when the next step truly depends on the result within the same round (120s cap). Never use bash to search files or web: use glob and grep instead; file reads and changes belong in read_file, write_file, edit_file.",
+            r#"{"type":"object","properties":{"command":{"type":"string","description":"Command to run from session workspace"},"background":{"type":"boolean","description":"Omit (default): background by default — inline result if quick, otherwise a job id. true: return the job id immediately, no wait. false: block for the result (120s cap)."}},"required":["command"]}"#,
+        ),
+        def(
+            "jobs",
+            "Check, wait for, or kill background commands started by the bash tool (every command is a job; quick ones finish and report inline). action=check returns status, command and output tail for the session's jobs (ids empty = all). action=wait blocks until the selected jobs exit or timeout_ms (default 30000) elapses. action=kill terminates their whole process group. Use check between other tool calls to keep a long build moving without blocking.",
+            r#"{"type":"object","properties":{"action":{"type":"string","enum":["check","wait","kill"],"description":"Operation. Default check."},"ids":{"type":"array","items":{"type":"string"},"description":"Job ids to target; empty = all of this session's jobs"},"timeout_ms":{"type":"integer","description":"wait only: max ms to block, default 30000"}}}"#,
         ),
         dispatch_def(),
         skill_def(),
@@ -171,12 +176,13 @@ mod tests {
                 "glob",
                 "visualize",
                 "bash",
+                "jobs",
                 "dispatch",
                 "skill",
                 "customize",
             ]
         );
-        assert_eq!(crate::tool_definitions().len(), 13);
+        assert_eq!(crate::tool_definitions().len(), 14);
     }
 
     #[test]
@@ -202,7 +208,7 @@ mod tests {
         assert_eq!(without_tool(&tools, "dispatch").len(), tools.len());
         // Stripping everything but keeping order otherwise.
         let no_bash = without_tool(&crate::tool_definitions(), "bash");
-        assert_eq!(no_bash.len(), 12);
+        assert_eq!(no_bash.len(), 13);
         assert_eq!(no_bash[4].function.name, "edit_file");
     }
 }

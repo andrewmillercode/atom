@@ -9,6 +9,7 @@ use crate::{
     customize, file_edit, read_file, search, skills, vector_search, visualize, web_fetch,
     web_search,
 };
+use atom_core::cancel::CancelToken;
 use atom_core::types::ImageData;
 use atom_sandbox::approvals::Approver;
 use atom_sandbox::policy::SandboxConfig;
@@ -31,7 +32,8 @@ pub(crate) fn empty_arguments_msg(tool: &str) -> String {
 
 /// Everything a tool call needs: session identity, provider plumbing for
 /// dispatch turns, sandbox policy, the approval gate, the subagent
-/// spawner, and the per-session seen-file cache.
+/// spawner, the per-session seen-file cache, and the turn's
+/// cancellation token (Esc / interruption kills in-flight commands).
 pub struct ToolCtx<'a> {
     pub cwd: PathBuf,
     pub session_id: String,
@@ -46,6 +48,10 @@ pub struct ToolCtx<'a> {
     /// Per-session fileSeen cache (Go keeps it on Session). None means
     /// write_file/edit_file always report "not been read".
     pub file_seen: Option<&'a FileSeen>,
+    /// Turn cancellation: a cancelled token makes in-flight bash return
+    /// immediately (killing the command) instead of running to its
+    /// timeout. None in tests.
+    pub cancel: Option<&'a CancelToken>,
 }
 
 /// Resolve a model-supplied path against the session workspace. Tool code
@@ -133,6 +139,7 @@ pub async fn execute_tool(ctx: &ToolCtx<'_>, name: &str, args_json: &str) -> Too
         "write_file" => file_edit::execute_write_file(args_json, ctx).await,
         "edit_file" => file_edit::execute_edit_file(args_json, ctx).await,
         "bash" => execute_bash(args_json, ctx).await,
+        "jobs" => execute_jobs(args_json, ctx).await,
         _ => {
             if name.starts_with("mcp_") {
                 return ToolOutcome::from_text(
@@ -149,17 +156,26 @@ pub async fn execute_tool(ctx: &ToolCtx<'_>, name: &str, args_json: &str) -> Too
     }
 }
 
-/// Bash via the sandbox pipeline. Output shapes mirror Go's
-/// CombinedOutput handling:
+/// Bash via the sandbox pipeline. Background by default: the result
+/// comes back inline when the command finishes quickly (a ~10s head
+/// start — cut short by a mid-turn prompt), otherwise the call returns
+/// the job id immediately and the command keeps running; an explicit
+/// `background: false` blocks up to the sandbox timeout. Output shapes
+/// mirror Go's CombinedOutput handling:
 /// - success: TrimSpace(stdout+stderr)
 /// - non-zero exit: "exit status N\n<combined output>"
 /// - policy refusal / not approved: the sandbox's explanatory stderr
-/// - timeout: an error line (Go had no timeout at all).
+/// - timeout / cancel / job handoff: an explanatory line.
 async fn execute_bash(args_json: &str, ctx: &ToolCtx<'_>) -> ToolOutcome {
     #[derive(serde::Deserialize)]
     struct Args {
         #[serde(default)]
         command: String,
+        /// None (default): background by default — inline result when
+        /// quick, otherwise the job id. false: block until exit (or
+        /// the sandbox timeout). true: job id immediately, no wait.
+        #[serde(default)]
+        background: Option<bool>,
     }
     if args_json.trim().is_empty() {
         return ToolOutcome::from_text(empty_arguments_msg("bash"));
@@ -168,16 +184,45 @@ async fn execute_bash(args_json: &str, ctx: &ToolCtx<'_>) -> ToolOutcome {
         Ok(a) => a,
         Err(e) => return ToolOutcome::from_text(format!("error parsing arguments: {e}")),
     };
-    let out = atom_sandbox::exec::run(
+    let mode = match args.background {
+        None => atom_sandbox::exec::BashMode::Background,
+        Some(false) => atom_sandbox::exec::BashMode::Block,
+        Some(true) => atom_sandbox::exec::BashMode::Detach,
+    };
+    let out = atom_sandbox::exec::run_tool(
         &args.command,
         &ctx.cwd,
         &ctx.cwd,
         &ctx.session_id,
         &ctx.sandbox_cfg,
         ctx.approver,
+        mode,
+        ctx.cancel,
     )
     .await;
 
+    if let Some(job_id) = out.backgrounded {
+        let mut text = format!(
+            "command still running as job {job_id}. \
+             Check progress with the jobs tool (action=check), block for completion \
+             with action=wait, or stop it with action=kill."
+        );
+        let partial = out.stdout.trim();
+        if !partial.is_empty() {
+            text.push_str("\noutput so far:\n");
+            text.push_str(partial);
+        }
+        return ToolOutcome::from_text(text);
+    }
+    if out.cancelled {
+        let mut text = "error: command cancelled by the user".to_string();
+        let partial = out.stdout.trim();
+        if !partial.is_empty() {
+            text.push_str("\npartial output:\n");
+            text.push_str(partial);
+        }
+        return ToolOutcome::from_text(text);
+    }
     if out.timed_out {
         return ToolOutcome::from_text(format!(
             "error: command timed out after {}s",
@@ -194,6 +239,51 @@ async fn execute_bash(args_json: &str, ctx: &ToolCtx<'_>) -> ToolOutcome {
         return ToolOutcome::from_text(format!("exit status {}\n{}", out.exit_code, combined));
     }
     ToolOutcome::from_text(combined.trim().to_string())
+}
+
+/// The `jobs` tool: inspect, wait for, or kill background commands
+/// started by the bash tool. Results belong to the calling session.
+async fn execute_jobs(args_json: &str, ctx: &ToolCtx<'_>) -> ToolOutcome {
+    #[derive(serde::Deserialize)]
+    struct Args {
+        #[serde(default)]
+        action: Option<String>,
+        #[serde(default)]
+        ids: Vec<String>,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+    }
+    if args_json.trim().is_empty() {
+        return ToolOutcome::from_text(empty_arguments_msg("jobs"));
+    }
+    let args: Args = match serde_json::from_str(args_json) {
+        Ok(a) => a,
+        Err(e) => return ToolOutcome::from_text(format!("error parsing arguments: {e}")),
+    };
+    let action = args.action.as_deref().unwrap_or("check");
+    let lines = match action {
+        "check" => atom_sandbox::jobs::check(&ctx.session_id, &args.ids),
+        "wait" => {
+            let timeout = std::time::Duration::from_millis(
+                args.timeout_ms
+                    .unwrap_or(atom_sandbox::jobs::WAIT_TIMEOUT.as_millis() as u64),
+            );
+            atom_sandbox::jobs::wait(&ctx.session_id, &args.ids, timeout).await
+        }
+        "kill" => atom_sandbox::jobs::kill(&ctx.session_id, &args.ids).await,
+        _other => {
+            return ToolOutcome::from_text(format!(
+                "error: action must be one of check, wait, kill (got \"{action}\")"
+            ))
+        }
+    };
+    if lines.is_empty() {
+        return ToolOutcome::from_text(
+            "no background jobs (start one with the bash tool; long commands become jobs automatically)"
+                .into(),
+        );
+    }
+    ToolOutcome::from_text(lines.join("\n\n"))
 }
 
 #[cfg(test)]
@@ -220,6 +310,7 @@ pub(crate) mod test_support {
             approver: &*ALLOW_ONCE,
             spawner: None,
             file_seen: None,
+            cancel: None,
         }
     }
 
@@ -238,6 +329,7 @@ pub(crate) mod test_support {
             approver: &*ALLOW_ONCE,
             spawner: Some(spawner),
             file_seen: None,
+            cancel: None,
         }
     }
 
@@ -270,6 +362,7 @@ pub(crate) mod test_support {
                 approver,
                 spawner: None,
                 file_seen: Some(&self.seen),
+                cancel: None,
             }
         }
     }
@@ -626,6 +719,111 @@ mod tests {
         let ctx = spawner_ctx(&s);
         let out = execute_tool(&ctx, "dispatch", r#"{"action":"inspect"}"#).await;
         assert!(out.text.contains("\"delegates\""));
+    }
+
+    // ---- background bash + jobs tool ----
+
+    /// Isolates the atom data dir for one test (XDG_DATA_HOME is
+    /// process-global, so a mutex guards concurrent runs; background
+    /// job logs land under dataDir()/jobs/<session>/).
+    struct DataDirEnv {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prev_xdg: Option<std::ffi::OsString>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl DataDirEnv {
+        fn new() -> Self {
+            static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let lock = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+            let dir = tempfile::TempDir::new().unwrap();
+            let prev_xdg = std::env::var_os("XDG_DATA_HOME");
+            std::env::set_var("XDG_DATA_HOME", dir.path());
+            DataDirEnv {
+                _lock: lock,
+                prev_xdg,
+                _dir: dir,
+            }
+        }
+    }
+
+    impl Drop for DataDirEnv {
+        fn drop(&mut self) {
+            match &self.prev_xdg {
+                Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+                None => std::env::remove_var("XDG_DATA_HOME"),
+            }
+        }
+    }
+
+    fn job_id_from(text: &str) -> String {
+        let rest = &text[text.find("job ").expect("job id in result") + 4..];
+        let end = rest
+            .find(|c: char| c.is_whitespace() || c == '.')
+            .unwrap_or(rest.len());
+        rest[..end].to_string()
+    }
+
+    #[tokio::test]
+    async fn bash_background_true_returns_job_id_and_jobs_tool_manages_it() {
+        let _env = DataDirEnv::new();
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+
+        let out = execute_tool(&ctx, "bash", r#"{"command":"sleep 30","background":true}"#).await;
+        assert!(
+            out.text.starts_with("command still running"),
+            "background ack expected: {}",
+            out.text
+        );
+        let job_id = job_id_from(&out.text);
+
+        // jobs check: the job exists and reports running.
+        let out = execute_tool(&ctx, "jobs", r#"{"action":"check"}"#).await;
+        assert!(out.text.contains(&job_id), "{}", out.text);
+        assert!(out.text.contains("running"), "{}", out.text);
+
+        // jobs kill: stops it; a follow-up check reports the exit.
+        let out = execute_tool(
+            &ctx,
+            "jobs",
+            &serde_json::json!({"action": "kill", "ids": [job_id]}).to_string(),
+        )
+        .await;
+        assert!(out.text.contains("killed"), "{}", out.text);
+        let out = execute_tool(
+            &ctx,
+            "jobs",
+            &serde_json::json!({"action": "check", "ids": [job_id]}).to_string(),
+        )
+        .await;
+        assert!(out.text.contains("exited"), "{}", out.text);
+    }
+
+    #[tokio::test]
+    async fn bash_background_false_waits_for_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+        let out = execute_tool(
+            &ctx,
+            "bash",
+            r#"{"command":"echo sync","background":false}"#,
+        )
+        .await;
+        assert_eq!(out.text, "sync");
+    }
+
+    #[tokio::test]
+    async fn jobs_bad_action_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+        let out = execute_tool(&ctx, "jobs", r#"{"action":"explode"}"#).await;
+        assert!(
+            out.text
+                .starts_with("error: action must be one of check, wait, kill"),
+            "{}",
+            out.text
+        );
     }
 
     #[test]

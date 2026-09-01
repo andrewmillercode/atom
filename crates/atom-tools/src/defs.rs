@@ -20,7 +20,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDef> {
     vec![
         def(
             "web_search",
-            "Search web for current info. Returns titles, URLs, snippets. Use when user asks about current events or info not in training data. Keep query concise, then answer from results.",
+            "Search web for current info. Returns titles, URLs, snippets. Use when user asks about current events or info not in training data. Keep query concise, then answer from results. Providers are tried in order (selected first, then parallel, exa, tinyfish, ollama); parallel and exa fall back to their free keyless hosted-MCP routes, so keyless setups still search.",
             r#"{"type":"object","properties":{"query":{"type":"string","description":"Search query"}},"required":["query"]}"#,
         ),
         webfetch_def(),
@@ -57,7 +57,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDef> {
 pub fn webfetch_def() -> ToolDef {
     def(
         "webfetch",
-        "Fetch a single URL and return its content. Format: markdown (default), text, or html. Use when you already have the URL and want its content; use web_search to find URLs first. Read-only. 5MB max, 30s default timeout (max 120s). Bot-challenged sites (Cloudflare, Anubis) may still block. Provider selection lives in Settings; the tool always dispatches through the configured fetch provider with fallback.",
+        "Fetch a single URL and return its content. Format: markdown (default), text, or html. Use when you already have the URL and want its content; use web_search to find URLs first. Read-only. 5MB max, 30s default timeout (max 120s). Bot-challenged sites (Cloudflare, Anubis) may still block. Provider selection lives in Settings; the tool always dispatches through the configured fetch provider with fallback (REST route when a key resolves, then the provider's free hosted-MCP route for parallel and exa), then a direct fetch.",
         r#"{"type":"object","properties":{"url":{"type":"string","description":"The URL to fetch (http or https)"},"format":{"type":"string","enum":["markdown","text","html"],"description":"Output format. Default markdown."},"timeout":{"type":"integer","description":"Timeout in seconds, max 120. Default 30."}},"required":["url"]}"#,
     )
 }

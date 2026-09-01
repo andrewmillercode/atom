@@ -1254,6 +1254,7 @@ pub fn overlay_view_data(app: &App, kind: OverlayKind) -> OverlayViewData {
                         meta: String::new(),
                         marker: String::new(),
                         swatch: Vec::new(),
+                        badges: Vec::new(),
                     }),
                     None => ViewRow::Header(row.label.clone()),
                 })
@@ -1355,6 +1356,7 @@ pub fn overlay_view_data(app: &App, kind: OverlayKind) -> OverlayViewData {
                         meta: String::new(),
                         marker: String::new(),
                         swatch: Vec::new(),
+                        badges: e.caps.iter().map(|c| c.to_string()).collect(),
                     })
                 })
                 .collect();
@@ -1395,6 +1397,7 @@ pub fn overlay_view_data(app: &App, kind: OverlayKind) -> OverlayViewData {
                         meta: String::new(),
                         marker: String::new(),
                         swatch: Vec::new(),
+                        badges: Vec::new(),
                     })
                 })
                 .collect();
@@ -1411,6 +1414,7 @@ pub fn overlay_view_data(app: &App, kind: OverlayKind) -> OverlayViewData {
                         meta: String::new(),
                         marker: String::new(),
                         swatch: Vec::new(),
+                        badges: Vec::new(),
                     })
                 })
                 .collect();
@@ -1442,6 +1446,7 @@ pub fn overlay_view_data(app: &App, kind: OverlayKind) -> OverlayViewData {
                             entry.theme.secondary.clone(),
                             entry.theme.foreground.clone(),
                         ],
+                        badges: Vec::new(),
                     })
                 })
                 .collect();
@@ -1468,6 +1473,7 @@ fn fork_view_rows(app: &App) -> OverlayViewData {
                     meta: String::new(),
                     marker: String::new(),
                     swatch: Vec::new(),
+                    badges: Vec::new(),
                 })
             }
         })
@@ -1588,6 +1594,9 @@ pub fn overlay_spec<'a>(
         footer: data.footer.as_str(),
         loading,
         spinner_frame: app.spinner_frame,
+        // The provider-key prompt is an input-only view: its list is
+        // empty by design, so the "no matches" placeholder is noise.
+        hide_empty_state: kind == OverlayKind::ProviderKey,
     }
 }
 

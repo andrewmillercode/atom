@@ -47,16 +47,18 @@ async fn web_search_with_config(
         return ToolOutcome::from_text("search error: query is empty".into());
     }
     let selected = config.resolved_web_search();
-    // Every bundled provider dispatches over direct HTTP (web_fetch
-    // parity): the selected provider is tried first and the remaining
-    // bundled ones follow as fallback on auth/quota rejections
-    // (401/402/403/429). MCP is the last resort for user-added servers
-    // only and stays single-shot: the user picked that server.
+    // Every bundled provider dispatches over direct HTTP or its
+    // hosted MCP route: the selected provider is tried first and the
+    // remaining bundled ones follow as fallback on auth/quota
+    // rejections (401/402/403/429). MCP is the last resort for
+    // user-added servers only and stays single-shot: the user picked
+    // that server.
     if SEARCH_PROVIDERS.contains(&selected.server.trim()) {
         let order = search_provider_order(&selected.server);
-        let (text, provider) = run_search_chain(&order, &SearchEndpoints::default(), query).await;
+        let (text, provider) =
+            run_search_chain(&order, &SearchEndpoints::default(), query, cwd).await;
         return ToolOutcome {
-            tool_provider: provider.into(),
+            tool_provider: provider,
             ..ToolOutcome::from_text(text)
         };
     }
@@ -69,7 +71,10 @@ async fn web_search_with_config(
 }
 
 /// Bundled search providers in priority order (web_fetch parity).
-const SEARCH_PROVIDERS: [&str; 4] = ["tinyfish", "parallel", "exa", "ollama"];
+/// parallel and exa lead: both serve keyless hosted-MCP routes, so a
+/// keyless setup still searches. tinyfish's free tier requires an API
+/// key on every call; ollama is the keyed last resort.
+const SEARCH_PROVIDERS: [&str; 4] = ["parallel", "exa", "tinyfish", "ollama"];
 
 /// Per-provider search endpoints; injectable so tests run against
 /// local servers. Defaults are the production endpoints.
@@ -108,17 +113,29 @@ fn search_provider_order(selected: &str) -> Vec<&'static str> {
     out
 }
 
-/// A provider joins the chain iff its credentials can be resolved
-/// (env > auth.json > legacy), except tinyfish and parallel which are
-/// always available (free tiers, key optional; exa is paid, ollama
-/// requires a key). Mirrors web_fetch's provider_available, except
-/// ollama search uses the ollama-cloud key resolver.
+/// A provider joins the chain unless it has no usable route. Routes
+/// per provider (search):
+///   - REST adapters need a resolved key (env > auth.json > legacy);
+///     tinyfish and ollama have no keyless variant at all.
+///   - parallel and exa publish hosted MCP endpoints that serve
+///     anonymous calls, so they are usable without a key.
+///
+/// Mirrors web_fetch's provider_available, except ollama search uses
+/// the ollama-cloud key resolver.
 fn search_provider_available(id: &str) -> bool {
     match id {
-        "tinyfish" | "parallel" => true,
-        "ollama" => !ollama_web_search_key().trim().is_empty(),
-        "exa" => !crate::auth_keys::resolve_provider_key(id).trim().is_empty(),
+        "parallel" | "exa" => true,
+        "tinyfish" | "ollama" => !resolve_provider_key_for(id).trim().is_empty(),
         _ => false,
+    }
+}
+
+/// Key resolver per bundled provider id: ollama search shares the
+/// ollama-cloud key resolver in place of a plain provider key.
+fn resolve_provider_key_for(id: &str) -> String {
+    match id {
+        "ollama" => ollama_web_search_key(),
+        _ => crate::auth_keys::resolve_provider_key(id),
     }
 }
 
@@ -126,7 +143,8 @@ async fn run_search_chain(
     order: &[&'static str],
     endpoints: &SearchEndpoints,
     query: &str,
-) -> (String, &'static str) {
+    cwd: &std::path::Path,
+) -> (String, String) {
     let tinyfish_ep = endpoints.tinyfish.clone();
     let parallel_ep = endpoints.parallel.clone();
     let exa_ep = endpoints.exa.clone();
@@ -141,69 +159,143 @@ async fn run_search_chain(
             query.clone(),
         );
         async move {
-            match id {
+            let key = resolve_provider_key_for(id);
+            // Route 1: keyed REST. Skipped silently when no key is
+            // resolved — an unauthenticated call would only burn a 401.
+            let rest = match id {
                 "tinyfish" => {
-                    let client = match provider_client() {
-                        Ok(c) => c,
-                        Err(e) => return Err(e),
-                    };
-                    tinyfish_search_result(
-                        &query,
-                        &tinyfish_ep,
-                        &client,
-                        &crate::auth_keys::resolve_provider_key("tinyfish"),
-                    )
-                    .await
+                    if key.trim().is_empty() {
+                        None
+                    } else {
+                        let client = provider_client()?;
+                        Some(
+                            tinyfish_search_result(&query, &tinyfish_ep, &client, &key)
+                                .await
+                                .map(|text| (text, id.to_string())),
+                        )
+                    }
                 }
                 "parallel" => {
-                    parallel_search_result(
-                        &parallel_ep,
-                        &query,
-                        &crate::auth_keys::resolve_provider_key("parallel"),
-                    )
-                    .await
+                    if key.trim().is_empty() {
+                        None
+                    } else {
+                        Some(
+                            parallel_search_result(&parallel_ep, &query, &key)
+                                .await
+                                .map(|text| (text, id.to_string())),
+                        )
+                    }
                 }
                 "exa" => {
-                    exa_search_result(
-                        &exa_ep,
-                        &query,
-                        &crate::auth_keys::resolve_provider_key("exa"),
-                    )
-                    .await
+                    if key.trim().is_empty() {
+                        None
+                    } else {
+                        Some(
+                            exa_search_result(&exa_ep, &query, &key)
+                                .await
+                                .map(|text| (text, id.to_string())),
+                        )
+                    }
                 }
                 "ollama" => {
-                    let client = match provider_client() {
-                        Ok(c) => c,
-                        Err(e) => return Err(e),
-                    };
-                    ollama_search_result(&ollama_ep, &query, &client, &ollama_web_search_key())
-                        .await
+                    let client = provider_client()?;
+                    Some(
+                        ollama_search_result(&query, &ollama_ep, &client, &key)
+                            .await
+                            .map(|text| (text, id.to_string())),
+                    )
                 }
-                _ => Err(SearchError::Transport(format!("unknown provider {id}"))),
+                _ => return Err(SearchError::Transport(format!("unknown provider {id}"))),
+            };
+            match rest {
+                // No key on a keyed REST adapter: fall through to the
+                // hosted MCP route, or skip the provider entirely when
+                // it has none (tinyfish, ollama).
+                None => match id {
+                    "parallel" | "exa" => mcp_search_route(id, &query, cwd).await,
+                    _ => Err(SearchError::Skip(format!("{id}: no key configured"))),
+                },
+                Some(Ok(success)) => Ok(success),
+                // Auth or quota on REST: try the provider's hosted MCP
+                // route before walking to the next provider.
+                Some(Err(SearchError::AuthOrQuota(msg))) => match id {
+                    "parallel" | "exa" => {
+                        eprintln!("websearch: {id} REST -> {msg}; trying hosted MCP");
+                        mcp_search_route(id, &query, cwd).await
+                    }
+                    _ => Err(SearchError::AuthOrQuota(msg)),
+                },
+                // BadRequest and Transport mean our request is wrong or
+                // the provider is flaky; aborting beats silently hiding it.
+                Some(Err(other)) => Err(other),
             }
         }
     })
     .await
     {
         ChainResult::Success(results, provider) => (results, provider),
-        ChainResult::BadRequest(msg) | ChainResult::Transport(msg) => (
-            format!("search error: {msg}"),
-            "",
-        ),
+        ChainResult::BadRequest(msg) | ChainResult::Transport(msg) => {
+            (format!("search error: {msg}"), String::new())
+        }
         ChainResult::Exhausted(fallbacks) => {
             if fallbacks.is_empty() {
-                ("search error: no search provider configured".to_string(), "")
+                (
+                    "search error: no search provider configured".to_string(),
+                    String::new(),
+                )
             } else {
                 (
                     format!(
                         "search error: all search providers exhausted: {}",
                         fallbacks.join("; ")
                     ),
-                    "",
+                    String::new(),
                 )
             }
         }
     }
+}
+
+/// The keyless-capable hosted MCP route for bundled search profiles
+/// (parallel: `web_search` at search.parallel.ai/mcp, exa:
+/// `web_search_exa` at mcp.exa.ai). Resolves to a `mcp:<provider>`
+/// label so tool results say which route served the call. A stored
+/// key is still attached as an auth header when one resolves, lifting
+/// rate limits for those providers.
+async fn mcp_search_route(
+    provider: &str,
+    query: &str,
+    cwd: &std::path::Path,
+) -> Result<(String, String), SearchError> {
+    let profile = atom_core::config::bundled_web_search_profile(provider)
+        .filter(|p| !p.url.is_empty())
+        .ok_or_else(|| SearchError::Transport(format!("{provider}: no hosted MCP endpoint")))?;
+    let mut headers = std::collections::BTreeMap::new();
+    let key = crate::auth_keys::resolve_provider_key(provider);
+    if let Some((name, value)) = profile_auth_header(provider, &key) {
+        headers.insert(name, value);
+    }
+    let args = if provider == "parallel" {
+        serde_json::json!({"objective": query, "search_queries": [query]})
+    } else {
+        serde_json::json!({profile.query_argument: query})
+    };
+    let override_config = Some(crate::mcp::MCPServerConfig {
+        url: profile.url,
+        headers,
+        typ: "http".into(),
+        ..Default::default()
+    });
+    let result =
+        crate::mcp::execute_mcp_selection(provider, &profile.tool, args, cwd, override_config)
+            .await;
+    if let Some(error) = result.strip_prefix("error: ") {
+        return Err(SearchError::AuthOrQuota(format!("hosted MCP: {error}")));
+    }
+    if result.trim().is_empty() {
+        return Ok(("no results found".to_string(), format!("mcp:{provider}")));
+    }
+    Ok((result, format!("mcp:{provider}")))
 }
 
 /// MCP-routed search: bundled profiles build an HTTP-server override,
@@ -264,7 +356,7 @@ async fn mcp_web_search(
 /// uses a bearer token, exa and tinyfish each use their own api-key
 /// header. Returns None when no key is resolved (TinyFish then falls
 /// back to unauthenticated calls at stricter rate limits).
-fn profile_auth_header(provider: &str, key: &str) -> Option<(String, String)> {
+pub(crate) fn profile_auth_header(provider: &str, key: &str) -> Option<(String, String)> {
     if key.trim().is_empty() {
         return None;
     }
@@ -293,6 +385,11 @@ enum SearchError {
     AuthOrQuota(String),
     BadRequest(String),
     Transport(String),
+    /// The provider has no usable route for the current credentials
+    /// (e.g. a keyed REST adapter with no key stored and no hosted
+    /// MCP fallback). Walk down silently — this is configuration, not
+    /// a failure worth reporting.
+    Skip(String),
 }
 
 impl SearchError {
@@ -303,6 +400,7 @@ impl SearchError {
             SearchError::AuthOrQuota(m) => SearchError::AuthOrQuota(format!("{provider}: {m}")),
             SearchError::BadRequest(m) => SearchError::BadRequest(format!("{provider}: {m}")),
             SearchError::Transport(m) => SearchError::Transport(format!("{provider}: {m}")),
+            SearchError::Skip(m) => SearchError::Skip(format!("{provider}: {m}")),
         }
     }
 }
@@ -312,7 +410,8 @@ impl std::fmt::Display for SearchError {
         match self {
             SearchError::AuthOrQuota(m)
             | SearchError::BadRequest(m)
-            | SearchError::Transport(m) => write!(f, "{m}"),
+            | SearchError::Transport(m)
+            | SearchError::Skip(m) => write!(f, "{m}"),
         }
     }
 }
@@ -341,7 +440,7 @@ fn provider_client() -> Result<reqwest::Client, SearchError> {
 
 /// Outcome of walking the provider chain.
 enum ChainResult {
-    Success(String, &'static str),
+    Success(String, String),
     BadRequest(String),
     Transport(String),
     /// Every available provider rejected us with AuthOrQuota.
@@ -350,27 +449,52 @@ enum ChainResult {
 
 /// Try each available provider in `order`, walking down on
 /// AuthOrQuota errors only. BadRequest and Transport abort the chain
-/// immediately.
+/// immediately. Emits one summary line per call:
+/// `websearch {parallel: 401, exa: 200, tinyfish: skip, ollama: unused}`
+/// (codes documented in `web_chain_log`).
 async fn try_search_chain<F, Fut>(order: &[&'static str], mut attempt: F) -> ChainResult
 where
     F: FnMut(&'static str) -> Fut,
-    Fut: std::future::Future<Output = Result<String, SearchError>>,
+    Fut: std::future::Future<Output = Result<(String, String), SearchError>>,
 {
+    let mut outcomes: Vec<(String, String)> = Vec::new();
     let mut fallbacks: Vec<String> = Vec::new();
     for id in order {
         if !search_provider_available(id) {
+            outcomes.push(((*id).into(), "skip".into()));
             continue;
         }
         match attempt(id).await {
-            Ok(results) => return ChainResult::Success(results, id),
+            Ok((results, provider)) => {
+                outcomes.push(((*id).into(), "200".into()));
+                crate::web_chain_log::log_chain("websearch", order, &outcomes);
+                return ChainResult::Success(results, provider);
+            }
+            Err(SearchError::Skip(_)) => {
+                outcomes.push(((*id).into(), "skip".into()));
+                continue;
+            }
             Err(SearchError::AuthOrQuota(msg)) => {
+                let code = crate::web_chain_log::code_from_msg(&msg, "mcp-err");
+                outcomes.push(((*id).into(), code));
                 eprintln!("websearch: {id} -> {msg}; falling back");
                 fallbacks.push(msg);
             }
-            Err(SearchError::BadRequest(msg)) => return ChainResult::BadRequest(msg),
-            Err(SearchError::Transport(msg)) => return ChainResult::Transport(msg),
+            Err(SearchError::BadRequest(msg)) => {
+                let code = crate::web_chain_log::code_from_msg(&msg, "bad-request");
+                outcomes.push(((*id).into(), code));
+                crate::web_chain_log::log_chain("websearch", order, &outcomes);
+                return ChainResult::BadRequest(msg);
+            }
+            Err(SearchError::Transport(msg)) => {
+                let code = crate::web_chain_log::code_from_msg(&msg, "conn");
+                outcomes.push(((*id).into(), code));
+                crate::web_chain_log::log_chain("websearch", order, &outcomes);
+                return ChainResult::Transport(msg);
+            }
         }
     }
+    crate::web_chain_log::log_chain("websearch", order, &outcomes);
     ChainResult::Exhausted(fallbacks)
 }
 
@@ -830,7 +954,7 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let result = web_search_with_config("latest atom release", cwd.path(), &config).await;
         assert_eq!(
-            result,
+            result.text,
             "search error: unknown MCP server \"not-configured\""
         );
     }
@@ -961,20 +1085,21 @@ mod tests {
         );
         assert_eq!(
             search_provider_order("exa"),
-            vec!["exa", "tinyfish", "parallel", "ollama"]
+            vec!["exa", "parallel", "tinyfish", "ollama"]
         );
         assert_eq!(
             search_provider_order("parallel"),
-            vec!["parallel", "tinyfish", "exa", "ollama"]
+            vec!["parallel", "exa", "tinyfish", "ollama"]
         );
         assert_eq!(
             search_provider_order("ollama"),
-            vec!["ollama", "tinyfish", "parallel", "exa"]
+            vec!["ollama", "parallel", "exa", "tinyfish"]
         );
-        // Unknown/empty selection keeps the base priority order.
+        // Unknown/empty selection keeps the base priority order: the
+        // keyless providers (parallel, exa) first.
         assert_eq!(
             search_provider_order(""),
-            vec!["tinyfish", "parallel", "exa", "ollama"]
+            vec!["parallel", "exa", "tinyfish", "ollama"]
         );
     }
 
@@ -1023,6 +1148,10 @@ mod tests {
     /// the chain instead of stopping with `search error: tinyfish: HTTP 401`.
     #[tokio::test]
     async fn tinyfish_401_falls_back_to_parallel() {
+        // Both REST adapters are keyed now; inject keys so both routes
+        // actually run (same env-injection pattern as the auth tests).
+        std::env::set_var("TINYFISH_API_KEY", "chain-test-tinyfish-key");
+        std::env::set_var("PARALLEL_API_KEY", "chain-test-parallel-key");
         let tinyfish_endpoint = serve(
             status_response("HTTP/1.1 401 Unauthorized", r#"{"error":"invalid key"}"#),
             |_| {},
@@ -1045,12 +1174,16 @@ mod tests {
             &search_provider_order("tinyfish"),
             &chain_endpoints(&tinyfish_endpoint, &parallel_endpoint),
             "what is ollama?",
+            std::path::Path::new("."),
         )
         .await;
         assert_eq!(
-            got,
+            got.0,
             "1. Parallel\n   https://parallel.ai/\n   The search API. Beta."
         );
+        assert_eq!(got.1, "parallel");
+        std::env::remove_var("TINYFISH_API_KEY");
+        std::env::remove_var("PARALLEL_API_KEY");
     }
 
     #[tokio::test]
@@ -1058,36 +1191,33 @@ mod tests {
         // Stub dispatch (web_fetch parity): a stubbed attempt lets the
         // test exercise the walk without depending on which keys exist
         // in the local auth store (exa/ollama availability varies).
+        // Clear the bundled keys so "tinyfish" is availability-skipped
+        // even when run concurrently with the env-injecting tests.
+        std::env::remove_var("TINYFISH_API_KEY");
+        std::env::remove_var("EXA_API_KEY");
         let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
         let calls_c = calls.clone();
         let result = try_search_chain(&["mystery", "tinyfish", "parallel"], move |id| {
             let calls = calls_c.clone();
             async move {
                 calls.lock().unwrap().push(id);
-                match id {
-                    "tinyfish" => Err(SearchError::AuthOrQuota(
-                        "tinyfish: HTTP 401: denied".into(),
-                    )),
-                    _ => Err(SearchError::AuthOrQuota(
-                        "parallel: HTTP 429: slow down".into(),
-                    )),
-                }
+                let r: Result<(String, String), SearchError> = Err(match id {
+                    "tinyfish" => SearchError::AuthOrQuota("tinyfish: HTTP 401: denied".into()),
+                    _ => SearchError::AuthOrQuota("parallel: HTTP 429: slow down".into()),
+                });
+                r
             }
         })
         .await;
         // "mystery" is not a bundled provider and must be skipped
-        // without calling the adapter.
-        assert_eq!(*calls.lock().unwrap(), vec!["tinyfish", "parallel"]);
+        // without calling the adapter. "tinyfish" has no REST key in
+        // the stub environment and no hosted MCP route, so
+        // availability skips it before any call.
+        assert_eq!(*calls.lock().unwrap(), vec!["parallel"]);
         let ChainResult::Exhausted(fallbacks) = result else {
             panic!("expected exhaustion");
         };
-        assert_eq!(
-            fallbacks,
-            vec![
-                "tinyfish: HTTP 401: denied".to_string(),
-                "parallel: HTTP 429: slow down".to_string()
-            ]
-        );
+        assert_eq!(fallbacks, vec!["parallel: HTTP 429: slow down".to_string()]);
     }
 
     #[tokio::test]

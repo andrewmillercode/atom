@@ -172,23 +172,23 @@ pub fn bundled_web_search_profiles() -> Vec<WebSearchProfile> {
             query_argument: "query".into(),
             auth: WebSearchAuth::Optional,
         },
-        // TinyFish exposes a plain REST endpoint, not MCP; atom-tools
-        // routes it to the REST adapter at the web_search call site, so
-        // the profile entry only drives tool-name resolution/defaulting.
+        // TinyFish requires an API key on every call (free at any
+        // wallet balance, but never unauthenticated); it exposes REST
+        // only, so keyless runs skip straight to the next provider.
         WebSearchProfile {
             id: "tinyfish".into(),
             name: "TinyFish Web Search".into(),
             url: "https://api.search.tinyfish.ai".into(),
             tool: "web_search".into(),
             query_argument: "query".into(),
-            auth: WebSearchAuth::Optional,
+            auth: WebSearchAuth::Required,
         },
         // Ollama does not publish a hosted MCP endpoint. atom-tools
         // exposes it through the same selected-capability boundary using
         // the official REST API as a bundled compatibility adapter.
         WebSearchProfile {
             id: "ollama".into(),
-            name: "Ollama Web Search".into(),
+            name: "Ollama Cloud Web Search".into(),
             url: String::new(),
             tool: "web_search".into(),
             query_argument: "query".into(),
@@ -207,40 +207,58 @@ pub fn bundled_web_search_profile(id: &str) -> Option<WebSearchProfile> {
 pub struct WebFetchProfile {
     pub id: String,
     pub name: String,
+    /// REST endpoint (keyed; metered per call where noted).
     pub url: String,
     pub tool: String,
     pub auth: WebSearchAuth,
+    /// Hosted MCP endpoint for the keyless route, if the provider
+    /// publishes one (parallel and exa). Empty = no MCP route.
+    pub mcp_url: String,
+    /// The MCP tool served at `mcp_url` (parallel: `web_fetch`,
+    /// exa: `web_fetch_exa`). Empty when there is no MCP route.
+    pub mcp_tool: String,
 }
 
 pub fn bundled_web_fetch_profiles() -> Vec<WebFetchProfile> {
     vec![
-        WebFetchProfile {
-            id: "tinyfish".into(),
-            name: "TinyFish Web Fetch".into(),
-            url: "https://api.fetch.tinyfish.ai".into(),
-            tool: "web_fetch".into(),
-            auth: WebSearchAuth::Optional,
-        },
         WebFetchProfile {
             id: "parallel".into(),
             name: "Parallel Web Fetch".into(),
             url: "https://api.parallel.ai/v1/extract".into(),
             tool: "web_fetch".into(),
             auth: WebSearchAuth::Optional,
+            mcp_url: "https://search.parallel.ai/mcp".into(),
+            mcp_tool: "web_fetch".into(),
         },
+        // Ordered free -> paid in the picker: parallel and exa serve
+        // keyless hosted-MCP fetch routes; tinyfish and ollama need API
+        // keys on every call.
         WebFetchProfile {
             id: "exa".into(),
             name: "Exa Web Fetch".into(),
             url: "https://api.exa.ai/contents".into(),
             tool: "web_fetch".into(),
+            auth: WebSearchAuth::Optional,
+            mcp_url: "https://mcp.exa.ai/mcp?tools=web_fetch_exa".into(),
+            mcp_tool: "web_fetch_exa".into(),
+        },
+        WebFetchProfile {
+            id: "tinyfish".into(),
+            name: "TinyFish Web Fetch".into(),
+            url: "https://api.fetch.tinyfish.ai".into(),
+            tool: "web_fetch".into(),
             auth: WebSearchAuth::Required,
+            mcp_url: String::new(),
+            mcp_tool: String::new(),
         },
         WebFetchProfile {
             id: "ollama".into(),
-            name: "Ollama Web Fetch".into(),
+            name: "Ollama Cloud Web Fetch".into(),
             url: "https://ollama.com/api/web_fetch".into(),
             tool: "web_fetch".into(),
             auth: WebSearchAuth::Required,
+            mcp_url: String::new(),
+            mcp_tool: String::new(),
         },
     ]
 }
@@ -348,14 +366,27 @@ mod tests {
         assert!(bundled_web_fetch_profile("parallel").is_some());
         assert!(bundled_web_fetch_profile("exa").is_some());
         assert!(bundled_web_fetch_profile("ollama").is_some());
+        // exa serves a keyless hosted-MCP fetch route (web_fetch_exa);
+        // tinyfish is REST-only and always requires an API key.
         assert_eq!(
             bundled_web_fetch_profile("exa").unwrap().auth,
-            WebSearchAuth::Required
+            WebSearchAuth::Optional
         );
         assert_eq!(
             bundled_web_fetch_profile("tinyfish").unwrap().auth,
-            WebSearchAuth::Optional
+            WebSearchAuth::Required
         );
+        for id in ["parallel", "exa"] {
+            let p = bundled_web_fetch_profile(id).unwrap();
+            assert!(!p.mcp_url.is_empty() && !p.mcp_tool.is_empty(), "{id}");
+        }
+        for id in ["tinyfish", "ollama"] {
+            assert!(bundled_web_fetch_profile(id).unwrap().mcp_url.is_empty());
+        }
+        // parallel is the first (free, keyless) fallback in both
+        // bundled orderings.
+        assert_eq!(bundled_web_fetch_profiles()[0].id, "parallel");
+        assert_eq!(bundled_web_search_profiles()[0].id, "parallel");
     }
 
     #[test]

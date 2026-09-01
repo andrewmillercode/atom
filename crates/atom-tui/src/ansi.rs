@@ -92,6 +92,14 @@ pub fn style_tool_name() -> Style {
 pub fn style_tool_hint() -> Style {
     Style::new().fg(c_muted()).bg(c_card_dark())
 }
+/// Approval button key letter: foreground on the prompt-input card color.
+pub fn style_approval_key() -> Style {
+    Style::new().fg(c_foreground()).bg(c_card_light())
+}
+/// Approval button action word: muted on the prompt-input card color.
+pub fn style_approval_word() -> Style {
+    Style::new().fg(c_muted()).bg(c_card_light())
+}
 pub fn style_error() -> Style {
     Style::new().fg(c_secondary())
 }

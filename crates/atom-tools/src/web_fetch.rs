@@ -44,7 +44,7 @@ struct Args {
     timeout: Option<u64>,
 }
 
-pub async fn web_fetch(arguments: &str, _ctx: &ToolCtx<'_>) -> ToolOutcome {
+pub async fn web_fetch(arguments: &str, ctx: &ToolCtx<'_>) -> ToolOutcome {
     if arguments.trim().is_empty() {
         return ToolOutcome::from_text(crate::exec::empty_arguments_msg("webfetch"));
     }
@@ -73,22 +73,82 @@ pub async fn web_fetch(arguments: &str, _ctx: &ToolCtx<'_>) -> ToolOutcome {
     let selected = atom_core::config::load().resolved_web_fetch().server;
     let order = provider_order(&selected);
 
+    let cwd = ctx.cwd.clone();
     match try_provider_chain(&order, |id| {
         let url = args.url.clone();
+        let cwd = cwd.clone();
         async move {
             let key = crate::auth_keys::resolve_provider_key(id);
-            match id {
-                "tinyfish" => fetch_tinyfish(&url, &key, format).await,
-                "parallel" => fetch_parallel(&url, &key, format).await,
-                "exa" => fetch_exa(&url, &key, format).await,
-                "ollama" => fetch_ollama(&url, &key, format).await,
-                _ => Err(FetchError::Transport(format!("unknown provider {id}"))),
+            // Route 1: keyed REST. Skipped silently when no key is
+            // resolved — an unauthenticated call would only burn a 401.
+            let rest = match id {
+                "tinyfish" => {
+                    if key.trim().is_empty() {
+                        None
+                    } else {
+                        Some(
+                            fetch_tinyfish(&url, &key, format)
+                                .await
+                                .map(|o| (o, id.to_string())),
+                        )
+                    }
+                }
+                "parallel" => {
+                    if key.trim().is_empty() {
+                        None
+                    } else {
+                        Some(
+                            fetch_parallel(&url, &key, format)
+                                .await
+                                .map(|o| (o, id.to_string())),
+                        )
+                    }
+                }
+                "exa" => {
+                    if key.trim().is_empty() {
+                        None
+                    } else {
+                        Some(
+                            fetch_exa(&url, &key, format)
+                                .await
+                                .map(|o| (o, id.to_string())),
+                        )
+                    }
+                }
+                "ollama" => Some(
+                    fetch_ollama(&url, &key, format)
+                        .await
+                        .map(|o| (o, id.to_string())),
+                ),
+                _ => return Err(FetchError::Transport(format!("unknown provider {id}"))),
+            };
+            match rest {
+                // No key on a keyed REST adapter: fall through to the
+                // hosted MCP route, or skip the provider entirely when
+                // it has none (tinyfish, ollama).
+                None => match id {
+                    "parallel" | "exa" => mcp_fetch_route(id, &url, &cwd).await,
+                    _ => Err(FetchError::Skip(format!("{id}: no key configured"))),
+                },
+                Some(Ok((outcome, provider))) => Ok((outcome, provider)),
+                // Auth or quota on REST: try the provider's hosted MCP
+                // route before walking to the next provider.
+                Some(Err(FetchError::AuthOrQuota(msg))) => match id {
+                    "parallel" | "exa" => {
+                        eprintln!("webfetch: {id} REST -> {msg}; trying hosted MCP");
+                        mcp_fetch_route(id, &url, &cwd).await
+                    }
+                    _ => Err(FetchError::AuthOrQuota(msg)),
+                },
+                // BadRequest and Transport mean our request is wrong or
+                // the provider is flaky; aborting beats silently hiding it.
+                Some(Err(other)) => Err(other),
             }
         }
     })
     .await
     {
-        ChainResult::Success(outcome) => return outcome,
+        ChainResult::Success(outcome, _provider) => return outcome,
         ChainResult::BadRequest(msg) | ChainResult::Transport(msg) => {
             return ToolOutcome::from_text(format!("webfetch error: {msg}"));
         }
@@ -143,9 +203,11 @@ const OLLAMA_ENDPOINT: &str = "https://ollama.com/api/web_fetch";
 
 /// Bundled fetch providers in priority order, with the user-selected
 /// one moved to the front. Unknown/empty selections just get the base
-/// order.
+/// order. parallel and exa lead: both serve keyless hosted-MCP routes
+/// (parallel's serves anonymous fetches), so a keyless setup still
+/// fetches. tinyfish (key per call) and ollama follow.
 fn provider_order(selected: &str) -> Vec<&'static str> {
-    let base: [&'static str; 4] = ["tinyfish", "parallel", "exa", "ollama"];
+    let base: [&'static str; 4] = ["parallel", "exa", "tinyfish", "ollama"];
     let selected = selected.trim();
     let matched = base.iter().find(|b| **b == selected).copied();
     let mut out: Vec<&'static str> = base
@@ -159,14 +221,17 @@ fn provider_order(selected: &str) -> Vec<&'static str> {
     out
 }
 
-/// A provider joins the chain iff its credentials can be resolved
-/// (env > auth.json > legacy), except tinyfish and parallel which are
-/// always available (free tiers, key optional; exa is paid, ollama
-/// requires a key).
+/// A provider joins the chain unless it has no usable route. Routes
+/// per provider (fetch):
+///   - REST adapters need a resolved key (env > auth.json > legacy);
+///     tinyfish and ollama have no keyless variant at all.
+///   - parallel (`web_fetch` at search.parallel.ai/mcp) and exa
+///     (`web_fetch_exa` at mcp.exa.ai) publish hosted MCP endpoints
+///     that serve anonymous calls, so they are usable without a key.
 fn provider_available(id: &str) -> bool {
     match id {
-        "tinyfish" | "parallel" => true,
-        "exa" | "ollama" => !crate::auth_keys::resolve_provider_key(id).trim().is_empty(),
+        "parallel" | "exa" => true,
+        "tinyfish" | "ollama" => !crate::auth_keys::resolve_provider_key(id).trim().is_empty(),
         _ => false,
     }
 }
@@ -184,6 +249,10 @@ enum FetchError {
     /// Network failure or 5xx — the provider is flaky/unreachable;
     /// surface it rather than silently hiding it.
     Transport(String),
+    /// The provider has no usable route for the current credentials
+    /// (keyed REST adapter, no key stored, no hosted MCP fallback).
+    /// Walk down silently — configuration, not a failure.
+    Skip(String),
 }
 
 fn classify_status(status: reqwest::StatusCode, body: &[u8]) -> Result<(), FetchError> {
@@ -234,7 +303,7 @@ fn provider_client() -> Result<reqwest::Client, FetchError> {
 
 /// Outcome of walking the provider chain.
 enum ChainResult {
-    Success(ToolOutcome),
+    Success(ToolOutcome, String),
     BadRequest(String),
     Transport(String),
     /// Every available provider rejected us with AuthOrQuota.
@@ -242,32 +311,167 @@ enum ChainResult {
 }
 
 /// Try each available provider in `order`, walking down on
-/// AuthOrQuota errors only. BadRequest and Transport abort the chain
-/// immediately.
+/// AuthOrQuota errors only, and skipping Skip errors silently.
+/// BadRequest and Transport abort the chain immediately. The attempt
+/// closure owns the per-provider route walk (REST, then the provider's
+/// hosted MCP route); the returned label already reflects the route
+/// that served the call (`id` or `mcp:<id>`). Emits one summary line
+/// per call:
+/// `webfetch {parallel: 401, exa: 200, tinyfish: skip, ollama: unused}`
+/// (codes documented in `web_chain_log`).
 async fn try_provider_chain<F, Fut>(order: &[&'static str], mut attempt: F) -> ChainResult
 where
     F: FnMut(&'static str) -> Fut,
-    Fut: std::future::Future<Output = Result<ToolOutcome, FetchError>>,
+    Fut: std::future::Future<Output = Result<(ToolOutcome, String), FetchError>>,
 {
+    let mut outcomes: Vec<(String, String)> = Vec::new();
     let mut fallbacks: Vec<String> = Vec::new();
     for id in order {
         if !provider_available(id) {
+            outcomes.push(((*id).into(), "skip".into()));
             continue;
         }
         match attempt(id).await {
-            Ok(mut outcome) => {
-                outcome.tool_provider = (*id).to_string();
-                return ChainResult::Success(outcome);
+            Ok((outcome, provider)) => {
+                outcomes.push(((*id).into(), "200".into()));
+                crate::web_chain_log::log_chain("webfetch", order, &outcomes);
+                return ChainResult::Success(outcome, provider);
+            }
+            Err(FetchError::Skip(_)) => {
+                outcomes.push(((*id).into(), "skip".into()));
+                continue;
             }
             Err(FetchError::AuthOrQuota(msg)) => {
+                let code = crate::web_chain_log::code_from_msg(&msg, "mcp-err");
+                outcomes.push(((*id).into(), code));
                 eprintln!("webfetch: {id} -> {msg}; falling back");
                 fallbacks.push(format!("{id}: {msg}"));
             }
-            Err(FetchError::BadRequest(msg)) => return ChainResult::BadRequest(msg),
-            Err(FetchError::Transport(msg)) => return ChainResult::Transport(msg),
+            Err(FetchError::BadRequest(msg)) => {
+                let code = crate::web_chain_log::code_from_msg(&msg, "bad-request");
+                outcomes.push(((*id).into(), code));
+                crate::web_chain_log::log_chain("webfetch", order, &outcomes);
+                return ChainResult::BadRequest(msg);
+            }
+            Err(FetchError::Transport(msg)) => {
+                let code = crate::web_chain_log::code_from_msg(&msg, "conn");
+                outcomes.push(((*id).into(), code));
+                crate::web_chain_log::log_chain("webfetch", order, &outcomes);
+                return ChainResult::Transport(msg);
+            }
         }
     }
+    crate::web_chain_log::log_chain("webfetch", order, &outcomes);
     ChainResult::Exhausted(fallbacks)
+}
+
+/// The keyless-capable hosted MCP route for bundled fetch profiles
+/// (parallel: `web_fetch` at search.parallel.ai/mcp, exa:
+/// `web_fetch_exa` at mcp.exa.ai). A stored key is still attached as
+/// an auth header when one resolves, lifting rate limits for those
+/// providers. Returns a `mcp:<provider>` label so tool results say
+/// which route served the call.
+async fn mcp_fetch_route(
+    provider: &str,
+    url: &str,
+    cwd: &std::path::Path,
+) -> Result<(ToolOutcome, String), FetchError> {
+    let profile = atom_core::config::bundled_web_fetch_profile(provider)
+        .filter(|p| !p.mcp_url.is_empty())
+        .ok_or_else(|| FetchError::Transport(format!("{provider}: no hosted MCP endpoint")))?;
+    let mut headers = std::collections::BTreeMap::new();
+    let key = crate::auth_keys::resolve_provider_key(provider);
+    if let Some((name, value)) = crate::web_search::profile_auth_header(provider, &key) {
+        headers.insert(name, value);
+    }
+    let args = match provider {
+        // parallel web_fetch: up to 20 URLs; excerpt-focused output.
+        "parallel" => serde_json::json!({"urls": [url]}),
+        // exa web_fetch_exa: markdown extraction, cap size like REST.
+        _ => serde_json::json!({"urls": [url], "maxCharacters": 5000}),
+    };
+    let override_config = Some(crate::mcp::MCPServerConfig {
+        url: profile.mcp_url,
+        headers,
+        typ: "http".into(),
+        ..Default::default()
+    });
+    let result =
+        crate::mcp::execute_mcp_selection(provider, &profile.mcp_tool, args, cwd, override_config)
+            .await;
+    if let Some(error) = result.strip_prefix("error: ") {
+        return Err(FetchError::AuthOrQuota(format!("hosted MCP: {error}")));
+    }
+    let mut outcome = ToolOutcome::from_text(normalize_mcp_fetch(provider, &result));
+    let provider_label = format!("mcp:{provider}");
+    outcome.tool_provider = provider_label.clone();
+    Ok((outcome, provider_label))
+}
+
+/// Normalize the MCP fetch result text: parallel's web_fetch returns a
+/// JSON extract blob; exa's web_fetch_exa already returns markdown.
+/// Anything unparseable passes through unchanged.
+fn normalize_mcp_fetch(provider: &str, result: &str) -> String {
+    if provider != "parallel" {
+        return result.to_string();
+    }
+    let json_start = match result.find('{') {
+        Some(i) => i,
+        None => return result.to_string(),
+    };
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&result[json_start..]) else {
+        return result.to_string();
+    };
+    let Some(results) = parsed.get("results").and_then(|r| r.as_array()) else {
+        return result.to_string();
+    };
+    let mut sb = String::new();
+    for r in results {
+        let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("");
+        let title = r.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        let full = r.get("full_content").and_then(|v| v.as_str()).unwrap_or("");
+        if !sb.is_empty() {
+            sb.push_str("\n\n");
+        }
+        if !title.is_empty() {
+            sb.push_str(&format!("# {title}\n"));
+        }
+        if !url.is_empty() {
+            sb.push_str(&format!("{url}\n\n"));
+        }
+        if !full.is_empty() {
+            sb.push_str(full);
+        } else {
+            let excerpts = r
+                .get("excerpts")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|e| e.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n\n")
+                })
+                .unwrap_or_default();
+            sb.push_str(&excerpts);
+        }
+    }
+    if let Some(errors) = parsed.get("errors").and_then(|e| e.as_array()) {
+        if !errors.is_empty() {
+            sb.push_str("\n\nerrors: ");
+            sb.push_str(
+                &errors
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            );
+        }
+    }
+    if sb.trim().is_empty() {
+        result.to_string()
+    } else {
+        sb
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -455,6 +659,7 @@ async fn fetch_json_extract(
         FetchError::AuthOrQuota(m) => FetchError::AuthOrQuota(format!("{provider}: {m}")),
         FetchError::BadRequest(m) => FetchError::BadRequest(format!("{provider}: {m}")),
         FetchError::Transport(m) => FetchError::Transport(format!("{provider}: {m}")),
+        FetchError::Skip(m) => FetchError::Skip(format!("{provider}: {m}")),
     })?;
     let parsed: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|e| FetchError::BadRequest(format!("{provider}: {e}")))?;
@@ -1351,46 +1556,52 @@ mod tests {
         );
         assert_eq!(
             provider_order("exa"),
-            vec!["exa", "tinyfish", "parallel", "ollama"]
+            vec!["exa", "parallel", "tinyfish", "ollama"]
         );
-        // Unknown/empty selection keeps the base priority order.
+        // Unknown selection keeps the base priority order: parallel
+        // and exa first (their hosted MCP routes are free and keyless).
         assert_eq!(
             provider_order(""),
-            vec!["tinyfish", "parallel", "exa", "ollama"]
+            vec!["parallel", "exa", "tinyfish", "ollama"]
         );
         assert_eq!(
             provider_order("not-a-provider"),
-            vec!["tinyfish", "parallel", "exa", "ollama"]
+            vec!["parallel", "exa", "tinyfish", "ollama"]
         );
     }
 
     #[test]
-    fn provider_available_skips_exa_without_key() {
-        // If a key is configured in the local auth store this test
-        // can't clear it (auth_keys.rs owns the store), so degrade to
-        // asserting only the env-var path.
-        let locally_configured = atom_core::providers::auth::lookup_auth_entry("exa").is_some()
-            || !atom_core::providers::auth::legacy_provider_key("exa").is_empty();
-
+    fn provider_available_env_keys_and_mcp_routes() {
         let old = std::env::var("EXA_API_KEY").ok();
+        // Restore base below; positive paths only (see note).
         std::env::remove_var("EXA_API_KEY");
-        let without = provider_available("exa");
+
+        // Note: the keyless path can't be asserted here — the suite
+        // mutates these env vars concurrently, so "without" is racy.
+        // Positive paths only: an explicit env key always makes the
+        // keyed REST adapters available.
         std::env::set_var("EXA_API_KEY", "test-key-123");
-        let with = provider_available("exa");
+        let with_exa = provider_available("exa");
+        std::env::set_var("TINYFISH_API_KEY", "test-key-123");
+        let with_tinyfish = provider_available("tinyfish");
+        let with_ollama = {
+            std::env::set_var("OLLAMA_API_KEY", "test-key-123");
+            let ok = provider_available("ollama");
+            std::env::remove_var("OLLAMA_API_KEY");
+            ok
+        };
         // Restore regardless of assertion outcome.
         match old {
             Some(v) => std::env::set_var("EXA_API_KEY", v),
             None => std::env::remove_var("EXA_API_KEY"),
         }
+        std::env::remove_var("TINYFISH_API_KEY");
 
-        if locally_configured {
-            eprintln!("skipping unavailable-assert: exa key in local auth store");
-        } else {
-            assert!(!without, "exa must be skipped with no key configured");
-        }
-        assert!(with, "exa must be available with EXA_API_KEY set");
-        // Free tiers are always available.
-        assert!(provider_available("tinyfish"));
+        assert!(with_exa, "exa must be available with EXA_API_KEY set");
+        assert!(with_tinyfish, "tinyfish must be available with a key");
+        assert!(with_ollama, "ollama must be available with a key");
+        // parallel stays available via its hosted MCP route even
+        // without a key.
         assert!(provider_available("parallel"));
     }
 
@@ -1425,43 +1636,109 @@ mod tests {
     }
 
     /// Stub dispatch test: a 401 from the first provider walks down to
-    /// the second, whose success wins.
+    /// the second, whose success wins. Uses the hosted-MCP-capable ids
+    /// (parallel, exa) so the availability gate never depends on env.
     #[tokio::test]
     async fn chain_falls_back_to_next_provider_on_auth_error() {
         let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
         let calls_c = calls.clone();
-        let result = try_provider_chain(&["tinyfish", "parallel"], move |id| {
+        let result = try_provider_chain(&["parallel", "exa"], move |id| {
             let calls = calls_c.clone();
             async move {
                 calls.lock().unwrap().push(id);
-                match id {
-                    "tinyfish" => Err(FetchError::AuthOrQuota("HTTP 401: denied".into())),
-                    _ => Ok(ToolOutcome::from_text("second provider won".into())),
-                }
+                let r: Result<(ToolOutcome, String), FetchError> = match id {
+                    "parallel" => Err(FetchError::AuthOrQuota("HTTP 401: denied".into())),
+                    _ => Ok((
+                        ToolOutcome::from_text("second provider won".into()),
+                        id.to_string(),
+                    )),
+                };
+                r
             }
         })
         .await;
-        assert_eq!(*calls.lock().unwrap(), vec!["tinyfish", "parallel"]);
-        let ChainResult::Success(outcome) = result else {
+        assert_eq!(*calls.lock().unwrap(), vec!["parallel", "exa"]);
+        let ChainResult::Success(outcome, provider) = result else {
             panic!("expected the second provider to win");
         };
         assert_eq!(outcome.text, "second provider won");
+        assert_eq!(provider, "exa");
+    }
+
+    #[tokio::test]
+    async fn chain_skips_providers_without_usable_route_silently() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+        let calls_c = calls.clone();
+        let result = try_provider_chain(&["exa", "parallel"], move |id| {
+            let calls = calls_c.clone();
+            async move {
+                calls.lock().unwrap().push(id);
+                let r: Result<(ToolOutcome, String), FetchError> = match id {
+                    // Skip: no usable route right now (walk down
+                    // silently, no fallback entry, no stderr noise).
+                    "exa" => Err(FetchError::Skip("exa: no key".into())),
+                    _ => Ok((
+                        ToolOutcome::from_text("skipped past".into()),
+                        id.to_string(),
+                    )),
+                };
+                r
+            }
+        })
+        .await;
+        assert_eq!(*calls.lock().unwrap(), vec!["exa", "parallel"]);
+        let ChainResult::Success(outcome, _) = result else {
+            panic!("expected parallel to win silently");
+        };
+        assert_eq!(outcome.text, "skipped past");
+    }
+
+    #[tokio::test]
+    async fn chain_skips_keyless_provider_without_mcp_route() {
+        std::env::remove_var("TINYFISH_API_KEY");
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+        let calls_c = calls.clone();
+        let result = try_provider_chain(&["tinyfish", "exa"], move |id| {
+            let calls = calls_c.clone();
+            async move {
+                calls.lock().unwrap().push(id);
+                let r: Result<(ToolOutcome, String), FetchError> = match id {
+                    // Never reached: tinyfish is availability-skipped
+                    // (keyed REST, no hosted MCP route, no key).
+                    "tinyfish" => Err(FetchError::Skip("tinyfish: no key".into())),
+                    _ => Ok((
+                        ToolOutcome::from_text("mcp fell through".into()),
+                        format!("mcp:{id}"),
+                    )),
+                };
+                r
+            }
+        })
+        .await;
+        assert_eq!(*calls.lock().unwrap(), vec!["exa"]);
+        let ChainResult::Success(outcome, provider) = result else {
+            panic!("expected exa to win");
+        };
+        assert_eq!(outcome.text, "mcp fell through");
+        assert_eq!(provider, "mcp:exa");
     }
 
     #[tokio::test]
     async fn chain_transport_error_aborts_immediately() {
         let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
         let calls_c = calls.clone();
-        let result = try_provider_chain(&["tinyfish", "parallel"], move |id| {
+        let result = try_provider_chain(&["parallel", "exa"], move |id| {
             let calls = calls_c.clone();
             async move {
                 calls.lock().unwrap().push(id);
-                Err(FetchError::Transport("HTTP 503: down".into()))
+                let r: Result<(ToolOutcome, String), FetchError> =
+                    Err(FetchError::Transport("HTTP 503: down".into()));
+                r
             }
         })
         .await;
         // No silent recovery: a single transport error ends the walk.
-        assert_eq!(*calls.lock().unwrap(), vec!["tinyfish"]);
+        assert_eq!(*calls.lock().unwrap(), vec!["parallel"]);
         assert!(
             matches!(result, ChainResult::Transport(_)),
             "expected transport"
@@ -1474,15 +1751,17 @@ mod tests {
         let calls_c = calls.clone();
         // "mystery" is not a bundled provider and must be skipped
         // without calling the adapter.
-        let result = try_provider_chain(&["mystery", "tinyfish", "parallel"], move |id| {
+        let result = try_provider_chain(&["mystery", "parallel", "exa"], move |id| {
             let calls = calls_c.clone();
             async move {
                 calls.lock().unwrap().push(id);
-                Err(FetchError::AuthOrQuota("HTTP 429".into()))
+                let r: Result<(ToolOutcome, String), FetchError> =
+                    Err(FetchError::AuthOrQuota("HTTP 429".into()));
+                r
             }
         })
         .await;
-        assert_eq!(*calls.lock().unwrap(), vec!["tinyfish", "parallel"]);
+        assert_eq!(*calls.lock().unwrap(), vec!["parallel", "exa"]);
         let ChainResult::Exhausted(fallbacks) = result else {
             panic!("expected exhaustion");
         };

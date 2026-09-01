@@ -3891,7 +3891,14 @@ impl App {
                     return Vec::new();
                 }
                 self.overlay_auth_id = e.id.clone();
-                self.open_overlay(OverlayKind::ProviderMethod);
+                // Web-tool providers (tinyfish, parallel, exa) only take
+                // API keys — skip the API Key/OAuth method choice.
+                if atom_core::providers::providers::provider_caps(&e.id).contains(&"Models") {
+                    self.open_overlay(OverlayKind::ProviderMethod);
+                } else {
+                    self.overlay_auth_type = "api".into();
+                    self.open_overlay(OverlayKind::ProviderKey);
+                }
                 self.overlay_q.clear();
                 self.overlay_sel = 0;
                 Vec::new()
@@ -3940,7 +3947,17 @@ impl App {
                     self.working_msg.clear();
                     return Vec::new();
                 }
-                self.open_models_for_provider(&id);
+                if atom_core::providers::providers::provider_caps(&id).contains(&"Models") {
+                    self.open_models_for_provider(&id);
+                } else {
+                    // Web-tool providers (search/fetch only) have no
+                    // models: return to the providers list so the row
+                    // now reads connected.
+                    self.overlay_providers = providers::list_addable_providers();
+                    self.open_overlay(OverlayKind::Providers);
+                    self.overlay_q.clear();
+                    self.overlay_sel = 0;
+                }
                 vec![Effect::ReloadProviders]
             }
             OverlayKind::Settings => match self.overlay_sel {
@@ -4055,14 +4072,15 @@ impl App {
 
     fn approval_key(&mut self, k: KeyEvent, req: ApprovalPrompt) -> Vec<Effect> {
         // v2 spec: four buttons, no session-scoped grant.
-        //   y → allow_once, a → allow_always, n → deny_once,
-        //   d → deny_once. Esc is intentionally not bound — the four
+        //   Y → allow_once, A → allow_always, N → deny_once,
+        //   D → deny_always (lowercase and the capital letters shown
+        //   on the buttons). Esc is intentionally not bound — the four
         //   visible buttons are the only choices.
         let decision = match k.code {
-            KeyCode::Char('y') => Some(("allow_once", "allowed once")),
-            KeyCode::Char('a') => Some(("allow_always", "always allowed")),
-            KeyCode::Char('n') => Some(("deny_once", "denied")),
-            KeyCode::Char('d') => Some(("deny_always", "denied, rule saved")),
+            KeyCode::Char('y') | KeyCode::Char('Y') => Some(("allow_once", "allowed once")),
+            KeyCode::Char('a') | KeyCode::Char('A') => Some(("allow_always", "always allowed")),
+            KeyCode::Char('n') | KeyCode::Char('N') => Some(("deny_once", "denied")),
+            KeyCode::Char('d') | KeyCode::Char('D') => Some(("deny_always", "denied, rule saved")),
             KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.quitting = true;
                 return vec![Effect::Quit];
@@ -4085,8 +4103,8 @@ impl App {
         }
     }
 
-    /// Clear the inline approval card (button row, help row, child
-    /// header) once the user has answered the prompt. The block stays
+    /// Clear the inline approval card (button row, child header) once
+    /// the user has answered the prompt. The block stays
     /// `tool_done = false`: the tool hasn't actually returned yet — the
     /// server is still running the command and will send a `tool_result`
     /// event with the real output, which `attach_tool_result` needs a
@@ -4141,20 +4159,24 @@ impl App {
     /// Check if a click at (content_row, col) falls on an approval button in
     /// block `bi`. Returns the decision string ("allow_once" etc.) or None.
     fn approval_button_hit(&self, bi: usize, content_row: usize, col: usize) -> Option<String> {
-        // The buttons are on the rendered line just above the help row,
-        // which is itself above the bottom pad row. With the v2 layout:
-        //   ... body rows ... [buttons] [help] [pad]
-        // so the buttons live three lines from the end (antepenultimate).
+        // The buttons are on the rendered line just above the bottom
+        // pad row. Block layout is [pad] [header] ...body... [pad],
+        // and the button line is the last body row, so it sits two
+        // lines from the end (penultimate). It was briefly `len - 3`
+        // while a help row sat between buttons and pad; the help row
+        // is gone and that offset silently broke button clicks.
         let block_start = *self.block_start.get(bi)?;
         let block_lines = self.blocks[bi].lines.as_ref()?;
-        let button_row = block_start + block_lines.len().saturating_sub(3);
+        let button_row = block_start + block_lines.len().saturating_sub(2);
         if content_row != button_row {
             return None;
         }
-        // Button layout: "  [y] once   [a] always   [n] deny   [d] never  "
+        // Button layout: "  Y Once   A Always   N Deny   D Never  "
+        // Body rows are wrapped with a one-cell leading pad column,
+        // so a line-relative col c is button-relative c - 1.
         let buttons = blocks::approval_buttons();
         for btn in &buttons {
-            if col >= btn.col_start && col < btn.col_end {
+            if col > btn.col_start && col < btn.col_end + 1 {
                 return Some(btn.decision.to_string());
             }
         }
@@ -5199,6 +5221,73 @@ mod tests {
         app.handle_stream_event(&ev2);
         let cards = app.blocks.iter().filter(|b| b.approval.is_some()).count();
         assert_eq!(cards, 2);
+    }
+
+    #[test]
+    fn click_on_approval_button_resolves_decision() {
+        let mut app = App::new_test(90, 30);
+        let request = serde_json::json!({
+            "type": "approval_request",
+            "id": "req1",
+            "session_id": "sess1",
+            "command": "npm install",
+            "cwd": "/work",
+            "rule_id": "pkg-install",
+            "reason": "package manager with install",
+        });
+        app.handle_stream_event(&parse_stream_event(&request));
+        app.viewport_dirty = true;
+        app.refresh_viewport();
+
+        let bi = app
+            .blocks
+            .iter()
+            .position(|b| b.approval.is_some())
+            .expect("approval card block exists");
+        let lines = app.blocks[bi].lines.as_ref().expect("block rendered");
+        // Button line is the penultimate rendered row (bottom pad is last).
+        let row = app.block_start[bi] + lines.len() - 2;
+
+        // Click the middle of "A Always" (button col + box pad cell).
+        let btn = &blocks::approval_buttons()[1];
+        let em = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: (TUI_HPAD + btn.col_start + 2) as u16,
+            row: (VIEWPORT_VPAD + row - app.scroll_y) as u16,
+            modifiers: KeyModifiers::empty(),
+        };
+        let fx = app.mouse(em);
+        assert!(app.approval.is_none(), "click closed the prompt");
+        assert!(
+            matches!(
+                fx.first(),
+                Some(Effect::RespondApproval { decision, .. }) if decision == "allow_always"
+            ),
+            "click resolved approval: {fx:?}"
+        );
+
+        // A click on the gap between buttons resolves nothing.
+        let mut app = App::new_test(90, 30);
+        app.handle_stream_event(&parse_stream_event(&request));
+        app.viewport_dirty = true;
+        app.refresh_viewport();
+        let bi = app
+            .blocks
+            .iter()
+            .position(|b| b.approval.is_some())
+            .unwrap();
+        let lines = app.blocks[bi].lines.as_ref().unwrap();
+        let row = app.block_start[bi] + lines.len() - 3; // row above the buttons
+        let btn = &blocks::approval_buttons()[1];
+        let em = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: (TUI_HPAD + btn.col_start + 2) as u16,
+            row: (VIEWPORT_VPAD + row - app.scroll_y) as u16,
+            modifiers: KeyModifiers::empty(),
+        };
+        let fx = app.mouse(em);
+        assert!(fx.is_empty(), "row above buttons is not clickable: {fx:?}");
+        assert!(app.approval.is_some(), "prompt stays up on a miss");
     }
 
     #[test]

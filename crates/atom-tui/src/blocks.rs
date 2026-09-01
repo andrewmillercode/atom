@@ -1600,7 +1600,9 @@ fn approval_block_body(appr: &InlineApproval, width: usize) -> Vec<Line<'static>
     lines
 }
 
-/// Produce the clickable button line for an approval block.
+/// Produce the clickable button line for an approval block. Each
+/// button renders as a two-span chip over the prompt-input card
+/// color: key letter in foreground, action word in muted.
 fn approval_button_line() -> Line<'static> {
     let buttons = approval_buttons();
     let mut spans = Vec::new();
@@ -1608,7 +1610,12 @@ fn approval_button_line() -> Line<'static> {
         if i > 0 {
             spans.push(Span::styled("  ", ansi::style_tool()));
         }
-        spans.push(Span::styled(btn.label.to_string(), ansi::style_tool_name()));
+        let (key, word) = btn.label.split_once(' ').unwrap_or((btn.label, ""));
+        spans.push(Span::styled(key.to_string(), ansi::style_approval_key()));
+        spans.push(Span::styled(
+            format!(" {word}"),
+            ansi::style_approval_word(),
+        ));
     }
     Line::from(spans)
 }
@@ -1617,14 +1624,14 @@ fn approval_button_line() -> Line<'static> {
 /// to the content area (after left pad).
 pub fn approval_buttons() -> Vec<ApprovalButton> {
     // v2 spec: four buttons, no session-scoped grant.
-    //   [y] once   [a] always   [n] deny   [d] never
+    //   Y Once   A Always   N Deny   D Never
     // Each maps to one of the v2 Decision wire names
     // (allow_once / allow_always / deny_once / deny_always).
     let labels: &[(&str, &str)] = &[
-        ("[y] once", "allow_once"),
-        ("[a] always", "allow_always"),
-        ("[n] deny", "deny_once"),
-        ("[d] never", "deny_always"),
+        ("Y Once", "allow_once"),
+        ("A Always", "allow_always"),
+        ("N Deny", "deny_once"),
+        ("D Never", "deny_always"),
     ];
     let gap = 2usize;
     let mut col = 0;

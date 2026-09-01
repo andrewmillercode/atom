@@ -55,6 +55,38 @@ pub struct ProviderListEntry {
     pub connected: bool,
     /// auth.json or legacy file; disconnectable with d
     pub stored: bool,
+    /// Capabilities surfaced in the providers overlay's fixed badge
+    /// column: "Models", "Web Search", "Web Fetch".
+    pub caps: Vec<&'static str>,
+}
+
+/// webToolProviders are non-model backends that share the provider
+/// list and auth store but expose no /v1/models: pure web search /
+/// fetch services, keyed by their own API keys.
+pub const WEB_TOOL_PROVIDERS: [(&str, &str); 3] = [
+    ("tinyfish", "TinyFish"),
+    ("parallel", "Parallel"),
+    ("exa", "Exa"),
+];
+
+pub fn is_web_tool_provider(id: &str) -> bool {
+    WEB_TOOL_PROVIDERS.iter().any(|(wid, _)| *wid == id)
+}
+
+/// providerCaps reports what a provider id can be used for, read off
+/// the bundled capability tables: every models.dev provider lists
+/// models; the web-tool providers (and ollama-cloud, whose API hosts
+/// both) list search and fetch.
+pub fn provider_caps(id: &str) -> Vec<&'static str> {
+    let mut caps = Vec::new();
+    if !is_web_tool_provider(id) {
+        caps.push("Models");
+    }
+    if is_web_tool_provider(id) || matches!(id, "ollama-cloud" | "ollama") {
+        caps.push("Web Search");
+        caps.push("Web Fetch");
+    }
+    caps
 }
 
 /// providerByName returns the provider with the given display name, or
@@ -358,6 +390,18 @@ pub fn list_addable_providers() -> Vec<ProviderListEntry> {
         }
         entries.push(make_provider_list_entry(&id, &p, &store));
     }
+    // Web-tool providers (search/fetch only, no models) share the
+    // list so their API keys are manageable in the same place.
+    for (id, label) in WEB_TOOL_PROVIDERS {
+        let mut e = ProviderListEntry {
+            id: id.to_string(),
+            label: label.to_string(),
+            caps: provider_caps(id),
+            ..Default::default()
+        };
+        fill_connection_status(&mut e, &store);
+        entries.push(e);
+    }
     entries.sort_by(|a, b| {
         if a.connected != b.connected {
             return b.connected.cmp(&a.connected);
@@ -372,6 +416,8 @@ pub fn list_addable_providers() -> Vec<ProviderListEntry> {
     entries
 }
 
+/// makeProviderListEntry builds one overlay row for a models.dev
+/// provider: display name, connection status, and capability badges.
 fn make_provider_list_entry(
     id: &str,
     p: &super::modelsdev::ModelsDevProvider,
@@ -384,8 +430,22 @@ fn make_provider_list_entry(
         } else {
             p.name.clone()
         },
+        caps: provider_caps(id),
         ..Default::default()
     };
+    fill_connection_status(&mut e, store);
+    e
+}
+
+/// fillConnectionStatus sets connected/stored/status on an entry by
+/// resolving the provider's credential: auth.json (including builtin
+/// aliases like ollama-cloud <-> ollama), a legacy flat file, or an
+/// env var from the models.dev catalog.
+fn fill_connection_status(
+    e: &mut ProviderListEntry,
+    store: &HashMap<String, super::auth::AuthEntry>,
+) {
+    let id = e.id.as_str();
     let mut found: Option<super::auth::AuthEntry> = None;
     for k in super::auth::auth_ids_for(id) {
         if let Some(ae) = store.get(&k) {
@@ -402,28 +462,36 @@ fn make_provider_list_entry(
         e.connected = true;
         e.stored = true;
         e.status = format!("connected ({})", kind);
-        return e;
+        return;
     }
     if !super::auth::legacy_provider_key(id).is_empty() {
         e.connected = true;
         e.stored = true;
         e.status = "connected (api)".into();
-        return e;
+        return;
     }
-    if !catalog_env_key(id, p).is_empty() || !builtin_env_key(id).is_empty() {
+    if is_web_tool_provider(id) {
+        // Web-tool providers have no models.dev catalog entry, so no
+        // env-var list and no keyless public tier. The bundled
+        // hosted-MCP routes still work keylessly at the tool level,
+        // but the provider row reflects the keyed REST tier only.
+        e.status = "not connected".into();
+        return;
+    }
+    let p = super::modelsdev::models_dev_provider(id).unwrap_or_default();
+    if !catalog_env_key(id, &p).is_empty() || !builtin_env_key(id).is_empty() {
         e.connected = true;
         e.stored = false;
         e.status = "connected (api)".into();
-        return e;
+        return;
     }
     if id == "opencode" {
         e.connected = true;
         e.stored = false;
         e.status = "connected (public)".into();
-        return e;
+        return;
     }
     e.status = "not connected".into();
-    e
 }
 
 pub fn filter_provider_entries(
@@ -433,7 +501,15 @@ pub fn filter_provider_entries(
     let q = query.to_lowercase();
     entries
         .iter()
-        .filter(|e| entry_matches_query(&q, &e.id.to_lowercase(), &e.label.to_lowercase()))
+        .filter(|e| {
+            entry_matches_query(&q, &e.id.to_lowercase(), &e.label.to_lowercase())
+                // Capability badges are searchable too, so "web fetch",
+                // "web search", and "models" find the right rows.
+                || {
+                    let caps = e.caps.join(" ").to_lowercase();
+                    !caps.is_empty() && entry_matches_query(&q, "", &caps)
+                }
+        })
         .cloned()
         .collect()
 }

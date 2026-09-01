@@ -19,6 +19,7 @@ pub mod search;
 pub mod skills;
 pub mod vector_search;
 pub mod visualize;
+pub mod web_chain_log;
 pub mod web_fetch;
 pub mod web_search;
 

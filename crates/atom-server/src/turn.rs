@@ -23,6 +23,7 @@ use atom_core::session::title::{generate_title, title_provider};
 use atom_core::types::{
     ChatRequest, Message, StreamOptions, StreamResult, StreamToolCallDelta, ToolCall,
 };
+use atom_sandbox::exec::PendingExit;
 use atom_tools::defs::without_tool;
 use chrono::{Local, Utc};
 use futures::{FutureExt, Stream, StreamExt};
@@ -33,6 +34,7 @@ use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 
 /// maxToolRounds is a runaway-loop guard, not a task-length budget.
 /// Stopping at 30 left real sessions mid-edit: the model still had tool
@@ -516,7 +518,14 @@ async fn finish_paused_turn(
     opts: &TurnOpts,
     key: &str,
     base_url: &str,
+    running: &mut Vec<PendingCmd>,
+    done_rx: &mut mpsc::Receiver<(String, PendingExit)>,
 ) {
+    // Commands still running when the turn pauses are killed with their
+    // partial output recorded, exactly like an Esc while parked — every
+    // pause path funnels through here, so none of them can leak a command
+    // or drop its result. No-op when nothing is running.
+    cancel_running(state, sess, out, id, running, done_rx).await;
     let ev = json!({"type": "paused"});
     emit(state, out, id, &ev).await;
     let leftover = ctx.handle.take_pending();
@@ -574,6 +583,345 @@ pub fn spawn_turn(
     tokio::spawn(async move {
         run_session_turn_guarded(&state, &mut sess, &id, opts, out, parent).await;
     });
+}
+
+/// One bash command that is still running after the tool phase. The
+/// turn parks on it; the result is recorded as the original tool call's
+/// result when the command exits (or is killed by Esc).
+struct PendingCmd {
+    call_id: String,
+    /// sess.messages index of the assistant tool_calls message that owns
+    /// this call — its result belongs right after that message, before
+    /// anything an interjected prompt added.
+    after_idx: usize,
+    command: String,
+    started: Instant,
+    /// Signalled when the turn stops waiting on this command (Esc).
+    kill: CancelToken,
+    /// sess.messages index of the placeholder pushed for this call while
+    /// it runs (None until an interjection pushes one). The exact slot
+    /// matters: record_pending_result replaces it in place, and a fold
+    /// can shift indexes, so the entry is re-verified before use.
+    placeholder_idx: Option<usize>,
+    /// Live output written so far, for placeholder refresh.
+    output: atom_sandbox::exec::PendingOutput,
+}
+
+/// How parking on running commands ended.
+enum ParkOutcome {
+    /// Every command exited; the real results are in history.
+    AllDone,
+    /// The user interjected: placeholders were pushed for the still-
+    /// running commands, and the prompts + any compaction request are
+    /// handed back for the next (placeholder) round.
+    Prompt {
+        injected: Vec<Message>,
+        compact: Option<String>,
+    },
+    /// Esc while parked: commands killed, partial results recorded.
+    Cancelled,
+}
+
+/// First free slot for a tool result of the assistant message at
+/// `after_idx`: right after it, skipping tool results already recorded
+/// there. Inserting every result at this slot keeps the provider
+/// history valid (assistant(tool_calls) → tool(result) → …).
+fn result_insert_pos(sess: &Session, after_idx: usize) -> usize {
+    let mut pos = after_idx + 1;
+    while sess.messages.get(pos).is_some_and(|m| m.role == "tool") {
+        pos += 1;
+    }
+    pos
+}
+
+/// Live placeholder tool results for commands that are still running.
+/// Called once per round before the request is built, so the model
+/// always sees the current state of its running commands — elapsed
+/// seconds and the output written so far — without any status tool. A
+/// command without an entry yet (first interjection since it started)
+/// gets one inserted; the real result replaces it on completion.
+fn refresh_placeholders(sess: &mut Session, running: &mut [PendingCmd]) {
+    for p in running {
+        // One entry per call: a second interjection must not stack
+        // another placeholder on top of the first — record_pending_result
+        // replaces only one, and two tool results for one call id are out
+        // of contract for several providers (Anthropic rejects outright).
+        let slot = p
+            .placeholder_idx
+            .filter(|&i| {
+                sess.messages
+                    .get(i)
+                    .is_some_and(|m| m.role == "tool" && m.tool_call_id == p.call_id)
+            })
+            .or_else(|| {
+                sess.messages
+                    .iter()
+                    .position(|m| m.role == "tool" && m.tool_call_id == p.call_id)
+            });
+        let slot = match slot {
+            Some(i) => i,
+            None => {
+                // Never inserted: only when the owning assistant message
+                // still exists — if a fold removed the call itself, an
+                // entry for it would be an orphan (and dead weight for
+                // sanitize_messages).
+                let Some(after_idx) = sess.messages.iter().position(|m| {
+                    m.role == "assistant" && m.tool_calls.iter().any(|tc| tc.id == p.call_id)
+                }) else {
+                    continue;
+                };
+                let pos = result_insert_pos(sess, after_idx);
+                sess.messages.insert(
+                    pos,
+                    Message {
+                        role: "tool".into(),
+                        tool_call_id: p.call_id.clone(),
+                        ..Default::default()
+                    },
+                );
+                p.placeholder_idx = Some(pos);
+                pos
+            }
+        };
+        sess.messages[slot].content = pending_placeholder_text(p);
+    }
+}
+
+/// The placeholder text for one running command: elapsed time plus the
+/// output written so far (tail-capped — the full output arrives when
+/// the command exits and replaces this entry).
+fn pending_placeholder_text(p: &PendingCmd) -> String {
+    let secs = p.started.elapsed().as_secs();
+    let mut text = format!(
+        "[background command still running: {} — started {}s ago",
+        p.command, secs
+    );
+    let so_far = p.output.text();
+    let so_far = so_far.trim_end();
+    if so_far.is_empty() {
+        text.push_str("; no output yet");
+    } else {
+        let head_cut = so_far.chars().count().saturating_sub(600);
+        let tail: String = if head_cut > 0 {
+            format!("…{}", so_far.chars().skip(head_cut).collect::<String>())
+        } else {
+            so_far.to_string()
+        };
+        text.push_str("; output so far:\n");
+        text.push_str(&tail);
+    }
+    text.push_str(
+        "\nThis entry is refreshed automatically; its output replaces it \
+         when the command exits. Do not sleep, poll, or re-run it to wait. \
+         If the user asked something, answer them now in plain text.]",
+    );
+    text
+}
+
+/// Records a pending command's exit as the original tool call's result:
+/// replaces the placeholder pushed for an interjected prompt, or
+/// inserts right after the owning assistant message — before anything
+/// the prompt added.
+async fn record_pending_result(
+    state: &Arc<AppState>,
+    sess: &mut Session,
+    out: &EventOut,
+    id: &str,
+    p: &PendingCmd,
+    exit: PendingExit,
+) {
+    let mut content = if exit.killed {
+        atom_tools::format_bash_cancelled(&exit)
+    } else {
+        atom_tools::format_bash_exit(exit.exit_code, &exit.output)
+    };
+    cap_tool_output(&mut content);
+    // Slot resolution, most specific first: the exact entry the
+    // placeholder occupied (verified — a fold can shift indexes), then
+    // any other tool entry for this call, then re-anchor next to the
+    // assistant message that owns the call. When even the owning call is
+    // gone from history (folded away entirely), nothing is inserted: an
+    // orphan result would be dead weight sanitize_messages drops anyway.
+    let slot = p
+        .placeholder_idx
+        .filter(|&i| {
+            sess.messages
+                .get(i)
+                .is_some_and(|m| m.role == "tool" && m.tool_call_id == p.call_id)
+        })
+        .or_else(|| {
+            sess.messages
+                .iter()
+                .position(|m| m.role == "tool" && m.tool_call_id == p.call_id)
+        })
+        .or_else(|| {
+            sess.messages
+                .iter()
+                .position(|m| {
+                    m.role == "assistant" && m.tool_calls.iter().any(|tc| tc.id == p.call_id)
+                })
+                .map(|after_idx| result_insert_pos(sess, after_idx))
+        });
+    match slot {
+        Some(i)
+            if sess
+                .messages
+                .get(i)
+                .is_some_and(|m| m.role == "tool" && m.tool_call_id == p.call_id) =>
+        {
+            sess.messages[i].content = content.clone();
+        }
+        Some(i) => {
+            sess.messages.insert(
+                i,
+                Message {
+                    role: "tool".into(),
+                    tool_call_id: p.call_id.clone(),
+                    content: content.clone(),
+                    ..Default::default()
+                },
+            );
+        }
+        None => {}
+    }
+    persist_session_now(state, sess, id).await;
+    let ev = event(vec![
+        ("type", json!("tool_result")),
+        ("text", json!(content)),
+        ("tool_provider", json!("")),
+        ("call_id", json!(p.call_id)),
+    ]);
+    emit(state, out, id, &ev).await;
+}
+
+/// Esc unwind with commands still running: kill them all (waiters also
+/// watch the turn token) and record their partial output before the
+/// turn finishes.
+async fn cancel_running(
+    state: &Arc<AppState>,
+    sess: &mut Session,
+    out: &EventOut,
+    id: &str,
+    running: &mut Vec<PendingCmd>,
+    done_rx: &mut mpsc::Receiver<(String, PendingExit)>,
+) {
+    for p in running.iter() {
+        p.kill.cancel();
+    }
+    while !running.is_empty() {
+        match tokio::time::timeout(Duration::from_secs(10), done_rx.recv()).await {
+            Ok(Some((call_id, exit))) => {
+                if let Some(pos) = running.iter().position(|p| p.call_id == call_id) {
+                    let p = running.remove(pos);
+                    record_pending_result(state, sess, out, id, &p, exit).await;
+                }
+            }
+            _ => break, // drain timed out or the channel closed
+        }
+    }
+    running.clear();
+}
+
+/// Parks the turn on the running commands: selects over their exits,
+/// a mid-turn prompt (the pending-message slot + round cancel), and
+/// the turn cancel (Esc kills the commands' process groups). There is
+/// no timeout — a test suite may run for minutes; runaway protection
+/// is the user's Esc.
+#[allow(clippy::too_many_arguments)]
+async fn park_for_pending(
+    state: &Arc<AppState>,
+    sess: &mut Session,
+    out: &EventOut,
+    id: &str,
+    ctx: &TurnCtx,
+    running: &mut Vec<PendingCmd>,
+    done_rx: &mut mpsc::Receiver<(String, PendingExit)>,
+) -> ParkOutcome {
+    // A parked turn is interruptible by a mid-turn prompt exactly like
+    // a model round is: register a round-cancel token so /send's
+    // cancel_round wakes the select below.
+    let park_cancel = CancelToken::new();
+    ctx.handle.set_round_cancel(Some(park_cancel.clone()));
+    let outcome = loop {
+        // Completions that landed while the turn was streaming a round
+        // are already buffered in the channel: record them first.
+        while let Ok((call_id, exit)) = done_rx.try_recv() {
+            if let Some(pos) = running.iter().position(|p| p.call_id == call_id) {
+                let p = running.remove(pos);
+                record_pending_result(state, sess, out, id, &p, exit).await;
+            }
+        }
+        if running.is_empty() {
+            break ParkOutcome::AllDone;
+        }
+        // A prompt (or compaction) queued while the turn was busy?
+        let injected = ctx.handle.take_pending();
+        let compact = ctx.handle.take_compact();
+        if !injected.is_empty() || compact.is_some() {
+            // No placeholders needed here: the next round top refreshes
+            // every running command before the request is built.
+            break ParkOutcome::Prompt { injected, compact };
+        }
+        let turn_cancel = ctx.handle.cancel_token();
+        tokio::select! {
+            biased;
+            _ = turn_cancel.cancelled() => {
+                // Esc while parked: kill every pending command's process
+                // group and record the partial output as its tool result.
+                cancel_running(state, sess, out, id, running, done_rx).await;
+                break ParkOutcome::Cancelled;
+            }
+            _ = ctx.parent.cancelled() => {
+                cancel_running(state, sess, out, id, running, done_rx).await;
+                break ParkOutcome::Cancelled;
+            }
+            _ = park_cancel.cancelled() => {
+                let injected = ctx.handle.take_pending();
+                let compact = ctx.handle.take_compact();
+                if injected.is_empty() && compact.is_none() {
+                    // Spurious wake (raced with a completion): keep parking.
+                    continue;
+                }
+                break ParkOutcome::Prompt { injected, compact };
+            }
+            Some((call_id, exit)) = done_rx.recv() => {
+                if let Some(pos) = running.iter().position(|p| p.call_id == call_id) {
+                    let p = running.remove(pos);
+                    record_pending_result(state, sess, out, id, &p, exit).await;
+                    if running.is_empty() {
+                        break ParkOutcome::AllDone;
+                    }
+                }
+            }
+        }
+    };
+    ctx.handle.set_round_cancel(None);
+    outcome
+}
+
+/// Handles a [`ParkOutcome::Prompt`]: folds if compaction was queued,
+/// appends the injected prompts (the placeholders were already pushed),
+/// and persists.
+async fn after_park_prompt(
+    state: &Arc<AppState>,
+    sess: &mut Session,
+    out: &EventOut,
+    id: &str,
+    injected: Vec<Message>,
+    compact: Option<String>,
+) {
+    if let Some(extra) = compact {
+        if let Err(ferr) = fold_session(state, sess, out, id, &extra).await {
+            emit(state, out, id, &fold_error_event(&ferr)).await;
+        }
+    }
+    for m in injected {
+        state
+            .subs
+            .broadcast(id, &json!({"type": "user_message", "text": m.content}));
+        sess.messages.push(m);
+    }
+    persist_session_now(state, sess, id).await;
 }
 
 /// foldSession summarizes older turns and notifies the client with the
@@ -705,6 +1053,11 @@ pub async fn run_session_turn_guarded(
         .await;
     if res.is_err() {
         eprintln!("atoms: turn task for session {id} panicked; clearing active-turn state");
+        // The turn died without reaching its own unwind paths: cancel the
+        // handle so background-command waiters select their kill branch
+        // instead of shepherding an orphan whose result can no longer be
+        // recorded.
+        state.turns.cancel_session_turns(id);
     }
     state.turns.force_end_session_turns(id);
 }
@@ -800,6 +1153,11 @@ pub async fn run_session_turn(
 
     let mut finished = false;
     let mut nudge_attempt: usize = 0;
+    // Commands still running from the tool phase: the turn parks on
+    // them instead of looping, and their results are recorded into
+    // history when they exit (see PendingCmd / park_for_pending).
+    let mut running: Vec<PendingCmd> = Vec::new();
+    let (done_tx, mut done_rx) = mpsc::channel::<(String, PendingExit)>(16);
     let mut empty_response_attempt: usize = 0;
     // The "current time" system note is captured once per turn, not per
     // round: it is folded into the system prefix of every request, and a
@@ -810,7 +1168,17 @@ pub async fn run_session_turn(
         // Stop immediately when the turn was paused.
         if ctx.err() {
             finish_paused_turn(
-                state, sess, &out, id, &ctx, &parent_id, &opts, &key, &base_url,
+                state,
+                sess,
+                &out,
+                id,
+                &ctx,
+                &parent_id,
+                &opts,
+                &key,
+                &base_url,
+                &mut running,
+                &mut done_rx,
             )
             .await;
             return;
@@ -858,6 +1226,16 @@ pub async fn run_session_turn(
                 }
                 emit(state, &out, id, &fold_error_event(&err)).await;
             }
+        }
+
+        // Live status for running commands: elapsed time and output so
+        // far, written into each command's placeholder entry right before
+        // the request is built. This is how the model "checks on its
+        // tool" — no status tool, the state is simply in the history it
+        // is about to see. Runs after any fold so entries are placed
+        // against post-fold history.
+        if !running.is_empty() {
+            refresh_placeholders(sess, &mut running);
         }
 
         // Tell viewers a model round is starting (first token is still
@@ -920,7 +1298,17 @@ pub async fn run_session_turn(
                     ctx.handle.set_round_cancel(None);
                     if ctx.err() {
                         finish_paused_turn(
-                            state, sess, &out, id, &ctx, &parent_id, &opts, &key, &base_url,
+                            state,
+                            sess,
+                            &out,
+                            id,
+                            &ctx,
+                            &parent_id,
+                            &opts,
+                            &key,
+                            &base_url,
+                            &mut running,
+                            &mut done_rx,
                         )
                         .await;
                         return;
@@ -938,7 +1326,17 @@ pub async fn run_session_turn(
                         ctx.handle.set_round_cancel(None);
                         if ctx.err() {
                             finish_paused_turn(
-                                state, sess, &out, id, &ctx, &parent_id, &opts, &key, &base_url,
+                                state,
+                                sess,
+                                &out,
+                                id,
+                                &ctx,
+                                &parent_id,
+                                &opts,
+                                &key,
+                                &base_url,
+                                &mut running,
+                                &mut done_rx,
                             )
                             .await;
                             return;
@@ -961,6 +1359,9 @@ pub async fn run_session_turn(
                             ..Default::default()
                         });
                         persist_session(state, sess, id).await;
+                        // A dead turn must not leak its background commands: kill them and
+                        // record their partial output as the tool results they own.
+                        cancel_running(state, sess, &out, id, &mut running, &mut done_rx).await;
                         end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
                         return;
                     }
@@ -983,7 +1384,17 @@ pub async fn run_session_turn(
                 Err(err) => {
                     if ctx.err() {
                         finish_paused_turn(
-                            state, sess, &out, id, &ctx, &parent_id, &opts, &key, &base_url,
+                            state,
+                            sess,
+                            &out,
+                            id,
+                            &ctx,
+                            &parent_id,
+                            &opts,
+                            &key,
+                            &base_url,
+                            &mut running,
+                            &mut done_rx,
                         )
                         .await;
                         return;
@@ -1000,6 +1411,9 @@ pub async fn run_session_turn(
                         ..Default::default()
                     });
                     persist_session(state, sess, id).await;
+                    // A dead turn must not leak its background commands: kill them and
+                    // record their partial output as the tool results they own.
+                    cancel_running(state, sess, &out, id, &mut running, &mut done_rx).await;
                     end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
                     return;
                 }
@@ -1025,7 +1439,17 @@ pub async fn run_session_turn(
                     ctx.handle.set_round_cancel(None);
                     if ctx.err() {
                         finish_paused_turn(
-                            state, sess, &out, id, &ctx, &parent_id, &opts, &key, &base_url,
+                            state,
+                            sess,
+                            &out,
+                            id,
+                            &ctx,
+                            &parent_id,
+                            &opts,
+                            &key,
+                            &base_url,
+                            &mut running,
+                            &mut done_rx,
                         )
                         .await;
                         return;
@@ -1043,7 +1467,17 @@ pub async fn run_session_turn(
                         ctx.handle.set_round_cancel(None);
                         if ctx.err() {
                             finish_paused_turn(
-                                state, sess, &out, id, &ctx, &parent_id, &opts, &key, &base_url,
+                                state,
+                                sess,
+                                &out,
+                                id,
+                                &ctx,
+                                &parent_id,
+                                &opts,
+                                &key,
+                                &base_url,
+                                &mut running,
+                                &mut done_rx,
                             )
                             .await;
                             return;
@@ -1066,6 +1500,9 @@ pub async fn run_session_turn(
                             ..Default::default()
                         });
                         persist_session(state, sess, id).await;
+                        // A dead turn must not leak its background commands: kill them and
+                        // record their partial output as the tool results they own.
+                        cancel_running(state, sess, &out, id, &mut running, &mut done_rx).await;
                         end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
                         return;
                     }
@@ -1088,7 +1525,17 @@ pub async fn run_session_turn(
                 Err(err) => {
                     if ctx.err() {
                         finish_paused_turn(
-                            state, sess, &out, id, &ctx, &parent_id, &opts, &key, &base_url,
+                            state,
+                            sess,
+                            &out,
+                            id,
+                            &ctx,
+                            &parent_id,
+                            &opts,
+                            &key,
+                            &base_url,
+                            &mut running,
+                            &mut done_rx,
                         )
                         .await;
                         return;
@@ -1105,6 +1552,9 @@ pub async fn run_session_turn(
                         ..Default::default()
                     });
                     persist_session(state, sess, id).await;
+                    // A dead turn must not leak its background commands: kill them and
+                    // record their partial output as the tool results they own.
+                    cancel_running(state, sess, &out, id, &mut running, &mut done_rx).await;
                     end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
                     return;
                 }
@@ -1134,7 +1584,17 @@ pub async fn run_session_turn(
                     ctx.handle.set_round_cancel(None);
                     if ctx.err() {
                         finish_paused_turn(
-                            state, sess, &out, id, &ctx, &parent_id, &opts, &key, &base_url,
+                            state,
+                            sess,
+                            &out,
+                            id,
+                            &ctx,
+                            &parent_id,
+                            &opts,
+                            &key,
+                            &base_url,
+                            &mut running,
+                            &mut done_rx,
                         )
                         .await;
                         return;
@@ -1152,7 +1612,17 @@ pub async fn run_session_turn(
                         ctx.handle.set_round_cancel(None);
                         if ctx.err() {
                             finish_paused_turn(
-                                state, sess, &out, id, &ctx, &parent_id, &opts, &key, &base_url,
+                                state,
+                                sess,
+                                &out,
+                                id,
+                                &ctx,
+                                &parent_id,
+                                &opts,
+                                &key,
+                                &base_url,
+                                &mut running,
+                                &mut done_rx,
                             )
                             .await;
                             return;
@@ -1175,6 +1645,9 @@ pub async fn run_session_turn(
                             ..Default::default()
                         });
                         persist_session(state, sess, id).await;
+                        // A dead turn must not leak its background commands: kill them and
+                        // record their partial output as the tool results they own.
+                        cancel_running(state, sess, &out, id, &mut running, &mut done_rx).await;
                         end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
                         return;
                     }
@@ -1197,7 +1670,17 @@ pub async fn run_session_turn(
                 Err(err) => {
                     if ctx.err() {
                         finish_paused_turn(
-                            state, sess, &out, id, &ctx, &parent_id, &opts, &key, &base_url,
+                            state,
+                            sess,
+                            &out,
+                            id,
+                            &ctx,
+                            &parent_id,
+                            &opts,
+                            &key,
+                            &base_url,
+                            &mut running,
+                            &mut done_rx,
                         )
                         .await;
                         return;
@@ -1214,6 +1697,9 @@ pub async fn run_session_turn(
                         ..Default::default()
                     });
                     persist_session(state, sess, id).await;
+                    // A dead turn must not leak its background commands: kill them and
+                    // record their partial output as the tool results they own.
+                    cancel_running(state, sess, &out, id, &mut running, &mut done_rx).await;
                     end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
                     return;
                 }
@@ -1236,6 +1722,9 @@ pub async fn run_session_turn(
                             ..Default::default()
                         });
                         persist_session(state, sess, id).await;
+                        // A dead turn must not leak its background commands: kill them and
+                        // record their partial output as the tool results they own.
+                        cancel_running(state, sess, &out, id, &mut running, &mut done_rx).await;
                         end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
                         return;
                     }
@@ -1252,7 +1741,17 @@ pub async fn run_session_turn(
                     ctx.handle.set_round_cancel(None);
                     if ctx.err() {
                         finish_paused_turn(
-                            state, sess, &out, id, &ctx, &parent_id, &opts, &key, &base_url,
+                            state,
+                            sess,
+                            &out,
+                            id,
+                            &ctx,
+                            &parent_id,
+                            &opts,
+                            &key,
+                            &base_url,
+                            &mut running,
+                            &mut done_rx,
                         )
                         .await;
                         return;
@@ -1275,7 +1774,17 @@ pub async fn run_session_turn(
                     ctx.handle.set_round_cancel(None);
                     if ctx.err() {
                         finish_paused_turn(
-                            state, sess, &out, id, &ctx, &parent_id, &opts, &key, &base_url,
+                            state,
+                            sess,
+                            &out,
+                            id,
+                            &ctx,
+                            &parent_id,
+                            &opts,
+                            &key,
+                            &base_url,
+                            &mut running,
+                            &mut done_rx,
                         )
                         .await;
                         return;
@@ -1298,6 +1807,9 @@ pub async fn run_session_turn(
                         ..Default::default()
                     });
                     persist_session(state, sess, id).await;
+                    // A dead turn must not leak its background commands: kill them and
+                    // record their partial output as the tool results they own.
+                    cancel_running(state, sess, &out, id, &mut running, &mut done_rx).await;
                     end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
                     return;
                 }
@@ -1326,7 +1838,17 @@ pub async fn run_session_turn(
                     ctx.handle.set_round_cancel(None);
                     if ctx.err() {
                         finish_paused_turn(
-                            state, sess, &out, id, &ctx, &parent_id, &opts, &key, &base_url,
+                            state,
+                            sess,
+                            &out,
+                            id,
+                            &ctx,
+                            &parent_id,
+                            &opts,
+                            &key,
+                            &base_url,
+                            &mut running,
+                            &mut done_rx,
                         )
                         .await;
                         return;
@@ -1343,7 +1865,17 @@ pub async fn run_session_turn(
                     ctx.handle.set_round_cancel(None);
                     if ctx.err() {
                         finish_paused_turn(
-                            state, sess, &out, id, &ctx, &parent_id, &opts, &key, &base_url,
+                            state,
+                            sess,
+                            &out,
+                            id,
+                            &ctx,
+                            &parent_id,
+                            &opts,
+                            &key,
+                            &base_url,
+                            &mut running,
+                            &mut done_rx,
                         )
                         .await;
                         return;
@@ -1366,6 +1898,9 @@ pub async fn run_session_turn(
                         ..Default::default()
                     });
                     persist_session(state, sess, id).await;
+                    // A dead turn must not leak its background commands: kill them and
+                    // record their partial output as the tool results they own.
+                    cancel_running(state, sess, &out, id, &mut running, &mut done_rx).await;
                     end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
                     return;
                 }
@@ -1390,7 +1925,17 @@ pub async fn run_session_turn(
                 Err(err) => {
                     if ctx.err() {
                         finish_paused_turn(
-                            state, sess, &out, id, &ctx, &parent_id, &opts, &key, &base_url,
+                            state,
+                            sess,
+                            &out,
+                            id,
+                            &ctx,
+                            &parent_id,
+                            &opts,
+                            &key,
+                            &base_url,
+                            &mut running,
+                            &mut done_rx,
                         )
                         .await;
                         return;
@@ -1407,6 +1952,9 @@ pub async fn run_session_turn(
                         ..Default::default()
                     });
                     persist_session(state, sess, id).await;
+                    // A dead turn must not leak its background commands: kill them and
+                    // record their partial output as the tool results they own.
+                    cancel_running(state, sess, &out, id, &mut running, &mut done_rx).await;
                     end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
                     return;
                 }
@@ -1429,7 +1977,17 @@ pub async fn run_session_turn(
                 emit(state, &out, id, &retry_ev).await;
                 if sleep_ctx(ctx.handle.cancel_token(), &ctx.parent, delay).await {
                     finish_paused_turn(
-                        state, sess, &out, id, &ctx, &parent_id, &opts, &key, &base_url,
+                        state,
+                        sess,
+                        &out,
+                        id,
+                        &ctx,
+                        &parent_id,
+                        &opts,
+                        &key,
+                        &base_url,
+                        &mut running,
+                        &mut done_rx,
                     )
                     .await;
                     return;
@@ -1453,6 +2011,9 @@ pub async fn run_session_turn(
                 ..Default::default()
             });
             persist_session(state, sess, id).await;
+            // A dead turn must not leak its background commands: kill them and
+            // record their partial output as the tool results they own.
+            cancel_running(state, sess, &out, id, &mut running, &mut done_rx).await;
             end_of_turn(state, sess, id, &ctx.handle, &parent_id).await;
             return;
         }
@@ -1499,7 +2060,17 @@ pub async fn run_session_turn(
                     .push(assistant_message(&sess.model, &base_url, &result, None));
             }
             finish_paused_turn(
-                state, sess, &out, id, &ctx, &parent_id, &opts, &key, &base_url,
+                state,
+                sess,
+                &out,
+                id,
+                &ctx,
+                &parent_id,
+                &opts,
+                &key,
+                &base_url,
+                &mut running,
+                &mut done_rx,
             )
             .await;
             return;
@@ -1540,7 +2111,17 @@ pub async fn run_session_turn(
                     .unwrap_or(Duration::from_secs(15));
                 if sleep_ctx(ctx.handle.cancel_token(), &ctx.parent, delay).await {
                     finish_paused_turn(
-                        state, sess, &out, id, &ctx, &parent_id, &opts, &key, &base_url,
+                        state,
+                        sess,
+                        &out,
+                        id,
+                        &ctx,
+                        &parent_id,
+                        &opts,
+                        &key,
+                        &base_url,
+                        &mut running,
+                        &mut done_rx,
                     )
                     .await;
                     return;
@@ -1571,6 +2152,37 @@ pub async fn run_session_turn(
                 persist_session_now(state, sess, id).await;
                 continue 'rounds;
             }
+            // Commands are still running: the spoken answer stands, but
+            // the turn parks until they exit — their results land in
+            // history and the model reports next round.
+            if !running.is_empty() {
+                match park_for_pending(state, sess, &out, id, &ctx, &mut running, &mut done_rx)
+                    .await
+                {
+                    ParkOutcome::AllDone => {}
+                    ParkOutcome::Prompt { injected, compact } => {
+                        after_park_prompt(state, sess, &out, id, injected, compact).await;
+                    }
+                    ParkOutcome::Cancelled => {
+                        finish_paused_turn(
+                            state,
+                            sess,
+                            &out,
+                            id,
+                            &ctx,
+                            &parent_id,
+                            &opts,
+                            &key,
+                            &base_url,
+                            &mut running,
+                            &mut done_rx,
+                        )
+                        .await;
+                        return;
+                    }
+                }
+                continue 'rounds;
+            }
             finished = true;
             break;
         }
@@ -1586,6 +2198,7 @@ pub async fn run_session_turn(
             &result,
             Some(&result.tool_calls),
         ));
+        let assistant_idx = sess.messages.len() - 1;
         persist_session_now(state, sess, id).await;
 
         // Execute each tool and feed the result back to the model.
@@ -1594,6 +2207,7 @@ pub async fn run_session_turn(
                 ("type", json!("tool")),
                 ("name", json!(tc.function.name)),
                 ("arguments", json!(tc.function.arguments)),
+                ("call_id", json!(tc.id.clone())),
             ]);
             emit(state, &out, id, &ev).await;
 
@@ -1612,9 +2226,6 @@ pub async fn run_session_turn(
                 opts.reasoning_field.clone(),
             );
             let seen = state.file_seen_for(id);
-            // A live token: pause/interrupt (Esc, mid-turn message)
-            // kills in-flight commands instead of waiting them out.
-            let tool_cancel = ctx.handle.cancel_token();
             let tool_ctx = atom_tools::ToolCtx {
                 cwd: cwd.clone(),
                 session_id: id.to_string(),
@@ -1625,12 +2236,46 @@ pub async fn run_session_turn(
                 approver: &approver,
                 spawner: Some(&bridge),
                 file_seen: Some(seen.as_ref()),
-                cancel: Some(&tool_cancel),
             };
             let mut outcome =
                 atom_tools::execute_tool(&tool_ctx, &tc.function.name, &tc.function.arguments)
                     .await;
             cap_tool_output(&mut outcome.text);
+
+            // A bash command: the tool call returns immediately with the
+            // running process. The turn parks below — the model says
+            // nothing more until the command finishes or the user
+            // interjects — and the result is recorded as this call's
+            // result when it exits. The TUI block spins until then.
+            if let Some(proc) = outcome.pending.take().map(|b| *b) {
+                let kill = CancelToken::new();
+                let call_id = tc.id.clone();
+                running.push(PendingCmd {
+                    call_id: call_id.clone(),
+                    after_idx: assistant_idx,
+                    command: proc.command().to_string(),
+                    started: proc.started(),
+                    kill: kill.clone(),
+                    placeholder_idx: None,
+                    output: proc.output_handle(),
+                });
+                let tx = done_tx.clone();
+                let turn_cancel = ctx.handle.cancel_token();
+                let parent_cancel = ctx.parent.clone();
+                tokio::spawn(async move {
+                    let mut proc = proc;
+                    tokio::select! {
+                        biased;
+                        _ = kill.cancelled() => proc.kill().await,
+                        _ = turn_cancel.cancelled() => proc.kill().await,
+                        _ = parent_cancel.cancelled() => proc.kill().await,
+                        _ = proc.wait_exit() => {}
+                    }
+                    let exit = proc.collect().await;
+                    let _ = tx.send((call_id, exit)).await;
+                });
+                continue;
+            }
 
             sess.messages.push(Message {
                 role: "tool".into(),
@@ -1648,6 +2293,7 @@ pub async fn run_session_turn(
                 ("type", json!("tool_result")),
                 ("text", json!(outcome.text)),
                 ("tool_provider", json!(outcome.tool_provider)),
+                ("call_id", json!(tc.id.clone())),
             ]);
             emit(state, &out, id, &result_ev).await;
             // Send any file diff as its own event so the client can attach
@@ -1656,11 +2302,15 @@ pub async fn run_session_turn(
                 let diff_ev = event(vec![
                     ("type", json!("tool_diff")),
                     ("diff", json!(outcome.diff)),
+                    ("call_id", json!(tc.id.clone())),
                 ]);
                 emit(state, &out, id, &diff_ev).await;
             }
             // Stop between tools when the turn was paused.
             if ctx.err() {
+                // Commands still running (this or earlier rounds) are
+                // killed with their partial output recorded.
+                cancel_running(state, sess, &out, id, &mut running, &mut done_rx).await;
                 for skipped in &result.tool_calls[tool_index + 1..] {
                     sess.messages.push(Message {
                         role: "tool".into(),
@@ -1670,10 +2320,51 @@ pub async fn run_session_turn(
                     });
                 }
                 finish_paused_turn(
-                    state, sess, &out, id, &ctx, &parent_id, &opts, &key, &base_url,
+                    state,
+                    sess,
+                    &out,
+                    id,
+                    &ctx,
+                    &parent_id,
+                    &opts,
+                    &key,
+                    &base_url,
+                    &mut running,
+                    &mut done_rx,
                 )
                 .await;
                 return;
+            }
+        }
+
+        // Commands are still running: park. The turn waits here — no
+        // further model rounds — until they exit (the real results then
+        // land in history and the model reports next round) or the user
+        // interjects (the prompt is answered against placeholder
+        // results without stopping the commands).
+        if !running.is_empty() {
+            match park_for_pending(state, sess, &out, id, &ctx, &mut running, &mut done_rx).await {
+                ParkOutcome::AllDone => {}
+                ParkOutcome::Prompt { injected, compact } => {
+                    after_park_prompt(state, sess, &out, id, injected, compact).await;
+                }
+                ParkOutcome::Cancelled => {
+                    finish_paused_turn(
+                        state,
+                        sess,
+                        &out,
+                        id,
+                        &ctx,
+                        &parent_id,
+                        &opts,
+                        &key,
+                        &base_url,
+                        &mut running,
+                        &mut done_rx,
+                    )
+                    .await;
+                    return;
+                }
             }
         }
         // Loop again: the model now sees the tool results.
@@ -1682,7 +2373,9 @@ pub async fn run_session_turn(
     if !finished {
         // Exhausted the runaway guard while the model was still calling
         // tools. Persist the partial turn and tell the client, instead of
-        // going silent with unfinished work.
+        // going silent with unfinished work. Commands still running are
+        // killed with their partial output recorded.
+        cancel_running(state, sess, &out, id, &mut running, &mut done_rx).await;
         let ev = event(vec![
             ("type", json!("error")),
             (
@@ -1793,6 +2486,8 @@ async fn sleep_ctx(turn: CancelToken, parent: &CancelToken, delay: Duration) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atom_core::types::FunctionCall;
+    use atom_sandbox::exec::PendingOutput;
 
     #[test]
     fn done_event_includes_elapsed_milliseconds() {
@@ -1813,6 +2508,78 @@ mod tests {
                 arguments: args.into(),
             },
         }
+    }
+
+    /// A second mid-turn interjection while the same command runs must
+    /// not stack a second placeholder: record_pending_result replaces
+    /// only one entry, duplicates are out of contract for several
+    /// providers, and a stale "still running" copy would survive the real
+    /// result forever.
+    #[test]
+    fn placeholders_do_not_stack_on_repeated_interjections() {
+        let mut sess = Session::default();
+        sess.messages.push(Message {
+            role: "assistant".into(),
+            tool_calls: vec![
+                ToolCall {
+                    id: "call1".into(),
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: "bash".into(),
+                        arguments: r#"{"command":"cargo test"}"#.into(),
+                    },
+                },
+                ToolCall {
+                    id: "call2".into(),
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: "bash".into(),
+                        arguments: r#"{"command":"sleep 60"}"#.into(),
+                    },
+                },
+            ],
+            ..Default::default()
+        });
+        let output = PendingOutput::default();
+        output.extend(true, b"running 45 tests...");
+        let mut running = vec![PendingCmd {
+            call_id: "call1".into(),
+            after_idx: 0,
+            command: "cargo test".into(),
+            started: Instant::now(),
+            kill: CancelToken::new(),
+            placeholder_idx: None,
+            output: output.clone(),
+        }];
+
+        refresh_placeholders(&mut sess, &mut running);
+        refresh_placeholders(&mut sess, &mut running);
+
+        let count = sess
+            .messages
+            .iter()
+            .filter(|m| m.role == "tool" && m.tool_call_id == "call1")
+            .count();
+        assert_eq!(count, 1, "placeholders stacked: {:#?}", sess.messages);
+        assert_eq!(running[0].placeholder_idx, Some(1));
+        assert!(
+            sess.messages[1].content.contains("running 45 tests..."),
+            "live output missing: {:?}",
+            sess.messages[1].content
+        );
+        assert!(sess.messages[1].content.contains("Do not sleep, poll"));
+        // A command with no output yet reads differently.
+        let mut quiet = vec![PendingCmd {
+            call_id: "call2".into(),
+            after_idx: 0,
+            command: "sleep 60".into(),
+            started: Instant::now(),
+            kill: CancelToken::new(),
+            placeholder_idx: None,
+            output: PendingOutput::default(),
+        }];
+        refresh_placeholders(&mut sess, &mut quiet);
+        assert!(sess.messages[2].content.contains("no output yet"));
     }
 
     /// OpenAI-style streams fragment one call's arguments across many deltas

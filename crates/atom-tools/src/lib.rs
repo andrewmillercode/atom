@@ -24,7 +24,9 @@ pub mod web_fetch;
 pub mod web_search;
 
 pub use dispatch::{is_dispatch_session_id, parse_dispatch_session_id, DispatchPlan};
-pub use exec::{execute_tool, SubagentHandle, ToolCtx, ToolOutcome};
+pub use exec::{
+    execute_tool, format_bash_cancelled, format_bash_exit, SubagentHandle, ToolCtx, ToolOutcome,
+};
 pub use file_edit::FileSeen;
 pub use mcp::{close_all_mcp, has_deferred_tools};
 

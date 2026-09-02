@@ -23,6 +23,9 @@ pub struct StreamEvent {
     pub text: String,
     pub name: String,
     pub arguments: String,
+    /// The provider tool-call id the event belongs to, so results attach
+    /// to the right block when several background commands are in flight.
+    pub call_id: String,
     pub message: String,
     pub diff: String,
     /// Model that completed a turn, set on `done` events.
@@ -66,6 +69,7 @@ pub fn parse_stream_event(v: &Value) -> StreamEvent {
         text: jstr(v, "text"),
         name: jstr(v, "name"),
         arguments: jstr(v, "arguments"),
+        call_id: jstr(v, "call_id"),
         message: jstr(v, "message"),
         diff: jstr(v, "diff"),
         model: jstr(v, "model"),

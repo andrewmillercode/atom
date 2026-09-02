@@ -29,12 +29,20 @@ To make `atom` available on your PATH during development:
 make dev
 ```
 
-This symlinks the debug build into `~/.local/bin` as `atomdev` and
-`atomsdev` (plain symlinks to `target/debug/atom` and
-`target/debug/atoms` — there are no separate dev binaries; release
-installs keep the `atom`/`atoms` names). Make sure `~/.local/bin` is on
-your `PATH`. The client starts the `atomsdev` server automatically if
-it isn't already running.
+This installs the debug build into `~/.local/bin` as `atomdev` and
+`atomsdev` — **real copies** of `target/debug/atom` and
+`target/debug/atoms`, not symlinks. Copies are required because macOS
+26 (Tahoe) derives process names (`ps comm`, Activity Monitor) from the
+fully resolved executable path: symlinks and hardlinks both resolve
+away, so a symlinked `atomsdev` would display as `atoms` and `pkill`
+could not tell the dev server from the release one. The copies
+self-heal: `make dev` leaves a `.atomdev-source` marker naming the
+cargo target dir, the client warns when cargo has built something
+newer than the install, and `find_server_binary` refreshes the
+`atomsdev` copy before spawning the server. Re-run `make dev` after a
+plain `cargo build` to silence the warning. Make sure `~/.local/bin`
+is on your `PATH`. The client starts the `atomsdev` server
+automatically if it isn't already running.
 
 Dev and release never mix: dev binaries and the auto-updater are
 gated on the debug build, and dev state lives in `atom-dev` data/

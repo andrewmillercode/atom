@@ -610,17 +610,36 @@ pub fn running_server_pid() -> Option<i32> {
 /// Locate the `atoms` server binary (named `atomsdev` in dev builds —
 /// see atom_core::build). It lives next to the running `atom`
 /// executable (same directory), which works for both dev and release
-/// installs.
+/// installs. Dev installs are real copies (macOS 26 derives process
+/// names from the resolved executable path — symlinks resolve away —
+/// so a symlinked atomsdev would display as "atoms"); the copy is
+/// refreshed from the cargo artifact when cargo has built something
+/// newer than the last `make dev`.
 fn find_server_binary() -> Result<PathBuf> {
     let exe = std::env::current_exe().context("find own executable")?;
     let dir = exe.parent().context("executable has no parent dir")?;
     let name = atom_core::build::server_name();
 
     // 1. Next to the running executable: the release install dir, or
-    //    the dev install dir — `make dev` links the real
-    //    cargo-built atomsdev binary into ~/.local/bin.
+    //    the dev install dir — `make dev` copies the cargo-built
+    //    atom/atoms artifacts in as atomdev/atomsdev.
     let candidate = dir.join(name);
     if candidate.is_file() {
+        if atom_core::build::is_dev() {
+            if let Some(artifact) = atom_core::build::dev_debug_artifact(dir, "atoms") {
+                if artifact.is_file() && newer_mtime(&artifact, &candidate) {
+                    // The copy went stale: `cargo build` ran after the
+                    // last `make dev`. Repair it so the server runs the
+                    // latest build under the atomsdev name; if the
+                    // install dir is not writable, run the artifact
+                    // directly (it just displays as "atoms" this once).
+                    if refresh_copy(&artifact, &candidate).is_ok() {
+                        return Ok(candidate);
+                    }
+                    return Ok(artifact);
+                }
+            }
+        }
         return Ok(candidate);
     }
     // 2. Fallback: look on PATH (handles `cargo install` putting both
@@ -628,14 +647,18 @@ fn find_server_binary() -> Result<PathBuf> {
     if let Some(found) = atom_core::deps::find_in_path(name) {
         return Ok(found);
     }
-    // 3. Dev builds: plain `cargo run` with no make symlinks — fall back
-    //    to the `atoms` artifact beside the canonicalized executable.
-    //    Canonicalizing matters on macOS, where current_exe keeps the
-    //    atomdev symlink path: resolving it lands in target/debug, whose
-    //    sibling `atoms` is the matching dev server. The unresolved dir
-    //    is deliberately not searched: it can hold a release `atoms`
-    //    that serves the release socket, which a dev client can't use.
+    // 3. Dev builds with no server sibling (a broken or partial dev
+    //    install, or plain `cargo run` with no `make dev`): fall back
+    //    to the cargo artifact recorded by the `.atomdev-source`
+    //    marker, else to the sibling of the canonicalized executable —
+    //    canonicalizing covers a manual symlink install whose target
+    //    dir is target/debug.
     if atom_core::build::is_dev() {
+        if let Some(artifact) = atom_core::build::dev_debug_artifact(dir, "atoms") {
+            if artifact.is_file() {
+                return Ok(artifact);
+            }
+        }
         if let Ok(canon) = exe.canonicalize() {
             if let Some(parent) = canon.parent() {
                 let sibling = parent.join("atoms");
@@ -654,6 +677,34 @@ fn find_server_binary() -> Result<PathBuf> {
         "cannot find `{name}` server binary (looked in {} and PATH){hint}",
         dir.display()
     ))
+}
+
+/// Strictly-newer mtime comparison; any stat or timestamp error reads
+/// as "not newer" so callers fall back to the existing file.
+fn newer_mtime(a: &Path, b: &Path) -> bool {
+    match (a.metadata(), b.metadata()) {
+        (Ok(ma), Ok(mb)) => match (ma.modified(), mb.modified()) {
+            (Ok(x), Ok(y)) => x > y,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Refresh an installed dev copy from a newer cargo artifact. Copy to
+/// a temp file beside the target and rename over it — never write the
+/// live path directly: a plain truncate+write is non-atomic and
+/// ETXTBSYs on Linux when the server is running; with the rename, a
+/// running process simply keeps the old inode and the next spawn picks
+/// up the new build.
+fn refresh_copy(artifact: &Path, live: &Path) -> std::io::Result<()> {
+    let stem = live
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("atomdev");
+    let tmp = live.with_file_name(format!(".{}.new-{}", stem, std::process::id()));
+    std::fs::copy(artifact, &tmp)?;
+    std::fs::rename(&tmp, live)
 }
 
 /// runningServerIsExpected reports whether the live server process (the
@@ -682,9 +733,11 @@ fn running_server_is_expected() -> bool {
 }
 
 /// The executable path behind a pid: /proc/<pid>/exe on Linux; on macOS
-/// `ps -o comm` reports the argv[0] path the process was exec'd with
-/// (the client always spawns the server by full path, so that is the
-/// binary's path).
+/// `ps -o comm` (proc_pidpath) reports the fully RESOLVED executable
+/// path — on macOS 26 it resolves symlinks and hardlinks and ignores
+/// argv[0] (probed 2026-09), which is why the dev install must be a
+/// real file named atomsdev. The client spawns the server by full path,
+/// so the resolved path is that file.
 fn running_exe(pid: i32) -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     {
@@ -736,8 +789,10 @@ pub async fn ensure_server() -> Result<()> {
     }
 
     // Start the server as a detached background process using the
-    // dedicated `atoms` binary. The kernel names the process from the
-    // executable filename, so Activity Monitor / ps show "atoms".
+    // dedicated `atoms` binary — a real file, so Activity Monitor / ps
+    // show its own name ("atoms", or "atomsdev" for the dev install
+    // copy; macOS names processes by the resolved executable path, so
+    // symlinks would not work — see find_server_binary).
     let server_exe = find_server_binary()?;
     let log_dir = atom_core::session::store::data_dir();
     let log_file = log_dir.join("server.log");
@@ -846,6 +901,59 @@ mod tests {
             "install symlink must match the real binary"
         );
         assert!(!same_server_binary(&real, &other), "atoms is not atomsdev");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refresh_copy_swaps_in_the_newer_artifact() {
+        let dir = std::env::temp_dir().join(format!("atom-refresh-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let artifact = dir.join("target").join("debug").join("atoms");
+        std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        std::fs::write(&artifact, b"new build").unwrap();
+        let live = dir.join("atomsdev");
+        std::fs::write(&live, b"old build").unwrap();
+
+        refresh_copy(&artifact, &live).expect("refresh succeeds");
+
+        assert_eq!(
+            std::fs::read(&live).unwrap(),
+            b"new build",
+            "live copy must now hold the artifact contents"
+        );
+        // The temp file was renamed away, not left behind.
+        assert!(!live.with_file_name(format!(".atomsdev.new-{}", std::process::id())).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn newer_mtime_orders_by_modification_time() {
+        let dir = std::env::temp_dir().join(format!("atom-mtime-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a");
+        let b = dir.join("b");
+        std::fs::write(&a, b"x").unwrap();
+        std::fs::write(&b, b"x").unwrap();
+
+        // Freshly written files share a timestamp: not strictly newer.
+        assert!(!newer_mtime(&a, &b));
+        assert!(!newer_mtime(&b, &a));
+
+        // Touch a into the future (b touches now): now strictly newer.
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
+        let fa = std::fs::File::options().append(true).open(&a).unwrap();
+        fa.set_times(
+            std::fs::FileTimes::new().set_modified(future),
+        )
+        .unwrap();
+        assert!(newer_mtime(&a, &b));
+        assert!(!newer_mtime(&b, &a));
+
+        // Missing file: reads as "not newer".
+        assert!(!newer_mtime(&dir.join("missing"), &b));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

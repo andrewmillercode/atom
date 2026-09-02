@@ -168,6 +168,13 @@ async fn run() -> Result<()> {
 
     let args = parse_args()?;
 
+    // Dev installs (`make dev`) are real copies of the cargo artifacts;
+    // if `cargo build` has since produced something newer, the copies
+    // are stale — say so before anyone debugs yesterday's code. The
+    // server copy is repaired automatically (find_server_binary); the
+    // client copy cannot replace itself, so it just warns.
+    warn_stale_dev_install();
+
     // Interactive launch (everything but stats/output-test/hot): print a
     // startup line, then auto-update before the deps check and TUI, so
     // the upgrade flow is visible on the clean terminal:
@@ -434,4 +441,32 @@ fn zero_session() -> atom_core::session::store::SessionInfo {
 
 fn is_terminal() -> bool {
     unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 }
+}
+
+/// Warn when the dev install (`make dev` copies of the cargo artifacts)
+/// is older than what cargo has since built, per the `.atomdev-source`
+/// marker the Makefile leaves next to the copies. No-op for release
+/// installs and for running straight out of target/debug (no marker
+/// there, and the artifact is the binary itself).
+fn warn_stale_dev_install() {
+    if !atom_core::build::is_dev() {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else { return };
+    let Some(dir) = exe.parent() else { return };
+    let Some(artifact) = atom_core::build::dev_debug_artifact(dir, "atom") else {
+        return;
+    };
+    let (Ok(am), Ok(em)) = (artifact.metadata(), exe.metadata()) else {
+        return;
+    };
+    let (Ok(at), Ok(et)) = (am.modified(), em.modified()) else {
+        return;
+    };
+    if at > et {
+        eprintln!(
+            "[atom] dev install is stale: {} is newer than this atomdev — run `make dev`",
+            artifact.display()
+        );
+    }
 }

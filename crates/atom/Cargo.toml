@@ -12,11 +12,16 @@ name = "atoms"
 path = "src/atoms.rs"
 
 # Dev installs (`make dev`) run under the names atomdev/atomsdev. These
-# are not separate cargo binaries: `make dev` symlinks atomdev ->
-# target/debug/atom and atomsdev -> target/debug/atoms. Flavor is keyed
-# on cfg!(debug_assertions), not the name — a dev install IS the debug
-# binary — so duplicate bin targets would only double linking on every
-# cargo build/test for no behavioral difference.
+# are not separate cargo binaries: `make dev` copies the debug atom/atoms
+# artifacts into ~/.local/bin as atomdev/atomsdev. Copies, not symlinks:
+# macOS 26 names processes by the fully resolved executable path, so a
+# symlinked atomsdev would display as "atoms" in ps / Activity Monitor.
+# The copies self-heal (see the Makefile's .atomdev-source marker and
+# find_server_binary): the client warns when cargo has built something
+# newer, and the atomsdev copy is refreshed before the server spawns.
+# Flavor is keyed on cfg!(debug_assertions), not the name — a dev
+# install IS the debug binary — so duplicate bin targets would only
+# double linking on every cargo build/test for no behavioral difference.
 
 [dependencies]
 atom-core = { workspace = true }

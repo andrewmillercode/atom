@@ -717,11 +717,6 @@ async fn handle_send(
             ..Default::default()
         };
         if state.turns.inject_session_message(id, msg) {
-            // Prompt acceleration: in-flight bash calls in this session
-            // stop waiting for inline results and hand back their job
-            // ids immediately. The registry is the coordination point —
-            // no token is threaded through the turn handle.
-            atom_sandbox::jobs::flush_wait(id);
             let (resp, tx) = ndjson_response();
             tokio::spawn(async move {
                 // Drop tx at the end of the block so the body closes.
@@ -1026,6 +1021,38 @@ async fn signal_shutdown(socket: PathBuf) {
     std::process::exit(0);
 }
 
+/// sweepInterruptedBackgroundCommands runs once at server startup.
+/// Background commands are children of this process, so a restart kills
+/// them mid-run — but their transcript entries still read
+/// "[background command still running …]", a claim that would never
+/// become true and that tells the model to expect output that never
+/// arrives. Rewrite those entries so reloaded sessions don't dangle on a
+/// phantom command.
+fn sweep_interrupted_background_commands(store: &SessionStore) {
+    for sess in store.list() {
+        let mut changed = false;
+        let messages = sess
+            .messages
+            .iter()
+            .map(|m| {
+                if m.role == "tool" && m.content.starts_with("[background command still running:") {
+                    changed = true;
+                    let mut m2 = m.clone();
+                    m2.content = "[background command interrupted by a server \
+                                  restart; no output was recorded]"
+                        .into();
+                    m2
+                } else {
+                    m.clone()
+                }
+            })
+            .collect::<Vec<_>>();
+        if changed {
+            store.update(&sess.id, messages, &sess.title);
+        }
+    }
+}
+
 /// runServer starts the atom session server. It returns when another
 /// live server is detected (clean exit) or on a listener error.
 pub async fn run_server() -> anyhow::Result<()> {
@@ -1036,6 +1063,7 @@ pub async fn run_server() -> anyhow::Result<()> {
     }
 
     let store = SessionStore::open().map_err(|e| anyhow::anyhow!("session store: {e}"))?;
+    sweep_interrupted_background_commands(&store);
     let state = Arc::new(AppState::new(
         Arc::new(store),
         atom_sandbox::policy::SandboxConfig::load(),
@@ -1067,6 +1095,51 @@ pub async fn run_server() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atom_core::types::Message;
+
+    /// A server restart kills background commands; the sweep must rewrite
+    /// their still-running transcript entries and leave everything else.
+    #[test]
+    fn startup_sweep_rewrites_orphaned_placeholders() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::open_in_dir(dir.path()).unwrap();
+        let mut sess = store.create("m", "/tmp", vec![]);
+        sess.messages.push(Message {
+            role: "tool".into(),
+            tool_call_id: "call1".into(),
+            content: "[background command still running: cargo test — started 5s ago. \
+                 Its output replaces this entry automatically when it exits; \
+                 do not sleep, poll, or re-run it to wait.]"
+                .into(),
+            ..Default::default()
+        });
+        sess.messages.push(Message {
+            role: "tool".into(),
+            tool_call_id: "call2".into(),
+            content: "ok".into(),
+            ..Default::default()
+        });
+        store.save(&sess);
+
+        sweep_interrupted_background_commands(&store);
+
+        let reloaded = store.get(&sess.id).unwrap();
+        assert!(
+            reloaded.messages[0]
+                .content
+                .starts_with("[background command interrupted by a server restart"),
+            "placeholder not rewritten: {:?}",
+            reloaded.messages[0].content
+        );
+        assert_eq!(reloaded.messages[1].content, "ok", "real result touched");
+        // Idempotent: a second pass is a no-op.
+        sweep_interrupted_background_commands(&store);
+        let reloaded = store.get(&sess.id).unwrap();
+        assert_eq!(reloaded.messages[0].tool_call_id, "call1");
+        assert!(reloaded.messages[0]
+            .content
+            .starts_with("[background command interrupted by a server restart"));
+    }
 
     /// listenOnSocket must detect a live server on the path and defer to
     /// it without touching its socket file.

@@ -303,6 +303,11 @@ pub struct App {
     /// Kill switch for the running shell command, armed by the spawned
     /// task; Ctrl+C sends on it to abort the child process.
     pub shell_kill: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Shell-mode commands finished since the last submitted prompt,
+    /// as (command, output). They ride along on the next outgoing
+    /// message as <bash-input>/<bash-stdout> tags so the model sees
+    /// what the user ran in the shell.
+    pub shell_log: Vec<(String, String)>,
 }
 
 impl App {
@@ -412,6 +417,7 @@ impl App {
             shell_mode: false,
             shell_running: false,
             shell_kill: None,
+            shell_log: Vec::new(),
         };
         m.refresh_thinking_levels();
         m.apply_thinking(&m.session.thinking.clone());
@@ -947,11 +953,12 @@ impl App {
                     title,
                     tool_name: ev.name.clone(),
                     text,
+                    call_id: ev.call_id.clone(),
                     ..Default::default()
                 });
             }
             "tool_result" => {
-                blocks::attach_tool_result(&mut self.blocks, &ev.text, "");
+                blocks::attach_tool_result(&mut self.blocks, &ev.call_id, &ev.text, "");
                 self.viewport_dirty = true;
                 if blocks::assign_block_diagram_ids(&mut self.blocks) {
                     self.preview_dirty = true;
@@ -970,13 +977,26 @@ impl App {
                 }
             }
             "tool_diff" => {
-                for b in self.blocks.iter_mut().rev() {
-                    if b.kind == BlockKind::Tool && b.diff.is_empty() {
-                        b.diff = ev.diff.clone();
-                        b.lines = None;
-                        self.viewport_dirty = true;
-                        break;
-                    }
+                let target = self
+                    .blocks
+                    .iter()
+                    .position(|b| {
+                        b.kind == BlockKind::Tool
+                            && b.diff.is_empty()
+                            && !ev.call_id.is_empty()
+                            && b.call_id == ev.call_id
+                    })
+                    .or_else(|| {
+                        self.blocks.iter().rposition(|b| {
+                            b.kind == BlockKind::Tool
+                                && b.diff.is_empty()
+                                && (ev.call_id.is_empty() || b.call_id.is_empty())
+                        })
+                    });
+                if let Some(b) = target.and_then(|i| self.blocks.get_mut(i)) {
+                    b.diff = ev.diff.clone();
+                    b.lines = None;
+                    self.viewport_dirty = true;
                 }
             }
             "compaction" => {
@@ -1429,7 +1449,7 @@ impl App {
             let req = SendRequest {
                 session_id: self.session.id.clone(),
                 turn_id: self.turn_id.clone(),
-                message: text.to_string(),
+                message: self.message_with_shell(text),
                 thinking: self.thinking_level(),
                 images: imgs,
                 key: self.sel_provider.key.clone(),
@@ -1470,7 +1490,7 @@ impl App {
             let req = SendRequest {
                 session_id: self.session.id.clone(),
                 turn_id: self.turn_id.clone(),
-                message: text.to_string(),
+                message: self.message_with_shell(text),
                 thinking: self.thinking_level(),
                 images: imgs,
                 key: self.sel_provider.key.clone(),
@@ -2351,6 +2371,10 @@ impl App {
             self.following = true;
             self.streaming = false;
             self.interrupting = false;
+            // Shell-mode output belongs to the session it ran in: a
+            // queued log from another session must not ride along on
+            // the next prompt here.
+            self.shell_log.clear();
             // The turn id belongs to the session it was generated for: a
             // stale id from the previous view would make a pause target a
             // turn that never exists (e.g. a subagent's "dispatch-<id>"
@@ -2768,10 +2792,11 @@ impl App {
             b.kind == BlockKind::Tool && b.tool_name == "shell" && !b.tool_done && b.title == title
         }) {
             block.tool_done = true;
-            block.result = result;
+            block.result = result.clone();
             block.lines = None;
             self.viewport_dirty = true;
         }
+        self.shell_log.push((cmd, result));
 
         let mut effects = Vec::new();
         if !new_cwd.is_empty() && new_cwd != self.cwd {
@@ -2785,6 +2810,33 @@ impl App {
             }
         }
         effects
+    }
+
+    /// Outgoing wire message: the user's text plus any shell-mode
+    /// commands run since the last prompt, appended as
+    /// <bash-input>/<bash-stdout> tags so the model sees what the user
+    /// ran in the shell. Clears the log — each command ships once.
+    fn message_with_shell(&mut self, text: &str) -> String {
+        let log = std::mem::take(&mut self.shell_log);
+        if log.is_empty() {
+            return text.to_string();
+        }
+        let mut msg = text.to_string();
+        for (cmd, out) in log {
+            let out = out.trim();
+            let out = if out.is_empty() {
+                "(no output)".to_string()
+            } else if out.chars().count() > 2000 {
+                let tail: String = out.chars().skip(out.chars().count() - 2000).collect();
+                format!("…(truncated)…\n{tail}")
+            } else {
+                out.to_string()
+            };
+            msg.push_str(&format!(
+                "\n<bash-input>{cmd}</bash-input>\n<bash-stdout>{out}</bash-stdout>"
+            ));
+        }
+        msg
     }
 
     // -- keys ----------------------------------------------------------------
@@ -5047,6 +5099,55 @@ mod tests {
             new_cwd: String::new(),
         });
         assert!(app.blocks.last().unwrap().result.contains("killed"));
+    }
+
+    #[test]
+    fn shell_commands_ride_along_on_the_next_prompt() {
+        let mut app = App::new_test(90, 30);
+        app.session.id = "sess1".into();
+        app.key(key(KeyCode::Char('!'), KeyModifiers::NONE));
+        app.input.set_value("cargo test");
+        app.key(key(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_msg(AppMsg::ShellDone {
+            cmd: "cargo test".into(),
+            cwd: app.cwd.clone(),
+            output: "test result: ok. 5 passed".into(),
+            code: Some(0),
+            new_cwd: String::new(),
+        });
+        // Second command with empty output.
+        app.input.set_value("true");
+        app.key(key(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_msg(AppMsg::ShellDone {
+            cmd: "true".into(),
+            cwd: app.cwd.clone(),
+            output: String::new(),
+            code: Some(0),
+            new_cwd: String::new(),
+        });
+
+        let fx = app.handle_input("why did that fail?");
+        let Effect::SendTurn(req) = &fx[0] else {
+            panic!("expected SendTurn, got {:?}", fx[0]);
+        };
+        // The wire message carries the shell traffic as tags…
+        assert!(req.message.starts_with("why did that fail?\n"));
+        assert!(req
+            .message
+            .contains("<bash-input>cargo test</bash-input>\n<bash-stdout>test result: ok. 5 passed</bash-stdout>"));
+        assert!(req
+            .message
+            .contains("<bash-input>true</bash-input>\n<bash-stdout>(no output)</bash-stdout>"));
+        // …but the user's block shows the raw prompt.
+        assert_eq!(app.blocks.last().unwrap().text, "why did that fail?");
+        // Each command ships once: the next prompt is clean.
+        assert!(app.shell_log.is_empty());
+        app.streaming = false; // the turn has ended
+        let fx = app.handle_input("again");
+        let Effect::SendTurn(req) = &fx[0] else {
+            panic!("expected SendTurn, got {:?}", fx[0]);
+        };
+        assert_eq!(req.message, "again");
     }
 
     #[test]

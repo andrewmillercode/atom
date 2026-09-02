@@ -415,6 +415,122 @@ async fn send_runs_tool_rounds() {
     assert_eq!(got.messages[3].content, "all done");
 }
 
+/// The pending-bash UX: the model calls a long bash command, the turn
+/// parks (no further rounds), a mid-turn prompt is answered against a
+/// placeholder result without stopping the command, and the real result
+/// is recorded as THE result of the original tool call — inserted right
+/// after its assistant tool_calls message, before the interjected
+/// prompt — with a tool_result event that fills the original block.
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_bash_answers_prompt_and_records_real_result() {
+    let env = TestEnv::new("pending-bash");
+    let base_url = spawn_mock_provider(vec![
+        // Round 1: a long command; the turn parks on it.
+        sse_response(concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"sleep 1 && echo all green\\\"}\"}}]}}]}\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3,\"total_tokens\":8}}\n",
+            "data: [DONE]\n",
+        )),
+        // Round 2 (placeholder round after the mid-turn prompt): the
+        // model answers the prompt without stopping the command.
+        sse_response(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"started the test suite, should take a few seconds\"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":2,\"total_tokens\":13}}\n",
+            "data: [DONE]\n",
+        )),
+        // Round 3: the command has exited; the model reports the result.
+        sse_response(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"tests finished\"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":17,\"completion_tokens\":1,\"total_tokens\":18}}\n",
+            "data: [DONE]\n",
+        )),
+    ])
+    .await;
+    let state = spawn_server(&env, off_cfg()).await;
+
+    let ws = env.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let sess = state
+        .store
+        .create("test-model", &ws.display().to_string(), vec![]);
+
+    let rx = client::stream_send(
+        &sess.id,
+        &json!({"message": "run the tests", "base_url": base_url}),
+    )
+    .await
+    .unwrap();
+
+    // Land the prompt while the command is parked (~200ms into the 1s
+    // sleep). The injected send is answered with the tiny injected
+    // stream; the original stream keeps painting.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut inject_rx = client::stream_send(&sess.id, &json!({"message": "hows it going"}))
+        .await
+        .expect("mid-turn prompt must be accepted, not conflict");
+    let ack = tokio::time::timeout(Duration::from_secs(5), inject_rx.recv())
+        .await
+        .unwrap()
+        .expect("injected stream open");
+    assert_eq!(ack["type"], "injected");
+    assert!(inject_rx.recv().await.is_none(), "injected stream closes");
+
+    let events = collect_until_done(rx).await;
+    let types: Vec<String> = events
+        .iter()
+        .map(|e| e["type"].as_str().unwrap_or("").to_string())
+        .collect();
+    // tool_result (the real sleep result) arrives after the placeholder
+    // round's reply, and the final answer follows it.
+    assert_eq!(
+        types,
+        vec![
+            "round_start",
+            "tool_pending",
+            "usage",
+            "tool",
+            "round_start",
+            "content",
+            "usage",
+            "tool_result",
+            "round_start",
+            "content",
+            "usage",
+            "done",
+        ],
+        "{events:?}"
+    );
+
+    // History: the real tool result sits at its recorded position —
+    // immediately after the assistant tool_calls message, BEFORE the
+    // interjected prompt.
+    let got = state.store.get(&sess.id).unwrap();
+    let roles: Vec<&str> = got.messages.iter().map(|m| m.role.as_str()).collect();
+    assert_eq!(
+        roles,
+        vec![
+            "user",
+            "assistant",
+            "tool",
+            "user",
+            "assistant",
+            "assistant"
+        ]
+    );
+    assert_eq!(got.messages[2].tool_call_id, "call_a");
+    assert_eq!(
+        got.messages[2].content, "all green",
+        "tool result must be the real one, not the placeholder"
+    );
+    assert!(!got.messages[2].content.contains("still running"));
+    assert_eq!(got.messages[3].content, "hows it going");
+    assert_eq!(
+        got.messages[4].content,
+        "started the test suite, should take a few seconds"
+    );
+    assert_eq!(got.messages[5].content, "tests finished");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn denied_file_write_surfaces_approval_and_finishes_turn() {
     let env = TestEnv::new("write-approval");

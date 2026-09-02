@@ -125,6 +125,9 @@ pub struct Block {
     pub tool_done: bool,
     /// dispatch child session; empty for other tools
     pub session_id: String,
+    /// provider tool-call id this block was created for; results attach
+    /// by id so out-of-order completions land on the right block
+    pub call_id: String,
     /// Pending sandbox approval rendered inline as a tool block.
     /// Contains (approval_id, session_id, rule_id, reason, cwd, command).
     /// `None` for regular tool blocks.
@@ -172,6 +175,7 @@ impl Default for Block {
             result: String::new(),
             tool_done: false,
             session_id: String::new(),
+            call_id: String::new(),
             approval: None,
             expanded: false,
             active: false,
@@ -335,11 +339,12 @@ pub fn messages_to_blocks(msgs: &[Message]) -> Vec<Block> {
                         title: tool_display_name(&tc.function.name),
                         tool_name: tc.function.name.clone(),
                         text: tool_action(&tc.function.name, &tc.function.arguments),
+                        call_id: tc.id.clone(),
                         ..Default::default()
                     });
                 }
             }
-            "tool" => attach_tool_result(&mut blocks, &msg.content, &msg.diff),
+            "tool" => attach_tool_result(&mut blocks, &msg.tool_call_id, &msg.content, &msg.diff),
             _ => {}
         }
     }
@@ -794,49 +799,62 @@ pub fn diagram_geometry(d: &mut DiagramRef, inner: usize) -> bool {
     true
 }
 
-/// call; an unmatched result becomes its own block.
-pub fn attach_tool_result(blocks: &mut Vec<Block>, content: &str, diff: &str) {
+/// attachToolResult fills the open tool block a result belongs to; an
+/// unmatched result becomes its own block.
+pub fn attach_tool_result(blocks: &mut Vec<Block>, call_id: &str, content: &str, diff: &str) {
     let id = atom_tools::parse_dispatch_session_id(content);
-    for b in blocks.iter_mut() {
-        if b.kind == BlockKind::Tool && !b.tool_done {
-            b.result = content.to_string();
-            b.tool_done = true;
-            // Diagram markers are only honored for visualize results. Any
-            // other tool output that happens to quote the marker line
-            // (a grep over this repo's source, for instance) must not
-            // hijack the block into a diagram card.
-            if b.tool_name == "visualize" && content.contains("[atom-diagram]") {
-                b.diagram =
-                    parse_diagram_marker(content).map(|(svg, png, png_dark, html, w, h)| {
-                        DiagramRef {
-                            svg,
-                            png,
-                            png_dark,
-                            html,
-                            w,
-                            h,
-                            ..Default::default()
-                        }
-                    });
-            }
-            if !diff.is_empty() {
-                b.diff = diff.to_string();
-            }
-            if !id.is_empty() {
-                b.session_id = id.clone();
-            }
-            b.lines = None;
-            return;
-        }
+    // Results must attach to the block of their own tool call: a turn can
+    // park on a background command while later tool calls complete, so
+    // "first open block" would cross-wire outputs between commands. Match
+    // by call id first; the open-block fallback covers events without an
+    // id (tests, legacy recorded sessions).
+    let pos = blocks
+        .iter()
+        .position(|b| {
+            b.kind == BlockKind::Tool && !b.tool_done && !call_id.is_empty() && b.call_id == call_id
+        })
+        .or_else(|| {
+            blocks
+                .iter()
+                .position(|b| b.kind == BlockKind::Tool && !b.tool_done && call_id.is_empty())
+        });
+    let Some(b) = pos.map(|i| &mut blocks[i]) else {
+        blocks.push(Block {
+            kind: BlockKind::Tool,
+            result: content.to_string(),
+            tool_done: true,
+            diff: diff.to_string(),
+            session_id: id,
+            call_id: call_id.to_string(),
+            ..Default::default()
+        });
+        return;
+    };
+    b.result = content.to_string();
+    b.tool_done = true;
+    // Diagram markers are only honored for visualize results. Any
+    // other tool output that happens to quote the marker line
+    // (a grep over this repo's source, for instance) must not
+    // hijack the block into a diagram card.
+    if b.tool_name == "visualize" && content.contains("[atom-diagram]") {
+        b.diagram =
+            parse_diagram_marker(content).map(|(svg, png, png_dark, html, w, h)| DiagramRef {
+                svg,
+                png,
+                png_dark,
+                html,
+                w,
+                h,
+                ..Default::default()
+            });
     }
-    blocks.push(Block {
-        kind: BlockKind::Tool,
-        result: content.to_string(),
-        tool_done: true,
-        diff: diff.to_string(),
-        session_id: id,
-        ..Default::default()
-    });
+    if !diff.is_empty() {
+        b.diff = diff.to_string();
+    }
+    if !id.is_empty() {
+        b.session_id = id.clone();
+    }
+    b.lines = None;
 }
 
 /// toolResultSummary strips an embedded unified diff from the result so
@@ -1982,13 +2000,55 @@ mod tests {
                 ..Default::default()
             },
         ];
-        attach_tool_result(&mut blocks, "one", "");
-        attach_tool_result(&mut blocks, "two", "");
+        attach_tool_result(&mut blocks, "", "one", "");
+        attach_tool_result(&mut blocks, "", "two", "");
         assert_eq!(blocks[0].result, "one");
         assert_eq!(blocks[1].result, "two");
-        attach_tool_result(&mut blocks, "orphan", "");
+        attach_tool_result(&mut blocks, "", "orphan", "");
         assert_eq!(blocks.len(), 3);
         assert_eq!(blocks[2].result, "orphan");
+    }
+
+    /// Two background commands in flight, completing out of order: each
+    /// result must land on its own call's block, not whichever open block
+    /// comes first.
+    #[test]
+    fn attach_pairs_out_of_order_results_by_call_id() {
+        let mut blocks = vec![
+            Block {
+                kind: BlockKind::Tool,
+                title: "Bash".into(),
+                tool_name: "bash".into(),
+                call_id: "call-a".into(),
+                ..Default::default()
+            },
+            Block {
+                kind: BlockKind::Tool,
+                title: "Bash".into(),
+                tool_name: "bash".into(),
+                call_id: "call-b".into(),
+                ..Default::default()
+            },
+        ];
+        // call-b finishes first.
+        attach_tool_result(&mut blocks, "call-b", "sleep output", "");
+        assert!(!blocks[0].tool_done, "call-a block was claimed");
+        assert_eq!(blocks[1].result, "sleep output");
+        attach_tool_result(&mut blocks, "call-a", "cargo test output", "");
+        assert_eq!(blocks[0].result, "cargo test output");
+        assert!(blocks[0].tool_done && blocks[1].tool_done);
+        // A result with an unknown id becomes its own block, never steals
+        // an open one.
+        let mut blocks = vec![Block {
+            kind: BlockKind::Tool,
+            tool_name: "bash".into(),
+            call_id: "call-a".into(),
+            ..Default::default()
+        }];
+        attach_tool_result(&mut blocks, "call-x", "stray", "");
+        assert_eq!(blocks.len(), 2);
+        assert!(!blocks[0].tool_done);
+        assert_eq!(blocks[1].result, "stray");
     }
 
     #[test]
@@ -2009,8 +2069,8 @@ mod tests {
         assert!(running
             .iter()
             .any(|line| crate::ansi::line_plain(line).contains('*')));
-        attach_tool_result(&mut blocks, "", "");
-        attach_tool_result(&mut blocks, "done", "");
+        attach_tool_result(&mut blocks, "", "", "");
+        attach_tool_result(&mut blocks, "", "done", "");
         assert!(blocks[0].tool_done);
         assert!(blocks[0].result.is_empty());
         assert_eq!(blocks[1].result, "done");
@@ -2028,7 +2088,7 @@ mod tests {
             tool_name: "dispatch".into(),
             ..Default::default()
         }];
-        attach_tool_result(&mut blocks, "id: 0123456789abcdef\nstarted", "");
+        attach_tool_result(&mut blocks, "", "id: 0123456789abcdef\nstarted", "");
         assert_eq!(blocks[0].session_id, "0123456789abcdef");
     }
 
@@ -2409,6 +2469,7 @@ mod tests {
         }];
         attach_tool_result(
             &mut blocks,
+            "",
             "rendered diagram\n [atom-diagram] png=/a.png png-dark=/a-dark.png html=/a.html width=100 height=50",
             "",
         );
@@ -2420,7 +2481,7 @@ mod tests {
         assert_eq!((d.w, d.h), (100, 50));
         assert_eq!(d.id, 0, "ids are assigned later by the app");
         // Results without a marker leave the diagram empty.
-        attach_tool_result(&mut blocks, "plain", "");
+        attach_tool_result(&mut blocks, "", "plain", "");
         assert!(blocks[1].diagram.is_none());
     }
 
@@ -2437,7 +2498,7 @@ mod tests {
                 tool_name: name.into(),
                 ..Default::default()
             }];
-            attach_tool_result(&mut blocks, content, "");
+            attach_tool_result(&mut blocks, "", content, "");
             assert!(blocks[0].tool_done);
             assert!(
                 blocks[0].diagram.is_none(),

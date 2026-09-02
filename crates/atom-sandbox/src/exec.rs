@@ -21,18 +21,16 @@ use atom_core::util::sha256_hash;
 use once_cell::sync::Lazy;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 
-/// Hard wall-clock limit for one command. v2 has no confinement, so
-/// this is just a runaway safety net.
+/// Hard wall-clock limit for the legacy blocking entry point ([`run`] /
+/// [`run_with`], used by tests and callers that need a synchronous
+/// result). The bash tool itself has no timeout: a command runs until
+/// it exits and the turn waits; runaway protection is the user's Esc.
 pub const EXEC_TIMEOUT: Duration = Duration::from_secs(120);
-
-/// How long a command may run foreground before the bash tool hands it
-/// to the job registry and returns the job id (agent keeps the turn,
-/// the command keeps running, output lands in the job's log file).
-pub const HEAD_START: Duration = Duration::from_secs(10);
 
 pub(crate) const BASH: &str = "/bin/bash";
 
@@ -68,7 +66,7 @@ impl ConfineKind {
 }
 
 /// Result of one sandboxed execution.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ExecOutcome {
     pub exit_code: i32,
     pub stdout: String,
@@ -79,12 +77,9 @@ pub struct ExecOutcome {
     /// v2: always `ConfineKind::None`. Field kept so audit log records
     /// stay well-formed and downstream code keeps compiling.
     pub confined: ConfineKind,
-    /// Set when the command outlived its foreground budget and
-    /// continued as a background job: the job id.
-    pub backgrounded: Option<String>,
-    /// Set when the command was killed because the turn was cancelled
-    /// (Esc / interruption) while it ran.
-    pub cancelled: bool,
+    /// Set when the command is still running: the caller (the turn
+    /// loop) parks on it and the tool result is recorded when it exits.
+    pub pending: Option<PendingProcess>,
 }
 
 impl Default for ExecOutcome {
@@ -97,10 +92,169 @@ impl Default for ExecOutcome {
             verdict: Analysis::default(),
             approved: false,
             confined: ConfineKind::None,
-            backgrounded: None,
-            cancelled: false,
+            pending: None,
         }
     }
+}
+
+/// A bash command that is still running. The bash tool returns one for
+/// every command — the turn loop parks on it until it exits (no
+/// timeout; runaway protection is the user's Esc) and records the
+/// output as the original tool call's result. stdout/stderr are drained
+/// continuously by spawned tasks so large output cannot fill the pipe
+/// buffers and deadlock a long-running command.
+pub struct PendingProcess {
+    command: String,
+    started: Instant,
+    child: Child,
+    status: Option<std::process::ExitStatus>,
+    stdout_task: tokio::task::JoinHandle<()>,
+    stderr_task: tokio::task::JoinHandle<()>,
+    output: PendingOutput,
+    killed: bool,
+}
+
+/// Live view of a running command's output. The pipe readers append
+/// every chunk to these shared buffers as it arrives, so the turn loop
+/// can peek at partial output while the command is still running
+/// (placeholder refresh) without touching the child handle.
+#[derive(Clone, Default)]
+pub struct PendingOutput(Arc<std::sync::Mutex<PartialOutput>>);
+
+#[derive(Default)]
+struct PartialOutput {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+impl PendingOutput {
+    /// Everything written so far: stdout then stderr, matching the order
+    /// [`PendingExit::output`] uses at collection time.
+    pub fn text(&self) -> String {
+        let out = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    }
+
+    /// Appends one chunk to the buffer. The pipe readers call this per
+    /// read; tests use it to seed partial output.
+    pub fn extend(&self, stdout: bool, chunk: &[u8]) {
+        let mut out = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if stdout {
+            out.stdout.extend_from_slice(chunk);
+        } else {
+            out.stderr.extend_from_slice(chunk);
+        }
+    }
+}
+
+impl std::fmt::Debug for PendingProcess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingProcess")
+            .field("command", &self.command)
+            .field("started", &self.started)
+            .field("killed", &self.killed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PendingProcess {
+    /// The command this process is running (for placeholder results).
+    pub fn command(&self) -> &str {
+        &self.command
+    }
+
+    /// When the command was spawned (for placeholder results).
+    pub fn started(&self) -> Instant {
+        self.started
+    }
+
+    /// How long the command has been running.
+    pub fn elapsed(&self) -> Duration {
+        self.started.elapsed()
+    }
+
+    /// A cloneable handle to the output written so far — the turn loop
+    /// keeps one on the pending command to refresh placeholders while
+    /// this process runs.
+    pub fn output_handle(&self) -> PendingOutput {
+        self.output.clone()
+    }
+
+    /// Was the process killed (Esc) rather than exiting on its own.
+    pub fn killed(&self) -> bool {
+        self.killed
+    }
+
+    /// SIGKILL the process group and reap the child. The child was
+    /// spawned with process_group(0), so its pgid == its pid and the
+    /// group kill reaches `bash -lc "cargo test"`'s grandchildren too.
+    pub async fn kill(&mut self) {
+        let pid = self.child.id().unwrap_or(0) as i32;
+        if pid > 0 {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+        let _ = self.child.kill().await;
+        self.status = self.child.wait().await.ok();
+        self.killed = true;
+    }
+
+    /// Waits for the process to exit on its own (no timeout — a long
+    /// test suite runs until it is done).
+    pub async fn wait_exit(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let status = self.child.wait().await;
+        self.status = status.as_ref().ok().copied();
+        status
+    }
+
+    /// Joins the concurrent pipe readers and returns the exit. Safe
+    /// after [`kill`] or a normal [`wait_exit`]: both streams close when
+    /// the process (group) dies, so these joins return promptly.
+    pub async fn collect(self) -> PendingExit {
+        let _ = self.stdout_task.await;
+        let _ = self.stderr_task.await;
+        let exit_code = self
+            .status
+            .as_ref()
+            .map(|s| s.code().unwrap_or(-1))
+            .unwrap_or(-1);
+        let output = {
+            let mut buf = self.output.0.lock().unwrap_or_else(|p| p.into_inner());
+            (
+                String::from_utf8_lossy(&buf.stdout).into_owned(),
+                String::from_utf8_lossy(&buf.stderr).into_owned(),
+            )
+        };
+        PendingExit {
+            exit_code,
+            output: format!("{}{}", output.0, output.1),
+            killed: self.killed,
+        }
+    }
+
+    /// Convenience for direct callers (tests): wait for exit or the kill
+    /// token, then collect.
+    pub async fn run_until_done(mut self, kill: CancelToken) -> PendingExit {
+        tokio::select! {
+            biased;
+            _ = kill.cancelled() => self.kill().await,
+            _ = self.wait_exit() => {}
+        }
+        self.collect().await
+    }
+}
+
+/// The exit of a pending command: its exit code, combined output, and
+/// whether it was killed by the user (Esc) instead of exiting itself.
+pub struct PendingExit {
+    pub exit_code: i32,
+    pub output: String,
+    pub killed: bool,
 }
 
 /// First matched rule id that exists in the built-in table (synthetic
@@ -309,28 +463,11 @@ struct Authed {
     decision: &'static str,
 }
 
-/// How the bash tool wants a command to run.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum BashMode {
-    /// Background by default: wait out a short head start for an
-    /// inline result; if the command is still running, hand the child
-    /// to the registry and return its job id. A mid-turn prompt
-    /// (registry flush) ends the wait early.
-    Background,
-    /// Hand the child to the registry immediately and return the job
-    /// id; the command keeps running.
-    Detach,
-    /// Block until exit (or EXEC_TIMEOUT). Ignores prompt acceleration:
-    /// the agent chose to wait on this result.
-    Block,
-}
-
-/// The bash tool's entry point: like [`run`] but with a cancellation
-/// token (turn pause/interrupt) and the background-job wait. When the
-/// wait ends without an exit, the outcome carries the job id; on
-/// cancellation the child's process group is killed and the partial
-/// output is returned.
-#[allow(clippy::too_many_arguments)]
+/// The bash tool's entry point: like [`run`] but returning a
+/// [`PendingProcess`] for the command — every bash call is pending
+/// until the command exits. The turn loop parks on it; Esc (via the
+/// kill token) stops the whole process group. There is no timeout:
+/// a long test suite runs until it is done.
 pub async fn run_tool(
     cmd: &str,
     cwd: &Path,
@@ -338,8 +475,6 @@ pub async fn run_tool(
     session_id: &str,
     cfg: &SandboxConfig,
     approver: &dyn Approver,
-    mode: BashMode,
-    cancel: Option<&CancelToken>,
 ) -> ExecOutcome {
     run_tool_with(
         &data_dir(),
@@ -349,15 +484,11 @@ pub async fn run_tool(
         session_id,
         cfg,
         approver,
-        mode,
-        HEAD_START,
-        cancel,
     )
     .await
 }
 
-/// [`run_tool`] with an explicit data dir (hermetic tests) and head
-/// start (tests don't wait out the real 10s).
+/// [`run_tool`] with an explicit data dir (hermetic tests).
 #[allow(clippy::too_many_arguments)]
 pub async fn run_tool_with(
     data_dir_path: &Path,
@@ -367,9 +498,6 @@ pub async fn run_tool_with(
     session_id: &str,
     cfg: &SandboxConfig,
     approver: &dyn Approver,
-    mode: BashMode,
-    head_start: Duration,
-    cancel: Option<&CancelToken>,
 ) -> ExecOutcome {
     let authed = match authorize(
         data_dir_path,
@@ -393,162 +521,90 @@ pub async fn run_tool_with(
             None
         }
     };
-    let tmp_path = tmpdir.as_ref().map(|t| t.path().to_path_buf());
 
-    // One spawn-and-register path: every command is a job from spawn
-    // time, with output streaming into its per-job log file. The child
-    // stays with the caller while the tool waits for an inline result;
-    // the registry entry is filled in (attach) or dropped (remove)
-    // depending on how the wait ends.
-    let (job_id, out_path, mut child) = match crate::jobs::spawn_registered(
-        data_dir_path,
-        session_id,
-        cmd,
-        cwd,
-        tmp_path.as_deref(),
-    ) {
-        Ok(spawned) => spawned,
-        Err(err) => {
-            let outcome = ExecOutcome {
-                exit_code: -1,
-                stderr: format!("{err}\n"),
+    // Spawn piped: the reader tasks drain both streams concurrently so
+    // output larger than the 64KB pipe buffers cannot deadlock the
+    // command. Own process group so Esc reaches the grandchildren.
+    let mut command = Command::new(BASH);
+    command.arg("-lc").arg(cmd);
+    command.current_dir(cwd);
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    command.env_clear();
+    for (k, v) in scrub_env() {
+        command.env(k, v);
+    }
+    if let Some(t) = tmpdir.as_ref().map(|t| t.path()) {
+        command.env("TMPDIR", t);
+        command.env("TMP", t);
+        command.env("TEMP", t);
+    }
+    command.kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let outcome = match command.spawn() {
+        Ok(mut child) => {
+            // Drain the pipes from the start: wait_with_output-style
+            // collection happens later, when the turn loop parks on the
+            // child and it finally exits.
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+            let output = PendingOutput::default();
+            let stdout_buf = output.clone();
+            let stderr_buf = output.clone();
+            let stdout_task = tokio::spawn(async move {
+                if let Some(mut pipe) = stdout {
+                    let mut chunk = [0u8; 8192];
+                    loop {
+                        match pipe.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => stdout_buf.extend(true, &chunk[..n]),
+                        }
+                    }
+                }
+            });
+            let stderr_task = tokio::spawn(async move {
+                if let Some(mut pipe) = stderr {
+                    let mut chunk = [0u8; 8192];
+                    loop {
+                        match pipe.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => stderr_buf.extend(false, &chunk[..n]),
+                        }
+                    }
+                }
+            });
+            ExecOutcome {
+                exit_code: 0,
                 approved: authed.approved,
                 verdict: authed.verdict.clone(),
                 confined: ConfineKind::None,
+                pending: Some(PendingProcess {
+                    command: cmd.to_string(),
+                    started: Instant::now(),
+                    child,
+                    status: None,
+                    stdout_task,
+                    stderr_task,
+                    output,
+                    killed: false,
+                }),
                 ..Default::default()
-            };
-            audit(
-                data_dir_path,
-                session_id,
-                cmd,
-                &authed.verdict,
-                authed.decision,
-                &outcome,
-                None,
-            );
-            return outcome;
-        }
-    };
-
-    // `background: true`: the job id comes back immediately, no wait.
-    if mode == BashMode::Detach {
-        crate::jobs::attach(&job_id, child);
-        let outcome = ExecOutcome {
-            exit_code: 0,
-            stdout: read_log(&out_path),
-            approved: authed.approved,
-            verdict: authed.verdict.clone(),
-            confined: ConfineKind::None,
-            backgrounded: Some(job_id),
-            ..Default::default()
-        };
-        audit(
-            data_dir_path,
-            session_id,
-            cmd,
-            &authed.verdict,
-            authed.decision,
-            &outcome,
-            Some("backgrounded"),
-        );
-        return outcome;
-    }
-
-    let started = Instant::now();
-    let mut cancelled = false;
-    let mut timed_out = false;
-    let mut handoff = false;
-    let mut status: Option<std::process::ExitStatus> = None;
-    let cancel_wait = async {
-        match cancel {
-            Some(t) => t.cancelled().await,
-            None => std::future::pending::<()>().await,
-        }
-    };
-    // The inline wait: the head start, cut short by a mid-turn prompt
-    // (registry flush). Block mode never hands off — the agent asked
-    // to wait for this result, capped at EXEC_TIMEOUT.
-    let head_start_wait = async {
-        if mode == BashMode::Block {
-            std::future::pending::<()>().await;
-        }
-        loop {
-            if crate::jobs::flushed(&job_id) || started.elapsed() >= head_start {
-                return;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-    };
-    tokio::select! {
-        biased;
-        _ = cancel_wait, if cancel.is_some() => {
-            kill_group(&mut child).await;
-            cancelled = true;
-        }
-        res = child.wait() => status = res.ok(),
-        _ = head_start_wait => handoff = true,
-        _ = tokio::time::sleep(EXEC_TIMEOUT), if mode == BashMode::Block => {
-            kill_group(&mut child).await;
-            timed_out = true;
-        }
-    }
-
-    if handoff {
-        // Still running when the head start ran out (or a prompt
-        // accelerated the handoff): the same child, now owned by the
-        // registry, keeps running as the job.
-        crate::jobs::attach(&job_id, child);
-        let outcome = ExecOutcome {
-            exit_code: 0,
-            stdout: read_log(&out_path),
+        Err(e) => ExecOutcome {
+            exit_code: -1,
+            stderr: format!("atom: failed to spawn: {e}\n"),
             approved: authed.approved,
             verdict: authed.verdict.clone(),
             confined: ConfineKind::None,
-            backgrounded: Some(job_id),
             ..Default::default()
-        };
-        audit(
-            data_dir_path,
-            session_id,
-            cmd,
-            &authed.verdict,
-            authed.decision,
-            &outcome,
-            Some("backgrounded"),
-        );
-        return outcome;
-    }
-
-    // Inline result: the registry entry and log file were only
-    // scaffolding for the wait — remove both, exactly like a command
-    // that never became a job.
-    crate::jobs::remove(&job_id);
-    let output = read_log(&out_path);
-    let _ = std::fs::remove_file(&out_path);
-    if let Some(t) = tmpdir {
-        if let Err(e) = t.cleanup() {
-            eprintln!("atom: failed to remove session tmpdir: {e}");
-        }
-    }
-    let exit_code = status
-        .as_ref()
-        .map(|s| s.code().unwrap_or(-1))
-        .unwrap_or(-1);
-    let outcome = ExecOutcome {
-        exit_code,
-        stdout: output,
-        stderr: String::new(),
-        timed_out,
-        cancelled,
-        approved: authed.approved,
-        verdict: authed.verdict.clone(),
-        confined: ConfineKind::None,
-        backgrounded: None,
+        },
     };
-    let note = if cancelled {
-        Some("cancelled")
-    } else if timed_out {
-        Some("timeout")
+    let note = if outcome.pending.is_some() {
+        Some("pending")
     } else {
         None
     };
@@ -562,27 +618,6 @@ pub async fn run_tool_with(
         note,
     );
     outcome
-}
-
-/// SIGKILL the child's whole process group and reap it. The child was
-/// spawned with process_group(0), so its pgid == its pid.
-async fn kill_group(child: &mut Child) {
-    let pid = child.id().unwrap_or(0) as i32;
-    if pid > 0 {
-        unsafe {
-            libc::kill(-pid, libc::SIGKILL);
-        }
-    }
-    let _ = child.kill().await;
-    let _ = child.wait().await;
-}
-
-/// Read a job/foreground log; "" if it doesn't exist yet.
-fn read_log(out_path: &Path) -> String {
-    match std::fs::read(out_path) {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-        Err(_) => String::new(),
-    }
 }
 
 /// RAII guard for the per-session scratch directory under
@@ -894,106 +929,95 @@ mod tests {
         assert_eq!(out.verdict.verdict, Verdict::Allow);
     }
 
-    // ---- background jobs + cancellation ----
+    // ---- pending-process model ----
 
     fn unique_session() -> String {
         static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        format!("jobsess-{}-{n}", std::process::id())
+        format!("pend-{}-{n}", std::process::id())
     }
 
+    /// Every bash call comes back pending; the turn loop parks on it
+    /// until the command exits and records the output as the result.
     #[tokio::test]
-    async fn slow_command_returns_job_id_and_job_keeps_running() {
+    async fn pending_command_completes_with_full_output() {
         let e = env();
-        let sid = unique_session();
         let out = run_tool_with(
             e._data.path(),
-            "echo starting; sleep 5; echo done",
+            "echo starting; sleep 1; echo done",
             e._ws.path(),
             e._ws.path(),
-            &sid,
+            &unique_session(),
             &default_cfg(),
             &AutoApprover(Decision::AllowOnce),
-            BashMode::Background,
-            Duration::from_millis(400),
-            None,
         )
         .await;
-        let job_id = out
-            .backgrounded
-            .expect("command past the head start hands off to the registry");
         assert_eq!(out.exit_code, 0);
-        assert!(!out.cancelled && !out.timed_out);
+        assert!(out.approved);
+        let pp = out.pending.expect("bash returns a pending process");
+        assert_eq!(pp.command(), "echo starting; sleep 1; echo done");
 
-        // The job was registered at spawn and keeps running under the
-        // same id.
-        let status = crate::jobs::check(&sid, &[job_id.clone()]);
-        assert_eq!(status.len(), 1);
-        assert!(status[0].contains("running"), "{}", status[0]);
-        assert!(status[0].contains("echo starting"), "{}", status[0]);
-
-        // wait blocks for completion and reports the exit.
-        let lines = crate::jobs::wait(&sid, &[job_id.clone()], Duration::from_secs(10)).await;
-        assert!(lines[0].contains("exited 0"), "{}", lines[0]);
-        assert!(lines[0].contains("done"), "{}", lines[0]);
-        // Log files live under dataDir()/jobs/<session>/.
-        let log = e
-            ._data
-            .path()
-            .join("jobs")
-            .join(sid.trim_start_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-'))
-            .join(format!("{job_id}.log"));
-        assert!(log.exists(), "job log missing at {log:?}; lines={lines:?}");
+        let exit = pp.run_until_done(CancelToken::new()).await;
+        assert!(!exit.killed);
+        assert_eq!(exit.exit_code, 0);
+        assert!(exit.output.contains("starting") && exit.output.contains("done"));
     }
 
-    /// A mid-turn prompt flags the registry (flush_wait); the in-flight
-    /// tool call returns its job id right away instead of waiting out
-    /// the head start.
+    /// Partial output is peekable while the command is still running:
+    /// the turn loop refreshes placeholders from this live view without
+    /// any status tool.
     #[tokio::test]
-    async fn flush_wait_returns_the_job_id_immediately() {
+    async fn pending_output_is_peekable_mid_run() {
         let e = env();
-        let started = std::time::Instant::now();
-        let data = e._data.path().to_path_buf();
-        let ws = e._ws.path().to_path_buf();
-        let waiter = tokio::spawn(async move {
-            run_tool_with(
-                &data,
-                "sleep 30",
-                &ws,
-                &ws,
-                "flush-sess",
-                &default_cfg(),
-                &AutoApprover(Decision::AllowOnce),
-                BashMode::Background,
-                Duration::from_secs(60),
-                None,
-            )
-            .await
-        });
-        // Land the prompt ~1s into the 30s command: the tool call must
-        // give up the wait long before its 60s head start.
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        crate::jobs::flush_wait("flush-sess");
-        let out = waiter.await.unwrap();
-        let job_id = out
-            .backgrounded
-            .expect("flush should hand off the still-running command");
-        assert!(!out.cancelled);
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed < Duration::from_secs(10),
-            "flush should return immediately, took {elapsed:?}"
-        );
-        // The job keeps running in the registry.
-        let status = crate::jobs::check("flush-sess", &[job_id.clone()]);
-        assert!(status[0].contains("running"), "{}", status[0]);
-        crate::jobs::kill("flush-sess", &[job_id]).await;
+        let out = run_tool_with(
+            e._data.path(),
+            "echo partial-marker; sleep 5; echo never-reached",
+            e._ws.path(),
+            e._ws.path(),
+            &unique_session(),
+            &default_cfg(),
+            &AutoApprover(Decision::AllowOnce),
+        )
+        .await;
+        let mut pp = out.pending.expect("pending process");
+        let peek = pp.output_handle();
+
+        // Poll until the marker shows up, well before the 5s sleep ends.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if peek.text().contains("partial-marker") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "output never became peekable"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!peek.text().contains("never-reached"));
+
+        pp.kill().await;
+        let exit = pp.collect().await;
+        assert!(exit.killed);
+        assert!(exit.output.contains("partial-marker"));
     }
 
+    /// Esc (the kill token) stops the whole process group promptly —
+    /// including the command's children, not just the immediate bash.
     #[tokio::test]
-    async fn cancel_kills_foreground_command_promptly() {
+    async fn esc_kills_pending_command_process_group() {
         let e = env();
-        let sid = unique_session();
+        let out = run_tool_with(
+            e._data.path(),
+            "sh -c 'sleep 30' & wait", // grandchild under the tool's bash
+            e._ws.path(),
+            e._ws.path(),
+            &unique_session(),
+            &default_cfg(),
+            &AutoApprover(Decision::AllowOnce),
+        )
+        .await;
+        let mut pp = out.pending.expect("pending process");
         let token = CancelToken::new();
         let t2 = token.clone();
         tokio::spawn(async move {
@@ -1001,83 +1025,65 @@ mod tests {
             t2.cancel();
         });
         let started = std::time::Instant::now();
-        let out = run_tool_with(
-            e._data.path(),
-            "sleep 30",
-            e._ws.path(),
-            e._ws.path(),
-            &sid,
-            &default_cfg(),
-            &AutoApprover(Decision::AllowOnce),
-            BashMode::Block,
-            EXEC_TIMEOUT,
-            Some(&token),
-        )
-        .await;
-        assert!(out.cancelled, "expected a cancelled outcome");
-        assert!(out.backgrounded.is_none());
-        // Killed, not waited out: well under the 30s the command wanted.
-        assert!(started.elapsed() < Duration::from_secs(5));
-        // The registry entry + log were scaffolding for the wait.
+        let exit = pp.run_until_done(token).await;
+        assert!(exit.killed, "expected a killed exit");
         assert!(
-            crate::jobs::check(&sid, &[]).is_empty(),
-            "cancelled command leaves no job behind"
+            started.elapsed() < Duration::from_secs(5),
+            "kill should be prompt, took {:?}",
+            started.elapsed()
         );
     }
 
+    /// Output far beyond the 64KB pipe buffers must not deadlock: the
+    /// reader tasks drain the pipes from spawn time.
     #[tokio::test]
-    async fn detach_mode_returns_job_id_immediately_and_kill_stops_the_group() {
+    async fn huge_output_does_not_deadlock() {
         let e = env();
-        let sid = unique_session();
         let out = run_tool_with(
             e._data.path(),
-            "sleep 30",
+            "yes | head -c 300000",
             e._ws.path(),
             e._ws.path(),
-            &sid,
+            &unique_session(),
             &default_cfg(),
             &AutoApprover(Decision::AllowOnce),
-            BashMode::Detach,
-            HEAD_START,
-            None,
         )
         .await;
-        let job_id = out.backgrounded.expect("detach mode returns a job id");
-        let status = crate::jobs::check(&sid, &[]);
-        assert!(status.iter().any(|s| s.contains(&job_id)), "{status:?}");
-
-        let lines = crate::jobs::kill(&sid, &[job_id.clone()]).await;
-        assert!(lines[0].contains("killed"), "{}", lines[0]);
-        let after = crate::jobs::check(&sid, &[job_id]);
-        assert!(after[0].contains("exited"), "{}", after[0]);
+        let pp = out.pending.expect("pending process");
+        let exit = tokio::time::timeout(
+            Duration::from_secs(30),
+            pp.run_until_done(CancelToken::new()),
+        )
+        .await
+        .expect("drained pipes must not deadlock");
+        assert_eq!(exit.exit_code, 0, "output: {}", exit.output.len());
+        assert_eq!(exit.output.len(), 300000);
     }
 
+    /// A long command is pending with no timeout: the tool call returns
+    /// immediately while the command keeps running.
     #[tokio::test]
-    async fn quick_command_completes_inline_and_leaves_no_job() {
+    async fn tool_call_returns_before_command_finishes() {
         let e = env();
-        let sid = unique_session();
+        let started = std::time::Instant::now();
         let out = run_tool_with(
             e._data.path(),
-            "echo quick",
+            "sleep 2",
             e._ws.path(),
             e._ws.path(),
-            &sid,
+            &unique_session(),
             &default_cfg(),
             &AutoApprover(Decision::AllowOnce),
-            BashMode::Background,
-            Duration::from_secs(5),
-            None,
         )
         .await;
-        assert_eq!(out.stdout.trim_end(), "quick");
-        assert_eq!(out.exit_code, 0);
-        assert!(out.backgrounded.is_none() && !out.cancelled);
-        // Inline delivery removes the job entry (and its log file).
         assert!(
-            crate::jobs::check(&sid, &[]).is_empty(),
-            "{:?}",
-            crate::jobs::check(&sid, &[])
+            started.elapsed() < Duration::from_secs(1),
+            "tool call must not wait for the command: {:?}",
+            started.elapsed()
         );
+        let pp = out.pending.expect("pending process");
+        let exit = pp.run_until_done(CancelToken::new()).await;
+        assert_eq!(exit.exit_code, 0);
     }
 
     #[tokio::test]

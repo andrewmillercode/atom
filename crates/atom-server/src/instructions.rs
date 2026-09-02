@@ -114,10 +114,14 @@ mod tests {
         let instr = load_instructions_from(&sub.display().to_string());
         let found: Vec<&str> = instr
             .iter()
-            .filter(|m| m.content.contains("rules"))
-            .map(|m| match () {
-                _ if m.content.contains("leaf") => "leaf",
-                _ => "root",
+            .filter_map(|m| {
+                if m.content.contains("leaf rules") {
+                    Some("leaf")
+                } else if m.content.contains("root rules") {
+                    Some("root")
+                } else {
+                    None
+                }
             })
             .collect();
         assert_eq!(

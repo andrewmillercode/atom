@@ -38,5 +38,12 @@ async fn run() -> Result<()> {
     // Deps check: headless mode, warn only.
     atom_core::deps::ensure_on_startup(false, &atom_core::deps::RealInstaller).await;
 
+    // Warm the models.dev catalog in the background so turn routing
+    // (api_protocol_for), context windows, and dispatch validation read
+    // an in-memory copy instead of racing a disk parse. This never
+    // blocks startup: ensure serves a disk cache of any age instantly
+    // and only revalidates over the network in the background.
+    tokio::spawn(atom_core::providers::modelsdev::ensure_models_dev_catalog());
+
     atom_server::http::run_server().await
 }

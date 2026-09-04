@@ -109,7 +109,7 @@ mod tests {
         assert_eq!(dev_target_dir(&dir).as_deref(), Some(dir.as_path()));
         assert_eq!(
             dev_debug_artifact(&dir, "atoms").as_deref(),
-            Some(&dir.join("debug").join("atoms"))
+            Some(dir.join("debug").join("atoms").as_path())
         );
 
         // Dangling marker (target dir deleted): treated as absent.

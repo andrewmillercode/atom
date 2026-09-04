@@ -179,7 +179,7 @@ fn usage_variants(app: &App, width: usize) -> Vec<String> {
 /// keyboard (e.g. atom over SSH from a phone).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NavAction {
-    /// Open the subagent manager (mirrors Shift+↓).
+    /// Toggle the subagent manager (mirrors Shift+↓).
     OpenSubagents,
     /// Return to the parent session (mirrors Shift+↑).
     ReturnToParent,
@@ -194,7 +194,14 @@ pub fn nav_segments(app: &App) -> Vec<(NavAction, Vec<Span<'static>>)> {
     let mut segs: Vec<(NavAction, Vec<Span<'static>>)> = Vec::new();
     let n = app.manage_agents.len();
     if n > 0 {
-        let label = if n == 1 {
+        // Shift+↓ toggles the menu, so the hint changes with its state.
+        let label = if app.manage_visible {
+            if n == 1 {
+                "(1 subagent) Shift ↓ to close".to_string()
+            } else {
+                format!("({n} subagents) Shift ↓ to close")
+            }
+        } else if n == 1 {
             "(1 subagent) Shift ↓".to_string()
         } else {
             format!("({n} subagents) Shift ↓")

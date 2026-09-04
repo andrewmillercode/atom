@@ -54,8 +54,10 @@ pub const SCROLLBAR_WIDTH: usize = 2;
 /// splashTickInterval drives the empty-session atom animation.
 pub const SPLASH_TICK_MS: u64 = 33;
 
-/// MiniDot runs at ~24 fps for smooth animation.
-pub const SPINNER_TICK_MS: u64 = 42;
+/// MiniDot spinner tick. 33ms ≈ 30 fps; each tick triggers a full-screen
+/// `view::draw`, so this trades animation smoothness for CPU during
+/// streaming/tool-wait phases (24 fps original → 16 fps → 30 fps).
+pub const SPINNER_TICK_MS: u64 = 33;
 
 /// outputTestSceneDuration backs the --output-test scene timer.
 pub const TEST_SCENE_TICK_SECS: u64 = 3;
@@ -1166,6 +1168,8 @@ impl App {
                     {
                         block.model = ev.model.clone();
                         block.turn_duration = ev.duration;
+                        block.tokens_per_sec =
+                            (ev.tokens_per_sec > 0.0).then_some(ev.tokens_per_sec);
                         block.lines = None;
                         self.viewport_dirty = true;
                     }
@@ -1177,27 +1181,38 @@ impl App {
     }
 
     pub fn finalize_reasoning(&mut self, dur: Option<Duration>) {
-        let Some(idx) = self
+        // Close every active reasoning block, newest first. Two can be
+        // active at once when a mid-turn submit drops a User block while
+        // reasoning deltas are still streaming: the next delta stacks a
+        // second block after it, and closing only the newest (the old
+        // rposition) orphaned the first, whose spinner then ran until
+        // the end of the turn.
+        let mut changed = false;
+        while let Some(idx) = self
             .blocks
             .iter()
             .rposition(|b| b.kind == BlockKind::Reasoning && b.active)
-        else {
-            return;
-        };
-        // A placeholder from round_start that never received reasoning
-        // text is removed outright; keeping it would leave a stray
-        // "Thinking" header above pure-content replies.
-        if self.blocks[idx].text.is_empty() {
-            self.blocks.remove(idx);
-            return;
+        {
+            // A placeholder from round_start that never received reasoning
+            // text is removed outright; keeping it would leave a stray
+            // "Thinking" header above pure-content replies.
+            if self.blocks[idx].text.is_empty() {
+                self.blocks.remove(idx);
+            } else {
+                let b = &mut self.blocks[idx];
+                b.active = false;
+                b.dur = Some(
+                    dur.unwrap_or_else(|| {
+                        b.started_at.map(|t| t.elapsed()).unwrap_or(Duration::ZERO)
+                    }),
+                );
+                b.lines = None;
+            }
+            changed = true;
         }
-        let b = &mut self.blocks[idx];
-        b.active = false;
-        b.dur = Some(
-            dur.unwrap_or_else(|| b.started_at.map(|t| t.elapsed()).unwrap_or(Duration::ZERO)),
-        );
-        b.lines = None;
-        self.viewport_dirty = true;
+        if changed {
+            self.viewport_dirty = true;
+        }
     }
 
     pub fn finalize_compaction(&mut self) {
@@ -1372,6 +1387,17 @@ impl App {
         }]
     }
 
+    /// Shift+↓ and its clickable status-bar hint both toggle the
+    /// subagent menu: open it when hidden, dismiss it when shown.
+    pub fn toggle_manage_menu(&mut self) -> Vec<Effect> {
+        if self.manage_visible {
+            self.dismiss_manage_menu();
+            Vec::new()
+        } else {
+            self.open_manage_menu()
+        }
+    }
+
     // -- input handling ----------------------------------------------------
 
     /// handleInput processes submitted text: slash commands run locally,
@@ -1429,6 +1455,12 @@ impl App {
             // round). Nothing is paused or killed, and the already-open
             // stream keeps painting, so the App only pushes the user
             // block optimistically and keeps its streaming state.
+            // The server cancels the streaming round asynchronously, so
+            // reasoning deltas can keep arriving after the User block
+            // lands. Close the live Thinking block now: leaving it
+            // active orphans it (a later finalize_reasoning closes only
+            // the newest) and its spinner would run until end of turn.
+            self.finalize_reasoning(None);
             let imgs: Vec<ImageData> = self.pending.iter().map(|p| p.img.clone()).collect();
             let imgs_meta = std::mem::take(&mut self.pending);
             self.preview_dirty = true;
@@ -1566,9 +1598,8 @@ impl App {
                 Vec::new()
             }
             "/theme" => {
-                let rows = overlays::theme_rows();
                 self.open_overlay(OverlayKind::Theme);
-                self.overlay_sel = rows
+                self.overlay_sel = overlays::filtered_theme_rows(self)
                     .iter()
                     .position(|entry| entry.id == atom_core::render::colors::active_theme_name())
                     .unwrap_or(0);
@@ -2908,7 +2939,7 @@ impl App {
         }
         if let KeyCode::Down = k.code {
             if shift {
-                return self.open_manage_menu();
+                return self.toggle_manage_menu();
             }
         }
         if let KeyCode::Up = k.code {
@@ -4036,6 +4067,12 @@ impl App {
                     self.overlay_sel = rows.iter().position(|row| row.0 == selected).unwrap_or(0);
                     Vec::new()
                 }
+                4 => {
+                    self.atom_config.transparent_background =
+                        Some(!self.atom_config.resolved_transparent_background());
+                    self.save_atom_config();
+                    Vec::new()
+                }
                 _ => {
                     self.accept_settings_defaults();
                     self.overlay = None;
@@ -4073,7 +4110,7 @@ impl App {
                 Vec::new()
             }
             OverlayKind::Theme => {
-                let rows = overlays::theme_rows();
+                let rows = overlays::filtered_theme_rows(self);
                 let Some(entry) = rows.get(self.overlay_sel) else {
                     return Vec::new();
                 };
@@ -4636,7 +4673,7 @@ impl App {
     fn run_status_nav_action(&mut self, action: crate::statusbar::NavAction) -> Vec<Effect> {
         use crate::statusbar::NavAction;
         match action {
-            NavAction::OpenSubagents => self.open_manage_menu(),
+            NavAction::OpenSubagents => self.toggle_manage_menu(),
             NavAction::ReturnToParent => {
                 if !self.session.parent_id.is_empty() {
                     vec![Effect::LoadSession {
@@ -5435,6 +5472,27 @@ mod tests {
     }
 
     #[test]
+    fn shift_down_toggles_subagent_menu() {
+        let mut app = App::new_test(90, 30);
+        app.session.id = "parent".into();
+
+        // First Shift+Down opens, second closes, third reopens.
+        let fx = app.key(key(KeyCode::Down, KeyModifiers::SHIFT));
+        assert!(app.manage_visible);
+        assert!(fx.iter().any(|e| matches!(e, Effect::ListChildren { .. })));
+        app.key(key(KeyCode::Down, KeyModifiers::SHIFT));
+        assert!(!app.manage_visible);
+        app.key(key(KeyCode::Down, KeyModifiers::SHIFT));
+        assert!(app.manage_visible);
+
+        // The clickable status-bar hint toggles too.
+        app.run_status_nav_action(crate::statusbar::NavAction::OpenSubagents);
+        assert!(!app.manage_visible);
+        app.run_status_nav_action(crate::statusbar::NavAction::OpenSubagents);
+        assert!(app.manage_visible);
+    }
+
+    #[test]
     fn shift_up_closes_subagent_menu_on_parent() {
         let mut app = App::new_test(90, 30);
         app.session.id = "parent".into();
@@ -5653,6 +5711,19 @@ mod tests {
         let compaction = app.atom_config.compaction.unwrap();
         assert_eq!(compaction.model, "compact-model");
         assert!(!compaction.resolved_enabled());
+    }
+
+    #[test]
+    fn settings_toggle_flips_transparent_background() {
+        let mut app = App::new_test(80, 24);
+        app.overlay = Some(OverlayKind::Settings);
+        app.overlay_sel = 4;
+        assert!(app.confirm_overlay().is_empty());
+        assert_eq!(app.overlay, Some(OverlayKind::Settings));
+        assert_eq!(app.atom_config.transparent_background, Some(true));
+
+        app.confirm_overlay();
+        assert_eq!(app.atom_config.transparent_background, Some(false));
     }
 
     #[test]
@@ -6666,6 +6737,101 @@ mod tests {
     }
 
     #[test]
+    fn mid_turn_submit_finalizes_live_thinking() {
+        let mut app = App::new_test(80, 20);
+        app.session.id = "sess1".into();
+        app.sel_provider.base_url = "http://test:11434/v1".into();
+        app.streaming = true;
+        app.turn_id = "turn-1".into();
+
+        app.handle_stream_event(&StreamEvent {
+            event_type: "round_start".into(),
+            ..Default::default()
+        });
+        app.handle_stream_event(&StreamEvent {
+            event_type: "reasoning".into(),
+            text: "deep thought".into(),
+            ..Default::default()
+        });
+
+        // User sends a message mid-turn.
+        app.input.set_value("hm");
+        let text = app.input.value.trim().to_string();
+        let fx = app.handle_input(&text);
+        assert!(fx.iter().any(|e| matches!(e, Effect::InjectTurn { .. })));
+
+        // The live Thinking block must close at submit time, not keep
+        // spinning above the user message.
+        assert!(!app
+            .blocks
+            .iter()
+            .any(|b| b.kind == BlockKind::Reasoning && b.active));
+        assert_eq!(app.blocks.last().unwrap().kind, BlockKind::User);
+
+        // Deltas still in flight from the cancelled round stack a fresh
+        // block after the user message; its reasoning_end closes it.
+        app.handle_stream_event(&StreamEvent {
+            event_type: "reasoning".into(),
+            text: "tail of the cancelled round".into(),
+            ..Default::default()
+        });
+        assert_eq!(
+            app.blocks
+                .iter()
+                .filter(|b| b.kind == BlockKind::Reasoning && b.active)
+                .count(),
+            1
+        );
+        app.handle_stream_event(&StreamEvent {
+            event_type: "reasoning_end".into(),
+            ..Default::default()
+        });
+        assert!(!app
+            .blocks
+            .iter()
+            .any(|b| b.kind == BlockKind::Reasoning && b.active));
+    }
+
+    #[test]
+    fn finalize_reasoning_closes_every_active_block() {
+        let mut app = App::new_test(80, 20);
+        app.handle_stream_event(&StreamEvent {
+            event_type: "round_start".into(),
+            ..Default::default()
+        });
+        app.handle_stream_event(&StreamEvent {
+            event_type: "reasoning".into(),
+            text: "first".into(),
+            ..Default::default()
+        });
+        // The mid-turn race shape: a user block lands, then more
+        // reasoning deltas stack a second active block after it.
+        app.blocks.push(Block {
+            kind: BlockKind::User,
+            text: "hm".into(),
+            ..Default::default()
+        });
+        app.handle_stream_event(&StreamEvent {
+            event_type: "reasoning".into(),
+            text: "second".into(),
+            ..Default::default()
+        });
+        assert_eq!(
+            app.blocks
+                .iter()
+                .filter(|b| b.kind == BlockKind::Reasoning && b.active)
+                .count(),
+            2
+        );
+
+        app.finalize_reasoning(None);
+        assert!(!app
+            .blocks
+            .iter()
+            .any(|b| b.kind == BlockKind::Reasoning && b.active));
+    }
+
+    #[test]
     fn scroll_detaches_and_bottom_reattaches_following() {
         let mut app = App::new_test(80, 20);
         for i in 0..50 {
@@ -7117,5 +7283,35 @@ mod tests {
             app.blocks[0].lines.as_ref().is_none(),
             "theme switch must drop cached block colors"
         );
+    }
+
+    #[test]
+    fn theme_confirm_resolves_the_filtered_row() {
+        // With a typed query the visible list is the filtered subset and
+        // overlay_sel indexes it; confirm used to resolve against the
+        // unfiltered theme_rows, whose head is "atom" — so every
+        // query-picked theme landed on atom. Filter to a single non-atom
+        // theme and confirm the row the UI highlights.
+        let mut app = App::new_test(80, 20);
+        let prev = atom_core::render::colors::active_theme_name();
+
+        app.overlay = Some(OverlayKind::Theme);
+        app.overlay_q = "dracula".into();
+        app.overlay_sel = 0;
+
+        let effects = app.key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.atom_config.theme.as_deref(),
+            Some("dracula"),
+            "confirm must resolve through the filtered rows"
+        );
+        assert!(app.overlay.is_none());
+        assert!(matches!(effects.last(), Some(Effect::PaintPreviews)));
+
+        // Restore immediately: confirming flipped the global palette, and
+        // other tests pin default-theme colors. Keep the flip window as
+        // short as the assertions allow.
+        atom_core::render::colors::apply_theme(&prev).expect("restore previous theme");
+        app.atom_config.theme = None;
     }
 }

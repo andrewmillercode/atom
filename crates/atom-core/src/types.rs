@@ -74,6 +74,10 @@ pub struct Message {
     pub model: String,
     /// Total wall-clock duration of the completed turn.
     pub duration_ms: i64,
+    /// Generation speed of the final model round: completion tokens
+    /// (reasoning included) divided by the first-token → stream-end
+    /// window. 0 when unknown (provider reported no usage).
+    pub tokens_per_sec: f64,
     /// Token count of the request that produced this message.
     pub usage: Option<StreamUsage>,
     /// When the message was written; absent for transcripts persisted
@@ -121,6 +125,9 @@ fn message_plain_fields(m: &Message) -> serde_json::Value {
     }
     if m.duration_ms > 0 {
         obj.insert("duration_ms".into(), json!(m.duration_ms));
+    }
+    if m.tokens_per_sec > 0.0 {
+        obj.insert("tokens_per_sec".into(), json!(m.tokens_per_sec));
     }
     if let Some(u) = &m.usage {
         obj.insert("usage".into(), serde_json::to_value(u).unwrap());
@@ -182,6 +189,8 @@ impl<'de> Deserialize<'de> for Message {
             #[serde(default)]
             duration_ms: i64,
             #[serde(default)]
+            tokens_per_sec: f64,
+            #[serde(default)]
             usage: Option<StreamUsage>,
             #[serde(default)]
             created_at: Option<String>,
@@ -206,6 +215,7 @@ impl<'de> Deserialize<'de> for Message {
             provider: std::mem::take(&mut raw.provider),
             model: std::mem::take(&mut raw.model),
             duration_ms: raw.duration_ms,
+            tokens_per_sec: raw.tokens_per_sec,
             usage: raw.usage.take(),
             created_at,
         };
@@ -466,6 +476,11 @@ pub struct StreamResult {
     pub tool_calls: Vec<ToolCall>,
     pub usage: Option<StreamUsage>,
     pub finish_reason: String,
+    /// Server-measured time to first token: stream start → first delta.
+    pub ttft_ms: i64,
+    /// First token → stream end. Together with ttft_ms this spans the
+    /// whole model round that tokens-per-second is measured over.
+    pub gen_ms: i64,
 }
 
 #[cfg(test)]

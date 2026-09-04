@@ -215,9 +215,9 @@ async fn event_loop(
         tokio::time::interval(tokio::time::Duration::from_secs(app::TEST_SCENE_TICK_SECS));
     // Safety net against lost wakeups: any future that permanently fails to
     // fire would otherwise freeze the TUI with no way to detect or recover.
-    // A 250ms heartbeat bounds the worst case to a brief input hiccup while
-    // costing ~4 idle wakes/sec (ratatui's diff emits no bytes for a static
-    // frame). The select! re-arms every wakeup source on each heartbeat.
+    // A 250ms heartbeat bounds the worst case to a brief input hiccup. It
+    // only re-arms the select! wakeup sources and does not redraw (the
+    // frame_dirty gate skips the draw for no-op messages).
     let mut heartbeat_tick =
         tokio::time::interval(tokio::time::Duration::from_millis(HEARTBEAT_TICK_MS));
     for tick in [
@@ -233,6 +233,11 @@ async fn event_loop(
     let mut splash_was_active = false;
     let mut scene_was_active = false;
     let splash_start = tokio::time::Instant::now();
+    // Frame gating: the draw below renders the full screen, so it only
+    // runs when some message actually changed state. The heartbeat and
+    // other no-op wakes leave this false, making idle CPU ~0 instead of
+    // paying a full view::draw 4x/sec.
+    let mut frame_dirty = true;
 
     loop {
         run_effects(app, &tx, &mut st, &mut effects).await;
@@ -252,34 +257,37 @@ async fn event_loop(
         }
 
         let mut cursor_pos: Option<(u16, u16)> = None;
-        // Hold the tty write lock across the whole frame — draw, flush and
-        // cursor update are one escape sequence burst; a concurrent kitty
-        // paint interleaving here is what garbled the TUI until resize.
-        let tty_guard = preview::lock_tty();
-        // Flush newly rendered formula uploads/placements before the frame
-        // that displays their placeholder cells (same guard: these bytes
-        // must not interleave with the frame).
-        math::flush_terminal_commands();
-        terminal.draw(|f| {
-            cursor_pos = view::draw(app, f.area(), f.buffer_mut());
-        })?;
-        match cursor_pos {
-            Some((x, y)) => {
-                let _ = terminal.show_cursor();
-                let _ = terminal.set_cursor_position(ratatui::layout::Position::new(x, y));
+        if frame_dirty {
+            frame_dirty = false;
+            // Hold the tty write lock across the whole frame — draw, flush and
+            // cursor update are one escape sequence burst; a concurrent kitty
+            // paint interleaving here is what garbled the TUI until resize.
+            let tty_guard = preview::lock_tty();
+            // Flush newly rendered formula uploads/placements before the frame
+            // that displays their placeholder cells (same guard: these bytes
+            // must not interleave with the frame).
+            math::flush_terminal_commands();
+            terminal.draw(|f| {
+                cursor_pos = view::draw(app, f.area(), f.buffer_mut());
+            })?;
+            match cursor_pos {
+                Some((x, y)) => {
+                    let _ = terminal.show_cursor();
+                    let _ = terminal.set_cursor_position(ratatui::layout::Position::new(x, y));
+                }
+                None => {
+                    let _ = terminal.hide_cursor();
+                }
             }
-            None => {
-                let _ = terminal.hide_cursor();
+            drop(tty_guard);
+            // A first frame can discover the real terminal width before a
+            // crossterm Resize event arrives. If that changes diagram geometry,
+            // paint the matching kitty placement after the placeholder grid is
+            // on screen instead of leaving a stale/blank reserved area.
+            if app.preview_dirty && preview::kitty_terminal() {
+                effects.push(Effect::PaintPreviews);
+                run_effects(app, &tx, &mut st, &mut effects).await;
             }
-        }
-        drop(tty_guard);
-        // A first frame can discover the real terminal width before a
-        // crossterm Resize event arrives. If that changes diagram geometry,
-        // paint the matching kitty placement after the placeholder grid is
-        // on screen instead of leaving a stale/blank reserved area.
-        if app.preview_dirty && preview::kitty_terminal() {
-            effects.push(Effect::PaintPreviews);
-            run_effects(app, &tx, &mut st, &mut effects).await;
         }
         if app.quitting {
             return Ok(());
@@ -356,6 +364,13 @@ async fn event_loop(
         };
 
         let Some(msg) = msg else { continue };
+
+        // Any real message can change the view, so request a frame. The
+        // heartbeat is deliberately excluded: it exists only to re-arm the
+        // select! wakeup sources and must never trigger a full redraw.
+        if !matches!(msg, AppMsg::Heartbeat) {
+            frame_dirty = true;
+        }
 
         // Process this first message, then drain any other immediately
         // available events before rendering.  This coalesces bursts of

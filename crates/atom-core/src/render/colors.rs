@@ -10,6 +10,7 @@
 use once_cell::sync::Lazy;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
 /// The canonical theme shipped with atom, embedded at compile time so the
@@ -141,6 +142,20 @@ struct ThemeFile {
 static THEME: Lazy<RwLock<Theme>> =
     Lazy::new(|| RwLock::new(embedded_theme().unwrap_or_else(|_| Theme::default())));
 
+/// Bumped every time the active theme changes. Callers that derive
+/// expensive values from the palette (parsed `Color`s, ratatui styles)
+/// cache them keyed on this generation instead of re-deriving per frame.
+static THEME_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// Current theme generation; changes only on `load_theme_file` success.
+pub fn theme_gen() -> u64 {
+    THEME_GEN.load(Ordering::Relaxed)
+}
+
+/// Number of [`ThemeColor`] variants; lets callers cache one derived
+/// value per role in a fixed-size array.
+pub const THEME_COLOR_COUNT: usize = 18;
+
 /// Parses the compile-time-embedded `ui/theme.toml` into the default
 /// theme. Falls back to the constant-derived `Theme::default()` only if
 /// the embedded file is somehow malformed (it never should be).
@@ -181,6 +196,7 @@ pub fn load_theme_file(path: &Path) -> Result<(), String> {
     let file: ThemeFile = toml::from_str(&source).map_err(|error| error.to_string())?;
     let theme = theme_from_file(file)?;
     *THEME.write().unwrap_or_else(|error| error.into_inner()) = theme;
+    THEME_GEN.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
 
@@ -323,6 +339,10 @@ pub fn apply_theme(id: &str) -> Result<(), String> {
     *ACTIVE_THEME
         .write()
         .unwrap_or_else(|error| error.into_inner()) = id.to_string();
+    // Bump the generation after the palette swap so caches keyed on
+    // theme_gen (e.g. the TUI's per-role Color cache in ansi.rs) re-derive
+    // against the new palette. load_theme_file bumps for the same reason.
+    THEME_GEN.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
 
@@ -441,5 +461,22 @@ mod tests {
 
         let file: ThemeFile = toml::from_str("primary = 'blue'").unwrap();
         assert!(theme_from_file(file).unwrap_err().contains("#RRGGBB"));
+    }
+
+    #[test]
+    fn apply_theme_bumps_generation() {
+        // The TUI caches parsed Colors keyed on theme_gen; a switch that
+        // forgets the bump leaves every cached style on the old palette.
+        // "atom" is the embedded default, so the palette write is a no-op
+        // and cannot race the palette-content tests above. Single test for
+        // both success and failure paths: sibling tests would race the
+        // global counter if these ran in parallel.
+        let before = theme_gen();
+        apply_theme(default_theme_id()).expect("default theme must exist");
+        assert_eq!(theme_gen(), before + 1);
+        assert_eq!(active_theme_name(), default_theme_id());
+
+        assert!(apply_theme("no-such-theme").is_err());
+        assert_eq!(theme_gen(), before + 1, "failure must not bump");
     }
 }

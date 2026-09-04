@@ -16,8 +16,9 @@
 //!
 //! `input` is a list of items, not the chat `messages` array. Each
 //! item is either a user/assistant message (`{role, content: [...]}`),
-//! a tool call (`{type:"function_call", call_id, name, arguments}`), or
-//! a tool result (`{type:"function_call_output", call_id, output}`).
+//! a tool call (`{type:"function_call", call_id, name, arguments}` with
+//! `arguments` a JSON-encoded string — an object 400s), or a tool
+//! result (`{type:"function_call_output", call_id, output}`).
 //! System text moves to the top-level `instructions` field.
 //!
 //! Tool defs use `{type:"function", name, description, parameters}`
@@ -65,6 +66,15 @@ fn text_part(text: &str) -> Value {
     json!({ "type": "input_text", "text": text })
 }
 
+/// Assistant turns replay into the `input` array as *output* items: the
+/// Responses API only accepts `output_text` content parts on
+/// `assistant` messages. Sending `input_text` there 400s with
+/// "content type `input_text` is not valid on `assistant` messages"
+/// (seen on the opencode Zen gateway hosting muse-spark).
+fn output_text_part(text: &str) -> Value {
+    json!({ "type": "output_text", "text": text })
+}
+
 fn image_part(mime: &str, data: &str) -> Value {
     json!({
         "type": "input_image",
@@ -74,7 +84,12 @@ fn image_part(mime: &str, data: &str) -> Value {
 
 /// parseToolArgs decodes streamed tool-call argument fragments.
 /// Empty/malformed fragments become an empty object so the
-/// `function_call` item is always valid JSON.
+/// `function_call` item is always valid JSON. Callers must serialize
+/// the result back to a string: the Responses API types
+/// `function_call.arguments` as a JSON-encoded string, not an object —
+/// opencode Zen's muse-spark-1.3 upstream (Console) 400s with
+/// "`input[N]` `arguments` must be a string" when an object is sent
+/// (api.openai.com rejects it the same way).
 fn parse_tool_args(s: &str) -> Value {
     let trimmed = s.trim();
     if trimmed.is_empty() {
@@ -147,7 +162,7 @@ pub fn marshal_responses_request(
                     input.push(json!({
                         "type": "message",
                         "role": "assistant",
-                        "content": [text_part(&m.content)],
+                        "content": [output_text_part(&m.content)],
                     }));
                 }
                 for tc in &m.tool_calls {
@@ -158,7 +173,12 @@ pub fn marshal_responses_request(
                         "type": "function_call",
                         "call_id": tc.id,
                         "name": tc.function.name,
-                        "arguments": parse_tool_args(&tc.function.arguments),
+                        // arguments must be a JSON-encoded *string* per
+                        // the Responses schema (codex.rs replays the
+                        // same ToolCall.arguments string verbatim).
+                        // Value::to_string() is compact and infallible
+                        // for serde_json::Value.
+                        "arguments": parse_tool_args(&tc.function.arguments).to_string(),
                     }));
                 }
             }
@@ -352,11 +372,16 @@ where
     }
 
     fn usage(&self) -> Option<crate::types::StreamUsage> {
-        // prompt_tokens_total in atom is the full input (cached + uncached);
-        // Responses separates `input_tokens` (uncached) from
-        // `input_tokens_details.cached_tokens`. We sum to keep the
-        // per-turn meter accurate when partial caching kicks in.
-        let prompt = self.prompt + self.cached;
+        // input_tokens already INCLUDES the cached portion: verified
+        // live on opencode Zen (muse-spark-1.3), a repeated request
+        // reports input_tokens=642, cached_tokens=625,
+        // total_tokens=742=input+output — cached_tokens is a subset of
+        // input_tokens, not a disjoint bucket (api.openai.com documents
+        // the same). Summing would double-count the cached share and
+        // inflate the context meter. prompt_tokens_total in atom is
+        // the full input, which is exactly input_tokens here;
+        // cached_tokens feeds the cache-read display only.
+        let prompt = self.prompt;
         if prompt + self.output <= 0 && self.reasoning_tokens <= 0 {
             return None;
         }
@@ -657,6 +682,32 @@ mod tests {
     }
 
     #[test]
+    fn marshal_assistant_text_uses_output_text() {
+        // Regression: assistant turns replayed as `input_text` content
+        // parts 400 on the Responses API — only user/system input
+        // items may carry `input_text`; assistant messages need
+        // `output_text`.
+        let msgs = vec![
+            Message {
+                role: "user".into(),
+                content: "hi".into(),
+                ..Default::default()
+            },
+            Message {
+                role: "assistant".into(),
+                content: "hello there".into(),
+                ..Default::default()
+            },
+        ];
+        let body = marshal_responses_request("muse-spark", &msgs, &[], "", 1024).unwrap();
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input[0]["content"][0]["type"], "input_text");
+        assert_eq!(input[1]["role"], "assistant");
+        assert_eq!(input[1]["content"][0]["type"], "output_text");
+        assert_eq!(input[1]["content"][0]["text"], "hello there");
+    }
+
+    #[test]
     fn marshal_emits_function_call_and_output() {
         let msgs = vec![
             Message {
@@ -696,13 +747,58 @@ mod tests {
         assert_eq!(input[1]["type"], "function_call");
         assert_eq!(input[1]["name"], "calc");
         assert_eq!(input[1]["call_id"], "call_abc");
-        assert_eq!(input[1]["arguments"], json!({"a":2,"b":3}));
+        // Regression: `arguments` must be a JSON-encoded *string* on
+        // the wire. muse-spark-1.3's opencode Zen upstream (Console)
+        // 400s with "`input[N]` `arguments` must be a string" when an
+        // object is sent; api.openai.com requires the same.
+        assert!(input[1]["arguments"].is_string());
+        assert_eq!(input[1]["arguments"], r#"{"a":2,"b":3}"#);
         assert_eq!(input[2]["type"], "function_call_output");
         assert_eq!(input[2]["call_id"], "call_abc");
         assert_eq!(input[2]["output"], "5");
         let tdefs = body["tools"].as_array().unwrap();
         assert_eq!(tdefs[0]["type"], "function");
         assert_eq!(tdefs[0]["name"], "calc");
+    }
+
+    #[test]
+    fn marshal_malformed_arguments_stay_a_valid_string() {
+        // A router that emitted object-shaped or empty arguments gets
+        // normalized to a string at ingest; a replay of a call whose
+        // stored arguments are empty or unparseable must still marshal
+        // to a valid JSON-encoded string ("{}"), never an object or an
+        // empty string that would 400 the function_call item.
+        let call = |args: &str| Message {
+            role: "assistant".into(),
+            tool_calls: vec![ToolCall {
+                id: "call_x".into(),
+                call_type: "function".into(),
+                function: crate::types::FunctionCall {
+                    name: "calc".into(),
+                    arguments: args.into(),
+                },
+            }],
+            ..Default::default()
+        };
+        let tool = Message {
+            role: "tool".into(),
+            tool_call_id: "call_x".into(),
+            content: "5".into(),
+            ..Default::default()
+        };
+        for args in ["", "   ", "not json at all"] {
+            let body =
+                marshal_responses_request("muse-spark", &[call(args), tool.clone()], &[], "", 1024)
+                    .unwrap();
+            let input = body["input"].as_array().unwrap();
+            assert!(
+                input[0]["arguments"].is_string(),
+                "arguments for {args:?} must marshal to a string"
+            );
+            let parsed: Value = serde_json::from_str(input[0]["arguments"].as_str().unwrap())
+                .expect("arguments are valid JSON");
+            assert_eq!(parsed, json!({}));
+        }
     }
 
     #[test]
@@ -816,8 +912,9 @@ mod tests {
         let last = chunks.last().unwrap();
         assert_eq!(last.choices[0].finish_reason, "stop");
         let usage = last.usage.clone().expect("usage on final chunk");
-        // prompt = input_tokens + cached (3).
-        assert_eq!(usage.prompt_tokens, 17 + 3);
+        // prompt = input_tokens as reported (cached_tokens is a subset
+        // of input_tokens, not a disjoint bucket — no summing).
+        assert_eq!(usage.prompt_tokens, 17);
         assert_eq!(usage.completion_tokens, 12);
         assert_eq!(usage.reasoning_tokens, 4);
         assert_eq!(usage.cache_read_tokens, 3);

@@ -33,6 +33,9 @@ nothing to poll: never sleep, run the command again, or call other tools
 just to wait. If the user sent a message meanwhile, that message is a
 question for you to answer now in plain text; the running command keeps
 going on its own and its full output replaces the entry when it exits.
+A command that exits cleanly with no output after you have already
+answered does not start another round — the turn simply ends, so never
+restate an answer just because a command finished.
 
 ## Math in replies
 

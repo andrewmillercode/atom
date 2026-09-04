@@ -72,6 +72,13 @@ pub struct AtomConfig {
     /// a user theme in the config `themes/` directory).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
+    /// `None` means the chat viewport paints the theme background like
+    /// every other surface (the default). `Some(true)` renders the
+    /// conversation viewport on the terminal's default background
+    /// (transparent when the terminal profile has no background color);
+    /// all other surfaces keep the theme background.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transparent_background: Option<bool>,
 }
 
 const fn config_version() -> u32 {
@@ -87,6 +94,7 @@ impl Default for AtomConfig {
             web_fetch: None,
             auto_update: None,
             theme: None,
+            transparent_background: None,
         }
     }
 }
@@ -133,6 +141,12 @@ impl AtomConfig {
                 .unwrap_or_default();
         }
         value
+    }
+
+    /// Whether the chat viewport renders on the terminal's default
+    /// background instead of the theme background. Off by default.
+    pub fn resolved_transparent_background(&self) -> bool {
+        self.transparent_background.unwrap_or(false)
     }
 
     pub fn setup_complete(&self) -> bool {
@@ -373,6 +387,23 @@ mod tests {
             ..Default::default()
         }
         .resolved_enabled());
+    }
+
+    #[test]
+    fn transparent_background_defaults_off_and_toggles_explicitly() {
+        // `None` (unset) and `Some(false)` both keep the viewport opaque;
+        // only an explicit `Some(true)` switches to the terminal default.
+        assert!(!AtomConfig::default().resolved_transparent_background());
+        assert!(!AtomConfig {
+            transparent_background: Some(false),
+            ..Default::default()
+        }
+        .resolved_transparent_background());
+        assert!(AtomConfig {
+            transparent_background: Some(true),
+            ..Default::default()
+        }
+        .resolved_transparent_background());
     }
 
     #[test]

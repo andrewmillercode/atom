@@ -142,6 +142,9 @@ pub struct Block {
     /// Completed-turn metadata shown under the final assistant reply.
     pub model: String,
     pub turn_duration: Option<Duration>,
+    /// Generation speed over the final round's first-token → end
+    /// window ("87 tok/s" in the footer); None when unknown.
+    pub tokens_per_sec: Option<f64>,
     /// Pasted images attached to a user message. Their [IMG n] markers
     /// in `text` render as kitty placeholder grids (or chip text on
     /// terminals without kitty support).
@@ -183,6 +186,7 @@ impl Default for Block {
             dur: None,
             model: String::new(),
             turn_duration: None,
+            tokens_per_sec: None,
             images: Vec::new(),
             diagram: None,
             lines: None,
@@ -307,6 +311,7 @@ pub fn messages_to_blocks(msgs: &[Message]) -> Vec<Block> {
                 text: msg.content.clone(),
                 model: msg.model.clone(),
                 dur: (msg.duration_ms > 0).then(|| Duration::from_millis(msg.duration_ms as u64)),
+                tokens_per_sec: (msg.tokens_per_sec > 0.0).then_some(msg.tokens_per_sec),
                 ..Default::default()
             }),
             "error" => blocks.push(Block {
@@ -330,6 +335,7 @@ pub fn messages_to_blocks(msgs: &[Message]) -> Vec<Block> {
                         model: msg.model.clone(),
                         turn_duration: (msg.duration_ms > 0)
                             .then(|| Duration::from_millis(msg.duration_ms as u64)),
+                        tokens_per_sec: (msg.tokens_per_sec > 0.0).then_some(msg.tokens_per_sec),
                         ..Default::default()
                     });
                 }
@@ -1081,21 +1087,34 @@ pub fn render_block_linked(
                 out.links.extend(parsed.links);
             }
             if !b.model.is_empty() {
-                let dur = b.turn_duration.map(format_turn_duration);
-                let plain = match &dur {
-                    Some(dur) => format!("{} {dur}", b.model),
+                // Footer tail: duration, tokens/sec, or both, e.g.
+                // "3.1s · 87 tok/s". The whole tail is extra-muted so it
+                // recedes behind the model id.
+                let mut tail_parts = Vec::new();
+                if let Some(dur) = b.turn_duration {
+                    tail_parts.push(format_turn_duration(dur));
+                }
+                if let Some(tps) = b.tokens_per_sec {
+                    tail_parts.push(format_tokens_per_sec(tps));
+                }
+                let tail = if tail_parts.is_empty() {
+                    None
+                } else {
+                    Some(tail_parts.join(" · "))
+                };
+                let plain = match &tail {
+                    Some(tail) => format!("{} {tail}", b.model),
                     None => b.model.clone(),
                 };
                 for row in crate::prompt::wrap_plain(&plain, width.max(1)) {
-                    // The duration is extra-muted so it recedes behind the
-                    // model id; wrap_plain may put it on its own row.
-                    let spans = match &dur {
-                        Some(dur) if row.ends_with(dur.as_str()) => {
-                            let head = row[..row.len() - dur.len()].trim_end();
+                    // wrap_plain may put the tail on its own row.
+                    let spans = match &tail {
+                        Some(tail) if row.ends_with(tail.as_str()) => {
+                            let head = row[..row.len() - tail.len()].trim_end();
                             vec![
                                 Span::styled(head.to_string(), ansi::style_reasoning()),
                                 Span::styled(
-                                    format!(" {dur}"),
+                                    format!(" {tail}"),
                                     ansi::style_reasoning().fg(ansi::c_muted_extra()),
                                 ),
                             ]
@@ -1321,6 +1340,16 @@ fn render_user_body_linked(
         }
     }
     out
+}
+
+/// formatTokensPerSec renders the footer speed: integers at 100+,
+/// one decimal below.
+fn format_tokens_per_sec(tps: f64) -> String {
+    if tps >= 100.0 {
+        format!("{tps:.0} tok/s")
+    } else {
+        format!("{tps:.1} tok/s")
+    }
 }
 
 fn format_turn_duration(duration: Duration) -> String {
@@ -1761,6 +1790,9 @@ pub fn compaction_label(b: &Block, spinner_frame: &str) -> String {
     }
     if let Some(duration) = b.dur.filter(|duration| *duration > Duration::ZERO) {
         parts.push(format_turn_duration(duration));
+    }
+    if let Some(tps) = b.tokens_per_sec {
+        parts.push(format_tokens_per_sec(tps));
     }
     parts.join(" | ")
 }

@@ -441,8 +441,9 @@ impl SubagentHandle for DispatchBridge {
     /// create the child with fresh instructions, append the prompt, and
     /// kick off a detached turn.
     async fn spawn(&self, plan: DispatchPlan) -> String {
-        // The daemon does not retain the multi-megabyte catalog at idle.
-        // Dispatch is the first server-only operation that needs it.
+        // Cheap once the catalog is in memory (read-lock check); the
+        // server warmup at spawn usually filled it already. This is the
+        // fallback for a dispatch that races a first-ever run.
         atom_core::providers::modelsdev::ensure_models_dev_catalog().await;
         let parent_id = self.parent_id.clone();
         let Some(parent) = self

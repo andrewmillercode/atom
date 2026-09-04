@@ -6,7 +6,7 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block as RtBlock, Borders, Clear};
 
@@ -274,13 +274,20 @@ fn card_line(line: Line<'static>, width: usize, horizontal_pad: usize) -> Line<'
 }
 
 fn write_line(buf: &mut Buffer, x: u16, y: u16, max_w: usize, line: &Line<'_>) {
+    write_line_styled(buf, x, y, max_w, line, ansi::frame_style());
+}
+
+/// `write_line` with an explicit base style. The base sits under the
+/// line and span styles (ratatui's draw model), so transparent-mode
+/// callers can pass a base whose bg is the terminal default.
+fn write_line_styled(buf: &mut Buffer, x: u16, y: u16, max_w: usize, line: &Line<'_>, base: Style) {
     if y < buf.area.top() || y >= buf.area.bottom() || x >= buf.area.right() || max_w == 0 {
         return;
     }
     // Line-level style sits under every span style (ratatui's draw model);
     // math placeholder rows carry the Kitty image id there, so dropping it
     // would leave the formula's reserved cells unresolvable (blank).
-    let base = ansi::frame_style().patch(line.style);
+    let base = base.patch(line.style);
     let mut col = x;
     let mut last_col = None;
     let end = x
@@ -331,6 +338,17 @@ fn draw_viewport(app: &mut App, rect: Rect, buf: &mut Buffer) {
     // content is clipped to `content_viewport_height()` so a small blank
     // padding row is left at the bottom (when no footer menu is open).
     let vp_h = app.content_viewport_height().min(rect.height as usize);
+    // Transparent-background mode rides the terminal's default background
+    // for the conversation only: wipe the rect's bg first (covers blank
+    // rows and the bottom padding), then draw lines with a base whose bg
+    // stays at the terminal default. Every other surface (prompt, status,
+    // overlays, scrollbar) keeps the theme background via `frame_style()`.
+    let base = if app.atom_config.resolved_transparent_background() {
+        buf.set_style(rect, Style::new().bg(Color::Reset));
+        ansi::frame_style_transparent()
+    } else {
+        ansi::frame_style()
+    };
     if app.blocks.is_empty() {
         // Empty-conversation atom animation fills the content rows; the
         // remaining bottom padding row(s) stay blank (base background).
@@ -338,7 +356,14 @@ fn draw_viewport(app: &mut App, rect: Rect, buf: &mut Buffer) {
             atom_core::render::atom3d::render_atom3d(rect.width as i64, vp_h as i64, app.splash_t);
         let lines = ansi::ansi_to_lines(&art);
         for (i, line) in lines.iter().take(vp_h).enumerate() {
-            write_line(buf, rect.x, rect.y + i as u16, rect.width as usize, line);
+            write_line_styled(
+                buf,
+                rect.x,
+                rect.y + i as u16,
+                rect.width as usize,
+                line,
+                base,
+            );
         }
         return;
     }
@@ -368,12 +393,13 @@ fn draw_viewport(app: &mut App, rect: Rect, buf: &mut Buffer) {
             }
             _ => None,
         };
-        write_line(
+        write_line_styled(
             buf,
             rect.x,
             rect.y + row as u16,
             rect.width as usize,
             styled.as_ref().unwrap_or(line),
+            base,
         );
     }
 }
@@ -425,7 +451,7 @@ fn draw_footer_menu(app: &mut App, rect: Rect, buf: &mut Buffer) {
     let menu: Vec<Line<'static>> = if app.menu_visible {
         render_slash_menu(app)
     } else if app.manage_visible {
-        render_manage_menu(app)
+        render_manage_menu(app, rect.width as usize)
     } else if !matches!(app.picker_kind, PickerKind::None) {
         render_picker_menu(app)
     } else if app.context_visible {
@@ -541,7 +567,32 @@ fn command_desc(app: &App, c: &overlays::DynamicCommand) -> String {
     c.desc.clone()
 }
 
-fn render_manage_menu(app: &App) -> Vec<Line<'static>> {
+fn render_manage_menu(app: &App, width: usize) -> Vec<Line<'static>> {
+    use unicode_width::UnicodeWidthChar;
+    use unicode_width::UnicodeWidthStr;
+    // ellipsis so it's obvious the title continues.
+    fn ellipsize(s: &str, max: usize) -> String {
+        if UnicodeWidthStr::width(s) <= max {
+            return s.to_string();
+        }
+        if max <= 1 {
+            return "…".chars().take(max).collect();
+        }
+        let mut out: String = s
+            .chars()
+            .scan(0, |acc, ch| {
+                *acc += UnicodeWidthChar::width(ch).unwrap_or(0);
+                if *acc < max {
+                    Some(ch)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        out.push('…');
+        out
+    }
+
     let mut out = vec![Line::from(Span::styled("subagents", ansi::style_dim()))];
     if app.manage_agents.is_empty() {
         out.push(Line::from(Span::styled("no subagents", ansi::style_dim())));
@@ -601,6 +652,16 @@ fn render_manage_menu(app: &App) -> Vec<Line<'static>> {
         } else {
             format!("  {meta} | ")
         };
+        // Keep the meta + status columns visible at narrow widths:
+        // write_line hard-cuts overflowing spans, which is how the
+        // status used to get cropped off the right edge. The spare +1
+        // is a one-cell breathing gap before the status.
+        let budget = width.saturating_sub(
+            UnicodeWidthStr::width(meta.as_str())
+                + UnicodeWidthStr::width(status_text.as_str())
+                + 1,
+        );
+        let title = ellipsize(&title, budget);
         let name_style = if i == app.manage_sel {
             ansi::style_selected()
         } else {
@@ -1545,7 +1606,7 @@ mod tests {
         done.status = atom_core::session::store::DelegateStatus::Done;
         app.manage_agents = vec![working, sandbox, error, done];
 
-        let lines = render_manage_menu(&app);
+        let lines = render_manage_menu(&app, 80);
         assert!(ansi::line_plain(&lines[1]).contains("model-id (high) | ⠋ Working"));
         assert!(ansi::line_plain(&lines[2]).contains("model-id (high) | Sandbox"));
         assert_eq!(
@@ -1562,9 +1623,34 @@ mod tests {
         );
 
         app.spinner_frame = 1;
-        let lines = render_manage_menu(&app);
+        let lines = render_manage_menu(&app, 80);
         assert!(ansi::line_plain(&lines[1]).contains("| ⠙ Working"));
         assert!(ansi::line_plain(&lines[2]).contains("| Sandbox"));
+    }
+
+    #[test]
+    fn subagent_menu_truncates_title_to_keep_status_visible() {
+        let mut app = App::new_test(80, 24);
+        let mut agent = crate::app::empty_session_info();
+        agent.title = "a very long subagent prompt title that overflows".repeat(3);
+        agent.model = "glm-5.3-flash".into();
+        agent.status = atom_core::session::store::DelegateStatus::Working;
+        app.manage_agents = vec![agent];
+
+        let width = 40;
+        let lines = render_manage_menu(&app, width);
+        let plain = ansi::line_plain(&lines[1]);
+        assert!(plain.contains("Working"), "status survives: {plain:?}");
+        assert!(plain.ends_with("Working"), "status is last: {plain:?}");
+        assert!(
+            ansi::line_width(&lines[1]) <= width,
+            "row fits the width: {plain:?}"
+        );
+        // Narrow enough that the title must be cut, and the cut is marked.
+        assert!(plain.contains('…'), "title is ellipsized: {plain:?}");
+        // Wide terminal: no truncation at all.
+        let wide = render_manage_menu(&app, 200);
+        assert!(!ansi::line_plain(&wide[1]).contains('…'));
     }
 
     #[test]
@@ -1764,6 +1850,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn transparent_background_confines_transparency_to_the_viewport() {
+        let mut app = App::new_test(100, 30);
+        app.sel_model = "test-model".into();
+        app.atom_config.transparent_background = Some(true);
+        app.blocks.push(Block {
+            kind: BlockKind::User,
+            text: "hello world".into(),
+            ..Default::default()
+        });
+        app.refresh_viewport();
+        let term = frame(&mut app, 100, 30);
+
+        // Viewport rows without content ride the terminal default bg…
+        assert_eq!(cell(&term, 1, 24).bg, Color::Reset);
+        // …while content cards keep their own painted surfaces.
+        assert_eq!(cell(&term, 1, 1).bg, ansi::c_card_light());
+        // The scrollbar gutter sits outside the viewport and keeps the
+        // theme background, as does every other surface.
+        assert_eq!(cell(&term, 97, 24).bg, ansi::c_background());
+        assert_eq!(cell(&term, 0, 0).bg, ansi::c_background());
+        assert_eq!(cell(&term, 99, 29).bg, ansi::c_background());
+        for y in 25..=27 {
+            assert_eq!(cell(&term, 1, y).bg, ansi::c_card_light());
+        }
+        assert_eq!(cell(&term, 1, 28).bg, ansi::c_background());
+        assert_eq!(cell(&term, 1, 29).bg, ansi::c_background());
+
+        // Toggling off restores the theme background under the viewport.
+        app.atom_config.transparent_background = Some(false);
+        let term = frame(&mut app, 100, 30);
+        assert_eq!(cell(&term, 1, 24).bg, ansi::c_background());
+    }
+
+    #[test]
+    fn write_line_styled_honors_transparent_base() {
+        // Transparent base: bg stays the terminal default underneath,
+        // but span-level bg still wins where content paints one.
+        let mut buf = Buffer::empty(Rect::new(0, 0, 3, 1));
+        write_line_styled(
+            &mut buf,
+            0,
+            0,
+            3,
+            &Line::from(vec![
+                Span::raw("ab"),
+                Span::styled("c", Style::new().bg(Color::Red)),
+            ]),
+            ansi::frame_style_transparent(),
+        );
+        assert_eq!(buf[(0, 0)].bg, Color::Reset);
+        assert_eq!(buf[(1, 0)].bg, Color::Reset);
+        assert_eq!(buf[(2, 0)].bg, Color::Red);
+    }
+
     // -- Defect 2: chrome rows match Go's View() ordering ---------------------
 
     #[test]
@@ -1913,6 +2054,59 @@ mod tests {
             row_text(&term, 18).trim().is_empty(),
             "last viewport row 18"
         );
+    }
+
+    #[test]
+    fn height_only_resize_keeps_conversation_anchored() {
+        // Ghostty's macOS tab strip toggles its own row when the tab
+        // count crosses 1 <-> 2, resizing the grid by one row with the
+        // width unchanged. The conversation is top-anchored: content
+        // rows (and the scroll offset) must stay put, and only the
+        // bottom chrome shifts by exactly the row the grid lost or
+        // regained. Width is unchanged, so nothing re-wraps either.
+        let mut app = App::new_test(100, 30);
+        app.sel_model = "test-model".into();
+        app.input.set_value("hi there");
+        app.blocks.push(Block {
+            kind: BlockKind::User,
+            text: "hello".into(),
+            ..Default::default()
+        });
+        app.refresh_viewport();
+        let backend = TestBackend::new(100, 30);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        draw_into(&mut app, &mut term);
+        assert!(row_text(&term, 2).contains("hello"), "content row 2");
+        assert!(row_text(&term, 26).contains("hi there"), "input row 26");
+        assert!(row_text(&term, 28).contains("test-model"), "status row 28");
+
+        // Tab bar appears: the grid loses one row of chrome.
+        term.backend_mut().resize(100, 29);
+        draw_into(&mut app, &mut term);
+        assert!(
+            row_text(&term, 2).contains("hello"),
+            "conversation rows do not move on a height-only resize"
+        );
+        assert_eq!(
+            cell(&term, 1, 1).bg,
+            ansi::c_card_light(),
+            "user card stays at the top"
+        );
+        assert!(
+            row_text(&term, 25).contains("hi there"),
+            "prompt shifts up one"
+        );
+        assert!(
+            row_text(&term, 27).contains("test-model"),
+            "status shifts up one"
+        );
+
+        // Tab bar disappears: the row comes back and chrome returns.
+        term.backend_mut().resize(100, 30);
+        draw_into(&mut app, &mut term);
+        assert!(row_text(&term, 2).contains("hello"));
+        assert!(row_text(&term, 26).contains("hi there"));
+        assert!(row_text(&term, 28).contains("test-model"));
     }
 
     #[test]

@@ -532,6 +532,89 @@ async fn pending_bash_answers_prompt_and_records_real_result() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn quiet_parked_command_ends_turn_without_report_round() {
+    let env = TestEnv::new("quiet-park");
+    let base_url = spawn_mock_provider(vec![
+        // Round 1: a long command with no output; the turn parks on it.
+        sse_response(concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"sleep 1\\\"}\"}}]}}]}\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3,\"total_tokens\":8}}\n",
+            "data: [DONE]\n",
+        )),
+        // Round 2 (placeholder round after the mid-turn prompt): the
+        // model answers the prompt. The mock repeats this fixture for
+        // any further request, so a report round after the quiet exit
+        // would surface as a third round_start/content below.
+        sse_response(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"it is running in the background\"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":2,\"total_tokens\":13}}\n",
+            "data: [DONE]\n",
+        )),
+    ])
+    .await;
+    let state = spawn_server(&env, off_cfg()).await;
+
+    let ws = env.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let sess = state
+        .store
+        .create("test-model", &ws.display().to_string(), vec![]);
+
+    let rx = client::stream_send(
+        &sess.id,
+        &json!({"message": "start the long job", "base_url": base_url}),
+    )
+    .await
+    .unwrap();
+
+    // Land the prompt while the command is parked (~200ms into the 1s
+    // sleep). The injected send is answered with the placeholder round.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut inject_rx = client::stream_send(&sess.id, &json!({"message": "hows it going"}))
+        .await
+        .expect("mid-turn prompt must be accepted, not conflict");
+    let ack = tokio::time::timeout(Duration::from_secs(5), inject_rx.recv())
+        .await
+        .unwrap()
+        .expect("injected stream open");
+    assert_eq!(ack["type"], "injected");
+    assert!(inject_rx.recv().await.is_none(), "injected stream closes");
+
+    let events = collect_until_done(rx).await;
+    let types: Vec<String> = events
+        .iter()
+        .map(|e| e["type"].as_str().unwrap_or("").to_string())
+        .collect();
+    // The quiet exit (sleep 1, empty output) records its result and
+    // ends the turn — no report round after the spoken answer.
+    assert_eq!(
+        types,
+        vec![
+            "round_start",
+            "tool_pending",
+            "usage",
+            "tool",
+            "round_start",
+            "content",
+            "usage",
+            "tool_result",
+            "done",
+        ],
+        "{events:?}"
+    );
+
+    let got = state.store.get(&sess.id).unwrap();
+    let roles: Vec<&str> = got.messages.iter().map(|m| m.role.as_str()).collect();
+    assert_eq!(roles, vec!["user", "assistant", "tool", "user", "assistant"]);
+    assert_eq!(
+        got.messages[2].content, "",
+        "quiet exit records an empty result"
+    );
+    assert_eq!(got.messages[3].content, "hows it going");
+    assert_eq!(got.messages[4].content, "it is running in the background");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn denied_file_write_surfaces_approval_and_finishes_turn() {
     let env = TestEnv::new("write-approval");
     let ws = env.path().join("ws");

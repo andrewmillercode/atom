@@ -32,6 +32,9 @@ pub struct StreamEvent {
     pub model: String,
     /// Provider-reported reasoning duration or server-measured turn duration.
     pub duration: Option<Duration>,
+    /// Generation speed of the completed turn's final model round, set
+    /// on `done` events (0 when the provider reported no usage).
+    pub tokens_per_sec: f64,
     /// set for "usage" events when total > 0
     pub usage: Option<StreamUsage>,
     // approval_request fields
@@ -112,6 +115,10 @@ pub fn parse_stream_event(v: &Value) -> StreamEvent {
     if let Some(ms) = ms.filter(|m| *m > 0.0) {
         ev.duration = Some(Duration::from_secs_f64(ms / 1000.0));
     }
+    ev.tokens_per_sec = v
+        .get("tokens_per_sec")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
     // usage events carry session Input/Output totals (prompt/
     // completion) and the latest-round context size (total).
     let total_raw = jstr(v, "total");

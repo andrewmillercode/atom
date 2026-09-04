@@ -420,12 +420,21 @@ pub async fn compact_session(
     }
 
     let prompt = compaction_prompt_text(&summary);
+    // Compaction is a non-streaming request, so the generation window is
+    // the whole request rather than first-token → end.
+    let tokens_per_sec = parsed
+        .usage
+        .as_ref()
+        .filter(|u| u.completion_tokens > 0 && duration_ms > 0)
+        .map(|u| u.completion_tokens as f64 / (duration_ms as f64 / 1000.0))
+        .unwrap_or(0.0);
     let entry = Message {
         role: "compaction".into(),
         content: prompt,
         provider: provider_name_for_url(base_url),
         model: model.into(),
         duration_ms,
+        tokens_per_sec,
         usage: parsed.usage,
         ..Default::default()
     };

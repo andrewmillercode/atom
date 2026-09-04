@@ -430,13 +430,10 @@ pub fn overlay_count(app: &App) -> usize {
         )
         .len(),
         Some(OverlayKind::ProviderMethod) => 2,
-        Some(OverlayKind::Settings) => 5,
+        Some(OverlayKind::Settings) => 6,
         Some(OverlayKind::WebSearch) => web_search_rows(app).len(),
         Some(OverlayKind::WebFetch) => web_fetch_rows(app).len(),
-        Some(OverlayKind::Theme) => theme_rows()
-            .iter()
-            .filter(|e| filter_theme_match(e, &app.overlay_q))
-            .count(),
+        Some(OverlayKind::Theme) => filtered_theme_rows(app).len(),
         Some(OverlayKind::Fork) => fork_rows(app).len(),
         Some(OverlayKind::Profile) => profile_overlay_rows(app),
         _ => 0,
@@ -462,6 +459,14 @@ pub fn settings_labels(app: &App) -> Vec<String> {
         ),
         format!("Web search provider  {}", web.server),
         format!("Web fetch provider  {}", fetch.server),
+        format!(
+            "Transparent background  {}",
+            if app.atom_config.resolved_transparent_background() {
+                "on"
+            } else {
+                "off"
+            }
+        ),
         if app.settings_onboarding {
             "Continue with defaults / finish setup".into()
         } else {
@@ -486,6 +491,19 @@ pub fn filter_theme_match(entry: &atom_core::render::colors::ThemeEntry, query: 
         return true;
     }
     entry.name.to_lowercase().contains(&q) || entry.id.to_lowercase().contains(&q)
+}
+
+/// filteredThemeRows is the single source of truth for the theme picker's
+/// visible order: theme rows matching the overlay query. The count, the
+/// renderer, and the confirm handler must all index this same list so
+/// overlay_sel resolves to the row the user highlighted — resolving
+/// against the unfiltered theme_rows picks the wrong theme whenever a
+/// query is typed (the unfiltered head is "atom").
+pub fn filtered_theme_rows(app: &App) -> Vec<atom_core::render::colors::ThemeEntry> {
+    theme_rows()
+        .into_iter()
+        .filter(|e| filter_theme_match(e, &app.overlay_q))
+        .collect()
 }
 
 pub fn web_search_rows(app: &App) -> Vec<(String, String, String)> {
@@ -1430,9 +1448,8 @@ pub fn overlay_view_data(app: &App, kind: OverlayKind) -> OverlayViewData {
         }
         OverlayKind::Theme => {
             let active = atom_core::render::colors::active_theme_name();
-            let rows = theme_rows()
+            let rows = filtered_theme_rows(app)
                 .iter()
-                .filter(|e| filter_theme_match(e, &app.overlay_q))
                 .map(|entry| {
                     ViewRow::Item(ViewItem {
                         id: Some(entry.id.clone()),
@@ -2087,5 +2104,27 @@ mod tests {
         // Below the input (list area): not consumed (caret unchanged).
         assert!(!overlay_click_search(&mut app, 1, search_row + 1));
         assert_eq!(app.overlay_q_cursor, Some(2));
+    }
+
+    #[test]
+    fn settings_rows_include_transparent_background_toggle() {
+        let mut app = App::new_test(80, 24);
+        app.overlay = Some(OverlayKind::Settings);
+
+        let labels = settings_labels(&app);
+        assert_eq!(labels.len(), 6);
+        assert_eq!(overlay_count(&app), 6);
+        assert_eq!(labels[4], "Transparent background  off");
+
+        // Done stays the last row in both modes.
+        assert_eq!(labels[5], "Done");
+        let app_on = App {
+            atom_config: atom_core::config::AtomConfig {
+                transparent_background: Some(true),
+                ..Default::default()
+            },
+            ..app
+        };
+        assert_eq!(settings_labels(&app_on)[4], "Transparent background  on");
     }
 }

@@ -6,7 +6,8 @@ use crate::dispatch::{self, DispatchPlan};
 use crate::file_edit::FileSeen;
 use crate::mcp;
 use crate::{
-    file_edit, read_file, search, skills, vector_search, visualize, web_fetch, web_search,
+    customize, file_edit, read_file, search, skills, vector_search, visualize, web_fetch,
+    web_search,
 };
 use atom_core::types::ImageData;
 use atom_sandbox::approvals::Approver;
@@ -30,7 +31,8 @@ pub(crate) fn empty_arguments_msg(tool: &str) -> String {
 
 /// Everything a tool call needs: session identity, provider plumbing for
 /// dispatch turns, sandbox policy, the approval gate, the subagent
-/// spawner, and the per-session seen-file cache.
+/// spawner, the per-session seen-file cache, and the turn's
+/// cancellation token (Esc / interruption kills in-flight commands).
 pub struct ToolCtx<'a> {
     pub cwd: PathBuf,
     pub session_id: String,
@@ -61,11 +63,22 @@ pub(crate) fn resolve_tool_path(cwd: &std::path::Path, path: &str) -> PathBuf {
 /// Result of one tool call: model-visible text, optional image
 /// attachments (read_file on an image file), plus a unified diff of any
 /// file change ("" when the tool didn't change a file).
-#[derive(Default, Clone, Debug)]
+#[derive(Default, Debug)]
 pub struct ToolOutcome {
     pub text: String,
     pub images: Vec<ImageData>,
     pub diff: String,
+    /// Which provider served this call (search/fetch only): a bundled id
+    /// ("tinyfish", "parallel", "exa", "ollama"), "direct" for the direct
+    /// webfetch fallback, or "mcp:<server>" for user-configured servers.
+    /// Empty for all other tools.
+    pub tool_provider: String,
+    /// Set by the bash tool: the command is still running. The turn
+    /// loop parks on it and records the result as the original tool
+    /// call's result when it exits; the tool result the model sees for
+    /// now is a placeholder (or nothing, until a prompt forces one).
+    /// Boxed: the child handle is large and ToolOutcome mostly isn't.
+    pub pending: Option<Box<atom_sandbox::exec::PendingProcess>>,
 }
 
 impl ToolOutcome {
@@ -98,7 +111,8 @@ pub async fn execute_tool(ctx: &ToolCtx<'_>, name: &str, args_json: &str) -> Too
             args_json,
             &ctx.cwd.display().to_string(),
         )),
-        "dispatch" => ToolOutcome::from_text(dispatch::execute_dispatch(ctx, args_json).await),
+        "customize" => ToolOutcome::from_text(customize::execute_customize(args_json)),
+        "subagent" => ToolOutcome::from_text(dispatch::execute_dispatch(ctx, args_json).await),
         "web_search" => {
             #[derive(serde::Deserialize)]
             struct Args {
@@ -112,7 +126,7 @@ pub async fn execute_tool(ctx: &ToolCtx<'_>, name: &str, args_json: &str) -> Too
                 Ok(a) => a,
                 Err(e) => return ToolOutcome::from_text(format!("error parsing arguments: {e}")),
             };
-            ToolOutcome::from_text(web_search::web_search(&args.query, &ctx.cwd).await)
+            web_search::web_search(&args.query, &ctx.cwd).await
         }
         "webfetch" => web_fetch::web_fetch(args_json, ctx).await,
         "vector_search" => {
@@ -142,13 +156,16 @@ pub async fn execute_tool(ctx: &ToolCtx<'_>, name: &str, args_json: &str) -> Too
     }
 }
 
-/// Bash via the sandbox pipeline. Output shapes mirror Go's
-/// CombinedOutput handling:
+/// Bash via the sandbox pipeline. The call returns immediately with a
+/// pending process for every command — long ones simply run until done,
+/// the turn waits, and the result is recorded as the original tool
+/// call's result when the command exits. Output shapes for the recorded
+/// result (see [`format_bash_exit`]) mirror Go's CombinedOutput
+/// handling:
 /// - success: TrimSpace(stdout+stderr)
 /// - non-zero exit: "exit status N\n<combined output>"
 /// - policy refusal / not approved: the sandbox's explanatory stderr
-/// - timeout: an error line (Go had no timeout at all).
-async fn execute_bash(args_json: &str, ctx: &ToolCtx<'_>) -> ToolOutcome {
+pub(crate) async fn execute_bash(args_json: &str, ctx: &ToolCtx<'_>) -> ToolOutcome {
     #[derive(serde::Deserialize)]
     struct Args {
         #[serde(default)]
@@ -161,7 +178,7 @@ async fn execute_bash(args_json: &str, ctx: &ToolCtx<'_>) -> ToolOutcome {
         Ok(a) => a,
         Err(e) => return ToolOutcome::from_text(format!("error parsing arguments: {e}")),
     };
-    let out = atom_sandbox::exec::run(
+    let out = atom_sandbox::exec::run_tool(
         &args.command,
         &ctx.cwd,
         &ctx.cwd,
@@ -171,22 +188,45 @@ async fn execute_bash(args_json: &str, ctx: &ToolCtx<'_>) -> ToolOutcome {
     )
     .await;
 
-    if out.timed_out {
-        return ToolOutcome::from_text(format!(
-            "error: command timed out after {}s",
-            atom_sandbox::exec::EXEC_TIMEOUT.as_secs()
-        ));
+    if let Some(proc) = out.pending {
+        return ToolOutcome {
+            pending: Some(Box::new(proc)),
+            ..Default::default()
+        };
     }
     if out.exit_code < 0 && !out.stderr.is_empty() && !out.approved {
         // Blocked before running (deny verdict / refused approval /
         // spawn failure): surface the sandbox's message verbatim.
         return ToolOutcome::from_text(out.stderr.trim().to_string());
     }
-    let combined = format!("{}{}", out.stdout, out.stderr);
-    if out.exit_code != 0 {
-        return ToolOutcome::from_text(format!("exit status {}\n{}", out.exit_code, combined));
+    ToolOutcome::from_text(format_bash_exit(
+        out.exit_code,
+        &format!("{}{}", out.stdout, out.stderr),
+    ))
+}
+
+/// Formats one completed bash run exactly like a blocking tool call:
+/// trimmed combined output, or "exit status N\n<output>" on failure.
+/// Shared by the inline path and the turn loop's parked-completion
+/// recording so the tool block fills identically either way.
+pub fn format_bash_exit(exit_code: i32, combined: &str) -> String {
+    if exit_code != 0 {
+        format!("exit status {exit_code}\n{combined}")
+    } else {
+        combined.trim().to_string()
     }
-    ToolOutcome::from_text(combined.trim().to_string())
+}
+
+/// The result recorded for a pending bash command that the user killed
+/// (Esc) instead of letting it finish.
+pub fn format_bash_cancelled(exit: &atom_sandbox::exec::PendingExit) -> String {
+    let mut text = "error: command cancelled by the user".to_string();
+    let partial = exit.output.trim();
+    if !partial.is_empty() {
+        text.push_str("\npartial output:\n");
+        text.push_str(partial);
+    }
+    text
 }
 
 #[cfg(test)]
@@ -278,8 +318,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ctx = test_ctx(dir.path());
         let out = execute_tool(&ctx, "bash", r#"{"command":"echo hi"}"#).await;
-        assert_eq!(out.text, "hi");
-        assert!(out.images.is_empty() && out.diff.is_empty());
+        // Every bash call comes back pending; the turn loop parks on it
+        // and records format_bash_exit(exit) as the tool result.
+        let proc = out.pending.expect("bash returns a pending process");
+        assert_eq!(proc.command(), "echo hi");
+        let exit = proc
+            .run_until_done(atom_core::cancel::CancelToken::new())
+            .await;
+        assert_eq!(format_bash_exit(exit.exit_code, &exit.output), "hi");
+        assert!(!exit.killed);
     }
 
     #[tokio::test]
@@ -287,8 +334,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ctx = test_ctx(dir.path());
         let out = execute_tool(&ctx, "bash", r#"{"command":"echo boom; exit 3"}"#).await;
-        assert!(out.text.starts_with("exit status 3\n"), "{}", out.text);
-        assert!(out.text.contains("boom"), "{}", out.text);
+        let proc = out.pending.expect("pending process");
+        let exit = proc
+            .run_until_done(atom_core::cancel::CancelToken::new())
+            .await;
+        let text = format_bash_exit(exit.exit_code, &exit.output);
+        assert!(text.starts_with("exit status 3\n"), "{}", text);
+        assert!(text.contains("boom"), "{}", text);
     }
 
     #[tokio::test]
@@ -442,11 +494,11 @@ mod tests {
         let ctx = test_ctx(dir.path());
         let out = execute_tool(
             &ctx,
-            "dispatch",
+            "subagent",
             r#"{"action":"spawn","model":"m","thinking":"low","tasks":["x"]}"#,
         )
         .await;
-        assert_eq!(out.text, "error: dispatch requires an active session");
+        assert_eq!(out.text, "error: subagent requires an active session");
     }
 
     struct FakeSpawner {
@@ -508,7 +560,7 @@ mod tests {
         let ctx = spawner_ctx(&s);
         let out = execute_tool(
             &ctx,
-            "dispatch",
+            "subagent",
             r#"{"action":"spawn","model":"m","thinking":"low","tasks":["hi"]}"#,
         )
         .await;
@@ -517,7 +569,7 @@ mod tests {
 
         let out = execute_tool(
             &ctx,
-            "dispatch",
+            "subagent",
             r#"{"action":"send","ids":["0123456789abcdef"],"prompt":"go on"}"#,
         )
         .await;
@@ -525,7 +577,7 @@ mod tests {
 
         let out = execute_tool(
             &ctx,
-            "dispatch",
+            "subagent",
             r#"{"action":"inspect","ids":["0123456789abcdef"]}"#,
         )
         .await;
@@ -533,7 +585,7 @@ mod tests {
 
         let out = execute_tool(
             &ctx,
-            "dispatch",
+            "subagent",
             r#"{"action":"inspect","ids":["0123456789abcdef"],"wait":"all"}"#,
         )
         .await;
@@ -542,7 +594,7 @@ mod tests {
 
         let out = execute_tool(
             &ctx,
-            "dispatch",
+            "subagent",
             r#"{"action":"cancel","ids":["0123456789abcdef"]}"#,
         )
         .await;
@@ -555,7 +607,7 @@ mod tests {
         let ctx = spawner_ctx(&s);
         let out = execute_tool(
             &ctx,
-            "dispatch",
+            "subagent",
             r#"{"action":"spawn","provider":"shared-provider","model":"shared","thinking":"high","tasks":["one","two"]}"#,
         )
         .await;
@@ -581,7 +633,7 @@ mod tests {
         let ctx = spawner_ctx(&s);
         let out = execute_tool(
             &ctx,
-            "dispatch",
+            "subagent",
             r#"{"action":"spawn","thinking":"high","tasks":[]}"#,
         )
         .await;
@@ -589,7 +641,7 @@ mod tests {
 
         let out = execute_tool(
             &ctx,
-            "dispatch",
+            "subagent",
             r#"{"action":"spawn","thinking":"high","tasks":["  "]}"#,
         )
         .await;
@@ -603,7 +655,7 @@ mod tests {
         let ctx = spawner_ctx(&s);
         let out = execute_tool(
             &ctx,
-            "dispatch",
+            "subagent",
             r#"{"action":"spawn","thinking":"high","tasks":"just one task"}"#,
         )
         .await;
@@ -617,7 +669,7 @@ mod tests {
     async fn dispatch_inspect_without_target_lists_all() {
         let s = FakeSpawner::new();
         let ctx = spawner_ctx(&s);
-        let out = execute_tool(&ctx, "dispatch", r#"{"action":"inspect"}"#).await;
+        let out = execute_tool(&ctx, "subagent", r#"{"action":"inspect"}"#).await;
         assert!(out.text.contains("\"delegates\""));
     }
 
@@ -625,5 +677,6 @@ mod tests {
     fn tool_outcome_default_is_empty() {
         let o: ToolOutcome = Default::default();
         assert!(o.text.is_empty() && o.images.is_empty() && o.diff.is_empty());
+        assert!(o.pending.is_none());
     }
 }

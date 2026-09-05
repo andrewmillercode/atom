@@ -15,20 +15,24 @@
 use crate::approvals::{ApprovalRequest, ApprovalStore, Approver};
 use crate::policy::{prefix_for_command, RuleMatch, SandboxConfig};
 use crate::rules::{self, Analysis, Verdict};
+use atom_core::cancel::CancelToken;
 use atom_core::session::store::data_dir;
 use atom_core::util::sha256_hash;
 use once_cell::sync::Lazy;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Mutex;
-use std::time::Duration;
-use tokio::process::Command;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tokio::io::AsyncReadExt;
+use tokio::process::{Child, Command};
 
-/// Hard wall-clock limit for one command. v2 has no confinement, so
-/// this is just a runaway safety net.
+/// Hard wall-clock limit for the legacy blocking entry point ([`run`] /
+/// [`run_with`], used by tests and callers that need a synchronous
+/// result). The bash tool itself has no timeout: a command runs until
+/// it exits and the turn waits; runaway protection is the user's Esc.
 pub const EXEC_TIMEOUT: Duration = Duration::from_secs(120);
 
-const BASH: &str = "/bin/bash";
+pub(crate) const BASH: &str = "/bin/bash";
 
 /// Process-global approval store backed by sandbox.json. Held behind a
 /// `Lazy` so the disk read happens once on first use; per-process
@@ -62,7 +66,7 @@ impl ConfineKind {
 }
 
 /// Result of one sandboxed execution.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ExecOutcome {
     pub exit_code: i32,
     pub stdout: String,
@@ -73,6 +77,9 @@ pub struct ExecOutcome {
     /// v2: always `ConfineKind::None`. Field kept so audit log records
     /// stay well-formed and downstream code keeps compiling.
     pub confined: ConfineKind,
+    /// Set when the command is still running: the caller (the turn
+    /// loop) parks on it and the tool result is recorded when it exits.
+    pub pending: Option<PendingProcess>,
 }
 
 impl Default for ExecOutcome {
@@ -85,8 +92,169 @@ impl Default for ExecOutcome {
             verdict: Analysis::default(),
             approved: false,
             confined: ConfineKind::None,
+            pending: None,
         }
     }
+}
+
+/// A bash command that is still running. The bash tool returns one for
+/// every command — the turn loop parks on it until it exits (no
+/// timeout; runaway protection is the user's Esc) and records the
+/// output as the original tool call's result. stdout/stderr are drained
+/// continuously by spawned tasks so large output cannot fill the pipe
+/// buffers and deadlock a long-running command.
+pub struct PendingProcess {
+    command: String,
+    started: Instant,
+    child: Child,
+    status: Option<std::process::ExitStatus>,
+    stdout_task: tokio::task::JoinHandle<()>,
+    stderr_task: tokio::task::JoinHandle<()>,
+    output: PendingOutput,
+    killed: bool,
+}
+
+/// Live view of a running command's output. The pipe readers append
+/// every chunk to these shared buffers as it arrives, so the turn loop
+/// can peek at partial output while the command is still running
+/// (placeholder refresh) without touching the child handle.
+#[derive(Clone, Default)]
+pub struct PendingOutput(Arc<std::sync::Mutex<PartialOutput>>);
+
+#[derive(Default)]
+struct PartialOutput {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+impl PendingOutput {
+    /// Everything written so far: stdout then stderr, matching the order
+    /// [`PendingExit::output`] uses at collection time.
+    pub fn text(&self) -> String {
+        let out = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    }
+
+    /// Appends one chunk to the buffer. The pipe readers call this per
+    /// read; tests use it to seed partial output.
+    pub fn extend(&self, stdout: bool, chunk: &[u8]) {
+        let mut out = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if stdout {
+            out.stdout.extend_from_slice(chunk);
+        } else {
+            out.stderr.extend_from_slice(chunk);
+        }
+    }
+}
+
+impl std::fmt::Debug for PendingProcess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingProcess")
+            .field("command", &self.command)
+            .field("started", &self.started)
+            .field("killed", &self.killed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PendingProcess {
+    /// The command this process is running (for placeholder results).
+    pub fn command(&self) -> &str {
+        &self.command
+    }
+
+    /// When the command was spawned (for placeholder results).
+    pub fn started(&self) -> Instant {
+        self.started
+    }
+
+    /// How long the command has been running.
+    pub fn elapsed(&self) -> Duration {
+        self.started.elapsed()
+    }
+
+    /// A cloneable handle to the output written so far — the turn loop
+    /// keeps one on the pending command to refresh placeholders while
+    /// this process runs.
+    pub fn output_handle(&self) -> PendingOutput {
+        self.output.clone()
+    }
+
+    /// Was the process killed (Esc) rather than exiting on its own.
+    pub fn killed(&self) -> bool {
+        self.killed
+    }
+
+    /// SIGKILL the process group and reap the child. The child was
+    /// spawned with process_group(0), so its pgid == its pid and the
+    /// group kill reaches `bash -lc "cargo test"`'s grandchildren too.
+    pub async fn kill(&mut self) {
+        let pid = self.child.id().unwrap_or(0) as i32;
+        if pid > 0 {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+        let _ = self.child.kill().await;
+        self.status = self.child.wait().await.ok();
+        self.killed = true;
+    }
+
+    /// Waits for the process to exit on its own (no timeout — a long
+    /// test suite runs until it is done).
+    pub async fn wait_exit(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let status = self.child.wait().await;
+        self.status = status.as_ref().ok().copied();
+        status
+    }
+
+    /// Joins the concurrent pipe readers and returns the exit. Safe
+    /// after [`kill`] or a normal [`wait_exit`]: both streams close when
+    /// the process (group) dies, so these joins return promptly.
+    pub async fn collect(self) -> PendingExit {
+        let _ = self.stdout_task.await;
+        let _ = self.stderr_task.await;
+        let exit_code = self
+            .status
+            .as_ref()
+            .map(|s| s.code().unwrap_or(-1))
+            .unwrap_or(-1);
+        let output = {
+            let mut buf = self.output.0.lock().unwrap_or_else(|p| p.into_inner());
+            (
+                String::from_utf8_lossy(&buf.stdout).into_owned(),
+                String::from_utf8_lossy(&buf.stderr).into_owned(),
+            )
+        };
+        PendingExit {
+            exit_code,
+            output: format!("{}{}", output.0, output.1),
+            killed: self.killed,
+        }
+    }
+
+    /// Convenience for direct callers (tests): wait for exit or the kill
+    /// token, then collect.
+    pub async fn run_until_done(mut self, kill: CancelToken) -> PendingExit {
+        tokio::select! {
+            biased;
+            _ = kill.cancelled() => self.kill().await,
+            _ = self.wait_exit() => {}
+        }
+        self.collect().await
+    }
+}
+
+/// The exit of a pending command: its exit code, combined output, and
+/// whether it was killed by the user (Esc) instead of exiting itself.
+pub struct PendingExit {
+    pub exit_code: i32,
+    pub output: String,
+    pub killed: bool,
 }
 
 /// First matched rule id that exists in the built-in table (synthetic
@@ -140,6 +308,69 @@ pub async fn run_with(
     cfg: &SandboxConfig,
     approver: &dyn Approver,
 ) -> ExecOutcome {
+    // 1-3. analyze → guardrail floor → approval gate.
+    let authed = match authorize(
+        data_dir_path,
+        cmd,
+        cwd,
+        workspace_root,
+        session_id,
+        cfg,
+        approver,
+    )
+    .await
+    {
+        Err(blocked) => return blocked,
+        Ok(authed) => authed,
+    };
+
+    // 4. spawn (with env scrub + per-session tmpdir).
+    let tmpdir = match setup_session_tmpdir(session_id, data_dir_path) {
+        Ok(t) => Some(t),
+        Err(e) => {
+            // tmpdir failure is non-fatal; the command still runs in the
+            // host's $TMPDIR. Audit notes the fallback.
+            eprintln!("atom: failed to create session tmpdir: {e}");
+            None
+        }
+    };
+
+    let mut outcome = spawn_and_wait(tmpdir.as_ref().map(|t| t.path()), cmd, cwd).await;
+    outcome.verdict = authed.verdict.clone();
+    outcome.approved = authed.approved;
+    outcome.confined = ConfineKind::None;
+    audit(
+        data_dir_path,
+        session_id,
+        cmd,
+        &authed.verdict,
+        authed.decision,
+        &outcome,
+        None,
+    );
+
+    if let Some(t) = tmpdir {
+        if let Err(e) = t.cleanup() {
+            eprintln!("atom: failed to remove session tmpdir: {e}");
+        }
+    }
+    outcome
+}
+
+/// The head of the pipeline shared by every execution mode: static
+/// analysis, the guardrail floor, and the approval gate. Returns the
+/// verdict + approval decision, or a fully-audited blocking
+/// ExecOutcome (deny / not approved).
+#[allow(clippy::result_large_err)]
+async fn authorize(
+    data_dir_path: &Path,
+    cmd: &str,
+    cwd: &Path,
+    workspace_root: &Path,
+    session_id: &str,
+    cfg: &SandboxConfig,
+    approver: &dyn Approver,
+) -> Result<Authed, ExecOutcome> {
     // 1. analyze
     let verdict = rules::analyze_full(cmd, workspace_root, cwd, false);
 
@@ -163,7 +394,7 @@ pub async fn run_with(
             &outcome,
             None,
         );
-        return outcome;
+        return Err(outcome);
     }
 
     // 3. approval gate: Tier 1 → Allow (no prompt), Tier 2 → prompt.
@@ -212,43 +443,180 @@ pub async fn run_with(
                         &outcome,
                         None,
                     );
-                    return outcome;
+                    return Err(outcome);
                 }
             }
         }
         Verdict::Deny => unreachable!(),
     }
+    Ok(Authed {
+        verdict,
+        approved,
+        decision,
+    })
+}
 
-    // 4. spawn (with env scrub + per-session tmpdir).
+/// Verdict + approval decision from [`authorize`].
+struct Authed {
+    verdict: Analysis,
+    approved: bool,
+    decision: &'static str,
+}
+
+/// The bash tool's entry point: like [`run`] but returning a
+/// [`PendingProcess`] for the command — every bash call is pending
+/// until the command exits. The turn loop parks on it; Esc (via the
+/// kill token) stops the whole process group. There is no timeout:
+/// a long test suite runs until it is done.
+pub async fn run_tool(
+    cmd: &str,
+    cwd: &Path,
+    workspace_root: &Path,
+    session_id: &str,
+    cfg: &SandboxConfig,
+    approver: &dyn Approver,
+) -> ExecOutcome {
+    run_tool_with(
+        &data_dir(),
+        cmd,
+        cwd,
+        workspace_root,
+        session_id,
+        cfg,
+        approver,
+    )
+    .await
+}
+
+/// [`run_tool`] with an explicit data dir (hermetic tests).
+#[allow(clippy::too_many_arguments)]
+pub async fn run_tool_with(
+    data_dir_path: &Path,
+    cmd: &str,
+    cwd: &Path,
+    workspace_root: &Path,
+    session_id: &str,
+    cfg: &SandboxConfig,
+    approver: &dyn Approver,
+) -> ExecOutcome {
+    let authed = match authorize(
+        data_dir_path,
+        cmd,
+        cwd,
+        workspace_root,
+        session_id,
+        cfg,
+        approver,
+    )
+    .await
+    {
+        Err(blocked) => return blocked,
+        Ok(authed) => authed,
+    };
+
     let tmpdir = match setup_session_tmpdir(session_id, data_dir_path) {
         Ok(t) => Some(t),
         Err(e) => {
-            // tmpdir failure is non-fatal; the command still runs in the
-            // host's $TMPDIR. Audit notes the fallback.
             eprintln!("atom: failed to create session tmpdir: {e}");
             None
         }
     };
 
-    let mut outcome = spawn_and_wait(tmpdir.as_ref().map(|t| t.path()), cmd, cwd).await;
-    outcome.verdict = verdict.clone();
-    outcome.approved = approved;
-    outcome.confined = ConfineKind::None;
+    // Spawn piped: the reader tasks drain both streams concurrently so
+    // output larger than the 64KB pipe buffers cannot deadlock the
+    // command. Own process group so Esc reaches the grandchildren.
+    let mut command = Command::new(BASH);
+    command.arg("-lc").arg(cmd);
+    command.current_dir(cwd);
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    command.env_clear();
+    for (k, v) in scrub_env() {
+        command.env(k, v);
+    }
+    if let Some(t) = tmpdir.as_ref().map(|t| t.path()) {
+        command.env("TMPDIR", t);
+        command.env("TMP", t);
+        command.env("TEMP", t);
+    }
+    command.kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let outcome = match command.spawn() {
+        Ok(mut child) => {
+            // Drain the pipes from the start: wait_with_output-style
+            // collection happens later, when the turn loop parks on the
+            // child and it finally exits.
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+            let output = PendingOutput::default();
+            let stdout_buf = output.clone();
+            let stderr_buf = output.clone();
+            let stdout_task = tokio::spawn(async move {
+                if let Some(mut pipe) = stdout {
+                    let mut chunk = [0u8; 8192];
+                    loop {
+                        match pipe.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => stdout_buf.extend(true, &chunk[..n]),
+                        }
+                    }
+                }
+            });
+            let stderr_task = tokio::spawn(async move {
+                if let Some(mut pipe) = stderr {
+                    let mut chunk = [0u8; 8192];
+                    loop {
+                        match pipe.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => stderr_buf.extend(false, &chunk[..n]),
+                        }
+                    }
+                }
+            });
+            ExecOutcome {
+                exit_code: 0,
+                approved: authed.approved,
+                verdict: authed.verdict.clone(),
+                confined: ConfineKind::None,
+                pending: Some(PendingProcess {
+                    command: cmd.to_string(),
+                    started: Instant::now(),
+                    child,
+                    status: None,
+                    stdout_task,
+                    stderr_task,
+                    output,
+                    killed: false,
+                }),
+                ..Default::default()
+            }
+        }
+        Err(e) => ExecOutcome {
+            exit_code: -1,
+            stderr: format!("atom: failed to spawn: {e}\n"),
+            approved: authed.approved,
+            verdict: authed.verdict.clone(),
+            confined: ConfineKind::None,
+            ..Default::default()
+        },
+    };
+    let note = if outcome.pending.is_some() {
+        Some("pending")
+    } else {
+        None
+    };
     audit(
         data_dir_path,
         session_id,
         cmd,
-        &verdict,
-        decision,
+        &authed.verdict,
+        authed.decision,
         &outcome,
-        None,
+        note,
     );
-
-    if let Some(t) = tmpdir {
-        if let Err(e) = t.cleanup() {
-            eprintln!("atom: failed to remove session tmpdir: {e}");
-        }
-    }
     outcome
 }
 
@@ -561,6 +929,163 @@ mod tests {
         assert_eq!(out.verdict.verdict, Verdict::Allow);
     }
 
+    // ---- pending-process model ----
+
+    fn unique_session() -> String {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("pend-{}-{n}", std::process::id())
+    }
+
+    /// Every bash call comes back pending; the turn loop parks on it
+    /// until the command exits and records the output as the result.
+    #[tokio::test]
+    async fn pending_command_completes_with_full_output() {
+        let e = env();
+        let out = run_tool_with(
+            e._data.path(),
+            "echo starting; sleep 1; echo done",
+            e._ws.path(),
+            e._ws.path(),
+            &unique_session(),
+            &default_cfg(),
+            &AutoApprover(Decision::AllowOnce),
+        )
+        .await;
+        assert_eq!(out.exit_code, 0);
+        assert!(out.approved);
+        let pp = out.pending.expect("bash returns a pending process");
+        assert_eq!(pp.command(), "echo starting; sleep 1; echo done");
+
+        let exit = pp.run_until_done(CancelToken::new()).await;
+        assert!(!exit.killed);
+        assert_eq!(exit.exit_code, 0);
+        assert!(exit.output.contains("starting") && exit.output.contains("done"));
+    }
+
+    /// Partial output is peekable while the command is still running:
+    /// the turn loop refreshes placeholders from this live view without
+    /// any status tool.
+    #[tokio::test]
+    async fn pending_output_is_peekable_mid_run() {
+        let e = env();
+        let out = run_tool_with(
+            e._data.path(),
+            "echo partial-marker; sleep 5; echo never-reached",
+            e._ws.path(),
+            e._ws.path(),
+            &unique_session(),
+            &default_cfg(),
+            &AutoApprover(Decision::AllowOnce),
+        )
+        .await;
+        let mut pp = out.pending.expect("pending process");
+        let peek = pp.output_handle();
+
+        // Poll until the marker shows up, well before the 5s sleep ends.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if peek.text().contains("partial-marker") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "output never became peekable"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!peek.text().contains("never-reached"));
+
+        pp.kill().await;
+        let exit = pp.collect().await;
+        assert!(exit.killed);
+        assert!(exit.output.contains("partial-marker"));
+    }
+
+    /// Esc (the kill token) stops the whole process group promptly —
+    /// including the command's children, not just the immediate bash.
+    #[tokio::test]
+    async fn esc_kills_pending_command_process_group() {
+        let e = env();
+        let out = run_tool_with(
+            e._data.path(),
+            "sh -c 'sleep 30' & wait", // grandchild under the tool's bash
+            e._ws.path(),
+            e._ws.path(),
+            &unique_session(),
+            &default_cfg(),
+            &AutoApprover(Decision::AllowOnce),
+        )
+        .await;
+        let mut pp = out.pending.expect("pending process");
+        let token = CancelToken::new();
+        let t2 = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            t2.cancel();
+        });
+        let started = std::time::Instant::now();
+        let exit = pp.run_until_done(token).await;
+        assert!(exit.killed, "expected a killed exit");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "kill should be prompt, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Output far beyond the 64KB pipe buffers must not deadlock: the
+    /// reader tasks drain the pipes from spawn time.
+    #[tokio::test]
+    async fn huge_output_does_not_deadlock() {
+        let e = env();
+        let out = run_tool_with(
+            e._data.path(),
+            "yes | head -c 300000",
+            e._ws.path(),
+            e._ws.path(),
+            &unique_session(),
+            &default_cfg(),
+            &AutoApprover(Decision::AllowOnce),
+        )
+        .await;
+        let pp = out.pending.expect("pending process");
+        let exit = tokio::time::timeout(
+            Duration::from_secs(30),
+            pp.run_until_done(CancelToken::new()),
+        )
+        .await
+        .expect("drained pipes must not deadlock");
+        assert_eq!(exit.exit_code, 0, "output: {}", exit.output.len());
+        assert_eq!(exit.output.len(), 300000);
+    }
+
+    /// A long command is pending with no timeout: the tool call returns
+    /// immediately while the command keeps running.
+    #[tokio::test]
+    async fn tool_call_returns_before_command_finishes() {
+        let e = env();
+        let started = std::time::Instant::now();
+        let out = run_tool_with(
+            e._data.path(),
+            "sleep 2",
+            e._ws.path(),
+            e._ws.path(),
+            &unique_session(),
+            &default_cfg(),
+            &AutoApprover(Decision::AllowOnce),
+        )
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "tool call must not wait for the command: {:?}",
+            started.elapsed()
+        );
+        let pp = out.pending.expect("pending process");
+        let exit = pp.run_until_done(CancelToken::new()).await;
+        assert_eq!(exit.exit_code, 0);
+    }
+
     #[tokio::test]
     async fn deny_verdict_short_circuits_without_executing() {
         struct Panic;
@@ -725,12 +1250,10 @@ mod tests {
     #[tokio::test]
     async fn per_session_tmpdir_is_created_and_set() {
         let e = env();
-        // Use a custom TMPDIR parent so we don't litter /tmp.
-        let parent = tempfile::tempdir().unwrap();
-        // SAFETY: single-threaded test for env mutation.
-        unsafe {
-            std::env::set_var("TMPDIR", parent.path());
-        }
+        // Note: no TMPDIR mutation here — it is process-global and would
+        // make other tests' tempdirs nest inside `parent`, which this
+        // test then deletes. HOST_TMPDIR is computed once per process
+        // anyway, so the assertion below doesn't depend on it.
         let out = run_with(
             e._data.path(),
             "echo $TMPDIR",
@@ -747,9 +1270,6 @@ mod tests {
             "stdout: {}",
             out.stdout
         );
-        unsafe {
-            std::env::remove_var("TMPDIR");
-        }
     }
 
     #[test]

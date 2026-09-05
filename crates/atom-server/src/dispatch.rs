@@ -441,8 +441,9 @@ impl SubagentHandle for DispatchBridge {
     /// create the child with fresh instructions, append the prompt, and
     /// kick off a detached turn.
     async fn spawn(&self, plan: DispatchPlan) -> String {
-        // The daemon does not retain the multi-megabyte catalog at idle.
-        // Dispatch is the first server-only operation that needs it.
+        // Cheap once the catalog is in memory (read-lock check); the
+        // server warmup at spawn usually filled it already. This is the
+        // fallback for a dispatch that races a first-ever run.
         atom_core::providers::modelsdev::ensure_models_dev_catalog().await;
         let parent_id = self.parent_id.clone();
         let Some(parent) = self
@@ -450,7 +451,7 @@ impl SubagentHandle for DispatchBridge {
             .store_call(move |store| store.get(&parent_id))
             .await
         else {
-            return "error: dispatch requires an active session".into();
+            return "error: subagent requires an active session".into();
         };
 
         // Go inherits the caller's model BEFORE validating it.
@@ -495,10 +496,20 @@ impl SubagentHandle for DispatchBridge {
         let store_batch_id = plan.batch_id.clone();
         let store_batch_index = plan.batch_index;
         let store_prompt = plan.prompt.clone();
+        let store_instructions = plan.instructions.clone();
         let child = self
             .state
             .store_call(move |store| {
-                let instr = load_instructions_from(&store_cwd);
+                let mut instr = load_instructions_from(&store_cwd);
+                // An agent profile contributes its body as extra
+                // instructions after the standard ones.
+                if !store_instructions.is_empty() {
+                    instr.push(atom_core::types::Message {
+                        role: "system".into(),
+                        content: store_instructions,
+                        ..Default::default()
+                    });
+                }
                 let mut child = store.create_child(
                     &store_parent_id,
                     &store_model,

@@ -26,7 +26,14 @@ pub enum OverlayKind {
     ProviderKey,
     Settings,
     WebSearch,
+    WebFetch,
     Theme,
+    /// Dev-only /profile overlay: startup time plus CPU/RSS/VSZ/etime
+    /// snapshots for the client and the background `atoms` server.
+    /// The slash command is registered only when [`atom_core::build::
+    /// is_dev`] is true (handled at the call site in
+    /// [`crate::overlays::COMMANDS`]).
+    Profile,
     /// /fork: pick a user message in the current session to fork from.
     /// Rendered via the reusable fullscreen view template in
     /// [`crate::fullscreen_view`].
@@ -67,7 +74,7 @@ pub struct Command {
     pub kind: &'static str,
 }
 
-pub const COMMANDS: [Command; 16] = [
+pub const COMMANDS: [Command; 17] = [
     Command {
         name: "/new",
         desc: "start a new session",
@@ -141,6 +148,11 @@ pub const COMMANDS: [Command; 16] = [
     Command {
         name: "/thinking",
         desc: "toggle expanded thinking blocks",
+        kind: "",
+    },
+    Command {
+        name: "/profile",
+        desc: "show startup time and CPU/memory usage",
         kind: "",
     },
     Command {
@@ -256,14 +268,32 @@ const DEFAULT_COMMANDS: [&str; 7] = [
 /// An un-narrowed "/" shows only DEFAULT_COMMANDS; a single typed
 /// character opens up the full catalog.
 pub fn match_commands(typed: &str, dynamic_commands: &[DynamicCommand]) -> Vec<DynamicCommand> {
+    // /profile is a dev-only diagnostic. Filtering at match time keeps
+    // the catalog list out of release builds without two parallel
+    // COMMANDS arrays or a second set of slash handlers.
+    let visible_commands: &'static [Command] = if atom_core::build::is_dev() {
+        &COMMANDS
+    } else {
+        // Compile-time filter isn't ergonomic in stable Rust, so walk
+        // the array once at startup and cache the release-only view.
+        // The COMMANDS array only has one entry to skip.
+        static RELEASE_COMMANDS: std::sync::OnceLock<Vec<Command>> = std::sync::OnceLock::new();
+        RELEASE_COMMANDS.get_or_init(|| {
+            COMMANDS
+                .iter()
+                .filter(|&c| c.name != "/profile")
+                .cloned()
+                .collect()
+        })
+    };
     let builtins = if typed == "/" {
-        COMMANDS
+        visible_commands
             .iter()
             .filter(|c| DEFAULT_COMMANDS.contains(&c.name))
             .map(DynamicCommand::builtin)
             .collect::<Vec<_>>()
     } else {
-        COMMANDS
+        visible_commands
             .iter()
             .filter(|c| c.name.starts_with(typed))
             .map(DynamicCommand::builtin)
@@ -384,6 +414,7 @@ pub fn overlay_has_query(kind: Option<OverlayKind>) -> bool {
             | Some(OverlayKind::Session)
             | Some(OverlayKind::Providers)
             | Some(OverlayKind::ProviderKey)
+            | Some(OverlayKind::Theme)
             | Some(OverlayKind::Fork)
     )
 }
@@ -399,10 +430,12 @@ pub fn overlay_count(app: &App) -> usize {
         )
         .len(),
         Some(OverlayKind::ProviderMethod) => 2,
-        Some(OverlayKind::Settings) => 3,
+        Some(OverlayKind::Settings) => 6,
         Some(OverlayKind::WebSearch) => web_search_rows(app).len(),
-        Some(OverlayKind::Theme) => atom_core::render::colors::available_themes().len(),
+        Some(OverlayKind::WebFetch) => web_fetch_rows(app).len(),
+        Some(OverlayKind::Theme) => filtered_theme_rows(app).len(),
         Some(OverlayKind::Fork) => fork_rows(app).len(),
+        Some(OverlayKind::Profile) => profile_overlay_rows(app),
         _ => 0,
     }
 }
@@ -410,12 +443,30 @@ pub fn overlay_count(app: &App) -> usize {
 pub fn settings_labels(app: &App) -> Vec<String> {
     let compaction = app.atom_config.resolved_compaction();
     let web = app.atom_config.resolved_web_search();
+    let fetch = app.atom_config.resolved_web_fetch();
     vec![
         format!(
             "Compaction model  {} / {}",
             compaction.provider, compaction.model
         ),
+        format!(
+            "Auto-compaction  {}",
+            if compaction.resolved_enabled() {
+                "on"
+            } else {
+                "off"
+            }
+        ),
         format!("Web search provider  {}", web.server),
+        format!("Web fetch provider  {}", fetch.server),
+        format!(
+            "Transparent background  {}",
+            if app.atom_config.resolved_transparent_background() {
+                "on"
+            } else {
+                "off"
+            }
+        ),
         if app.settings_onboarding {
             "Continue with defaults / finish setup".into()
         } else {
@@ -427,6 +478,32 @@ pub fn settings_labels(app: &App) -> Vec<String> {
 /// themeRows lists selectable themes with their id and source label.
 pub fn theme_rows() -> Vec<atom_core::render::colors::ThemeEntry> {
     atom_core::render::colors::available_themes()
+}
+
+/// filterThemeMatch reports whether the theme row matches the overlay
+/// search query. An empty query matches every row. Matches are
+/// case-insensitive substring checks against both the display name and
+/// the stable theme id, so typing "dark" finds "Solarized Dark" and
+/// typing "solar" finds it by id.
+pub fn filter_theme_match(entry: &atom_core::render::colors::ThemeEntry, query: &str) -> bool {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return true;
+    }
+    entry.name.to_lowercase().contains(&q) || entry.id.to_lowercase().contains(&q)
+}
+
+/// filteredThemeRows is the single source of truth for the theme picker's
+/// visible order: theme rows matching the overlay query. The count, the
+/// renderer, and the confirm handler must all index this same list so
+/// overlay_sel resolves to the row the user highlighted — resolving
+/// against the unfiltered theme_rows picks the wrong theme whenever a
+/// query is typed (the unfiltered head is "atom").
+pub fn filtered_theme_rows(app: &App) -> Vec<atom_core::render::colors::ThemeEntry> {
+    theme_rows()
+        .into_iter()
+        .filter(|e| filter_theme_match(e, &app.overlay_q))
+        .collect()
 }
 
 pub fn web_search_rows(app: &App) -> Vec<(String, String, String)> {
@@ -451,6 +528,20 @@ pub fn web_search_rows(app: &App) -> Vec<(String, String, String)> {
         };
         rows.push((name.clone(), name, meta));
     }
+    rows
+}
+
+pub fn web_fetch_rows(_app: &App) -> Vec<(String, String, String)> {
+    let rows: Vec<(String, String, String)> = atom_core::config::bundled_web_fetch_profiles()
+        .into_iter()
+        .map(|profile| {
+            let auth = match profile.auth {
+                atom_core::config::WebSearchAuth::Optional => "anonymous · optional key",
+                atom_core::config::WebSearchAuth::Required => "API key required",
+            };
+            (profile.id, profile.name, auth.into())
+        })
+        .collect();
     rows
 }
 
@@ -863,6 +954,32 @@ pub fn stats_scroll_max(app: &App) -> usize {
     lines.len().saturating_sub(visible)
 }
 
+/// Number of raw render lines produced by the profile overlay — used
+/// to clamp Up/Down so the cursor can't scroll past the end. Mirrors
+/// `stats_scroll_max`.
+pub fn profile_scroll_max(app: &App) -> usize {
+    let Some(report) = &app.overlay_profile else {
+        return 0;
+    };
+    let width = crate::fullscreen_view::content_width(app.width.max(1) as usize);
+    let height = crate::fullscreen_view::content_height(app.height.max(1) as usize);
+    let data = overlay_view_data(app, OverlayKind::Profile);
+    let spec = overlay_spec(app, OverlayKind::Profile, &data);
+    let lines = crate::profile::render_profile(report, std::time::SystemTime::now());
+    let visible = crate::fullscreen_view::list_visible_rows(&spec, width, height);
+    lines.len().saturating_sub(visible)
+}
+
+/// profileOverlayRows is the count of profile raw lines — exposed as
+/// a helper for callers that want to read it directly (the App's key
+/// handler, scroll math).
+fn profile_overlay_rows(app: &App) -> usize {
+    let Some(report) = &app.overlay_profile else {
+        return 0;
+    };
+    crate::profile::render_profile(report, std::time::SystemTime::now()).len()
+}
+
 // ---------------------------------------------------------------------------
 // Footer menu geometry (slash/manage/picker/context).
 // ---------------------------------------------------------------------------
@@ -1163,6 +1280,7 @@ pub fn overlay_view_data(app: &App, kind: OverlayKind) -> OverlayViewData {
                         meta: String::new(),
                         marker: String::new(),
                         swatch: Vec::new(),
+                        badges: Vec::new(),
                     }),
                     None => ViewRow::Header(row.label.clone()),
                 })
@@ -1235,6 +1353,20 @@ pub fn overlay_view_data(app: &App, kind: OverlayKind) -> OverlayViewData {
                 .collect();
             OverlayViewData::new(rows, String::new())
         }
+        OverlayKind::Profile => {
+            let Some(report) = &app.overlay_profile else {
+                return OverlayViewData::new(Vec::new(), String::new());
+            };
+            // Profile is read-only — render at the current wall clock so the
+            // "client uptime" and "server uptime" rows stay in sync
+            // with the rest of the overlay (slight drift is fine).
+            let lines = crate::profile::render_profile(report, std::time::SystemTime::now());
+            let rows = lines
+                .into_iter()
+                .map(|line| ViewRow::Raw(vec![ratatui::text::Span::raw(line)]))
+                .collect();
+            OverlayViewData::new(rows, String::new())
+        }
         OverlayKind::Providers => {
             let filtered = atom_core::providers::providers::filter_provider_entries(
                 &app.overlay_providers,
@@ -1250,6 +1382,7 @@ pub fn overlay_view_data(app: &App, kind: OverlayKind) -> OverlayViewData {
                         meta: String::new(),
                         marker: String::new(),
                         swatch: Vec::new(),
+                        badges: e.caps.iter().map(|c| c.to_string()).collect(),
                     })
                 })
                 .collect();
@@ -1290,6 +1423,24 @@ pub fn overlay_view_data(app: &App, kind: OverlayKind) -> OverlayViewData {
                         meta: String::new(),
                         marker: String::new(),
                         swatch: Vec::new(),
+                        badges: Vec::new(),
+                    })
+                })
+                .collect();
+            OverlayViewData::new(rows, String::new())
+        }
+        OverlayKind::WebFetch => {
+            let rows = web_fetch_rows(app)
+                .iter()
+                .map(|(_, name, meta)| {
+                    ViewRow::Item(ViewItem {
+                        id: None,
+                        label: name.clone(),
+                        trailing: meta.clone(),
+                        meta: String::new(),
+                        marker: String::new(),
+                        swatch: Vec::new(),
+                        badges: Vec::new(),
                     })
                 })
                 .collect();
@@ -1297,7 +1448,7 @@ pub fn overlay_view_data(app: &App, kind: OverlayKind) -> OverlayViewData {
         }
         OverlayKind::Theme => {
             let active = atom_core::render::colors::active_theme_name();
-            let rows = theme_rows()
+            let rows = filtered_theme_rows(app)
                 .iter()
                 .map(|entry| {
                     ViewRow::Item(ViewItem {
@@ -1320,6 +1471,7 @@ pub fn overlay_view_data(app: &App, kind: OverlayKind) -> OverlayViewData {
                             entry.theme.secondary.clone(),
                             entry.theme.foreground.clone(),
                         ],
+                        badges: Vec::new(),
                     })
                 })
                 .collect();
@@ -1346,6 +1498,7 @@ fn fork_view_rows(app: &App) -> OverlayViewData {
                     meta: String::new(),
                     marker: String::new(),
                     swatch: Vec::new(),
+                    badges: Vec::new(),
                 })
             }
         })
@@ -1363,12 +1516,12 @@ pub fn overlay_chrome(app: &App, kind: OverlayKind) -> (String, String, String) 
     let (title, description, placeholder) = match kind {
         OverlayKind::Model => (
             "Select model".to_string(),
-            format!("{query_hint}Ctrl+P to pin, Esc to cancel"),
+            format!("{query_hint}Ctrl+P to pin"),
             "Search".to_string(),
         ),
         OverlayKind::Session => (
             "Sessions".to_string(),
-            format!("{query_hint}Ctrl+P to pin, Ctrl+D to delete, Esc to cancel"),
+            format!("{query_hint}Ctrl+P to pin, Ctrl+D to delete"),
             "Search".to_string(),
         ),
         OverlayKind::Stats => {
@@ -1379,19 +1532,18 @@ pub fn overlay_chrome(app: &App, kind: OverlayKind) -> (String, String, String) 
             };
             (
                 "Stats".to_string(),
-                format!("token usage ({window}) — ↑↓ to scroll, Esc to close"),
+                format!("token usage ({window}) — ↑↓ to scroll"),
                 String::new(),
             )
         }
         OverlayKind::Providers => (
             "Providers".to_string(),
-            "type to search, ↑↓ to navigate, Enter to add/update, Ctrl+D to disconnect, Esc to cancel"
-                .to_string(),
+            "type to search, ↑↓ to navigate, Enter to add/update, Ctrl+D to disconnect".to_string(),
             "Search".to_string(),
         ),
         OverlayKind::ProviderMethod => (
             format!("Auth for {}", app.overlay_auth_id),
-            "↑↓ to navigate, Enter to select, Esc to go back".to_string(),
+            "↑↓ to navigate, Enter to select".to_string(),
             String::new(),
         ),
         OverlayKind::ProviderKey => {
@@ -1402,23 +1554,33 @@ pub fn overlay_chrome(app: &App, kind: OverlayKind) -> (String, String, String) 
             };
             (
                 format!("Auth for {}", app.overlay_auth_id),
-                format!("enter {secret} — Enter to save, Esc to go back"),
+                format!("enter {secret} — Enter to save"),
                 secret.to_string(),
             )
         }
         OverlayKind::Settings => (
             "Settings".to_string(),
-            "↑↓ to navigate, Enter to change, Esc to close".to_string(),
+            "↑↓ to navigate, Enter to change".to_string(),
             String::new(),
         ),
         OverlayKind::WebSearch => (
             "Web search provider".to_string(),
-            "↑↓ to navigate, Enter to select, Esc to settings".to_string(),
+            "↑↓ to navigate, Enter to select".to_string(),
+            String::new(),
+        ),
+        OverlayKind::WebFetch => (
+            "Web fetch provider".to_string(),
+            "↑↓ to navigate, Enter to select".to_string(),
             String::new(),
         ),
         OverlayKind::Theme => (
             "Theme".to_string(),
-            "↑↓ to navigate, Enter to apply, Esc to cancel".to_string(),
+            format!("{query_hint}Enter to apply"),
+            "Search".to_string(),
+        ),
+        OverlayKind::Profile => (
+            "Profile".to_string(),
+            "startup time + CPU/memory — ↑↓ to scroll".to_string(),
             String::new(),
         ),
         OverlayKind::Fork => (
@@ -1457,6 +1619,9 @@ pub fn overlay_spec<'a>(
         footer: data.footer.as_str(),
         loading,
         spinner_frame: app.spinner_frame,
+        // The provider-key prompt is an input-only view: its list is
+        // empty by design, so the "no matches" placeholder is noise.
+        hide_empty_state: kind == OverlayKind::ProviderKey,
     }
 }
 
@@ -1939,5 +2104,27 @@ mod tests {
         // Below the input (list area): not consumed (caret unchanged).
         assert!(!overlay_click_search(&mut app, 1, search_row + 1));
         assert_eq!(app.overlay_q_cursor, Some(2));
+    }
+
+    #[test]
+    fn settings_rows_include_transparent_background_toggle() {
+        let mut app = App::new_test(80, 24);
+        app.overlay = Some(OverlayKind::Settings);
+
+        let labels = settings_labels(&app);
+        assert_eq!(labels.len(), 6);
+        assert_eq!(overlay_count(&app), 6);
+        assert_eq!(labels[4], "Transparent background  off");
+
+        // Done stays the last row in both modes.
+        assert_eq!(labels[5], "Done");
+        let app_on = App {
+            atom_config: atom_core::config::AtomConfig {
+                transparent_background: Some(true),
+                ..Default::default()
+            },
+            ..app
+        };
+        assert_eq!(settings_labels(&app_on)[4], "Transparent background  on");
     }
 }

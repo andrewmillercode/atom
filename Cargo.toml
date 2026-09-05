@@ -43,13 +43,13 @@ rand = "0.8"
 base64 = "0.22"
 sha2 = "0.10"
 hex = "0.4"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 resvg = "0.44"
 chrono = { version = "0.4", features = ["serde"] }
 glob = "0.3"
 tempfile = "3"
 unicode-width = "0.2"
-syntect = { version = "5", default-features = false, features = ["default-syntaxes", "plist-load", "regex-onig"] }
+syntect = { version = "5", default-features = false, features = ["default-syntaxes", "plist-load", "regex-fancy"] }
 similar = { version = "2", features = ["text"] }
 serde_yaml = "0.9"
 notify = "8"
@@ -70,4 +70,26 @@ strip = true
 # 398-crate graph — and keeps target/debug from ballooning into tens of
 # GB of debuginfo. Tradeoff: no variable inspection when debugging
 # atomdev under lldb (tests are the debugging path for logic).
+debug = "line-tables-only"
+
+# Dependencies get no debuginfo at all: their metadata dominates every
+# rlib and link time across the 2 bins + test binaries. Workspace crates
+# override this below and keep line tables so panic backtraces still
+# point at our own code.
+[profile.dev.package."*"]
+debug = false
+
+# Workspace crates: keep line tables (see profile.dev comment above).
+# The "*" override matches non-workspace dependencies only.
+[profile.dev.package.atom-core]
+debug = "line-tables-only"
+[profile.dev.package.atom-sandbox]
+debug = "line-tables-only"
+[profile.dev.package.atom-tools]
+debug = "line-tables-only"
+[profile.dev.package.atom-server]
+debug = "line-tables-only"
+[profile.dev.package.atom-tui]
+debug = "line-tables-only"
+[profile.dev.package.atom]
 debug = "line-tables-only"

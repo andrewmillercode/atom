@@ -17,6 +17,8 @@ struct LastModel {
     model: String,
     #[serde(default)]
     thinking: String,
+    #[serde(default)]
+    profile: String,
 }
 
 fn last_model_path() -> PathBuf {
@@ -36,7 +38,7 @@ fn load_last_model() -> Option<LastModel> {
 
 /// saveLastModel records the model as the last used one. An empty model
 /// is ignored; an empty thinking keeps the previously saved level.
-fn save_last_model_state(provider_name: &str, model: &str, thinking: &str) {
+fn save_last_model_state(provider_name: &str, model: &str, thinking: &str, profile: &str) {
     if model.is_empty() {
         return;
     }
@@ -44,6 +46,7 @@ fn save_last_model_state(provider_name: &str, model: &str, thinking: &str) {
         provider: provider_name.to_string(),
         model: model.to_string(),
         thinking: thinking.to_string(),
+        profile: profile.to_string(),
     };
     if lm.thinking.is_empty() {
         if let Some(prev) = load_last_model() {
@@ -145,6 +148,16 @@ async fn main() {
 }
 
 async fn run() -> Result<()> {
+    // Captured at the very top of run() so the dev-only /profile overlay
+    // can report "client started: HH:MM:SS" + "client uptime: Xs".
+    // Includes the args parse, auto-updater, and deps check; users will
+    // see the full cold-start duration (typically 1-3s on warm caches,
+    // longer on cold installs when the updater has to stage a new
+    // binary). Two flavors: wall-clock for display, monotonic for
+    // uptime math that's robust to clock skew.
+    let started_at_instant = std::time::Instant::now();
+    let started_at_wall = std::time::SystemTime::now();
+
     // Subcommand dispatch: `atom uninstall` removes the install without
     // needing the TUI / server / network. Handled before the standard
     // flag parser, the deps check, and the auto-updater — those would
@@ -157,6 +170,13 @@ async fn run() -> Result<()> {
     }
 
     let args = parse_args()?;
+
+    // Dev installs (`make dev`) are real copies of the cargo artifacts;
+    // if `cargo build` has since produced something newer, the copies
+    // are stale — say so before anyone debugs yesterday's code. The
+    // server copy is repaired automatically (find_server_binary); the
+    // client copy cannot replace itself, so it just warns.
+    warn_stale_dev_install();
 
     // Interactive launch (everything but stats/output-test/hot): print a
     // startup line, then auto-update before the deps check and TUI, so
@@ -193,6 +213,13 @@ async fn run() -> Result<()> {
     // shutdown cannot fire while we sit in menus with no event stream.
     tokio::spawn(atom_server::client::hold_server_alive());
 
+    // The server writes its PID to data_dir/server.pid at startup. We
+    // don't need it for the normal client flow, but /profile uses it
+    // to show live CPU/RSS for the background process alongside the
+    // client's own stats. Optional: a missing pid file just means the
+    // server section of /profile says "no server pid known".
+    let server_pid = atom_server::client::running_server_pid();
+
     // Stats mode: aggregated token usage report, then exit.
     if args.stats {
         let path = if args.stats_days > 0 {
@@ -228,6 +255,9 @@ async fn run() -> Result<()> {
         reasoning_field: String::new(),
     };
     let mut sel_model = String::new();
+    // Agent profile persisted from the last run; restored only when
+    // booting into the saved model (no explicit flags).
+    let mut profile = String::new();
 
     // No flags at all: default to the last used model, else open the
     // model selector on startup (empty sel_model).
@@ -243,6 +273,7 @@ async fn run() -> Result<()> {
             {
                 sel_provider = p;
                 sel_model = lm.model;
+                profile = lm.profile;
                 defaulted = true;
             }
         }
@@ -311,8 +342,13 @@ async fn run() -> Result<()> {
 
     // An explicitly chosen model becomes the default for future launches.
     if !sel_model.is_empty() {
-        let thinking = load_last_model().map(|m| m.thinking).unwrap_or_default();
-        save_last_model_state(&sel_provider.name, &sel_model, &thinking);
+        let last = load_last_model();
+        let thinking = last
+            .as_ref()
+            .map(|m| m.thinking.clone())
+            .unwrap_or_default();
+        let saved_profile = last.as_ref().map(|m| m.profile.clone()).unwrap_or_default();
+        save_last_model_state(&sel_provider.name, &sel_model, &thinking, &saved_profile);
     }
 
     // Create or resume a session.
@@ -341,7 +377,18 @@ async fn run() -> Result<()> {
         serde_json::from_value(v).context("could not parse session")?
     };
 
-    launch_tui(providers, sel_provider, sel_model, args, Some(session)).await
+    launch_tui(
+        providers,
+        sel_provider,
+        sel_model,
+        args,
+        Some(session),
+        started_at_instant,
+        started_at_wall,
+        server_pid,
+        profile,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -362,6 +409,10 @@ async fn launch_tui(
     sel_model: String,
     args: Args,
     session: Option<atom_core::session::store::SessionInfo>,
+    started_at_instant: std::time::Instant,
+    started_at_wall: std::time::SystemTime,
+    server_pid: Option<i32>,
+    profile: String,
 ) -> Result<()> {
     let opts = atom_tui::app::RunOptions {
         providers,
@@ -369,6 +420,15 @@ async fn launch_tui(
         sel_model,
         session: session.unwrap_or_else(zero_session),
         hot_state_path: args.hot_state.map(PathBuf::from),
+        // Wall-clock + monotonic companion. The wall value drives the
+        // "client started: HH:MM:SS" readout; the Instant is a
+        // skew-proof companion for uptime math in tests / future
+        // helpers (currently unused by the renderer but kept for
+        // symmetry with RunOptions).
+        started_at: Some(started_at_wall),
+        started_instant: Some(started_at_instant),
+        server_pid,
+        profile,
     };
     atom_tui::run(opts, args.hot).await
 }
@@ -396,4 +456,34 @@ fn zero_session() -> atom_core::session::store::SessionInfo {
 
 fn is_terminal() -> bool {
     unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 }
+}
+
+/// Warn when the dev install (`make dev` copies of the cargo artifacts)
+/// is older than what cargo has since built, per the `.atomdev-source`
+/// marker the Makefile leaves next to the copies. No-op for release
+/// installs and for running straight out of target/debug (no marker
+/// there, and the artifact is the binary itself).
+fn warn_stale_dev_install() {
+    if !atom_core::build::is_dev() {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let Some(dir) = exe.parent() else { return };
+    let Some(artifact) = atom_core::build::dev_debug_artifact(dir, "atom") else {
+        return;
+    };
+    let (Ok(am), Ok(em)) = (artifact.metadata(), exe.metadata()) else {
+        return;
+    };
+    let (Ok(at), Ok(et)) = (am.modified(), em.modified()) else {
+        return;
+    };
+    if at > et {
+        eprintln!(
+            "[atom] dev install is stale: {} is newer than this atomdev — run `make dev`",
+            artifact.display()
+        );
+    }
 }

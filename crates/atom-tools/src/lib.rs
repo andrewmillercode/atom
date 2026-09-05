@@ -5,7 +5,9 @@
 //! The bash tool routes through [`atom_sandbox::exec::run`]; everything
 //! else mirrors Go's model-visible strings.
 
+pub mod auth_keys;
 pub mod clipboard;
+pub mod customize;
 pub mod defs;
 pub mod dispatch;
 pub mod exec;
@@ -17,11 +19,14 @@ pub mod search;
 pub mod skills;
 pub mod vector_search;
 pub mod visualize;
+pub mod web_chain_log;
 pub mod web_fetch;
 pub mod web_search;
 
 pub use dispatch::{is_dispatch_session_id, parse_dispatch_session_id, DispatchPlan};
-pub use exec::{execute_tool, SubagentHandle, ToolCtx, ToolOutcome};
+pub use exec::{
+    execute_tool, format_bash_cancelled, format_bash_exit, SubagentHandle, ToolCtx, ToolOutcome,
+};
 pub use file_edit::FileSeen;
 pub use mcp::{close_all_mcp, has_deferred_tools};
 

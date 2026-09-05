@@ -1,7 +1,7 @@
 # Makefile for the `atom` / `atoms` executables
 #
-# Dev install (debug build, emitted by cargo as real atomdev/atomsdev
-# binaries and linked into ~/.local/bin):
+# Dev install (debug build, installed into ~/.local/bin as atomdev and
+# atomsdev — real copies, not symlinks; see the `dev` target):
 #   make dev
 #   make dev PREFIX=~/.local   # default
 #
@@ -38,23 +38,33 @@ CARGO_BUILD_FLAGS ?=
 
 all: build
 
-# Dev build (debug profile; also emits the atomdev/atomsdev dev aliases),
-# then link atomdev/atomsdev into $(BIN_DIR) so they're callable.
-# The dev install only needs the dev-named binaries: atomdev/atomsdev and
-# atom/atoms are built from the same sources and differ in debug-flavor
-# behavior by cfg!(debug_assertions), not by name, so compiling and
-# linking the release-named pair too doubles the final stage for nothing.
-# `make build` still emits all four.
+# Dev build (debug profile), then install atomdev/atomsdev into
+# $(BIN_DIR) so they're callable. Dev-vs-release flavor is keyed on
+# cfg!(debug_assertions), not the name, so the dev names are copies of
+# the debug atom/atoms artifacts — no duplicate bin targets that would
+# double linking on every cargo build/test.
+#
+# Copies rather than symlinks: macOS 26 (Tahoe) derives process names
+# (ps comm / Activity Monitor) from the fully resolved executable path —
+# symlinks and even hardlinks resolve away (probed 2026-09), so a
+# symlinked atomsdev displays as "atoms" and pkill cannot tell the dev
+# server from the release one. Copies are refreshed automatically: the
+# .atomdev-source marker below tells the dev client which cargo target
+# dir feeds this install, so atomdev warns when cargo has built
+# something newer and find_server_binary repairs the atomsdev copy
+# before spawning it (see crates/atom-server/src/client.rs).
 dev: dev-build
 	install -d $(BIN_DIR)
-	ln -sf $(CURDIR)/target/debug/atomdev $(BIN_DIR)/atomdev
-	ln -sf $(CURDIR)/target/debug/atomsdev $(BIN_DIR)/atomsdev
+	rm -f $(BIN_DIR)/atomdev $(BIN_DIR)/atomsdev
+	install -m 755 $(CURDIR)/target/debug/atom $(BIN_DIR)/atomdev
+	install -m 755 $(CURDIR)/target/debug/atoms $(BIN_DIR)/atomsdev
+	printf '%s\n' '$(CURDIR)/target' > $(BIN_DIR)/.atomdev-source
 
 build:
-	$(CARGO) build $(CARGO_BUILD_FLAGS) --bin atom --bin atoms --bin atomdev --bin atomsdev
+	$(CARGO) build $(CARGO_BUILD_FLAGS) --bin atom --bin atoms
 
 dev-build:
-	$(CARGO) build $(CARGO_BUILD_FLAGS) --bin atomdev --bin atomsdev
+	$(CARGO) build $(CARGO_BUILD_FLAGS) --bin atom --bin atoms
 
 build-release:
 	$(CARGO) build --release --bin atom --bin atoms
@@ -74,6 +84,7 @@ uninstall:
 	sleep 1
 	@echo "==> removing binaries from $(BIN_DIR)"
 	rm -f $(BIN_DIR)/atom $(BIN_DIR)/atoms $(BIN_DIR)/atomdev $(BIN_DIR)/atomsdev
+	rm -f $(BIN_DIR)/.atomdev-source
 	@echo "==> removing config $(CONFIG_DIR)"
 	@echo "    and data $(DATA_DIR) (sessions, credentials, logs)"
 	@echo "    plus the -dev dirs used by atomdev/atomsdev"

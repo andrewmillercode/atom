@@ -1,10 +1,12 @@
 //! `atoms` — the atom session-server binary.
 //!
 //! This is a thin entry point that runs the background HTTP server
-//! (the same code that `atom --serve` used to invoke). Shipping it as
-//! a separate binary means macOS Activity Monitor / `ps` display the
-//! process as "atoms" (atomsdev for dev builds) without any symlink or
-//! hard-link tricks.
+//! (the same code that `atom --serve` used to invoke). Shipping it as a
+//! separate binary keeps the background process named "atoms"
+//! ("atomsdev" for dev installs) in `ps` / Activity Monitor: process
+//! names follow the executable's own resolved path, and macOS resolves
+//! symlinks and even hardlinks away — so a single binary plus symlink
+//! names cannot produce two display names.
 //!
 //! The binary refuses to start unless the `_ATOM_LAUNCH` env var is set
 //! to the expected token — this prevents users from running it directly.
@@ -35,6 +37,13 @@ async fn main() {
 async fn run() -> Result<()> {
     // Deps check: headless mode, warn only.
     atom_core::deps::ensure_on_startup(false, &atom_core::deps::RealInstaller).await;
+
+    // Warm the models.dev catalog in the background so turn routing
+    // (api_protocol_for), context windows, and dispatch validation read
+    // an in-memory copy instead of racing a disk parse. This never
+    // blocks startup: ensure serves a disk cache of any age instantly
+    // and only revalidates over the network in the background.
+    tokio::spawn(atom_core::providers::modelsdev::ensure_models_dev_catalog());
 
     atom_server::http::run_server().await
 }

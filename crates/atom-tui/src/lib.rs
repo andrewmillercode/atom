@@ -19,6 +19,7 @@ pub mod math;
 pub mod outputtest;
 pub mod overlays;
 pub mod preview;
+pub mod profile;
 pub mod prompt;
 pub mod settings;
 pub mod spinner;
@@ -58,6 +59,12 @@ pub async fn run(opts: RunOptions, hot: bool) -> Result<()> {
     }
 
     let mut terminal = setup_terminal().context("terminal setup")?;
+    // "Ready" = first moment the TUI could accept input. Captured
+    // here (right after the terminal is in raw mode but before any
+    // draw) so the /profile overlay can report how long startup took:
+    // `ready_at - started_at`. Millisecond precision matters here —
+    // the value is what gets hillclimbed.
+    app.set_ready_at(std::time::SystemTime::now());
     let result = event_loop(&mut app, &mut terminal, tx, rx, false, hot).await;
     restore_terminal(&mut terminal);
     result
@@ -83,6 +90,10 @@ pub async fn run_output_test(
         tokio::spawn(hot::watch_sources(tx.clone()));
     }
     let mut terminal = setup_terminal().context("terminal setup")?;
+    // Same ready-at capture as `run` — output-test mode also goes
+    // through setup_terminal + event_loop, so the hillclimb metric
+    // has a consistent meaning across modes.
+    app.set_ready_at(std::time::SystemTime::now());
     let result = event_loop(&mut app, &mut terminal, tx, rx, true, hot_enabled).await;
     restore_terminal(&mut terminal);
     result
@@ -204,9 +215,9 @@ async fn event_loop(
         tokio::time::interval(tokio::time::Duration::from_secs(app::TEST_SCENE_TICK_SECS));
     // Safety net against lost wakeups: any future that permanently fails to
     // fire would otherwise freeze the TUI with no way to detect or recover.
-    // A 250ms heartbeat bounds the worst case to a brief input hiccup while
-    // costing ~4 idle wakes/sec (ratatui's diff emits no bytes for a static
-    // frame). The select! re-arms every wakeup source on each heartbeat.
+    // A 250ms heartbeat bounds the worst case to a brief input hiccup. It
+    // only re-arms the select! wakeup sources and does not redraw (the
+    // frame_dirty gate skips the draw for no-op messages).
     let mut heartbeat_tick =
         tokio::time::interval(tokio::time::Duration::from_millis(HEARTBEAT_TICK_MS));
     for tick in [
@@ -222,6 +233,11 @@ async fn event_loop(
     let mut splash_was_active = false;
     let mut scene_was_active = false;
     let splash_start = tokio::time::Instant::now();
+    // Frame gating: the draw below renders the full screen, so it only
+    // runs when some message actually changed state. The heartbeat and
+    // other no-op wakes leave this false, making idle CPU ~0 instead of
+    // paying a full view::draw 4x/sec.
+    let mut frame_dirty = true;
 
     loop {
         run_effects(app, &tx, &mut st, &mut effects).await;
@@ -241,34 +257,37 @@ async fn event_loop(
         }
 
         let mut cursor_pos: Option<(u16, u16)> = None;
-        // Hold the tty write lock across the whole frame — draw, flush and
-        // cursor update are one escape sequence burst; a concurrent kitty
-        // paint interleaving here is what garbled the TUI until resize.
-        let tty_guard = preview::lock_tty();
-        // Flush newly rendered formula uploads/placements before the frame
-        // that displays their placeholder cells (same guard: these bytes
-        // must not interleave with the frame).
-        math::flush_terminal_commands();
-        terminal.draw(|f| {
-            cursor_pos = view::draw(app, f.area(), f.buffer_mut());
-        })?;
-        match cursor_pos {
-            Some((x, y)) => {
-                let _ = terminal.show_cursor();
-                let _ = terminal.set_cursor_position(ratatui::layout::Position::new(x, y));
+        if frame_dirty {
+            frame_dirty = false;
+            // Hold the tty write lock across the whole frame — draw, flush and
+            // cursor update are one escape sequence burst; a concurrent kitty
+            // paint interleaving here is what garbled the TUI until resize.
+            let tty_guard = preview::lock_tty();
+            // Flush newly rendered formula uploads/placements before the frame
+            // that displays their placeholder cells (same guard: these bytes
+            // must not interleave with the frame).
+            math::flush_terminal_commands();
+            terminal.draw(|f| {
+                cursor_pos = view::draw(app, f.area(), f.buffer_mut());
+            })?;
+            match cursor_pos {
+                Some((x, y)) => {
+                    let _ = terminal.show_cursor();
+                    let _ = terminal.set_cursor_position(ratatui::layout::Position::new(x, y));
+                }
+                None => {
+                    let _ = terminal.hide_cursor();
+                }
             }
-            None => {
-                let _ = terminal.hide_cursor();
+            drop(tty_guard);
+            // A first frame can discover the real terminal width before a
+            // crossterm Resize event arrives. If that changes diagram geometry,
+            // paint the matching kitty placement after the placeholder grid is
+            // on screen instead of leaving a stale/blank reserved area.
+            if app.preview_dirty && preview::kitty_terminal() {
+                effects.push(Effect::PaintPreviews);
+                run_effects(app, &tx, &mut st, &mut effects).await;
             }
-        }
-        drop(tty_guard);
-        // A first frame can discover the real terminal width before a
-        // crossterm Resize event arrives. If that changes diagram geometry,
-        // paint the matching kitty placement after the placeholder grid is
-        // on screen instead of leaving a stale/blank reserved area.
-        if app.preview_dirty && preview::kitty_terminal() {
-            effects.push(Effect::PaintPreviews);
-            run_effects(app, &tx, &mut st, &mut effects).await;
         }
         if app.quitting {
             return Ok(());
@@ -345,6 +364,13 @@ async fn event_loop(
         };
 
         let Some(msg) = msg else { continue };
+
+        // Any real message can change the view, so request a frame. The
+        // heartbeat is deliberately excluded: it exists only to re-arm the
+        // select! wakeup sources and must never trigger a full redraw.
+        if !matches!(msg, AppMsg::Heartbeat) {
+            frame_dirty = true;
+        }
 
         // Process this first message, then drain any other immediately
         // available events before rendering.  This coalesces bursts of
@@ -497,6 +523,16 @@ fn initial_effects(app: &App, test_mode: bool) -> Vec<Effect> {
         Some(overlays::OverlayKind::Stats) => effects.push(Effect::FetchStats {
             days: app.stats_days,
         }),
+        Some(overlays::OverlayKind::Profile) => {
+            // /profile is the only overlay that opens already in
+            // "loading" state — the spinner runs while the worker
+            // shells out to `ps`. Re-fire the same effect so reopening
+            // the overlay after Esc gets a fresh sample.
+            effects.push(Effect::FetchProfile {
+                client_pid: std::process::id() as i32,
+                server_pid: app.server_pid,
+            });
+        }
         _ => {}
     }
     if app.manage_visible && !app.session.id.is_empty() {
@@ -642,7 +678,7 @@ async fn run_effects(
                 // Dial off the event loop so input/render/Esc stay live while
                 // the server warms up the stream (provider TTFB can be seconds).
                 tokio::spawn(async move {
-                    let mut resp = api::stream_send_healed(&req).await;
+                    let mut resp = api::stream_send(&req).await;
                     // The server may have shut down; restart and retry once.
                     if resp.is_err()
                         && !api::is_running().await
@@ -719,6 +755,23 @@ async fn run_effects(
                             .map(Box::new)
                             .map_err(|e| e.to_string()),
                     ));
+                });
+            }
+            Effect::FetchProfile {
+                client_pid,
+                server_pid,
+            } => {
+                // Carry the wall-clock startup + ready instants into the spawned
+                // task so the report can compute "client startup" and
+                // the live "client uptime" / "server uptime" tickers
+                // without re-reading App state on the worker side.
+                let started_at = app.started_at;
+                let ready_at = app.ready_at;
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let report =
+                        profile::gather(client_pid, server_pid, started_at, ready_at).await;
+                    let _ = tx.send(AppMsg::ProfileLoaded(Ok(Box::new(report))));
                 });
             }
             Effect::LoadSession { id } => {
@@ -858,38 +911,47 @@ async fn run_effects(
                     }
                 });
             }
-            Effect::InterruptTurn { pause_turn_id, req } => {
-                // Mid-stream submit: pause the running turn via the
-                // server first, then dial the interruption stream. The
-                // message rides in the request; nothing is stored.
-                let id = req.session_id.clone();
+            Effect::InjectTurn { req } => {
+                // Mid-turn submit: the server queues the prompt on the
+                // live turn and answers with a tiny {"type":"injected"}
+                // stream that closes. The already-open event stream for
+                // the running turn keeps painting, so this response is
+                // drained, never adopted as the active stream — unless
+                // the turn had just ended, in which case the server
+                // started a real one and we adopt it like a fresh send.
                 let body = req.to_body();
+                let session_id = req.session_id.clone();
                 let tx = tx.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = api::pause_turn(&id, &pause_turn_id).await {
-                        let _ = tx.send(AppMsg::Errored(e.to_string()));
-                    }
-                    // The pause targeted the turn that was streaming, but the
-                    // server may have another registration behind it (raced
-                    // pause, stale entry): heal the same way a plain send
-                    // would instead of surfacing a 409.
-                    let mut resp = api::stream_send_healed(&req).await;
+                    let mut resp = api::stream_send(&req).await;
                     // The server may have shut down; restart and retry once.
                     if resp.is_err()
                         && !api::is_running().await
                         && api::ensure_server().await.is_ok()
                     {
-                        resp = atom_server::client::stream_send(&id, &body).await;
+                        resp = atom_server::client::stream_send(&session_id, &body).await;
                     }
                     match resp {
-                        Ok(rx) => {
-                            let _ = tx.send(AppMsg::SendReady { sid: id, rx });
-                        }
+                        Ok(mut rx) => match rx.recv().await {
+                            Some(v)
+                                if v.get("type").and_then(|t| t.as_str()) == Some("injected") =>
+                            {
+                                while rx.recv().await.is_some() {}
+                            }
+                            first => {
+                                if let Some(v) = first {
+                                    let _ = tx.send(AppMsg::SendReady {
+                                        sid: session_id.clone(),
+                                        rx,
+                                    });
+                                    let _ = tx.send(AppMsg::SendEvent(v));
+                                }
+                            }
+                        },
                         Err(e) => {
                             let _ = tx.send(AppMsg::SendEvent(
                                 serde_json::json!({"type":"error","message": e.to_string()}),
                             ));
-                            let _ = tx.send(AppMsg::SendClosed);
                         }
                     }
                 });

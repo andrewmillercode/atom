@@ -1603,16 +1603,10 @@ mod tests {
         // split the segment into a phantom unknown-command argv0.
         assert_eq!(
             tokenize("cargo check 2>&1 | tail -30"),
-            vec![
-                vec!["cargo", "check", "2>&1"],
-                vec!["tail", "-30"],
-            ]
+            vec![vec!["cargo", "check", "2>&1"], vec!["tail", "-30"],]
         );
         // `>&2` opens a token (no cur yet) but stays glued.
-        assert_eq!(
-            tokenize("echo hi >&2"),
-            vec![vec!["echo", "hi", ">&2"]]
-        );
+        assert_eq!(tokenize("echo hi >&2"), vec![vec!["echo", "hi", ">&2"]]);
         // Bash combined redirect `&>file` is a token too.
         assert_eq!(
             tokenize("cargo build &> build.log"),
@@ -1620,10 +1614,7 @@ mod tests {
         );
         // zsh `|&` (stderr+stdout pipe) is a control operator, just
         // like `|`, and splits the pipeline into two segments.
-        assert_eq!(
-            tokenize("cmd1 |& cmd2"),
-            vec![vec!["cmd1"], vec!["cmd2"]]
-        );
+        assert_eq!(tokenize("cmd1 |& cmd2"), vec![vec!["cmd1"], vec!["cmd2"]]);
         // Standalone `&` (background) and `&&` (logical and) still
         // behave as control separators after the fix.
         assert_eq!(

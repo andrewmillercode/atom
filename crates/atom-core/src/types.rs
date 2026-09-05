@@ -64,6 +64,9 @@ pub struct Message {
     pub reasoning_ms: i64,
     pub tool_calls: Vec<ToolCall>,
     pub tool_call_id: String,
+    /// For tool-role messages: which provider served the call
+    /// (search/fetch only, e.g. "exa", "direct", "mcp:<server>").
+    pub tool_provider: String,
     pub diff: String,
     /// Who answered this message, so stats can attribute usage after a
     /// model switch.
@@ -71,6 +74,10 @@ pub struct Message {
     pub model: String,
     /// Total wall-clock duration of the completed turn.
     pub duration_ms: i64,
+    /// Generation speed of the final model round: completion tokens
+    /// (reasoning included) divided by the first-token → stream-end
+    /// window. 0 when unknown (provider reported no usage).
+    pub tokens_per_sec: f64,
     /// Token count of the request that produced this message.
     pub usage: Option<StreamUsage>,
     /// When the message was written; absent for transcripts persisted
@@ -104,6 +111,9 @@ fn message_plain_fields(m: &Message) -> serde_json::Value {
     if !m.tool_call_id.is_empty() {
         obj.insert("tool_call_id".into(), json!(m.tool_call_id));
     }
+    if !m.tool_provider.is_empty() {
+        obj.insert("tool_provider".into(), json!(m.tool_provider));
+    }
     if !m.diff.is_empty() {
         obj.insert("diff".into(), json!(m.diff));
     }
@@ -115,6 +125,9 @@ fn message_plain_fields(m: &Message) -> serde_json::Value {
     }
     if m.duration_ms > 0 {
         obj.insert("duration_ms".into(), json!(m.duration_ms));
+    }
+    if m.tokens_per_sec > 0.0 {
+        obj.insert("tokens_per_sec".into(), json!(m.tokens_per_sec));
     }
     if let Some(u) = &m.usage {
         obj.insert("usage".into(), serde_json::to_value(u).unwrap());
@@ -166,6 +179,8 @@ impl<'de> Deserialize<'de> for Message {
             #[serde(default)]
             tool_call_id: String,
             #[serde(default)]
+            tool_provider: String,
+            #[serde(default)]
             diff: String,
             #[serde(default)]
             provider: String,
@@ -173,6 +188,8 @@ impl<'de> Deserialize<'de> for Message {
             model: String,
             #[serde(default)]
             duration_ms: i64,
+            #[serde(default)]
+            tokens_per_sec: f64,
             #[serde(default)]
             usage: Option<StreamUsage>,
             #[serde(default)]
@@ -193,10 +210,12 @@ impl<'de> Deserialize<'de> for Message {
             reasoning_ms: raw.reasoning_ms,
             tool_calls: std::mem::take(&mut raw.tool_calls),
             tool_call_id: std::mem::take(&mut raw.tool_call_id),
+            tool_provider: std::mem::take(&mut raw.tool_provider),
             diff: std::mem::take(&mut raw.diff),
             provider: std::mem::take(&mut raw.provider),
             model: std::mem::take(&mut raw.model),
             duration_ms: raw.duration_ms,
+            tokens_per_sec: raw.tokens_per_sec,
             usage: raw.usage.take(),
             created_at,
         };
@@ -457,6 +476,11 @@ pub struct StreamResult {
     pub tool_calls: Vec<ToolCall>,
     pub usage: Option<StreamUsage>,
     pub finish_reason: String,
+    /// Server-measured time to first token: stream start → first delta.
+    pub ttft_ms: i64,
+    /// First token → stream end. Together with ttft_ms this spans the
+    /// whole model round that tokens-per-second is measured over.
+    pub gen_ms: i64,
 }
 
 #[cfg(test)]

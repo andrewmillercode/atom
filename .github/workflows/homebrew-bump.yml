@@ -1,0 +1,25 @@
+# Fires on any published release (tagged by scripts/release.sh via
+# `make release`, or created by hand). Tells homebrew-tap to sync
+# Formula/atom.rb to this release.
+#
+# Requires the HOMEBREW_TAP_TOKEN secret: a fine-grained PAT with
+# `repo` scope on andrewmillercode/homebrew-tap.
+name: Bump homebrew tap
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify homebrew-tap
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          curl -fsSL -X POST \
+            -H "Authorization: token $HOMEBREW_TAP_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/andrewmillercode/homebrew-tap/dispatches \
+            -d "{\"event_type\":\"atom-release\",\"client_payload\":{\"tag\":\"$GITHUB_REF_NAME\"}}"

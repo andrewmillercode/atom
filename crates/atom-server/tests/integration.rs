@@ -415,6 +415,208 @@ async fn send_runs_tool_rounds() {
     assert_eq!(got.messages[3].content, "all done");
 }
 
+/// The pending-bash UX: the model calls a long bash command, the turn
+/// parks (no further rounds), a mid-turn prompt is answered against a
+/// placeholder result without stopping the command, and the real result
+/// is recorded as THE result of the original tool call — inserted right
+/// after its assistant tool_calls message, before the interjected
+/// prompt — with a tool_result event that fills the original block.
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_bash_answers_prompt_and_records_real_result() {
+    let env = TestEnv::new("pending-bash");
+    let base_url = spawn_mock_provider(vec![
+        // Round 1: a long command; the turn parks on it.
+        sse_response(concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"sleep 1 && echo all green\\\"}\"}}]}}]}\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3,\"total_tokens\":8}}\n",
+            "data: [DONE]\n",
+        )),
+        // Round 2 (placeholder round after the mid-turn prompt): the
+        // model answers the prompt without stopping the command.
+        sse_response(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"started the test suite, should take a few seconds\"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":2,\"total_tokens\":13}}\n",
+            "data: [DONE]\n",
+        )),
+        // Round 3: the command has exited; the model reports the result.
+        sse_response(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"tests finished\"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":17,\"completion_tokens\":1,\"total_tokens\":18}}\n",
+            "data: [DONE]\n",
+        )),
+    ])
+    .await;
+    let state = spawn_server(&env, off_cfg()).await;
+
+    let ws = env.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let sess = state
+        .store
+        .create("test-model", &ws.display().to_string(), vec![]);
+
+    let rx = client::stream_send(
+        &sess.id,
+        &json!({"message": "run the tests", "base_url": base_url}),
+    )
+    .await
+    .unwrap();
+
+    // Land the prompt while the command is parked (~200ms into the 1s
+    // sleep). The injected send is answered with the tiny injected
+    // stream; the original stream keeps painting.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut inject_rx = client::stream_send(&sess.id, &json!({"message": "hows it going"}))
+        .await
+        .expect("mid-turn prompt must be accepted, not conflict");
+    let ack = tokio::time::timeout(Duration::from_secs(5), inject_rx.recv())
+        .await
+        .unwrap()
+        .expect("injected stream open");
+    assert_eq!(ack["type"], "injected");
+    assert!(inject_rx.recv().await.is_none(), "injected stream closes");
+
+    let events = collect_until_done(rx).await;
+    let types: Vec<String> = events
+        .iter()
+        .map(|e| e["type"].as_str().unwrap_or("").to_string())
+        .collect();
+    // tool_result (the real sleep result) arrives after the placeholder
+    // round's reply, and the final answer follows it.
+    assert_eq!(
+        types,
+        vec![
+            "round_start",
+            "tool_pending",
+            "usage",
+            "tool",
+            "round_start",
+            "content",
+            "usage",
+            "tool_result",
+            "round_start",
+            "content",
+            "usage",
+            "done",
+        ],
+        "{events:?}"
+    );
+
+    // History: the real tool result sits at its recorded position —
+    // immediately after the assistant tool_calls message, BEFORE the
+    // interjected prompt.
+    let got = state.store.get(&sess.id).unwrap();
+    let roles: Vec<&str> = got.messages.iter().map(|m| m.role.as_str()).collect();
+    assert_eq!(
+        roles,
+        vec![
+            "user",
+            "assistant",
+            "tool",
+            "user",
+            "assistant",
+            "assistant"
+        ]
+    );
+    assert_eq!(got.messages[2].tool_call_id, "call_a");
+    assert_eq!(
+        got.messages[2].content, "all green",
+        "tool result must be the real one, not the placeholder"
+    );
+    assert!(!got.messages[2].content.contains("still running"));
+    assert_eq!(got.messages[3].content, "hows it going");
+    assert_eq!(
+        got.messages[4].content,
+        "started the test suite, should take a few seconds"
+    );
+    assert_eq!(got.messages[5].content, "tests finished");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn quiet_parked_command_ends_turn_without_report_round() {
+    let env = TestEnv::new("quiet-park");
+    let base_url = spawn_mock_provider(vec![
+        // Round 1: a long command with no output; the turn parks on it.
+        sse_response(concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"sleep 1\\\"}\"}}]}}]}\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3,\"total_tokens\":8}}\n",
+            "data: [DONE]\n",
+        )),
+        // Round 2 (placeholder round after the mid-turn prompt): the
+        // model answers the prompt. The mock repeats this fixture for
+        // any further request, so a report round after the quiet exit
+        // would surface as a third round_start/content below.
+        sse_response(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"it is running in the background\"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":2,\"total_tokens\":13}}\n",
+            "data: [DONE]\n",
+        )),
+    ])
+    .await;
+    let state = spawn_server(&env, off_cfg()).await;
+
+    let ws = env.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let sess = state
+        .store
+        .create("test-model", &ws.display().to_string(), vec![]);
+
+    let rx = client::stream_send(
+        &sess.id,
+        &json!({"message": "start the long job", "base_url": base_url}),
+    )
+    .await
+    .unwrap();
+
+    // Land the prompt while the command is parked (~200ms into the 1s
+    // sleep). The injected send is answered with the placeholder round.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut inject_rx = client::stream_send(&sess.id, &json!({"message": "hows it going"}))
+        .await
+        .expect("mid-turn prompt must be accepted, not conflict");
+    let ack = tokio::time::timeout(Duration::from_secs(5), inject_rx.recv())
+        .await
+        .unwrap()
+        .expect("injected stream open");
+    assert_eq!(ack["type"], "injected");
+    assert!(inject_rx.recv().await.is_none(), "injected stream closes");
+
+    let events = collect_until_done(rx).await;
+    let types: Vec<String> = events
+        .iter()
+        .map(|e| e["type"].as_str().unwrap_or("").to_string())
+        .collect();
+    // The quiet exit (sleep 1, empty output) records its result and
+    // ends the turn — no report round after the spoken answer.
+    assert_eq!(
+        types,
+        vec![
+            "round_start",
+            "tool_pending",
+            "usage",
+            "tool",
+            "round_start",
+            "content",
+            "usage",
+            "tool_result",
+            "done",
+        ],
+        "{events:?}"
+    );
+
+    let got = state.store.get(&sess.id).unwrap();
+    let roles: Vec<&str> = got.messages.iter().map(|m| m.role.as_str()).collect();
+    assert_eq!(
+        roles,
+        vec!["user", "assistant", "tool", "user", "assistant"]
+    );
+    assert_eq!(
+        got.messages[2].content, "",
+        "quiet exit records an empty result"
+    );
+    assert_eq!(got.messages[3].content, "hows it going");
+    assert_eq!(got.messages[4].content, "it is running in the background");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn denied_file_write_surfaces_approval_and_finishes_turn() {
     let env = TestEnv::new("write-approval");
@@ -751,22 +953,23 @@ async fn events_stream_and_last_viewer_cancels_turns() {
     assert!(cancelled, "last subscriber leaving must cancel the turn");
 }
 
-/// A stale server-side turn must never brick a session: /send answers
-/// 409 while the turn is registered, the pause endpoint clears it (and
-/// waits for the turn to unwind), and the retried /send is accepted.
-/// This is the contract the TUI relies on to self-heal a desync between
-/// its "idle" composer state and the server's active-turn table, instead
-/// of surfacing "session already has an active turn" to the user.
+/// A mid-turn prompt is injected into the live turn instead of
+/// conflicting: /send is accepted, answers with a tiny injected stream,
+/// cancels only the provider round, and queues the prompt on the turn
+/// handle. The pause route (Esc) remains the hard stop, and a send to
+/// an idle session starts a normal turn.
 #[tokio::test(flavor = "multi_thread")]
-async fn send_conflict_clears_after_pause_and_retry() {
-    let env = TestEnv::new("send-conflict");
+async fn send_mid_turn_injects_into_live_turn() {
+    let env = TestEnv::new("send-inject");
     let state = spawn_server(&env, off_cfg()).await;
     let sess = state.store.create("m", "/tmp", vec![]);
     let sid = sess.id.clone();
 
-    // A live turn the client no longer knows about: it stops (end_turn)
-    // as soon as it is paused, the way run_session_turn unwinds.
-    let handle = state.turns.start_turn(&sid, "stale");
+    // A live turn with a registered provider round. /send must hand the
+    // prompt to it: no pause, no 409, and only the round is cancelled.
+    let handle = state.turns.start_turn(&sid, "live");
+    let round = atom_server::cancel::CancelToken::new();
+    handle.set_round_cancel(Some(round.clone()));
     {
         let handle = handle.clone();
         let state = state.clone();
@@ -777,15 +980,27 @@ async fn send_conflict_clears_after_pause_and_retry() {
         });
     }
 
-    // The send is rejected with the conflict the TUI must never surface.
-    let err = client::stream_send(&sid, &json!({"message": "hello", "turn_id": "t2"}))
+    // The send is accepted: a tiny injected stream, then close.
+    let mut rx = client::stream_send(&sid, &json!({"message": "hello", "turn_id": "t2"}))
         .await
-        .expect_err("send must conflict while a turn is active");
-    assert!(err.to_string().starts_with("409: "), "got: {err}");
-    assert!(err.to_string().contains("already has an active turn"));
+        .expect("mid-turn send must be accepted, not conflict");
+    let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .expect("injected stream open");
+    assert_eq!(first["type"], "injected");
+    assert!(rx.recv().await.is_none(), "injected stream closes");
 
-    // Pause every active turn of the session (the TUI's heal path);
-    // the server waits for the turn to unwind before answering.
+    // Only the provider round was cancelled; the turn lives on and the
+    // prompt is queued for the next round.
+    assert!(round.is_cancelled());
+    assert!(!handle.is_cancelled());
+    let pending = handle.take_pending();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].content, "hello");
+
+    // Esc (the pause route) remains the hard stop; once the turn is
+    // gone, a send starts a normal turn again.
     client::post(
         &format!("/api/sessions/{sid}/pause"),
         &json!({"turn_id": ""}),
@@ -795,10 +1010,9 @@ async fn send_conflict_clears_after_pause_and_retry() {
     assert!(handle.is_cancelled());
     assert!(!state.turns.session_has_active_turn(&sid));
 
-    // The retried send is accepted and streams events.
-    let mut rx = client::stream_send(&sid, &json!({"message": "hello", "turn_id": "t2"}))
+    let mut rx = client::stream_send(&sid, &json!({"message": "again", "turn_id": "t3"}))
         .await
-        .expect("send must be accepted after the pause");
+        .expect("send must be accepted once the session is idle");
     let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
         .await
         .unwrap()

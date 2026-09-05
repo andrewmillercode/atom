@@ -130,7 +130,8 @@ fn head_from_spans(text: String, spans: Vec<Span<'static>>) -> Head {
 
 fn status_head(app: &App) -> Head {
     let lvl = app.thinking_level();
-    if lvl.is_empty() {
+    let profile = app.profile_name();
+    if lvl.is_empty() && profile.is_empty() {
         head_from_spans(
             app.sel_model.clone(),
             vec![Span::styled(
@@ -139,14 +140,24 @@ fn status_head(app: &App) -> Head {
             )],
         )
     } else {
-        head_from_spans(
-            format!("{} {}", app.sel_model, lvl),
-            vec![
-                Span::styled(app.sel_model.clone(), ansi::style_foreground()),
-                Span::styled(" ", ansi::style_dim()),
-                Span::styled(lvl, ansi::style_primary()),
-            ],
-        )
+        let mut text = app.sel_model.clone();
+        let mut spans = vec![Span::styled(
+            app.sel_model.clone(),
+            ansi::style_foreground(),
+        )];
+        for (label, style) in [
+            (!lvl.is_empty()).then(|| (lvl, ansi::style_primary())),
+            (!profile.is_empty()).then(|| (profile, ansi::style_dim())),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            text.push(' ');
+            text.push_str(&label);
+            spans.push(Span::styled(" ", ansi::style_dim()));
+            spans.push(Span::styled(label, style));
+        }
+        head_from_spans(text, spans)
     }
 }
 
@@ -179,12 +190,10 @@ fn usage_variants(app: &App, width: usize) -> Vec<String> {
 /// keyboard (e.g. atom over SSH from a phone).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NavAction {
-    /// Open the subagent manager (mirrors Shift+↓).
+    /// Toggle the subagent manager (mirrors Shift+↓).
     OpenSubagents,
     /// Return to the parent session (mirrors Shift+↑).
     ReturnToParent,
-    /// Close the open footer menu (mirrors Esc).
-    CloseMenu,
 }
 
 /// Footer-menu and parent/child navigation hints. These used to occupy a
@@ -193,30 +202,25 @@ pub enum NavAction {
 /// Returns the hint phrases as styled segments tagged with the action a
 /// click on them triggers; empty when there is nothing to hint.
 pub fn nav_segments(app: &App) -> Vec<(NavAction, Vec<Span<'static>>)> {
-    use crate::overlays::PickerKind;
     let mut segs: Vec<(NavAction, Vec<Span<'static>>)> = Vec::new();
-    if app.manage_visible
-        || !matches!(app.picker_kind, PickerKind::None)
-        || app.context_visible
-        || app.reasoning_visible
-    {
-        segs.push((
-            NavAction::CloseMenu,
-            vec![Span::styled("esc to close", ansi::style_dim())],
-        ));
-    } else {
-        let n = app.manage_agents.len();
-        if n > 0 {
-            let label = if n == 1 {
-                "(1 subagent) Shift ↓".to_string()
+    let n = app.manage_agents.len();
+    if n > 0 {
+        // Shift+↓ toggles the menu, so the hint changes with its state.
+        let label = if app.manage_visible {
+            if n == 1 {
+                "(1 subagent) Shift ↓ to close".to_string()
             } else {
-                format!("({n} subagents) Shift ↓")
-            };
-            segs.push((
-                NavAction::OpenSubagents,
-                vec![Span::styled(label, ansi::style_dim())],
-            ));
-        }
+                format!("({n} subagents) Shift ↓ to close")
+            }
+        } else if n == 1 {
+            "(1 subagent) Shift ↓".to_string()
+        } else {
+            format!("({n} subagents) Shift ↓")
+        };
+        segs.push((
+            NavAction::OpenSubagents,
+            vec![Span::styled(label, ansi::style_dim())],
+        ));
     }
     if !app.session.parent_id.is_empty() {
         segs.push((
@@ -969,20 +973,7 @@ mod tests {
                     assert_eq!(text, "Shift ↑ to return", "{text:?}");
                     assert!(*row > 0, "return hint wrapped to a later row");
                 }
-                NavAction::CloseMenu => panic!("no menu open"),
             }
         }
-    }
-
-    #[test]
-    fn nav_hit_regions_when_menu_open_is_esc() {
-        let mut app = app_with_usage(StreamUsage::default(), 100);
-        app.context_visible = true;
-        let lines = status_bar_lines(&app);
-        let regions = nav_hit_regions(&app);
-        assert_eq!(regions.len(), 1);
-        assert_eq!(regions[0].3, NavAction::CloseMenu);
-        let text = line_slice(&lines[regions[0].0], regions[0].1, regions[0].2);
-        assert_eq!(text, "esc to close");
     }
 }

@@ -1,7 +1,8 @@
-//! dispatch tool, ported from dispatch.go: argument validation
-//! (model catalog + thinking levels via an injectable ModelCatalog),
-//! session-id parsing helpers, and DispatchPlan routing through the
-//! ctx spawner. Session-store work (child creation, ownership checks,
+//! subagent tool (internally still dispatch, ported from dispatch.go):
+//! argument validation (model catalog + thinking levels via an
+//! injectable ModelCatalog), session-id parsing helpers, agent-profile
+//! resolution, and DispatchPlan routing through the ctx spawner.
+//! Session-store work (child creation, ownership checks,
 //! nested-dispatch guard) lives behind SubagentHandle because Go's
 //! executeDispatch reaches into *SessionStore/*Session directly.
 
@@ -23,6 +24,8 @@ pub struct DispatchPlan {
     pub batch_index: usize,
     pub ids: Vec<String>,
     pub include_results: bool,
+    /// Resolved agent-profile body: extra instructions for the child.
+    pub instructions: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -293,6 +296,9 @@ const MAX_DISPATCH_BATCH: usize = 100;
 #[serde(default)]
 struct DispatchArgs {
     action: String,
+    /// Agent profile to spawn (e.g. "plan", "build", "default").
+    #[serde(default)]
+    agent: String,
     #[serde(default)]
     provider: String,
     #[serde(default)]
@@ -357,14 +363,14 @@ where
 /// store/parent error.
 pub async fn execute_dispatch(ctx: &ToolCtx<'_>, arguments: &str) -> String {
     if arguments.trim().is_empty() {
-        return crate::exec::empty_arguments_msg("dispatch");
+        return crate::exec::empty_arguments_msg("subagent");
     }
     let args: DispatchArgs = match serde_json::from_str(arguments) {
         Ok(a) => a,
         Err(e) => return format!("error parsing arguments: {e}"),
     };
     let Some(spawner) = ctx.spawner else {
-        return "error: dispatch requires an active session".to_string();
+        return "error: subagent requires an active session".to_string();
     };
     let action = args.action.trim();
     if action == "models" {
@@ -375,7 +381,7 @@ pub async fn execute_dispatch(ctx: &ToolCtx<'_>, arguments: &str) -> String {
         return "error: wait must be one of none, any, all".to_string();
     }
 
-    let base = DispatchPlan {
+    let mut base = DispatchPlan {
         provider: args.provider.trim().to_string(),
         model: args.model.trim().to_string(),
         thinking: args.thinking.trim().to_string(),
@@ -390,6 +396,26 @@ pub async fn execute_dispatch(ctx: &ToolCtx<'_>, arguments: &str) -> String {
         include_results: args.results.unwrap_or(true),
         ..Default::default()
     };
+    // An explicit agent selects a profile: its default model and
+    // thinking apply unless overridden by the explicit arguments, and
+    // its prompt rides along as child instructions. A `provider/model`
+    // model id routes the child to that provider.
+    if !args.agent.trim().is_empty() {
+        let Some(profile) = atom_core::profiles::find_profile(args.agent.trim()) else {
+            return format!("error: unknown agent \"{}\"", args.agent.trim());
+        };
+        if base.model.is_empty() {
+            let (provider, model) = atom_core::profiles::model_ref(&profile.model);
+            if base.provider.is_empty() {
+                base.provider = provider.unwrap_or_default().to_string();
+            }
+            base.model = model.to_string();
+        }
+        if base.thinking.is_empty() {
+            base.thinking = profile.thinking;
+        }
+        base.instructions = profile.body;
+    }
 
     match action {
         "spawn" => {

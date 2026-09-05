@@ -7,6 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 
@@ -61,6 +62,10 @@ fn models_dev_base_url_fallback(id: &str) -> Option<&'static str> {
         "openai" => Some("https://api.openai.com/v1"),
         "anthropic" => Some("https://api.anthropic.com/v1"),
         "amazon-bedrock" => Some("https://bedrock-runtime.us-east-1.amazonaws.com"),
+        // Vercel AI Gateway: models.dev's entry has no api URL, but the
+        // gateway is OpenAI-compatible at a stable host (its REST
+        // endpoint is ai-gateway.vercel.sh/v1, chat completions + models).
+        "vercel" => Some("https://ai-gateway.vercel.sh/v1"),
         _ => None,
     }
 }
@@ -760,9 +765,7 @@ pub fn set_models_dev_catalog_for_test(cat: Option<ModelsDevCatalog>) {
 
 fn set_catalog(cat: CompactModelsDevCatalog) {
     let mut g = MODELS_DEV_CATALOG.write().unwrap();
-    if g.is_none() {
-        *g = Some(Arc::new(cat));
-    }
+    *g = Some(Arc::new(cat));
 }
 
 fn current_models_dev_catalog() -> Option<Arc<CompactModelsDevCatalog>> {
@@ -814,9 +817,13 @@ fn compact_cache_is_current(
 }
 
 /// ensureModelsDevCatalog loads a cached catalog or fetches models.dev.
-/// A cache younger than 24h is used as-is when it still has provider
-/// `api` URLs. On fetch failure, a stale cache is used. Lookups on an
-/// empty catalog return no levels.
+/// Stale-while-revalidate: a disk cache of ANY age is served immediately
+/// (startup and turns never wait on the network); when the cache is
+/// older than 24h a background task revalidates against models.dev and
+/// atomically swaps the in-memory copy when the fetch lands. Only the
+/// first-ever run (no cache file at all) blocks on a fetch, because
+/// there is nothing local to serve. Lookups on an empty catalog return
+/// no levels.
 pub async fn ensure_models_dev_catalog() {
     if current_models_dev_catalog().is_some() {
         return;
@@ -827,49 +834,72 @@ pub async fn ensure_models_dev_catalog() {
     }
     let cache_path = models_dev_cache_path();
     let read_path = cache_path.clone();
-    let mut cached = tokio::task::spawn_blocking(move || read_models_dev_cache(&read_path))
+    let cached = tokio::task::spawn_blocking(move || read_models_dev_cache(&read_path))
         .await
         .ok()
         .flatten();
-    if let Some((cat, mtime)) = &cached {
-        if compact_cache_is_current(cat, *mtime, SystemTime::now()) {
-            let (cat, _) = cached.take().unwrap();
-            set_catalog(cat);
-            return;
-        }
-    }
+    let Some((cat, mtime)) = cached else {
+        // No usable cache file: first-ever run (or unwritable disk).
+        // Block once on the initial fetch so lookups have data; the
+        // steady-state path below never waits on the network.
+        fetch_and_store_catalog(cache_path).await;
+        return;
+    };
 
-    let fetched = fetch_models_dev_catalog().await;
-    match fetched {
-        Ok(raw) => {
-            let parsed = tokio::task::spawn_blocking(move || {
-                load_compact_models_dev_catalog_bytes(&raw).map(|fresh| (fresh, raw))
-            })
-            .await
-            .ok()
-            .and_then(Result::ok);
-            let Some((fresh, raw)) = parsed else {
-                if let Some((cat, _)) = cached {
-                    set_catalog(cat);
-                }
-                return;
-            };
-            if current_models_dev_catalog().is_some() {
-                return;
-            }
-            set_catalog(fresh);
-            tokio::task::spawn_blocking(move || write_models_dev_cache(&cache_path, &raw))
-                .await
-                .ok();
-        }
-        Err(_) => {
-            if current_models_dev_catalog().is_none() {
-                if let Some((cat, _)) = cached {
-                    set_catalog(cat);
-                }
-            }
-        }
+    // Serve from disk regardless of age, then revalidate in the
+    // background when stale.
+    let fresh = compact_cache_is_current(&cat, mtime, SystemTime::now());
+    set_catalog(cat);
+    if fresh {
+        return;
     }
+    spawn_catalog_revalidate(cache_path);
+}
+
+/// Serializes background revalidations within one process so a burst of
+/// ensure calls on a stale cache triggers a single fetch.
+static MODELS_DEV_REVALIDATING: AtomicBool = AtomicBool::new(false);
+
+fn spawn_catalog_revalidate(cache_path: PathBuf) {
+    if MODELS_DEV_REVALIDATING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    tokio::spawn(async move {
+        // The init lock serializes against a concurrent first-ever
+        // blocking fetch; it is never held across a network await by
+        // ensure_models_dev_catalog itself, so this cannot stall turn
+        // paths (which only take the fast read-lock check once the
+        // catalog slot is filled).
+        let _init = MODELS_DEV_INIT.lock().await;
+        fetch_and_store_catalog(cache_path).await;
+        MODELS_DEV_REVALIDATING.store(false, Ordering::Release);
+    });
+}
+
+/// fetchModelsDevCatalog fetches api.json, installs it in the empty
+/// catalog slot, and writes the raw bytes through to the disk cache.
+/// Network + parse failures are swallowed (the previous catalog, even a
+/// stale one, keeps serving) — same policy as the pre-revalidate code.
+async fn fetch_and_store_catalog(cache_path: PathBuf) {
+    let fetched = fetch_models_dev_catalog().await;
+    let Ok(raw) = fetched else {
+        return;
+    };
+    let parsed = tokio::task::spawn_blocking(move || {
+        load_compact_models_dev_catalog_bytes(&raw).map(|fresh| (fresh, raw))
+    })
+    .await
+    .ok()
+    .and_then(Result::ok);
+    let Some((fresh, raw)) = parsed else {
+        return;
+    };
+    // A just-fetched catalog is newer than anything already in memory
+    // (typically the stale disk copy), so the swap overwrites it.
+    set_catalog(fresh);
+    tokio::task::spawn_blocking(move || write_models_dev_cache(&cache_path, &raw))
+        .await
+        .ok();
 }
 
 fn read_models_dev_cache(path: &PathBuf) -> Option<(CompactModelsDevCatalog, SystemTime)> {
@@ -1134,6 +1164,21 @@ pub fn catalog_contains_model(model_id: &str) -> bool {
         .is_some()
 }
 
+/// providerForModel returns the models.dev provider id that lists the
+/// model id (preferred hosts first). Used to route a profile-pinned
+/// model id to a configured provider.
+pub fn provider_for_model(model_id: &str) -> Option<String> {
+    let cat = current_models_dev_catalog()?;
+    if model_id.is_empty() {
+        return None;
+    }
+    CATALOG_PREFERRED_PROVIDERS
+        .iter()
+        .map(|s| s.to_string())
+        .chain(cat.providers.iter().map(|e| e.id.to_string()))
+        .find(|provider_id| lookup_compact_model(&cat, provider_id, model_id).is_some())
+}
+
 /// modelSupportsImageInput reports whether the model accepts image
 /// input, per the models.dev catalog's `modalities.input`. Returns
 /// `Some(true)` when the model is multimodal, `Some(false)` when the
@@ -1236,7 +1281,19 @@ pub fn derive_reasoning_levels(m: &ModelsDevModel) -> Option<Vec<String>> {
         effort.insert(0, "none".into());
     }
     if effort.is_empty() {
-        return None;
+        // The model supports reasoning but the catalog left
+        // `reasoning_options` empty (common on the vercel AI Gateway,
+        // which lists every reasoning model this way). Expose the
+        // standard effort ladder so a reasoning picker still appears
+        // and a level gets sent — the gateway maps it to the model's
+        // native config. Models that do not support reasoning returned
+        // early above.
+        return Some(vec![
+            "none".into(),
+            "low".into(),
+            "medium".into(),
+            "high".into(),
+        ]);
     }
     Some(effort)
 }
@@ -1497,6 +1554,29 @@ mod tests {
         assert_eq!(reasoning_levels_for("openai", "m"), None);
     }
 
+    /// A model that supports reasoning but whose catalog entry leaves
+    /// `reasoning_options` empty (how the vercel AI Gateway lists every
+    /// reasoning model) must still get a picker. Previously this
+    /// produced no levels and no reasoning_effort was ever sent.
+    #[test]
+    fn reasoning_true_empty_options_gets_default_ladder() {
+        let _g = lock();
+        fixture_model("vercel", "deepseek/deepseek-v4-flash-0731", true, vec![]);
+        assert_eq!(
+            reasoning_levels_for("vercel", "deepseek/deepseek-v4-flash-0731"),
+            Some(vec![
+                "none".to_string(),
+                "low".to_string(),
+                "medium".to_string(),
+                "high".to_string()
+            ])
+        );
+        assert_eq!(
+            thinking_off_value("vercel", "deepseek/deepseek-v4-flash-0731"),
+            "none"
+        );
+    }
+
     #[test]
     fn default_thinking_index_is_last() {
         let levels = vec!["none".to_string(), "high".to_string(), "max".to_string()];
@@ -1664,6 +1744,16 @@ mod tests {
         ));
         assert!(is_addable_models_dev_provider(
             "openai",
+            &ModelsDevProvider::default()
+        ));
+        // Vercel AI Gateway has no catalog `api` either; the fallback
+        // keeps it addable so it shows up in the provider list.
+        assert_eq!(
+            models_dev_base_url("vercel"),
+            "https://ai-gateway.vercel.sh/v1"
+        );
+        assert!(is_addable_models_dev_provider(
+            "vercel",
             &ModelsDevProvider::default()
         ));
     }

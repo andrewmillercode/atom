@@ -54,8 +54,10 @@ pub const SCROLLBAR_WIDTH: usize = 2;
 /// splashTickInterval drives the empty-session atom animation.
 pub const SPLASH_TICK_MS: u64 = 33;
 
-/// MiniDot runs at ~24 fps for smooth animation.
-pub const SPINNER_TICK_MS: u64 = 42;
+/// MiniDot spinner tick. 33ms ≈ 30 fps; each tick triggers a full-screen
+/// `view::draw`, so this trades animation smoothness for CPU during
+/// streaming/tool-wait phases (24 fps original → 16 fps → 30 fps).
+pub const SPINNER_TICK_MS: u64 = 33;
 
 /// outputTestSceneDuration backs the --output-test scene timer.
 pub const TEST_SCENE_TICK_SECS: u64 = 3;
@@ -66,6 +68,23 @@ pub struct RunOptions {
     pub sel_model: String,
     pub session: SessionInfo,
     pub hot_state_path: Option<std::path::PathBuf>,
+    /// Wall-clock instant captured at the very top of `main()`. Used by
+    /// the dev-only `/profile` overlay to display when the client
+    /// started (HH:MM:SS) and how long it has been running. None in
+    /// tests, where `App::new_test` skips the field.
+    pub started_at: Option<SystemTime>,
+    /// Monotonic companion to `started_at`: same wall-clock instant
+    /// but tracked via `Instant` so the uptime math can't be fooled
+    /// by clock skew. None whenever `started_at` is None.
+    pub started_instant: Option<Instant>,
+    /// PID of the background `atoms` server the client connected to.
+    /// Read from the pid file `ensure_server` writes; None when the
+    /// server isn't reachable, so the profile overlay can show "no
+    /// server pid known" instead of crashing.
+    pub server_pid: Option<i32>,
+    /// Name of the agent profile persisted from the last run; empty
+    /// restores the default (no profile) state.
+    pub profile: String,
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +128,10 @@ pub struct App {
     pub thinking_levels: Vec<String>,
     pub thinking_idx: usize,
     pub thinking_pref: String,
+
+    // agent profiles (index 0 = implicit default, hidden in the UI)
+    pub profiles: Vec<atom_core::profiles::AgentProfile>,
+    pub profile_idx: usize,
 
     /// whether reasoning blocks are rendered; toggled with /thinking.
     pub show_reasoning: bool,
@@ -177,6 +200,10 @@ pub struct App {
     pub overlay_entries: Vec<atom_core::providers::providers::ModelEntry>,
     pub overlay_sessions: Vec<SessionInfo>,
     pub overlay_stats: Option<StatsReport>,
+    /// /profile: latest snapshot returned by Effect::FetchProfile.
+    /// None until the first fetch completes — the overlay shows a
+    /// spinner during that window, same as /stats.
+    pub overlay_profile: Option<crate::profile::ProfileReport>,
     pub stats_days: i64,
     pub overlay_providers: Vec<ProviderListEntry>,
     pub overlay_auth_id: String,
@@ -197,6 +224,23 @@ pub struct App {
     /// don't have to remember which entry was loaded if the user
     /// navigates around before confirming).
     pub overlay_fork_source: String,
+
+    /// Wall-clock instant from `RunOptions::started_at`. The /profile
+    /// overlay uses this to render "client started: HH:MM:SS" — the
+    /// actual launch time, not a duration. `started_instant` is the
+    /// matching monotonic instant so uptime math is skew-proof.
+    pub started_at: Option<SystemTime>,
+    pub started_instant: Option<Instant>,
+    /// Wall-clock when the TUI became ready to accept input (after
+    /// setup_terminal, before the first frame). Set once by
+    /// `event_loop`'s caller via `set_ready_at`. The /profile overlay
+    /// reports `ready_at - started_at` as "client startup" — the
+    /// hillclimb metric — and keeps using `started_at` for the live
+    /// "client uptime" ticker.
+    pub ready_at: Option<SystemTime>,
+    /// Server PID from `RunOptions::server_pid`. /profile feeds it to
+    /// `ps` for the server section; None means "server not reachable".
+    pub server_pid: Option<i32>,
 
     // terminal dimensions
     pub width: u16,
@@ -268,6 +312,11 @@ pub struct App {
     /// Kill switch for the running shell command, armed by the spawned
     /// task; Ctrl+C sends on it to abort the child process.
     pub shell_kill: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Shell-mode commands finished since the last submitted prompt,
+    /// as (command, output). They ride along on the next outgoing
+    /// message as <bash-input>/<bash-stdout> tags so the model sees
+    /// what the user ran in the shell.
+    pub shell_log: Vec<(String, String)>,
 }
 
 impl App {
@@ -284,6 +333,8 @@ impl App {
             thinking_levels: Vec::new(),
             thinking_idx: 0,
             thinking_pref: String::new(),
+            profiles: Vec::new(),
+            profile_idx: 0,
             show_reasoning: true,
             blocks: Vec::new(),
             content_lines: Vec::new(),
@@ -322,6 +373,7 @@ impl App {
             overlay_entries: Vec::new(),
             overlay_sessions: Vec::new(),
             overlay_stats: None,
+            overlay_profile: None,
             stats_days: 0,
             overlay_providers: Vec::new(),
             overlay_auth_id: String::new(),
@@ -333,6 +385,12 @@ impl App {
             pending_model_provider: String::new(),
             overlay_fork_user_messages: Vec::new(),
             overlay_fork_source: String::new(),
+            started_at: opts.started_at,
+            started_instant: opts.started_instant,
+            // Set by `set_ready_at` once the TUI is in raw mode and
+            // about to draw its first frame. None until then.
+            ready_at: None,
+            server_pid: opts.server_pid,
             width: 80,
             height: 24,
             err_msg: String::new(),
@@ -370,9 +428,18 @@ impl App {
             shell_mode: false,
             shell_running: false,
             shell_kill: None,
+            shell_log: Vec::new(),
         };
         m.refresh_thinking_levels();
         m.apply_thinking(&m.session.thinking.clone());
+        // Restore the persisted agent profile by name. Its model and
+        // thinking presets are already baked into the restored model.
+        if !opts.profile.is_empty() {
+            m.profiles = atom_core::profiles::load_profiles();
+            if let Some(idx) = m.profiles.iter().position(|p| p.name == opts.profile) {
+                m.profile_idx = idx;
+            }
+        }
         // Apply the persisted theme after any dev hot-theme load so the
         // user's selection wins in normal runs (hot reload only runs in
         // --hot mode, which layers on top of this afterwards).
@@ -402,6 +469,10 @@ impl App {
             sel_model: String::new(),
             session: empty_session_info(),
             hot_state_path: None,
+            started_at: None,
+            started_instant: None,
+            server_pid: None,
+            profile: String::new(),
         });
         app.width = width;
         app.height = height;
@@ -495,6 +566,138 @@ impl App {
         self.thinking_pref = self.thinking_levels[self.thinking_idx].clone();
     }
 
+    // -- agent profiles ----------------------------------------------------
+
+    /// Label of the selected profile; empty for the implicit default
+    /// (the no-profile state), which stays hidden in the status bar.
+    pub fn profile_name(&self) -> String {
+        self.profiles
+            .get(self.profile_idx)
+            .map(|p| p.name.clone())
+            .unwrap_or_default()
+    }
+
+    /// cycleProfile advances default -> plan -> build -> ... -> default,
+    /// applying each profile's model and thinking preset. Returns the
+    /// effects of any session model/thinking patch.
+    pub fn cycle_profile(&mut self) -> Vec<Effect> {
+        if self.profiles.is_empty() {
+            self.profiles = atom_core::profiles::load_profiles();
+        }
+        if self.profiles.len() <= 1 {
+            return Vec::new(); // only the implicit default exists
+        }
+        self.profile_idx = (self.profile_idx + 1) % self.profiles.len();
+        self.apply_profile()
+    }
+
+    fn apply_profile(&mut self) -> Vec<Effect> {
+        let Some(profile) = self.profiles.get(self.profile_idx) else {
+            return Vec::new();
+        };
+        if profile.name.is_empty() {
+            return Vec::new(); // default: the no-profile state, nothing to apply
+        }
+        let want_thinking = (!profile.thinking.is_empty()).then(|| profile.thinking.clone());
+        if profile.model.is_empty() {
+            // No model switch: only the thinking preset changes.
+            self.apply_profile_thinking(want_thinking);
+            return self.commit_thinking();
+        }
+        let (provider_ref, model_id) = atom_core::profiles::model_ref(&profile.model);
+        let provider = if model_id == self.sel_model {
+            None
+        } else {
+            match provider_ref {
+                // An explicit provider prefix names the provider.
+                Some(name) => self
+                    .providers
+                    .iter()
+                    .find(|p| p.name == name || p.id == name)
+                    .cloned(),
+                None => self.provider_for_profile_model(model_id),
+            }
+        };
+        match provider {
+            Some(provider) => self.use_model(provider, model_id.to_string(), want_thinking),
+            // Unknown provider for the pinned model: keep the current
+            // model so validation reports it at send time.
+            None => {
+                self.apply_profile_thinking(want_thinking);
+                self.commit_thinking()
+            }
+        }
+    }
+
+    /// Overrides the thinking level with the profile preset when it is
+    /// valid for the current model.
+    fn apply_profile_thinking(&mut self, want: Option<String>) {
+        let Some(level) = want else {
+            return;
+        };
+        self.refresh_thinking_levels();
+        if let Some(idx) = self.thinking_levels.iter().position(|l| *l == level) {
+            self.thinking_idx = idx;
+            self.thinking_pref = level;
+        }
+    }
+
+    /// Resolves a profile-pinned model id to a configured provider via
+    /// the models.dev catalog; falls back to the current provider.
+    fn provider_for_profile_model(&self, model: &str) -> Option<Provider> {
+        let catalog_id = modelsdev::provider_for_model(model)?;
+        self.providers
+            .iter()
+            .find(|p| modelsdev::provider_catalog_id(p) == catalog_id)
+            .cloned()
+    }
+
+    /// use_model switches the session's model (and optionally the
+    /// thinking level), patching a live session or seeding the next
+    /// session creation. Shared by the model picker and profile cycling;
+    /// `want_thinking` overrides the session's saved level (agent
+    /// profiles), otherwise it is preserved.
+    fn use_model(
+        &mut self,
+        provider: Provider,
+        model: String,
+        want_thinking: Option<String>,
+    ) -> Vec<Effect> {
+        let prev_thinking = self.thinking_level();
+        self.sel_provider = provider;
+        self.sel_model = model;
+        self.refresh_thinking_levels();
+        let want = want_thinking
+            .or_else(|| (!self.session.thinking.is_empty()).then(|| self.session.thinking.clone()));
+        match want {
+            Some(level) => self.apply_thinking(&level),
+            None => self.apply_thinking(&prev_thinking),
+        }
+        self.session.thinking = self.thinking_level();
+        self.persist_defaults();
+
+        if !self.session.id.is_empty() {
+            // Mid-session switch: update the model in place.
+            let provider = self.sel_provider.name.clone();
+            let model = self.sel_model.clone();
+            let thinking = self.session.thinking.clone();
+            self.session.provider = provider.clone();
+            self.session.model = model.clone();
+            return vec![Effect::PatchSessionModel {
+                provider,
+                model,
+                thinking,
+            }];
+        }
+        // No session yet: create one with the selected model.
+        vec![Effect::CreateSession {
+            provider: self.sel_provider.name.clone(),
+            model: self.sel_model.clone(),
+            cwd: self.cwd.clone(),
+            thinking: self.thinking_level(),
+        }]
+    }
+
     fn thinking_index_of(levels: &[String], saved: &str) -> i32 {
         if saved.is_empty() {
             return -1;
@@ -548,7 +751,12 @@ impl App {
         if thinking.is_empty() {
             thinking = self.session.thinking.clone();
         }
-        save_last_model_state(&self.sel_provider.name, &self.sel_model, &thinking);
+        save_last_model_state(
+            &self.sel_provider.name,
+            &self.sel_model,
+            &thinking,
+            &self.profile_name(),
+        );
     }
 
     pub fn commit_thinking(&mut self) -> Vec<Effect> {
@@ -902,11 +1110,12 @@ impl App {
                     title,
                     tool_name: ev.name.clone(),
                     text,
+                    call_id: ev.call_id.clone(),
                     ..Default::default()
                 });
             }
             "tool_result" => {
-                blocks::attach_tool_result(&mut self.blocks, &ev.text, "");
+                blocks::attach_tool_result(&mut self.blocks, &ev.call_id, &ev.text, "");
                 self.viewport_dirty = true;
                 if blocks::assign_block_diagram_ids(&mut self.blocks) {
                     self.preview_dirty = true;
@@ -925,13 +1134,26 @@ impl App {
                 }
             }
             "tool_diff" => {
-                for b in self.blocks.iter_mut().rev() {
-                    if b.kind == BlockKind::Tool && b.diff.is_empty() {
-                        b.diff = ev.diff.clone();
-                        b.lines = None;
-                        self.viewport_dirty = true;
-                        break;
-                    }
+                let target = self
+                    .blocks
+                    .iter()
+                    .position(|b| {
+                        b.kind == BlockKind::Tool
+                            && b.diff.is_empty()
+                            && !ev.call_id.is_empty()
+                            && b.call_id == ev.call_id
+                    })
+                    .or_else(|| {
+                        self.blocks.iter().rposition(|b| {
+                            b.kind == BlockKind::Tool
+                                && b.diff.is_empty()
+                                && (ev.call_id.is_empty() || b.call_id.is_empty())
+                        })
+                    });
+                if let Some(b) = target.and_then(|i| self.blocks.get_mut(i)) {
+                    b.diff = ev.diff.clone();
+                    b.lines = None;
+                    self.viewport_dirty = true;
                 }
             }
             "compaction" => {
@@ -1101,6 +1323,8 @@ impl App {
                     {
                         block.model = ev.model.clone();
                         block.turn_duration = ev.duration;
+                        block.tokens_per_sec =
+                            (ev.tokens_per_sec > 0.0).then_some(ev.tokens_per_sec);
                         block.lines = None;
                         self.viewport_dirty = true;
                     }
@@ -1112,27 +1336,36 @@ impl App {
     }
 
     pub fn finalize_reasoning(&mut self, dur: Option<Duration>) {
-        let Some(idx) = self
+        // Close every active reasoning block, newest first. Two can be
+        // active at once when a mid-turn submit drops a User block while
+        // reasoning deltas are still streaming: the next delta stacks a
+        // second block after it, and closing only the newest (the old
+        // rposition) orphaned the first, whose spinner then ran until
+        // the end of the turn.
+        let mut changed = false;
+        while let Some(idx) = self
             .blocks
             .iter()
             .rposition(|b| b.kind == BlockKind::Reasoning && b.active)
-        else {
-            return;
-        };
-        // A placeholder from round_start that never received reasoning
-        // text is removed outright; keeping it would leave a stray
-        // "Thinking" header above pure-content replies.
-        if self.blocks[idx].text.is_empty() {
-            self.blocks.remove(idx);
-            return;
+        {
+            // A placeholder from round_start that never received reasoning
+            // text is removed outright; keeping it would leave a stray
+            // "Thinking" header above pure-content replies.
+            if self.blocks[idx].text.is_empty() {
+                self.blocks.remove(idx);
+            } else {
+                let b = &mut self.blocks[idx];
+                b.active = false;
+                b.dur = Some(dur.unwrap_or_else(|| {
+                    b.started_at.map(|t| t.elapsed()).unwrap_or(Duration::ZERO)
+                }));
+                b.lines = None;
+            }
+            changed = true;
         }
-        let b = &mut self.blocks[idx];
-        b.active = false;
-        b.dur = Some(
-            dur.unwrap_or_else(|| b.started_at.map(|t| t.elapsed()).unwrap_or(Duration::ZERO)),
-        );
-        b.lines = None;
-        self.viewport_dirty = true;
+        if changed {
+            self.viewport_dirty = true;
+        }
     }
 
     pub fn finalize_compaction(&mut self) {
@@ -1169,6 +1402,15 @@ impl App {
             self.close_context_menu();
             self.close_reasoning_menu();
         }
+    }
+
+    /// Record the wall-clock instant the TUI became ready to accept
+    /// input (after `setup_terminal`, before the first frame).
+    /// /profile uses this as the end of its startup-time window —
+    /// `ready_at - started_at` is the static "ms to load" value that
+    /// gets hillclimbed. Called once by `event_loop`'s caller.
+    pub fn set_ready_at(&mut self, ready_at: SystemTime) {
+        self.ready_at = Some(ready_at);
     }
 
     /// Effective typed prefix for the slash menu. A Ctrl+P-opened menu
@@ -1298,6 +1540,17 @@ impl App {
         }]
     }
 
+    /// Shift+↓ and its clickable status-bar hint both toggle the
+    /// subagent menu: open it when hidden, dismiss it when shown.
+    pub fn toggle_manage_menu(&mut self) -> Vec<Effect> {
+        if self.manage_visible {
+            self.dismiss_manage_menu();
+            Vec::new()
+        } else {
+            self.open_manage_menu()
+        }
+    }
+
     // -- input handling ----------------------------------------------------
 
     /// handleInput processes submitted text: slash commands run locally,
@@ -1350,11 +1603,17 @@ impl App {
             || overlays::is_catalog_prompt(text, &self.slash_commands)
             || overlays::looks_like_file_path(text);
         if passthrough && (self.streaming || self.remote_working) {
-            // Mid-stream submit: the interruption rides in the effect.
-            // Pause the running turn via the server first, then dial the
-            // new /send stream; nothing is stored in the App. The prompt
-            // is cleared right away so the next draft can be typed while
-            // the pause/send happens in the background.
+            // Mid-turn submit: the prompt is injected into the running
+            // turn (queued server-side; the model sees it at the next
+            // round). Nothing is paused or killed, and the already-open
+            // stream keeps painting, so the App only pushes the user
+            // block optimistically and keeps its streaming state.
+            // The server cancels the streaming round asynchronously, so
+            // reasoning deltas can keep arriving after the User block
+            // lands. Close the live Thinking block now: leaving it
+            // active orphans it (a later finalize_reasoning closes only
+            // the newest) and its spinner would run until end of turn.
+            self.finalize_reasoning(None);
             let imgs: Vec<ImageData> = self.pending.iter().map(|p| p.img.clone()).collect();
             let imgs_meta = std::mem::take(&mut self.pending);
             self.preview_dirty = true;
@@ -1365,22 +1624,17 @@ impl App {
             self.close_context_menu();
             self.close_at_menu();
             self.err_msg.clear();
-            self.paused = true;
-            self.interrupting = true;
             self.blocks.push(Block {
                 kind: BlockKind::User,
                 text: text.to_string(),
                 images: imgs_meta,
                 ..Default::default()
             });
-            self.streaming = true;
-            let pause_turn_id = std::mem::take(&mut self.turn_id);
-            self.turn_id = new_turn_id();
             self.following = true;
             let req = SendRequest {
                 session_id: self.session.id.clone(),
                 turn_id: self.turn_id.clone(),
-                message: text.to_string(),
+                message: self.message_with_shell(text),
                 thinking: self.thinking_level(),
                 images: imgs,
                 key: self.sel_provider.key.clone(),
@@ -1390,10 +1644,7 @@ impl App {
                 compact_instructions: String::new(),
             };
             return vec![
-                Effect::InterruptTurn {
-                    pause_turn_id,
-                    req: Box::new(req),
-                },
+                Effect::InjectTurn { req: Box::new(req) },
                 Effect::PaintPreviews,
             ];
         }
@@ -1424,7 +1675,7 @@ impl App {
             let req = SendRequest {
                 session_id: self.session.id.clone(),
                 turn_id: self.turn_id.clone(),
-                message: text.to_string(),
+                message: self.message_with_shell(text),
                 thinking: self.thinking_level(),
                 images: imgs,
                 key: self.sel_provider.key.clone(),
@@ -1500,9 +1751,8 @@ impl App {
                 Vec::new()
             }
             "/theme" => {
-                let rows = overlays::theme_rows();
                 self.open_overlay(OverlayKind::Theme);
-                self.overlay_sel = rows
+                self.overlay_sel = overlays::filtered_theme_rows(self)
                     .iter()
                     .position(|entry| entry.id == atom_core::render::colors::active_theme_name())
                     .unwrap_or(0);
@@ -1592,6 +1842,28 @@ impl App {
                     }
                 }
                 self.refresh_viewport();
+                Vec::new()
+            }
+            "/profile" if atom_core::build::is_dev() => {
+                // Dev-only diagnostic overlay: startup time + CPU/RSS
+                // for the client and the running `atoms` server. Hidden
+                // in release builds — the catalog also omits it, so a
+                // user can't reach this arm without typing the literal
+                // command, but we double-check here in case a custom
+                // hook or scripted client tries to.
+                self.open_overlay(OverlayKind::Profile);
+                self.overlay_q.clear();
+                self.overlay_sel = 0;
+                self.overlay_scroll = 0;
+                self.overlay_profile = None;
+                self.working_msg = "sampling processes...".into();
+                vec![Effect::FetchProfile {
+                    client_pid: std::process::id() as i32,
+                    server_pid: self.server_pid,
+                }]
+            }
+            "/profile" => {
+                self.err_msg = "/profile is dev-only".into();
                 Vec::new()
             }
             other => {
@@ -1877,6 +2149,21 @@ impl App {
                 match report {
                     Ok(r) => {
                         self.overlay_stats = Some(*r);
+                        self.overlay_sel = 0;
+                        self.working_msg.clear();
+                    }
+                    Err(e) => {
+                        self.err_msg = e;
+                        self.working_msg.clear();
+                        self.overlay = None;
+                    }
+                }
+                Vec::new()
+            }
+            AppMsg::ProfileLoaded(report) => {
+                match report {
+                    Ok(r) => {
+                        self.overlay_profile = Some(*r);
                         self.overlay_sel = 0;
                         self.working_msg.clear();
                     }
@@ -2268,6 +2555,10 @@ impl App {
             self.following = true;
             self.streaming = false;
             self.interrupting = false;
+            // Shell-mode output belongs to the session it ran in: a
+            // queued log from another session must not ride along on
+            // the next prompt here.
+            self.shell_log.clear();
             // The turn id belongs to the session it was generated for: a
             // stale id from the previous view would make a pause target a
             // turn that never exists (e.g. a subagent's "dispatch-<id>"
@@ -2685,10 +2976,11 @@ impl App {
             b.kind == BlockKind::Tool && b.tool_name == "shell" && !b.tool_done && b.title == title
         }) {
             block.tool_done = true;
-            block.result = result;
+            block.result = result.clone();
             block.lines = None;
             self.viewport_dirty = true;
         }
+        self.shell_log.push((cmd, result));
 
         let mut effects = Vec::new();
         if !new_cwd.is_empty() && new_cwd != self.cwd {
@@ -2702,6 +2994,33 @@ impl App {
             }
         }
         effects
+    }
+
+    /// Outgoing wire message: the user's text plus any shell-mode
+    /// commands run since the last prompt, appended as
+    /// <bash-input>/<bash-stdout> tags so the model sees what the user
+    /// ran in the shell. Clears the log — each command ships once.
+    fn message_with_shell(&mut self, text: &str) -> String {
+        let log = std::mem::take(&mut self.shell_log);
+        if log.is_empty() {
+            return text.to_string();
+        }
+        let mut msg = text.to_string();
+        for (cmd, out) in log {
+            let out = out.trim();
+            let out = if out.is_empty() {
+                "(no output)".to_string()
+            } else if out.chars().count() > 2000 {
+                let tail: String = out.chars().skip(out.chars().count() - 2000).collect();
+                format!("…(truncated)…\n{tail}")
+            } else {
+                out.to_string()
+            };
+            msg.push_str(&format!(
+                "\n<bash-input>{cmd}</bash-input>\n<bash-stdout>{out}</bash-stdout>"
+            ));
+        }
+        msg
     }
 
     // -- keys ----------------------------------------------------------------
@@ -2773,7 +3092,7 @@ impl App {
         }
         if let KeyCode::Down = k.code {
             if shift {
-                return self.open_manage_menu();
+                return self.toggle_manage_menu();
             }
         }
         if let KeyCode::Up = k.code {
@@ -2923,6 +3242,14 @@ impl App {
                     return self.run_shell_command(cmd);
                 }
                 return self.handle_input(&text);
+            }
+            // Shift+Tab (BackTab on most terminals) cycles agent
+            // profiles; plain Tab and Ctrl+T cycle the thinking level.
+            KeyCode::Tab if shift => {
+                return self.cycle_profile();
+            }
+            KeyCode::BackTab => {
+                return self.cycle_profile();
             }
             KeyCode::Tab => {
                 self.cycle_thinking();
@@ -3219,6 +3546,24 @@ impl App {
             };
         }
 
+        // Tab re-samples the live pids in /profile so the overlay can
+        // be refreshed without leaving the view. Other overlays ignore
+        // Tab here — the menu/footer menu handlers consume it.
+        if matches!(
+            k,
+            KeyEvent {
+                code: KeyCode::Tab,
+                modifiers: KeyModifiers::NONE,
+                ..
+            }
+        ) && matches!(kind, OverlayKind::Profile)
+        {
+            return vec![Effect::FetchProfile {
+                client_pid: std::process::id() as i32,
+                server_pid: self.server_pid,
+            }];
+        }
+
         match k.code {
             KeyCode::Esc => {
                 match kind {
@@ -3230,7 +3575,11 @@ impl App {
                     }
                     OverlayKind::WebSearch => {
                         self.open_overlay(OverlayKind::Settings);
-                        self.overlay_sel = 1;
+                        self.overlay_sel = 2;
+                    }
+                    OverlayKind::WebFetch => {
+                        self.open_overlay(OverlayKind::Settings);
+                        self.overlay_sel = 3;
                     }
                     OverlayKind::Model
                         if self.model_picker_purpose
@@ -3278,6 +3627,15 @@ impl App {
                         // renderer's scroll must track it.
                         self.overlay_scroll = self.overlay_sel;
                     }
+                    OverlayKind::Profile => {
+                        // Profile reuses the same scroll-as-sel trick
+                        // as /stats: overlay_sel is the first visible
+                        // row, so the renderer can just copy it.
+                        if self.overlay_sel > 0 {
+                            self.overlay_sel -= 1;
+                        }
+                        self.overlay_scroll = self.overlay_sel;
+                    }
                     OverlayKind::Session => overlays::move_session_sel(self, -1),
                     OverlayKind::Model => overlays::move_model_sel(self, -1),
                     OverlayKind::Fork => {
@@ -3306,6 +3664,13 @@ impl App {
                         // See Up: scroll tracks the selection row.
                         self.overlay_scroll = self.overlay_sel;
                     }
+                    OverlayKind::Profile => {
+                        let max = overlays::profile_scroll_max(self);
+                        if self.overlay_sel < max {
+                            self.overlay_sel += 1;
+                        }
+                        self.overlay_scroll = self.overlay_sel;
+                    }
                     OverlayKind::Session => overlays::move_session_sel(self, 1),
                     OverlayKind::Model => overlays::move_model_sel(self, 1),
                     OverlayKind::Fork => {
@@ -3326,7 +3691,10 @@ impl App {
                 Vec::new()
             }
             KeyCode::Backspace => {
-                if matches!(kind, OverlayKind::Stats | OverlayKind::ProviderMethod) {
+                if matches!(
+                    kind,
+                    OverlayKind::Stats | OverlayKind::ProviderMethod | OverlayKind::Profile
+                ) {
                     return Vec::new();
                 }
                 if self.overlay_q_sel {
@@ -3532,6 +3900,9 @@ impl App {
         if self.atom_config.web_search.is_none() {
             self.atom_config.web_search = Some(self.atom_config.resolved_web_search());
         }
+        if self.atom_config.web_fetch.is_none() {
+            self.atom_config.web_fetch = Some(self.atom_config.resolved_web_fetch());
+        }
         self.settings_onboarding = false;
         self.save_atom_config();
     }
@@ -3651,6 +4022,7 @@ impl App {
                             e.provider.id.clone()
                         },
                         model: e.model.clone(),
+                        ..self.atom_config.compaction.clone().unwrap_or_default()
                     });
                     self.save_atom_config();
                     self.model_picker_purpose = overlays::ModelPickerPurpose::Chat;
@@ -3660,56 +4032,18 @@ impl App {
                     self.working_msg.clear();
                     return Vec::new();
                 }
-                let prev_thinking = self.thinking_level();
-                self.sel_provider = e.provider.clone();
-                self.sel_model = e.model.clone();
-                self.refresh_thinking_levels();
-                if !self.session.thinking.is_empty() {
-                    self.apply_thinking(&self.session.thinking.clone());
-                } else {
-                    self.apply_thinking(&prev_thinking);
-                }
-                self.session.thinking = self.thinking_level();
+                let fx = self.use_model(e.provider.clone(), e.model.clone(), None);
                 self.picker_settings
                     .push_recent(crate::settings::PickerSettings::model_ref(
                         &e.provider.name,
                         &e.model,
                     ));
                 self.save_picker_settings();
-                self.persist_defaults();
-
-                if !self.session.id.is_empty() {
-                    // Mid-session switch: update the model in place.
-                    let provider = e.provider.name.clone();
-                    let model = e.model.clone();
-                    let thinking = self.session.thinking.clone();
-                    self.session.provider = provider.clone();
-                    self.session.model = model.clone();
-                    self.overlay = None;
-                    self.overlay_q.clear();
-                    self.overlay_q_cursor = None;
-                    self.working_msg.clear();
-                    return vec![Effect::PatchSessionModel {
-                        provider,
-                        model,
-                        thinking,
-                    }];
-                }
-                // No session yet: create one with the selected model.
-                let provider = e.provider.name.clone();
-                let model = e.model.clone();
-                let cwd = self.cwd.clone();
-                let thinking = self.thinking_level();
                 self.overlay = None;
                 self.overlay_q.clear();
                 self.overlay_q_cursor = None;
                 self.working_msg.clear();
-                vec![Effect::CreateSession {
-                    provider,
-                    model,
-                    cwd,
-                    thinking,
-                }]
+                return fx;
             }
             OverlayKind::Session => {
                 let rows = overlays::session_rows(self);
@@ -3733,6 +4067,16 @@ impl App {
                 self.working_msg.clear();
                 Vec::new()
             }
+            OverlayKind::Profile => {
+                // /profile is read-only: Enter just closes (same shape
+                // as /stats). Tab is handled separately in the key
+                // dispatch so this path only sees Enter.
+                self.overlay = None;
+                self.overlay_q.clear();
+                self.overlay_q_cursor = None;
+                self.working_msg.clear();
+                Vec::new()
+            }
             OverlayKind::Providers => {
                 let filtered = filter_provider_entries(&self.overlay_providers, &self.overlay_q);
                 if filtered.is_empty() {
@@ -3746,7 +4090,14 @@ impl App {
                     return Vec::new();
                 }
                 self.overlay_auth_id = e.id.clone();
-                self.open_overlay(OverlayKind::ProviderMethod);
+                // Web-tool providers (tinyfish, parallel, exa) only take
+                // API keys — skip the API Key/OAuth method choice.
+                if atom_core::providers::providers::provider_caps(&e.id).contains(&"Models") {
+                    self.open_overlay(OverlayKind::ProviderMethod);
+                } else {
+                    self.overlay_auth_type = "api".into();
+                    self.open_overlay(OverlayKind::ProviderKey);
+                }
                 self.overlay_q.clear();
                 self.overlay_sel = 0;
                 Vec::new()
@@ -3795,7 +4146,17 @@ impl App {
                     self.working_msg.clear();
                     return Vec::new();
                 }
-                self.open_models_for_provider(&id);
+                if atom_core::providers::providers::provider_caps(&id).contains(&"Models") {
+                    self.open_models_for_provider(&id);
+                } else {
+                    // Web-tool providers (search/fetch only) have no
+                    // models: return to the providers list so the row
+                    // now reads connected.
+                    self.overlay_providers = providers::list_addable_providers();
+                    self.open_overlay(OverlayKind::Providers);
+                    self.overlay_q.clear();
+                    self.overlay_sel = 0;
+                }
                 vec![Effect::ReloadProviders]
             }
             OverlayKind::Settings => match self.overlay_sel {
@@ -3809,10 +4170,30 @@ impl App {
                     vec![Effect::FetchModels]
                 }
                 1 => {
+                    let mut compaction = self.atom_config.compaction.clone().unwrap_or_default();
+                    compaction.enabled = Some(!compaction.resolved_enabled());
+                    self.atom_config.compaction = Some(compaction);
+                    self.save_atom_config();
+                    Vec::new()
+                }
+                2 => {
                     self.open_overlay(OverlayKind::WebSearch);
                     let selected = self.atom_config.resolved_web_search().server;
                     let rows = overlays::web_search_rows(self);
                     self.overlay_sel = rows.iter().position(|row| row.0 == selected).unwrap_or(0);
+                    Vec::new()
+                }
+                3 => {
+                    self.open_overlay(OverlayKind::WebFetch);
+                    let selected = self.atom_config.resolved_web_fetch().server;
+                    let rows = overlays::web_fetch_rows(self);
+                    self.overlay_sel = rows.iter().position(|row| row.0 == selected).unwrap_or(0);
+                    Vec::new()
+                }
+                4 => {
+                    self.atom_config.transparent_background =
+                        Some(!self.atom_config.resolved_transparent_background());
+                    self.save_atom_config();
                     Vec::new()
                 }
                 _ => {
@@ -3833,11 +4214,26 @@ impl App {
                     Some(atom_core::config::WebSearchConfig { server: id, tool });
                 self.save_atom_config();
                 self.open_overlay(OverlayKind::Settings);
-                self.overlay_sel = 1;
+                self.overlay_sel = 2;
+                Vec::new()
+            }
+            OverlayKind::WebFetch => {
+                let rows = overlays::web_fetch_rows(self);
+                let Some((id, _, _)) = rows.get(self.overlay_sel).cloned() else {
+                    return Vec::new();
+                };
+                let tool = atom_core::config::bundled_web_fetch_profile(&id)
+                    .map(|profile| profile.tool)
+                    .unwrap_or_else(|| "web_fetch".into());
+                self.atom_config.web_fetch =
+                    Some(atom_core::config::WebFetchConfig { server: id, tool });
+                self.save_atom_config();
+                self.open_overlay(OverlayKind::Settings);
+                self.overlay_sel = 3;
                 Vec::new()
             }
             OverlayKind::Theme => {
-                let rows = overlays::theme_rows();
+                let rows = overlays::filtered_theme_rows(self);
                 let Some(entry) = rows.get(self.overlay_sel) else {
                     return Vec::new();
                 };
@@ -3888,14 +4284,15 @@ impl App {
 
     fn approval_key(&mut self, k: KeyEvent, req: ApprovalPrompt) -> Vec<Effect> {
         // v2 spec: four buttons, no session-scoped grant.
-        //   y → allow_once, a → allow_always, n → deny_once,
-        //   d / Esc → deny_once.
+        //   Y → allow_once, A → allow_always, N → deny_once,
+        //   D → deny_always (lowercase and the capital letters shown
+        //   on the buttons). Esc is intentionally not bound — the four
+        //   visible buttons are the only choices.
         let decision = match k.code {
-            KeyCode::Char('y') => Some(("allow_once", "allowed once")),
-            KeyCode::Char('a') => Some(("allow_always", "always allowed")),
-            KeyCode::Char('n') => Some(("deny_once", "denied")),
-            KeyCode::Char('d') => Some(("deny_always", "denied, rule saved")),
-            KeyCode::Esc => Some(("deny_once", "denied")),
+            KeyCode::Char('y') | KeyCode::Char('Y') => Some(("allow_once", "allowed once")),
+            KeyCode::Char('a') | KeyCode::Char('A') => Some(("allow_always", "always allowed")),
+            KeyCode::Char('n') | KeyCode::Char('N') => Some(("deny_once", "denied")),
+            KeyCode::Char('d') | KeyCode::Char('D') => Some(("deny_always", "denied, rule saved")),
             KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.quitting = true;
                 return vec![Effect::Quit];
@@ -3918,8 +4315,8 @@ impl App {
         }
     }
 
-    /// Clear the inline approval card (button row, help row, child
-    /// header) once the user has answered the prompt. The block stays
+    /// Clear the inline approval card (button row, child header) once
+    /// the user has answered the prompt. The block stays
     /// `tool_done = false`: the tool hasn't actually returned yet — the
     /// server is still running the command and will send a `tool_result`
     /// event with the real output, which `attach_tool_result` needs a
@@ -3974,20 +4371,24 @@ impl App {
     /// Check if a click at (content_row, col) falls on an approval button in
     /// block `bi`. Returns the decision string ("allow_once" etc.) or None.
     fn approval_button_hit(&self, bi: usize, content_row: usize, col: usize) -> Option<String> {
-        // The buttons are on the rendered line just above the help row,
-        // which is itself above the bottom pad row. With the v2 layout:
-        //   ... body rows ... [buttons] [help] [pad]
-        // so the buttons live three lines from the end (antepenultimate).
+        // The buttons are on the rendered line just above the bottom
+        // pad row. Block layout is [pad] [header] ...body... [pad],
+        // and the button line is the last body row, so it sits two
+        // lines from the end (penultimate). It was briefly `len - 3`
+        // while a help row sat between buttons and pad; the help row
+        // is gone and that offset silently broke button clicks.
         let block_start = *self.block_start.get(bi)?;
         let block_lines = self.blocks[bi].lines.as_ref()?;
-        let button_row = block_start + block_lines.len().saturating_sub(3);
+        let button_row = block_start + block_lines.len().saturating_sub(2);
         if content_row != button_row {
             return None;
         }
-        // Button layout: "  [y] once   [a] always   [n] deny   [d] never  "
+        // Button layout: "  Y Once   A Always   N Deny   D Never  "
+        // Body rows are wrapped with a one-cell leading pad column,
+        // so a line-relative col c is button-relative c - 1.
         let buttons = blocks::approval_buttons();
         for btn in &buttons {
-            if col >= btn.col_start && col < btn.col_end {
+            if col > btn.col_start && col < btn.col_end + 1 {
                 return Some(btn.decision.to_string());
             }
         }
@@ -4076,7 +4477,7 @@ impl App {
         self.link_pending = None;
         // Status-bar hints are clickable: the subagent indicator opens the
         // subagent menu (Shift+↓), "Shift ↑ to return" goes to the parent
-        // session, and "esc to close" dismisses an open footer menu.
+        // session.
         if let Some(action) = self.status_nav_hit(x, y) {
             return self.run_status_nav_action(action);
         }
@@ -4395,7 +4796,7 @@ impl App {
     fn run_status_nav_action(&mut self, action: crate::statusbar::NavAction) -> Vec<Effect> {
         use crate::statusbar::NavAction;
         match action {
-            NavAction::OpenSubagents => self.open_manage_menu(),
+            NavAction::OpenSubagents => self.toggle_manage_menu(),
             NavAction::ReturnToParent => {
                 if !self.session.parent_id.is_empty() {
                     vec![Effect::LoadSession {
@@ -4404,22 +4805,6 @@ impl App {
                 } else {
                     Vec::new()
                 }
-            }
-            NavAction::CloseMenu => {
-                if self.context_visible {
-                    self.close_context_menu();
-                } else if self.reasoning_visible {
-                    self.close_reasoning_menu();
-                } else if !matches!(self.picker_kind, PickerKind::None) {
-                    self.close_picker();
-                } else if self.manage_visible {
-                    self.dismiss_manage_menu();
-                } else if self.menu_visible {
-                    self.set_menu_visible(false);
-                } else if self.at_menu_visible {
-                    self.close_at_menu();
-                }
-                Vec::new()
             }
         }
     }
@@ -4649,6 +5034,8 @@ struct LastModel {
     model: String,
     #[serde(default)]
     thinking: String,
+    #[serde(default)]
+    profile: String,
 }
 
 fn last_model_path() -> std::path::PathBuf {
@@ -4664,7 +5051,12 @@ pub(crate) fn load_last_model_thinking() -> Option<String> {
     Some(lm.thinking)
 }
 
-pub(crate) fn save_last_model_state(provider_name: &str, model: &str, thinking: &str) {
+pub(crate) fn save_last_model_state(
+    provider_name: &str,
+    model: &str,
+    thinking: &str,
+    profile: &str,
+) {
     if model.is_empty() {
         return;
     }
@@ -4672,6 +5064,7 @@ pub(crate) fn save_last_model_state(provider_name: &str, model: &str, thinking: 
         provider: provider_name.to_string(),
         model: model.to_string(),
         thinking: thinking.to_string(),
+        profile: profile.to_string(),
     };
     if lm.thinking.is_empty() {
         lm.thinking = load_last_model_thinking().unwrap_or_default();
@@ -4709,13 +5102,12 @@ mod tests {
     #[test]
     fn approval_keys_map_to_wire_decisions() {
         let cases = [
-            // v2 spec: y/a/n/d map to the four decisions; Esc cancels
-            // into deny_once. The session/global keys are gone.
+            // v2 spec: y/a/n/d map to the four decisions. Esc is not
+            // bound — the four visible buttons are the only choices.
             (KeyCode::Char('y'), "allow_once"),
             (KeyCode::Char('a'), "allow_always"),
             (KeyCode::Char('n'), "deny_once"),
             (KeyCode::Char('d'), "deny_always"),
-            (KeyCode::Esc, "deny_once"),
         ];
         for (code, wire) in cases {
             let mut app = approval_app();
@@ -4875,6 +5267,55 @@ mod tests {
             new_cwd: String::new(),
         });
         assert!(app.blocks.last().unwrap().result.contains("killed"));
+    }
+
+    #[test]
+    fn shell_commands_ride_along_on_the_next_prompt() {
+        let mut app = App::new_test(90, 30);
+        app.session.id = "sess1".into();
+        app.key(key(KeyCode::Char('!'), KeyModifiers::NONE));
+        app.input.set_value("cargo test");
+        app.key(key(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_msg(AppMsg::ShellDone {
+            cmd: "cargo test".into(),
+            cwd: app.cwd.clone(),
+            output: "test result: ok. 5 passed".into(),
+            code: Some(0),
+            new_cwd: String::new(),
+        });
+        // Second command with empty output.
+        app.input.set_value("true");
+        app.key(key(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_msg(AppMsg::ShellDone {
+            cmd: "true".into(),
+            cwd: app.cwd.clone(),
+            output: String::new(),
+            code: Some(0),
+            new_cwd: String::new(),
+        });
+
+        let fx = app.handle_input("why did that fail?");
+        let Effect::SendTurn(req) = &fx[0] else {
+            panic!("expected SendTurn, got {:?}", fx[0]);
+        };
+        // The wire message carries the shell traffic as tags…
+        assert!(req.message.starts_with("why did that fail?\n"));
+        assert!(req
+            .message
+            .contains("<bash-input>cargo test</bash-input>\n<bash-stdout>test result: ok. 5 passed</bash-stdout>"));
+        assert!(req
+            .message
+            .contains("<bash-input>true</bash-input>\n<bash-stdout>(no output)</bash-stdout>"));
+        // …but the user's block shows the raw prompt.
+        assert_eq!(app.blocks.last().unwrap().text, "why did that fail?");
+        // Each command ships once: the next prompt is clean.
+        assert!(app.shell_log.is_empty());
+        app.streaming = false; // the turn has ended
+        let fx = app.handle_input("again");
+        let Effect::SendTurn(req) = &fx[0] else {
+            panic!("expected SendTurn, got {:?}", fx[0]);
+        };
+        assert_eq!(req.message, "again");
     }
 
     #[test]
@@ -5052,6 +5493,73 @@ mod tests {
     }
 
     #[test]
+    fn click_on_approval_button_resolves_decision() {
+        let mut app = App::new_test(90, 30);
+        let request = serde_json::json!({
+            "type": "approval_request",
+            "id": "req1",
+            "session_id": "sess1",
+            "command": "npm install",
+            "cwd": "/work",
+            "rule_id": "pkg-install",
+            "reason": "package manager with install",
+        });
+        app.handle_stream_event(&parse_stream_event(&request));
+        app.viewport_dirty = true;
+        app.refresh_viewport();
+
+        let bi = app
+            .blocks
+            .iter()
+            .position(|b| b.approval.is_some())
+            .expect("approval card block exists");
+        let lines = app.blocks[bi].lines.as_ref().expect("block rendered");
+        // Button line is the penultimate rendered row (bottom pad is last).
+        let row = app.block_start[bi] + lines.len() - 2;
+
+        // Click the middle of "A Always" (button col + box pad cell).
+        let btn = &blocks::approval_buttons()[1];
+        let em = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: (TUI_HPAD + btn.col_start + 2) as u16,
+            row: (VIEWPORT_VPAD + row - app.scroll_y) as u16,
+            modifiers: KeyModifiers::empty(),
+        };
+        let fx = app.mouse(em);
+        assert!(app.approval.is_none(), "click closed the prompt");
+        assert!(
+            matches!(
+                fx.first(),
+                Some(Effect::RespondApproval { decision, .. }) if decision == "allow_always"
+            ),
+            "click resolved approval: {fx:?}"
+        );
+
+        // A click on the gap between buttons resolves nothing.
+        let mut app = App::new_test(90, 30);
+        app.handle_stream_event(&parse_stream_event(&request));
+        app.viewport_dirty = true;
+        app.refresh_viewport();
+        let bi = app
+            .blocks
+            .iter()
+            .position(|b| b.approval.is_some())
+            .unwrap();
+        let lines = app.blocks[bi].lines.as_ref().unwrap();
+        let row = app.block_start[bi] + lines.len() - 3; // row above the buttons
+        let btn = &blocks::approval_buttons()[1];
+        let em = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: (TUI_HPAD + btn.col_start + 2) as u16,
+            row: (VIEWPORT_VPAD + row - app.scroll_y) as u16,
+            modifiers: KeyModifiers::empty(),
+        };
+        let fx = app.mouse(em);
+        assert!(fx.is_empty(), "row above buttons is not clickable: {fx:?}");
+        assert!(app.approval.is_some(), "prompt stays up on a miss");
+    }
+
+    #[test]
     fn tab_and_ctrl_t_cycle_thinking() {
         let mut app = App::new_test(90, 30);
         app.thinking_levels = vec!["none".into(), "low".into(), "high".into()];
@@ -5092,6 +5600,27 @@ mod tests {
         assert_eq!(app.input.value, "line\n\n");
         // Plain enter would send; ensure it did not run here.
         assert!(!app.streaming);
+    }
+
+    #[test]
+    fn shift_down_toggles_subagent_menu() {
+        let mut app = App::new_test(90, 30);
+        app.session.id = "parent".into();
+
+        // First Shift+Down opens, second closes, third reopens.
+        let fx = app.key(key(KeyCode::Down, KeyModifiers::SHIFT));
+        assert!(app.manage_visible);
+        assert!(fx.iter().any(|e| matches!(e, Effect::ListChildren { .. })));
+        app.key(key(KeyCode::Down, KeyModifiers::SHIFT));
+        assert!(!app.manage_visible);
+        app.key(key(KeyCode::Down, KeyModifiers::SHIFT));
+        assert!(app.manage_visible);
+
+        // The clickable status-bar hint toggles too.
+        app.run_status_nav_action(crate::statusbar::NavAction::OpenSubagents);
+        assert!(!app.manage_visible);
+        app.run_status_nav_action(crate::statusbar::NavAction::OpenSubagents);
+        assert!(app.manage_visible);
     }
 
     #[test]
@@ -5277,15 +5806,62 @@ mod tests {
             Some(atom_core::config::CompactionConfig {
                 provider: "openai".into(),
                 model: "compact-model".into(),
+                ..Default::default()
             })
         );
+    }
+
+    #[test]
+    fn settings_toggle_disables_and_reenables_auto_compaction() {
+        let mut app = App::new_test(80, 24);
+        app.overlay = Some(OverlayKind::Settings);
+        app.overlay_sel = 1;
+        assert!(app.confirm_overlay().is_empty());
+        assert_eq!(app.overlay, Some(OverlayKind::Settings));
+        assert_eq!(
+            app.atom_config.compaction,
+            Some(atom_core::config::CompactionConfig {
+                enabled: Some(false),
+                ..Default::default()
+            })
+        );
+
+        app.confirm_overlay();
+        assert!(app.atom_config.compaction.unwrap().resolved_enabled());
+
+        // Picking a compaction model keeps the disabled flag.
+        app.atom_config.compaction = Some(atom_core::config::CompactionConfig {
+            enabled: Some(false),
+            ..Default::default()
+        });
+        app.model_picker_purpose = overlays::ModelPickerPurpose::Compaction;
+        app.overlay = Some(OverlayKind::Model);
+        app.overlay_entries = vec![model_entry("openai", "compact-model")];
+        app.overlay_sel = overlays::first_model_row(&app);
+        assert!(app.confirm_overlay().is_empty());
+        let compaction = app.atom_config.compaction.unwrap();
+        assert_eq!(compaction.model, "compact-model");
+        assert!(!compaction.resolved_enabled());
+    }
+
+    #[test]
+    fn settings_toggle_flips_transparent_background() {
+        let mut app = App::new_test(80, 24);
+        app.overlay = Some(OverlayKind::Settings);
+        app.overlay_sel = 4;
+        assert!(app.confirm_overlay().is_empty());
+        assert_eq!(app.overlay, Some(OverlayKind::Settings));
+        assert_eq!(app.atom_config.transparent_background, Some(true));
+
+        app.confirm_overlay();
+        assert_eq!(app.atom_config.transparent_background, Some(false));
     }
 
     #[test]
     fn settings_web_search_picker_saves_bundled_tool() {
         let mut app = App::new_test(80, 24);
         app.overlay = Some(OverlayKind::Settings);
-        app.overlay_sel = 1;
+        app.overlay_sel = 2;
         assert!(app.confirm_overlay().is_empty());
         assert_eq!(app.overlay, Some(OverlayKind::WebSearch));
 
@@ -5298,6 +5874,27 @@ mod tests {
             Some(atom_core::config::WebSearchConfig {
                 server: "exa".into(),
                 tool: "web_search_exa".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn settings_web_fetch_picker_saves_bundled_tool() {
+        let mut app = App::new_test(80, 24);
+        app.overlay = Some(OverlayKind::Settings);
+        app.overlay_sel = 3;
+        assert!(app.confirm_overlay().is_empty());
+        assert_eq!(app.overlay, Some(OverlayKind::WebFetch));
+
+        let rows = overlays::web_fetch_rows(&app);
+        app.overlay_sel = rows.iter().position(|row| row.0 == "exa").unwrap();
+        assert!(app.confirm_overlay().is_empty());
+        assert_eq!(app.overlay, Some(OverlayKind::Settings));
+        assert_eq!(
+            app.atom_config.web_fetch,
+            Some(atom_core::config::WebFetchConfig {
+                server: "exa".into(),
+                tool: "web_fetch".into(),
             })
         );
     }
@@ -5524,26 +6121,6 @@ mod tests {
             overlays::stats_scroll_max(&app),
             "scroll clamps at max"
         );
-    }
-
-    #[test]
-    fn click_on_esc_hint_closes_open_menu() {
-        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
-        let mut app = App::new_test(100, 40);
-        app.context_visible = true;
-        app.refresh_viewport();
-        let geo = crate::view::Layout::compute(&app);
-        let regions = crate::statusbar::nav_hit_regions(&app);
-        let (row, c0, _, action) = regions[0];
-        assert_eq!(action, crate::statusbar::NavAction::CloseMenu);
-        let ev = MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: (TUI_HPAD + c0) as u16,
-            row: (geo.status_y + row) as u16,
-            modifiers: KeyModifiers::empty(),
-        };
-        let _ = app.mouse(ev);
-        assert!(!app.context_visible, "click closed the open menu");
     }
 
     #[test]
@@ -6233,7 +6810,7 @@ mod tests {
 
         app.handle_stream_event(&StreamEvent {
             event_type: "tool".into(),
-            name: "dispatch".into(),
+            name: "subagent".into(),
             arguments: r#"{"tasks":[]}"#.into(),
             ..Default::default()
         });
@@ -6288,6 +6865,101 @@ mod tests {
             app.blocks.is_empty(),
             "placeholder must not survive past done"
         );
+    }
+
+    #[test]
+    fn mid_turn_submit_finalizes_live_thinking() {
+        let mut app = App::new_test(80, 20);
+        app.session.id = "sess1".into();
+        app.sel_provider.base_url = "http://test:11434/v1".into();
+        app.streaming = true;
+        app.turn_id = "turn-1".into();
+
+        app.handle_stream_event(&StreamEvent {
+            event_type: "round_start".into(),
+            ..Default::default()
+        });
+        app.handle_stream_event(&StreamEvent {
+            event_type: "reasoning".into(),
+            text: "deep thought".into(),
+            ..Default::default()
+        });
+
+        // User sends a message mid-turn.
+        app.input.set_value("hm");
+        let text = app.input.value.trim().to_string();
+        let fx = app.handle_input(&text);
+        assert!(fx.iter().any(|e| matches!(e, Effect::InjectTurn { .. })));
+
+        // The live Thinking block must close at submit time, not keep
+        // spinning above the user message.
+        assert!(!app
+            .blocks
+            .iter()
+            .any(|b| b.kind == BlockKind::Reasoning && b.active));
+        assert_eq!(app.blocks.last().unwrap().kind, BlockKind::User);
+
+        // Deltas still in flight from the cancelled round stack a fresh
+        // block after the user message; its reasoning_end closes it.
+        app.handle_stream_event(&StreamEvent {
+            event_type: "reasoning".into(),
+            text: "tail of the cancelled round".into(),
+            ..Default::default()
+        });
+        assert_eq!(
+            app.blocks
+                .iter()
+                .filter(|b| b.kind == BlockKind::Reasoning && b.active)
+                .count(),
+            1
+        );
+        app.handle_stream_event(&StreamEvent {
+            event_type: "reasoning_end".into(),
+            ..Default::default()
+        });
+        assert!(!app
+            .blocks
+            .iter()
+            .any(|b| b.kind == BlockKind::Reasoning && b.active));
+    }
+
+    #[test]
+    fn finalize_reasoning_closes_every_active_block() {
+        let mut app = App::new_test(80, 20);
+        app.handle_stream_event(&StreamEvent {
+            event_type: "round_start".into(),
+            ..Default::default()
+        });
+        app.handle_stream_event(&StreamEvent {
+            event_type: "reasoning".into(),
+            text: "first".into(),
+            ..Default::default()
+        });
+        // The mid-turn race shape: a user block lands, then more
+        // reasoning deltas stack a second active block after it.
+        app.blocks.push(Block {
+            kind: BlockKind::User,
+            text: "hm".into(),
+            ..Default::default()
+        });
+        app.handle_stream_event(&StreamEvent {
+            event_type: "reasoning".into(),
+            text: "second".into(),
+            ..Default::default()
+        });
+        assert_eq!(
+            app.blocks
+                .iter()
+                .filter(|b| b.kind == BlockKind::Reasoning && b.active)
+                .count(),
+            2
+        );
+
+        app.finalize_reasoning(None);
+        assert!(!app
+            .blocks
+            .iter()
+            .any(|b| b.kind == BlockKind::Reasoning && b.active));
     }
 
     #[test]
@@ -6472,42 +7144,38 @@ mod tests {
     }
 
     #[test]
-    fn enter_during_stream_pauses_and_sends_interruption() {
+    fn enter_during_stream_injects_without_pausing() {
         let mut app = App::new_test(90, 30);
         app.session.id = "sess1".into();
         app.sel_provider.base_url = "http://test:11434/v1".into();
         app.streaming = true;
         app.turn_id = "turn-1".into();
 
-        // While streaming, typing "interrupt" and pressing Enter pauses
-        // the running turn and sends the interruption in one effect; the
-        // prompt is cleared immediately so the next draft can start.
+        // While streaming, typing "interrupt" and pressing Enter injects
+        // the prompt into the running turn: nothing pauses, the
+        // already-open stream keeps painting, and the input is free for
+        // the next draft immediately.
         app.input.set_value("interrupt");
         let text = app.input.value.trim().to_string();
         let fx = app.handle_input(&text);
 
-        // The message is not stored in the App: it rides in the effect,
-        // and the input is already free for the next draft.
-        assert!(app.paused);
+        assert!(!app.paused);
         assert!(app.streaming);
-        assert!(app.interrupting);
+        assert!(!app.interrupting);
         assert!(app.input.value.is_empty());
         let last = app.blocks.last().expect("user block pushed");
         assert_eq!(last.kind, BlockKind::User);
         assert_eq!(last.text, "interrupt");
-        let (pause_turn_id, req) = fx
+        let req = fx
             .iter()
             .find_map(|e| match e {
-                Effect::InterruptTurn { pause_turn_id, req } => {
-                    Some((pause_turn_id.as_str(), req.message.as_str()))
-                }
+                Effect::InjectTurn { req } => Some(req),
                 _ => None,
             })
-            .expect("InterruptTurn effect");
-        // Pause targets the turn that was streaming; the request carries
-        // the fresh turn id for the interruption itself.
-        assert_eq!(pause_turn_id, "turn-1");
-        assert_eq!(req, "interrupt");
+            .expect("InjectTurn effect");
+        // The live turn keeps its id: a later Esc must still target it.
+        assert_eq!(req.turn_id, "turn-1");
+        assert_eq!(req.message, "interrupt");
         assert!(fx.iter().any(|e| matches!(e, Effect::PaintPreviews)));
     }
 
@@ -6583,90 +7251,36 @@ mod tests {
     }
 
     #[test]
-    fn stale_saved_during_interrupt_does_not_reload() {
+    fn saved_and_send_closed_reload_after_mid_turn_inject() {
         let mut app = App::new_test(90, 30);
         app.session.id = "sess1".into();
         app.sel_provider.base_url = "http://test:11434/v1".into();
         app.streaming = true;
         app.turn_id = "turn-1".into();
 
-        // Mid-stream submit arms the interruption guard.
+        // Mid-turn submit: nothing pauses, the turn keeps streaming.
         app.input.set_value("interrupt");
         let text = app.input.value.trim().to_string();
         let fx = app.handle_input(&text);
-        assert!(app.interrupting);
-        assert!(fx.iter().any(|e| matches!(e, Effect::InterruptTurn { .. })));
+        assert!(!app.paused);
+        assert!(app.streaming);
+        assert!(fx.iter().any(|e| matches!(e, Effect::InjectTurn { .. })));
         assert_eq!(
             app.blocks.last().map(|b| b.text.as_str()),
             Some("interrupt")
         );
 
-        // The paused turn persists and broadcasts "saved" while the
-        // interruption is still dialing: it must not arm a reload.
+        // The running turn persists (the injected prompt included) and
+        // broadcasts "saved" while still live: the reload is deferred.
         let fx = app.handle_msg(AppMsg::SubEvent(serde_json::json!({"type": "saved"})));
         assert!(fx.is_empty());
-        assert!(!app.pending_saved);
+        assert!(app.pending_saved);
 
-        // The old stream closing must not reload either: the server
-        // transcript doesn't contain the interruption message yet, so a
-        // reload would drop the user block from the view.
+        // When the turn finally finishes, SendClosed reloads — the
+        // transcript now contains the injected message.
         let fx = app.handle_msg(AppMsg::SendClosed);
         assert!(!app.streaming);
-        assert!(!fx.iter().any(|e| matches!(e, Effect::LoadSession { .. })));
-        assert_eq!(
-            app.blocks.last().map(|b| b.text.as_str()),
-            Some("interrupt")
-        );
-    }
-
-    #[test]
-    fn interrupt_guard_clears_when_stream_starts() {
-        let mut app = App::new_test(90, 30);
-        app.session.id = "sess1".into();
-        app.streaming = true;
-        app.turn_id = "turn-1".into();
-        app.input.set_value("interrupt");
-        let text = app.input.value.trim().to_string();
-        app.handle_input(&text);
-        assert!(app.interrupting);
-
-        // The interruption's stream is live: the guard clears, so the
-        // turn's own "saved" broadcast and SendClosed reload normally.
-        app.handle_msg(AppMsg::SendStarted {
-            sid: "sess1".into(),
-        });
-        assert!(!app.interrupting);
-        assert!(app.streaming);
-        assert!(!app.paused);
-
-        app.handle_msg(AppMsg::SubEvent(serde_json::json!({"type": "saved"})));
-        assert!(app.pending_saved);
-        let fx = app.handle_msg(AppMsg::SendClosed);
         assert!(fx.iter().any(|e| matches!(e, Effect::LoadSession { .. })));
-    }
-
-    #[test]
-    fn entering_mid_stream_without_session_still_pauses() {
-        // Even without a session id, the message should be carried in the
-        // effect and the stream paused.
-        let mut app = App::new_test(90, 30);
-        app.session.id.clear();
-        app.streaming = true;
-
-        app.input.set_value("say something");
-        let text = app.input.value.trim().to_string();
-        let fx = app.handle_input(&text);
-
-        assert!(app.paused);
-        assert!(app.input.value.is_empty());
-        let interrupt = fx
-            .iter()
-            .find_map(|e| match e {
-                Effect::InterruptTurn { req, .. } => Some(req.message.as_str()),
-                _ => None,
-            })
-            .expect("InterruptTurn effect");
-        assert_eq!(interrupt, "say something");
     }
 
     #[test]
@@ -6800,5 +7414,35 @@ mod tests {
             app.blocks[0].lines.as_ref().is_none(),
             "theme switch must drop cached block colors"
         );
+    }
+
+    #[test]
+    fn theme_confirm_resolves_the_filtered_row() {
+        // With a typed query the visible list is the filtered subset and
+        // overlay_sel indexes it; confirm used to resolve against the
+        // unfiltered theme_rows, whose head is "atom" — so every
+        // query-picked theme landed on atom. Filter to a single non-atom
+        // theme and confirm the row the UI highlights.
+        let mut app = App::new_test(80, 20);
+        let prev = atom_core::render::colors::active_theme_name();
+
+        app.overlay = Some(OverlayKind::Theme);
+        app.overlay_q = "dracula".into();
+        app.overlay_sel = 0;
+
+        let effects = app.key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.atom_config.theme.as_deref(),
+            Some("dracula"),
+            "confirm must resolve through the filtered rows"
+        );
+        assert!(app.overlay.is_none());
+        assert!(matches!(effects.last(), Some(Effect::PaintPreviews)));
+
+        // Restore immediately: confirming flipped the global palette, and
+        // other tests pin default-theme colors. Keep the flip window as
+        // short as the assertions allow.
+        atom_core::render::colors::apply_theme(&prev).expect("restore previous theme");
+        app.atom_config.theme = None;
     }
 }

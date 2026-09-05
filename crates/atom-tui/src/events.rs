@@ -23,12 +23,18 @@ pub struct StreamEvent {
     pub text: String,
     pub name: String,
     pub arguments: String,
+    /// The provider tool-call id the event belongs to, so results attach
+    /// to the right block when several background commands are in flight.
+    pub call_id: String,
     pub message: String,
     pub diff: String,
     /// Model that completed a turn, set on `done` events.
     pub model: String,
     /// Provider-reported reasoning duration or server-measured turn duration.
     pub duration: Option<Duration>,
+    /// Generation speed of the completed turn's final model round, set
+    /// on `done` events (0 when the provider reported no usage).
+    pub tokens_per_sec: f64,
     /// set for "usage" events when total > 0
     pub usage: Option<StreamUsage>,
     // approval_request fields
@@ -66,6 +72,7 @@ pub fn parse_stream_event(v: &Value) -> StreamEvent {
         text: jstr(v, "text"),
         name: jstr(v, "name"),
         arguments: jstr(v, "arguments"),
+        call_id: jstr(v, "call_id"),
         message: jstr(v, "message"),
         diff: jstr(v, "diff"),
         model: jstr(v, "model"),
@@ -108,6 +115,10 @@ pub fn parse_stream_event(v: &Value) -> StreamEvent {
     if let Some(ms) = ms.filter(|m| *m > 0.0) {
         ev.duration = Some(Duration::from_secs_f64(ms / 1000.0));
     }
+    ev.tokens_per_sec = v
+        .get("tokens_per_sec")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
     // usage events carry session Input/Output totals (prompt/
     // completion) and the latest-round context size (total).
     let total_raw = jstr(v, "total");
@@ -171,6 +182,13 @@ pub enum Effect {
     FetchStats {
         days: i64,
     },
+    /// /profile: spawn a one-shot `ps` against the client and server
+    /// pids so the overlay can show live resource utilization. The
+    /// snapshot is delivered back as AppMsg::ProfileLoaded.
+    FetchProfile {
+        client_pid: i32,
+        server_pid: Option<i32>,
+    },
     LoadSession {
         id: String,
     },
@@ -216,12 +234,12 @@ pub enum Effect {
         id: String,
     },
     PauseTurn,
-    /// Mid-stream submit: pause the running turn via the server first,
-    /// then dial the /send stream for the interruption. The message
-    /// rides in the request so the App never stores a copy of the
-    /// submitted prompt.
-    InterruptTurn {
-        pause_turn_id: String,
+    /// Mid-turn submit: the prompt is handed to the running turn
+    /// (POST /send queues it on the live turn; the server answers with
+    /// a tiny {"type":"injected"} stream and closes). Nothing is
+    /// paused and the already-open event stream keeps painting; the
+    /// App never stores a copy of the submitted prompt.
+    InjectTurn {
         req: Box<SendRequest>,
     },
     Compact {
@@ -311,6 +329,10 @@ pub enum AppMsg {
     ProvidersRebuilt(Vec<atom_core::providers::providers::Provider>),
     ContextLoaded(Vec<ContextRow>),
     StatsLoaded(Result<Box<StatsReport>, String>),
+    /// /profile: snapshot of CPU/RSS/VSZ/etime for both processes,
+    /// delivered after Effect::FetchProfile finishes. The Box is a
+    /// future-proofing pun — the report itself stays small.
+    ProfileLoaded(Result<Box<crate::profile::ProfileReport>, String>),
     ClipboardText(String),
     /// Image bytes read from the OS clipboard via Ctrl/Cmd+V (mirrors the
     /// `data` half of Go's clipboardPasteMsg; text arrives separately as
@@ -418,6 +440,7 @@ impl std::fmt::Debug for AppMsg {
             AppMsg::ProvidersRebuilt(n) => write!(f, "ProvidersRebuilt({n})", n = n.len()),
             AppMsg::ContextLoaded(n) => write!(f, "ContextLoaded({n})", n = n.len()),
             AppMsg::StatsLoaded(r) => write!(f, "StatsLoaded({r:?})"),
+            AppMsg::ProfileLoaded(r) => write!(f, "ProfileLoaded({:?})", r.as_ref().map(|_| ())),
             AppMsg::ClipboardText(_) => write!(f, "ClipboardText(..)"),
             AppMsg::ClipboardImage { name, data } => {
                 write!(f, "ClipboardImage({name}, {} bytes)", data.len())

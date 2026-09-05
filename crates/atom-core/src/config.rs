@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 pub const CONFIG_VERSION: u32 = 1;
 pub const DEFAULT_COMPACTION_PROVIDER: &str = "opencode-zen";
 pub const DEFAULT_COMPACTION_MODEL: &str = "mimo-v2.5-free";
-pub const DEFAULT_WEB_SEARCH_SERVER: &str = "parallel";
+pub const DEFAULT_WEB_SEARCH_SERVER: &str = "tinyfish";
+pub const DEFAULT_WEB_FETCH_SERVER: &str = "tinyfish";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompactionConfig {
@@ -19,6 +20,17 @@ pub struct CompactionConfig {
     pub provider: String,
     #[serde(default)]
     pub model: String,
+    /// `None` means auto-compaction is enabled (the default). Set to
+    /// `false` to disable folding the conversation when it nears the
+    /// context limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+impl CompactionConfig {
+    pub fn resolved_enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,6 +40,14 @@ pub struct WebSearchConfig {
     pub server: String,
     /// MCP tool name. Bundled profiles fill their conventional tool when
     /// this is omitted.
+    #[serde(default)]
+    pub tool: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebFetchConfig {
+    #[serde(default)]
+    pub server: String,
     #[serde(default)]
     pub tool: String,
 }
@@ -42,6 +62,8 @@ pub struct AtomConfig {
     pub compaction: Option<CompactionConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_search: Option<WebSearchConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_fetch: Option<WebFetchConfig>,
     /// `None` means auto-update is enabled (the default). Set to `false`
     /// to disable the startup auto-updater.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -50,6 +72,13 @@ pub struct AtomConfig {
     /// a user theme in the config `themes/` directory).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
+    /// `None` means the chat viewport paints the theme background like
+    /// every other surface (the default). `Some(true)` renders the
+    /// conversation viewport on the terminal's default background
+    /// (transparent when the terminal profile has no background color);
+    /// all other surfaces keep the theme background.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transparent_background: Option<bool>,
 }
 
 const fn config_version() -> u32 {
@@ -62,8 +91,10 @@ impl Default for AtomConfig {
             version: CONFIG_VERSION,
             compaction: None,
             web_search: None,
+            web_fetch: None,
             auto_update: None,
             theme: None,
+            transparent_background: None,
         }
     }
 }
@@ -97,6 +128,25 @@ impl AtomConfig {
                 .unwrap_or_default();
         }
         value
+    }
+
+    pub fn resolved_web_fetch(&self) -> WebFetchConfig {
+        let mut value = self.web_fetch.clone().unwrap_or_default();
+        if value.server.trim().is_empty() {
+            value.server = DEFAULT_WEB_FETCH_SERVER.into();
+        }
+        if value.tool.trim().is_empty() {
+            value.tool = bundled_web_fetch_profile(&value.server)
+                .map(|p| p.tool)
+                .unwrap_or_default();
+        }
+        value
+    }
+
+    /// Whether the chat viewport renders on the terminal's default
+    /// background instead of the theme background. Off by default.
+    pub fn resolved_transparent_background(&self) -> bool {
+        self.transparent_background.unwrap_or(false)
     }
 
     pub fn setup_complete(&self) -> bool {
@@ -147,12 +197,23 @@ pub fn bundled_web_search_profiles() -> Vec<WebSearchProfile> {
             query_argument: "query".into(),
             auth: WebSearchAuth::Optional,
         },
+        // TinyFish requires an API key on every call (free at any
+        // wallet balance, but never unauthenticated); it exposes REST
+        // only, so keyless runs skip straight to the next provider.
+        WebSearchProfile {
+            id: "tinyfish".into(),
+            name: "TinyFish Web Search".into(),
+            url: "https://api.search.tinyfish.ai".into(),
+            tool: "web_search".into(),
+            query_argument: "query".into(),
+            auth: WebSearchAuth::Required,
+        },
         // Ollama does not publish a hosted MCP endpoint. atom-tools
         // exposes it through the same selected-capability boundary using
         // the official REST API as a bundled compatibility adapter.
         WebSearchProfile {
             id: "ollama".into(),
-            name: "Ollama Web Search".into(),
+            name: "Ollama Cloud Web Search".into(),
             url: String::new(),
             tool: "web_search".into(),
             query_argument: "query".into(),
@@ -163,6 +224,72 @@ pub fn bundled_web_search_profiles() -> Vec<WebSearchProfile> {
 
 pub fn bundled_web_search_profile(id: &str) -> Option<WebSearchProfile> {
     bundled_web_search_profiles()
+        .into_iter()
+        .find(|profile| profile.id == id)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebFetchProfile {
+    pub id: String,
+    pub name: String,
+    /// REST endpoint (keyed; metered per call where noted).
+    pub url: String,
+    pub tool: String,
+    pub auth: WebSearchAuth,
+    /// Hosted MCP endpoint for the keyless route, if the provider
+    /// publishes one (parallel and exa). Empty = no MCP route.
+    pub mcp_url: String,
+    /// The MCP tool served at `mcp_url` (parallel: `web_fetch`,
+    /// exa: `web_fetch_exa`). Empty when there is no MCP route.
+    pub mcp_tool: String,
+}
+
+pub fn bundled_web_fetch_profiles() -> Vec<WebFetchProfile> {
+    vec![
+        WebFetchProfile {
+            id: "parallel".into(),
+            name: "Parallel Web Fetch".into(),
+            url: "https://api.parallel.ai/v1/extract".into(),
+            tool: "web_fetch".into(),
+            auth: WebSearchAuth::Optional,
+            mcp_url: "https://search.parallel.ai/mcp".into(),
+            mcp_tool: "web_fetch".into(),
+        },
+        // Ordered free -> paid in the picker: parallel and exa serve
+        // keyless hosted-MCP fetch routes; tinyfish and ollama need API
+        // keys on every call.
+        WebFetchProfile {
+            id: "exa".into(),
+            name: "Exa Web Fetch".into(),
+            url: "https://api.exa.ai/contents".into(),
+            tool: "web_fetch".into(),
+            auth: WebSearchAuth::Optional,
+            mcp_url: "https://mcp.exa.ai/mcp?tools=web_fetch_exa".into(),
+            mcp_tool: "web_fetch_exa".into(),
+        },
+        WebFetchProfile {
+            id: "tinyfish".into(),
+            name: "TinyFish Web Fetch".into(),
+            url: "https://api.fetch.tinyfish.ai".into(),
+            tool: "web_fetch".into(),
+            auth: WebSearchAuth::Required,
+            mcp_url: String::new(),
+            mcp_tool: String::new(),
+        },
+        WebFetchProfile {
+            id: "ollama".into(),
+            name: "Ollama Cloud Web Fetch".into(),
+            url: "https://ollama.com/api/web_fetch".into(),
+            tool: "web_fetch".into(),
+            auth: WebSearchAuth::Required,
+            mcp_url: String::new(),
+            mcp_tool: String::new(),
+        },
+    ]
+}
+
+pub fn bundled_web_fetch_profile(id: &str) -> Option<WebFetchProfile> {
+    bundled_web_fetch_profiles()
         .into_iter()
         .find(|profile| profile.id == id)
 }
@@ -245,8 +372,76 @@ mod tests {
     fn missing_fields_resolve_without_becoming_configured() {
         let config = AtomConfig::default();
         assert!(!config.setup_complete());
-        assert_eq!(config.resolved_web_search().server, "parallel");
+        assert!(config.resolved_web_search().server == DEFAULT_WEB_SEARCH_SERVER);
         assert_eq!(config.resolved_compaction().model, DEFAULT_COMPACTION_MODEL);
+    }
+
+    #[test]
+    fn compaction_enabled_defaults_on_and_disables_explicitly() {
+        assert!(CompactionConfig::default().resolved_enabled());
+        assert!(AtomConfig::default()
+            .resolved_compaction()
+            .resolved_enabled());
+        assert!(!CompactionConfig {
+            enabled: Some(false),
+            ..Default::default()
+        }
+        .resolved_enabled());
+    }
+
+    #[test]
+    fn transparent_background_defaults_off_and_toggles_explicitly() {
+        // `None` (unset) and `Some(false)` both keep the viewport opaque;
+        // only an explicit `Some(true)` switches to the terminal default.
+        assert!(!AtomConfig::default().resolved_transparent_background());
+        assert!(!AtomConfig {
+            transparent_background: Some(false),
+            ..Default::default()
+        }
+        .resolved_transparent_background());
+        assert!(AtomConfig {
+            transparent_background: Some(true),
+            ..Default::default()
+        }
+        .resolved_transparent_background());
+    }
+
+    #[test]
+    fn tinyfish_is_default_for_search_and_fetch() {
+        assert_eq!(DEFAULT_WEB_SEARCH_SERVER, "tinyfish");
+        assert_eq!(DEFAULT_WEB_FETCH_SERVER, "tinyfish");
+        let config = AtomConfig::default();
+        assert_eq!(config.resolved_web_search().server, "tinyfish");
+        assert_eq!(config.resolved_web_fetch().server, "tinyfish");
+    }
+
+    #[test]
+    fn bundled_fetch_profiles_are_stable() {
+        assert!(bundled_web_fetch_profile("tinyfish").is_some());
+        assert!(bundled_web_fetch_profile("parallel").is_some());
+        assert!(bundled_web_fetch_profile("exa").is_some());
+        assert!(bundled_web_fetch_profile("ollama").is_some());
+        // exa serves a keyless hosted-MCP fetch route (web_fetch_exa);
+        // tinyfish is REST-only and always requires an API key.
+        assert_eq!(
+            bundled_web_fetch_profile("exa").unwrap().auth,
+            WebSearchAuth::Optional
+        );
+        assert_eq!(
+            bundled_web_fetch_profile("tinyfish").unwrap().auth,
+            WebSearchAuth::Required
+        );
+        for id in ["parallel", "exa"] {
+            let p = bundled_web_fetch_profile(id).unwrap();
+            assert!(!p.mcp_url.is_empty() && !p.mcp_tool.is_empty(), "{id}");
+        }
+        for id in ["tinyfish", "ollama"] {
+            assert!(bundled_web_fetch_profile(id).unwrap().mcp_url.is_empty());
+        }
+        // parallel is the first (free, keyless) fallback in both
+        // bundled orderings.
+        assert_eq!(bundled_web_fetch_profiles()[0].id, "parallel");
+        assert_eq!(bundled_web_search_profiles()[0].id, "parallel");
     }
 
     #[test]
@@ -255,6 +450,7 @@ mod tests {
             compaction: Some(CompactionConfig {
                 provider: DEFAULT_COMPACTION_PROVIDER.into(),
                 model: DEFAULT_COMPACTION_MODEL.into(),
+                ..Default::default()
             }),
             web_search: Some(WebSearchConfig {
                 server: "custom".into(),
@@ -286,6 +482,7 @@ mod tests {
             compaction: Some(CompactionConfig {
                 provider: "openai".into(),
                 model: "gpt-5".into(),
+                ..Default::default()
             }),
             web_search: Some(WebSearchConfig {
                 server: "exa".into(),

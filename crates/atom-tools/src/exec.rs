@@ -112,7 +112,7 @@ pub async fn execute_tool(ctx: &ToolCtx<'_>, name: &str, args_json: &str) -> Too
             &ctx.cwd.display().to_string(),
         )),
         "customize" => ToolOutcome::from_text(customize::execute_customize(args_json)),
-        "dispatch" => ToolOutcome::from_text(dispatch::execute_dispatch(ctx, args_json).await),
+        "subagent" => ToolOutcome::from_text(dispatch::execute_dispatch(ctx, args_json).await),
         "web_search" => {
             #[derive(serde::Deserialize)]
             struct Args {
@@ -494,11 +494,11 @@ mod tests {
         let ctx = test_ctx(dir.path());
         let out = execute_tool(
             &ctx,
-            "dispatch",
+            "subagent",
             r#"{"action":"spawn","model":"m","thinking":"low","tasks":["x"]}"#,
         )
         .await;
-        assert_eq!(out.text, "error: dispatch requires an active session");
+        assert_eq!(out.text, "error: subagent requires an active session");
     }
 
     struct FakeSpawner {
@@ -560,7 +560,7 @@ mod tests {
         let ctx = spawner_ctx(&s);
         let out = execute_tool(
             &ctx,
-            "dispatch",
+            "subagent",
             r#"{"action":"spawn","model":"m","thinking":"low","tasks":["hi"]}"#,
         )
         .await;
@@ -569,7 +569,7 @@ mod tests {
 
         let out = execute_tool(
             &ctx,
-            "dispatch",
+            "subagent",
             r#"{"action":"send","ids":["0123456789abcdef"],"prompt":"go on"}"#,
         )
         .await;
@@ -577,7 +577,7 @@ mod tests {
 
         let out = execute_tool(
             &ctx,
-            "dispatch",
+            "subagent",
             r#"{"action":"inspect","ids":["0123456789abcdef"]}"#,
         )
         .await;
@@ -585,7 +585,7 @@ mod tests {
 
         let out = execute_tool(
             &ctx,
-            "dispatch",
+            "subagent",
             r#"{"action":"inspect","ids":["0123456789abcdef"],"wait":"all"}"#,
         )
         .await;
@@ -594,7 +594,7 @@ mod tests {
 
         let out = execute_tool(
             &ctx,
-            "dispatch",
+            "subagent",
             r#"{"action":"cancel","ids":["0123456789abcdef"]}"#,
         )
         .await;
@@ -607,7 +607,7 @@ mod tests {
         let ctx = spawner_ctx(&s);
         let out = execute_tool(
             &ctx,
-            "dispatch",
+            "subagent",
             r#"{"action":"spawn","provider":"shared-provider","model":"shared","thinking":"high","tasks":["one","two"]}"#,
         )
         .await;
@@ -633,7 +633,7 @@ mod tests {
         let ctx = spawner_ctx(&s);
         let out = execute_tool(
             &ctx,
-            "dispatch",
+            "subagent",
             r#"{"action":"spawn","thinking":"high","tasks":[]}"#,
         )
         .await;
@@ -641,7 +641,7 @@ mod tests {
 
         let out = execute_tool(
             &ctx,
-            "dispatch",
+            "subagent",
             r#"{"action":"spawn","thinking":"high","tasks":["  "]}"#,
         )
         .await;
@@ -655,7 +655,7 @@ mod tests {
         let ctx = spawner_ctx(&s);
         let out = execute_tool(
             &ctx,
-            "dispatch",
+            "subagent",
             r#"{"action":"spawn","thinking":"high","tasks":"just one task"}"#,
         )
         .await;
@@ -669,7 +669,7 @@ mod tests {
     async fn dispatch_inspect_without_target_lists_all() {
         let s = FakeSpawner::new();
         let ctx = spawner_ctx(&s);
-        let out = execute_tool(&ctx, "dispatch", r#"{"action":"inspect"}"#).await;
+        let out = execute_tool(&ctx, "subagent", r#"{"action":"inspect"}"#).await;
         assert!(out.text.contains("\"delegates\""));
     }
 

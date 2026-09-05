@@ -130,7 +130,8 @@ fn head_from_spans(text: String, spans: Vec<Span<'static>>) -> Head {
 
 fn status_head(app: &App) -> Head {
     let lvl = app.thinking_level();
-    if lvl.is_empty() {
+    let profile = app.profile_name();
+    if lvl.is_empty() && profile.is_empty() {
         head_from_spans(
             app.sel_model.clone(),
             vec![Span::styled(
@@ -139,14 +140,24 @@ fn status_head(app: &App) -> Head {
             )],
         )
     } else {
-        head_from_spans(
-            format!("{} {}", app.sel_model, lvl),
-            vec![
-                Span::styled(app.sel_model.clone(), ansi::style_foreground()),
-                Span::styled(" ", ansi::style_dim()),
-                Span::styled(lvl, ansi::style_primary()),
-            ],
-        )
+        let mut text = app.sel_model.clone();
+        let mut spans = vec![Span::styled(
+            app.sel_model.clone(),
+            ansi::style_foreground(),
+        )];
+        for (label, style) in [
+            (!lvl.is_empty()).then(|| (lvl, ansi::style_primary())),
+            (!profile.is_empty()).then(|| (profile, ansi::style_dim())),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            text.push(' ');
+            text.push_str(&label);
+            spans.push(Span::styled(" ", ansi::style_dim()));
+            spans.push(Span::styled(label, style));
+        }
+        head_from_spans(text, spans)
     }
 }
 

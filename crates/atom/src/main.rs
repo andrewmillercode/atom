@@ -17,6 +17,8 @@ struct LastModel {
     model: String,
     #[serde(default)]
     thinking: String,
+    #[serde(default)]
+    profile: String,
 }
 
 fn last_model_path() -> PathBuf {
@@ -36,7 +38,7 @@ fn load_last_model() -> Option<LastModel> {
 
 /// saveLastModel records the model as the last used one. An empty model
 /// is ignored; an empty thinking keeps the previously saved level.
-fn save_last_model_state(provider_name: &str, model: &str, thinking: &str) {
+fn save_last_model_state(provider_name: &str, model: &str, thinking: &str, profile: &str) {
     if model.is_empty() {
         return;
     }
@@ -44,6 +46,7 @@ fn save_last_model_state(provider_name: &str, model: &str, thinking: &str) {
         provider: provider_name.to_string(),
         model: model.to_string(),
         thinking: thinking.to_string(),
+        profile: profile.to_string(),
     };
     if lm.thinking.is_empty() {
         if let Some(prev) = load_last_model() {
@@ -252,6 +255,9 @@ async fn run() -> Result<()> {
         reasoning_field: String::new(),
     };
     let mut sel_model = String::new();
+    // Agent profile persisted from the last run; restored only when
+    // booting into the saved model (no explicit flags).
+    let mut profile = String::new();
 
     // No flags at all: default to the last used model, else open the
     // model selector on startup (empty sel_model).
@@ -267,6 +273,7 @@ async fn run() -> Result<()> {
             {
                 sel_provider = p;
                 sel_model = lm.model;
+                profile = lm.profile;
                 defaulted = true;
             }
         }
@@ -335,8 +342,13 @@ async fn run() -> Result<()> {
 
     // An explicitly chosen model becomes the default for future launches.
     if !sel_model.is_empty() {
-        let thinking = load_last_model().map(|m| m.thinking).unwrap_or_default();
-        save_last_model_state(&sel_provider.name, &sel_model, &thinking);
+        let last = load_last_model();
+        let thinking = last
+            .as_ref()
+            .map(|m| m.thinking.clone())
+            .unwrap_or_default();
+        let saved_profile = last.as_ref().map(|m| m.profile.clone()).unwrap_or_default();
+        save_last_model_state(&sel_provider.name, &sel_model, &thinking, &saved_profile);
     }
 
     // Create or resume a session.
@@ -374,6 +386,7 @@ async fn run() -> Result<()> {
         started_at_instant,
         started_at_wall,
         server_pid,
+        profile,
     )
     .await
 }
@@ -399,6 +412,7 @@ async fn launch_tui(
     started_at_instant: std::time::Instant,
     started_at_wall: std::time::SystemTime,
     server_pid: Option<i32>,
+    profile: String,
 ) -> Result<()> {
     let opts = atom_tui::app::RunOptions {
         providers,
@@ -414,6 +428,7 @@ async fn launch_tui(
         started_at: Some(started_at_wall),
         started_instant: Some(started_at_instant),
         server_pid,
+        profile,
     };
     atom_tui::run(opts, args.hot).await
 }
@@ -452,7 +467,9 @@ fn warn_stale_dev_install() {
     if !atom_core::build::is_dev() {
         return;
     }
-    let Ok(exe) = std::env::current_exe() else { return };
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
     let Some(dir) = exe.parent() else { return };
     let Some(artifact) = atom_core::build::dev_debug_artifact(dir, "atom") else {
         return;

@@ -382,10 +382,7 @@ where
         // First delta of any kind ends the time-to-first-token window;
         // generation speed is measured from here to stream end.
         if first_token_at.is_none()
-            && (saw_reasoning
-                || saw_tool_call
-                || !reply.is_empty()
-                || !reasoning.is_empty())
+            && (saw_reasoning || saw_tool_call || !reply.is_empty() || !reasoning.is_empty())
         {
             first_token_at = Some(Instant::now());
         }
@@ -1226,7 +1223,7 @@ pub async fn run_session_turn(
         tools.push(atom_tools::defs::find_tool_def());
     }
     if !parent_id.is_empty() {
-        tools = without_tool(&tools, "dispatch");
+        tools = without_tool(&tools, "subagent");
     }
 
     // One failed auto-compact must not be retried on every tool round:

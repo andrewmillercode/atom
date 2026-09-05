@@ -605,7 +605,10 @@ async fn quiet_parked_command_ends_turn_without_report_round() {
 
     let got = state.store.get(&sess.id).unwrap();
     let roles: Vec<&str> = got.messages.iter().map(|m| m.role.as_str()).collect();
-    assert_eq!(roles, vec!["user", "assistant", "tool", "user", "assistant"]);
+    assert_eq!(
+        roles,
+        vec!["user", "assistant", "tool", "user", "assistant"]
+    );
     assert_eq!(
         got.messages[2].content, "",
         "quiet exit records an empty result"

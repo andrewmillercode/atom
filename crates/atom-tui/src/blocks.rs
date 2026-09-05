@@ -544,7 +544,7 @@ pub fn tool_action(name: &str, arguments: &str) -> String {
                 }
             }
         }
-        "dispatch" => {
+        "subagent" => {
             let v = ok(&args);
             let action = v.get("action").and_then(|a| a.as_str()).unwrap_or("");
             if action == "spawn" {
@@ -2004,12 +2004,12 @@ mod tests {
             "rust async traits"
         );
         assert_eq!(
-            tool_action("dispatch", r#"{"model":"m","prompt":"Review scenes"}"#),
+            tool_action("subagent", r#"{"model":"m","prompt":"Review scenes"}"#),
             "Review scenes"
         );
         assert_eq!(
             tool_action(
-                "dispatch",
+                "subagent",
                 r#"{"cancel":true,"session_id":"0123456789abcdef"}"#
             ),
             "cancel 0123456789abcdef"
@@ -2116,8 +2116,8 @@ mod tests {
     fn dispatch_result_sets_session_id() {
         let mut blocks = vec![Block {
             kind: BlockKind::Tool,
-            title: "Dispatch".into(),
-            tool_name: "dispatch".into(),
+            title: "Subagent".into(),
+            tool_name: "subagent".into(),
             ..Default::default()
         }];
         attach_tool_result(&mut blocks, "", "id: 0123456789abcdef\nstarted", "");

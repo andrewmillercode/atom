@@ -923,7 +923,9 @@ mod tests {
             "live copy must now hold the artifact contents"
         );
         // The temp file was renamed away, not left behind.
-        assert!(!live.with_file_name(format!(".atomsdev.new-{}", std::process::id())).exists());
+        assert!(!live
+            .with_file_name(format!(".atomsdev.new-{}", std::process::id()))
+            .exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -944,10 +946,8 @@ mod tests {
         // Touch a into the future (b touches now): now strictly newer.
         let future = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
         let fa = std::fs::File::options().append(true).open(&a).unwrap();
-        fa.set_times(
-            std::fs::FileTimes::new().set_modified(future),
-        )
-        .unwrap();
+        fa.set_times(std::fs::FileTimes::new().set_modified(future))
+            .unwrap();
         assert!(newer_mtime(&a, &b));
         assert!(!newer_mtime(&b, &a));
 

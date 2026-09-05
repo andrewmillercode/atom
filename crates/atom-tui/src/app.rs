@@ -82,6 +82,9 @@ pub struct RunOptions {
     /// server isn't reachable, so the profile overlay can show "no
     /// server pid known" instead of crashing.
     pub server_pid: Option<i32>,
+    /// Name of the agent profile persisted from the last run; empty
+    /// restores the default (no profile) state.
+    pub profile: String,
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +128,10 @@ pub struct App {
     pub thinking_levels: Vec<String>,
     pub thinking_idx: usize,
     pub thinking_pref: String,
+
+    // agent profiles (index 0 = implicit default, hidden in the UI)
+    pub profiles: Vec<atom_core::profiles::AgentProfile>,
+    pub profile_idx: usize,
 
     /// whether reasoning blocks are rendered; toggled with /thinking.
     pub show_reasoning: bool,
@@ -326,6 +333,8 @@ impl App {
             thinking_levels: Vec::new(),
             thinking_idx: 0,
             thinking_pref: String::new(),
+            profiles: Vec::new(),
+            profile_idx: 0,
             show_reasoning: true,
             blocks: Vec::new(),
             content_lines: Vec::new(),
@@ -423,6 +432,14 @@ impl App {
         };
         m.refresh_thinking_levels();
         m.apply_thinking(&m.session.thinking.clone());
+        // Restore the persisted agent profile by name. Its model and
+        // thinking presets are already baked into the restored model.
+        if !opts.profile.is_empty() {
+            m.profiles = atom_core::profiles::load_profiles();
+            if let Some(idx) = m.profiles.iter().position(|p| p.name == opts.profile) {
+                m.profile_idx = idx;
+            }
+        }
         // Apply the persisted theme after any dev hot-theme load so the
         // user's selection wins in normal runs (hot reload only runs in
         // --hot mode, which layers on top of this afterwards).
@@ -455,6 +472,7 @@ impl App {
             started_at: None,
             started_instant: None,
             server_pid: None,
+            profile: String::new(),
         });
         app.width = width;
         app.height = height;
@@ -548,6 +566,138 @@ impl App {
         self.thinking_pref = self.thinking_levels[self.thinking_idx].clone();
     }
 
+    // -- agent profiles ----------------------------------------------------
+
+    /// Label of the selected profile; empty for the implicit default
+    /// (the no-profile state), which stays hidden in the status bar.
+    pub fn profile_name(&self) -> String {
+        self.profiles
+            .get(self.profile_idx)
+            .map(|p| p.name.clone())
+            .unwrap_or_default()
+    }
+
+    /// cycleProfile advances default -> plan -> build -> ... -> default,
+    /// applying each profile's model and thinking preset. Returns the
+    /// effects of any session model/thinking patch.
+    pub fn cycle_profile(&mut self) -> Vec<Effect> {
+        if self.profiles.is_empty() {
+            self.profiles = atom_core::profiles::load_profiles();
+        }
+        if self.profiles.len() <= 1 {
+            return Vec::new(); // only the implicit default exists
+        }
+        self.profile_idx = (self.profile_idx + 1) % self.profiles.len();
+        self.apply_profile()
+    }
+
+    fn apply_profile(&mut self) -> Vec<Effect> {
+        let Some(profile) = self.profiles.get(self.profile_idx) else {
+            return Vec::new();
+        };
+        if profile.name.is_empty() {
+            return Vec::new(); // default: the no-profile state, nothing to apply
+        }
+        let want_thinking = (!profile.thinking.is_empty()).then(|| profile.thinking.clone());
+        if profile.model.is_empty() {
+            // No model switch: only the thinking preset changes.
+            self.apply_profile_thinking(want_thinking);
+            return self.commit_thinking();
+        }
+        let (provider_ref, model_id) = atom_core::profiles::model_ref(&profile.model);
+        let provider = if model_id == self.sel_model {
+            None
+        } else {
+            match provider_ref {
+                // An explicit provider prefix names the provider.
+                Some(name) => self
+                    .providers
+                    .iter()
+                    .find(|p| p.name == name || p.id == name)
+                    .cloned(),
+                None => self.provider_for_profile_model(model_id),
+            }
+        };
+        match provider {
+            Some(provider) => self.use_model(provider, model_id.to_string(), want_thinking),
+            // Unknown provider for the pinned model: keep the current
+            // model so validation reports it at send time.
+            None => {
+                self.apply_profile_thinking(want_thinking);
+                self.commit_thinking()
+            }
+        }
+    }
+
+    /// Overrides the thinking level with the profile preset when it is
+    /// valid for the current model.
+    fn apply_profile_thinking(&mut self, want: Option<String>) {
+        let Some(level) = want else {
+            return;
+        };
+        self.refresh_thinking_levels();
+        if let Some(idx) = self.thinking_levels.iter().position(|l| *l == level) {
+            self.thinking_idx = idx;
+            self.thinking_pref = level;
+        }
+    }
+
+    /// Resolves a profile-pinned model id to a configured provider via
+    /// the models.dev catalog; falls back to the current provider.
+    fn provider_for_profile_model(&self, model: &str) -> Option<Provider> {
+        let catalog_id = modelsdev::provider_for_model(model)?;
+        self.providers
+            .iter()
+            .find(|p| modelsdev::provider_catalog_id(p) == catalog_id)
+            .cloned()
+    }
+
+    /// use_model switches the session's model (and optionally the
+    /// thinking level), patching a live session or seeding the next
+    /// session creation. Shared by the model picker and profile cycling;
+    /// `want_thinking` overrides the session's saved level (agent
+    /// profiles), otherwise it is preserved.
+    fn use_model(
+        &mut self,
+        provider: Provider,
+        model: String,
+        want_thinking: Option<String>,
+    ) -> Vec<Effect> {
+        let prev_thinking = self.thinking_level();
+        self.sel_provider = provider;
+        self.sel_model = model;
+        self.refresh_thinking_levels();
+        let want = want_thinking
+            .or_else(|| (!self.session.thinking.is_empty()).then(|| self.session.thinking.clone()));
+        match want {
+            Some(level) => self.apply_thinking(&level),
+            None => self.apply_thinking(&prev_thinking),
+        }
+        self.session.thinking = self.thinking_level();
+        self.persist_defaults();
+
+        if !self.session.id.is_empty() {
+            // Mid-session switch: update the model in place.
+            let provider = self.sel_provider.name.clone();
+            let model = self.sel_model.clone();
+            let thinking = self.session.thinking.clone();
+            self.session.provider = provider.clone();
+            self.session.model = model.clone();
+            return vec![Effect::PatchSessionModel {
+                provider,
+                model,
+                thinking,
+            }];
+        }
+        // No session yet: create one with the selected model.
+        vec![Effect::CreateSession {
+            provider: self.sel_provider.name.clone(),
+            model: self.sel_model.clone(),
+            cwd: self.cwd.clone(),
+            thinking: self.thinking_level(),
+        }]
+    }
+
     fn thinking_index_of(levels: &[String], saved: &str) -> i32 {
         if saved.is_empty() {
             return -1;
@@ -601,7 +751,12 @@ impl App {
         if thinking.is_empty() {
             thinking = self.session.thinking.clone();
         }
-        save_last_model_state(&self.sel_provider.name, &self.sel_model, &thinking);
+        save_last_model_state(
+            &self.sel_provider.name,
+            &self.sel_model,
+            &thinking,
+            &self.profile_name(),
+        );
     }
 
     pub fn commit_thinking(&mut self) -> Vec<Effect> {
@@ -1201,11 +1356,9 @@ impl App {
             } else {
                 let b = &mut self.blocks[idx];
                 b.active = false;
-                b.dur = Some(
-                    dur.unwrap_or_else(|| {
-                        b.started_at.map(|t| t.elapsed()).unwrap_or(Duration::ZERO)
-                    }),
-                );
+                b.dur = Some(dur.unwrap_or_else(|| {
+                    b.started_at.map(|t| t.elapsed()).unwrap_or(Duration::ZERO)
+                }));
                 b.lines = None;
             }
             changed = true;
@@ -3090,6 +3243,14 @@ impl App {
                 }
                 return self.handle_input(&text);
             }
+            // Shift+Tab (BackTab on most terminals) cycles agent
+            // profiles; plain Tab and Ctrl+T cycle the thinking level.
+            KeyCode::Tab if shift => {
+                return self.cycle_profile();
+            }
+            KeyCode::BackTab => {
+                return self.cycle_profile();
+            }
             KeyCode::Tab => {
                 self.cycle_thinking();
                 return self.commit_thinking();
@@ -3871,56 +4032,18 @@ impl App {
                     self.working_msg.clear();
                     return Vec::new();
                 }
-                let prev_thinking = self.thinking_level();
-                self.sel_provider = e.provider.clone();
-                self.sel_model = e.model.clone();
-                self.refresh_thinking_levels();
-                if !self.session.thinking.is_empty() {
-                    self.apply_thinking(&self.session.thinking.clone());
-                } else {
-                    self.apply_thinking(&prev_thinking);
-                }
-                self.session.thinking = self.thinking_level();
+                let fx = self.use_model(e.provider.clone(), e.model.clone(), None);
                 self.picker_settings
                     .push_recent(crate::settings::PickerSettings::model_ref(
                         &e.provider.name,
                         &e.model,
                     ));
                 self.save_picker_settings();
-                self.persist_defaults();
-
-                if !self.session.id.is_empty() {
-                    // Mid-session switch: update the model in place.
-                    let provider = e.provider.name.clone();
-                    let model = e.model.clone();
-                    let thinking = self.session.thinking.clone();
-                    self.session.provider = provider.clone();
-                    self.session.model = model.clone();
-                    self.overlay = None;
-                    self.overlay_q.clear();
-                    self.overlay_q_cursor = None;
-                    self.working_msg.clear();
-                    return vec![Effect::PatchSessionModel {
-                        provider,
-                        model,
-                        thinking,
-                    }];
-                }
-                // No session yet: create one with the selected model.
-                let provider = e.provider.name.clone();
-                let model = e.model.clone();
-                let cwd = self.cwd.clone();
-                let thinking = self.thinking_level();
                 self.overlay = None;
                 self.overlay_q.clear();
                 self.overlay_q_cursor = None;
                 self.working_msg.clear();
-                vec![Effect::CreateSession {
-                    provider,
-                    model,
-                    cwd,
-                    thinking,
-                }]
+                return fx;
             }
             OverlayKind::Session => {
                 let rows = overlays::session_rows(self);
@@ -4911,6 +5034,8 @@ struct LastModel {
     model: String,
     #[serde(default)]
     thinking: String,
+    #[serde(default)]
+    profile: String,
 }
 
 fn last_model_path() -> std::path::PathBuf {
@@ -4926,7 +5051,12 @@ pub(crate) fn load_last_model_thinking() -> Option<String> {
     Some(lm.thinking)
 }
 
-pub(crate) fn save_last_model_state(provider_name: &str, model: &str, thinking: &str) {
+pub(crate) fn save_last_model_state(
+    provider_name: &str,
+    model: &str,
+    thinking: &str,
+    profile: &str,
+) {
     if model.is_empty() {
         return;
     }
@@ -4934,6 +5064,7 @@ pub(crate) fn save_last_model_state(provider_name: &str, model: &str, thinking: 
         provider: provider_name.to_string(),
         model: model.to_string(),
         thinking: thinking.to_string(),
+        profile: profile.to_string(),
     };
     if lm.thinking.is_empty() {
         lm.thinking = load_last_model_thinking().unwrap_or_default();
@@ -6679,7 +6810,7 @@ mod tests {
 
         app.handle_stream_event(&StreamEvent {
             event_type: "tool".into(),
-            name: "dispatch".into(),
+            name: "subagent".into(),
             arguments: r#"{"tasks":[]}"#.into(),
             ..Default::default()
         });

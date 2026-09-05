@@ -48,7 +48,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDef> {
             "Run commands needing shell: tests, builds, git, package managers. Last resort — only when no other builtin tool can do the job. Long commands simply run until done: the turn waits and the tool result arrives when the command finishes, however long that takes (the user's Esc stops a command). The user may send prompts mid-run — you will see them between rounds and can reply without stopping the command. Never use bash to search files or web: use glob and grep instead; file reads and changes belong in read_file, write_file, edit_file.",
             r#"{"type":"object","properties":{"command":{"type":"string","description":"Command to run from session workspace"}},"required":["command"]}"#,
         ),
-        dispatch_def(),
+        subagent_def(),
         skill_def(),
         customize_def(),
     ]
@@ -104,11 +104,11 @@ Rules: quote labels with punctuation, <br/> for line breaks, word-only labels ma
     )
 }
 
-pub fn dispatch_def() -> ToolDef {
+pub fn subagent_def() -> ToolDef {
     def(
-        "dispatch",
-        "Manage subagents through one bulk interface. action=models: discover exact providers and model IDs. action=spawn: one subagent per tasks string (max 100, min 1); tasks accepts a single string or a list of strings (a string is treated as a one-item list), all share provider/model/thinking; result has session id; send new prompt to continue, cancel to stop. spawn requires at least one task. action=inspect: status snapshot and optional results for ids, batch_id, or all owned subagents. action=send: continue selected subagents with prompt, or distinct messages per subagent. action=cancel: stop selected. Every operation bulk-capable; prefer batch_id over many IDs. User can open subagent by clicking tool block or shift+down. No nested dispatch, one level only.",
-        r#"{"type":"object","properties":{"action":{"type":"string","enum":["models","spawn","inspect","send","cancel"],"description":"Operation."},"tasks":{"anyOf":[{"type":"string"},{"type":"array","minItems":1,"maxItems":100,"items":{"type":"string"}}],"description":"Spawn only: one prompt per new subagent; a single string is treated as a one-item list."},"provider":{"type":"string","description":"Spawn only: exact provider from action=models. Omit to inherit."},"model":{"type":"string","description":"Spawn only: exact model ID from action=models. Omit to inherit."},"thinking":{"type":"string","description":"Spawn/send reasoning_effort: none, low, high, or max."},"batch_id":{"type":"string","description":"Target every subagent from one spawn."},"ids":{"type":"array","items":{"type":"string"},"description":"Selected subagent IDs. Omit ids and batch_id to target all owned."},"prompt":{"type":"string","description":"Send only: follow-up prompt shared by all targets."},"messages":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"prompt":{"type":"string"}},"required":["id","prompt"]},"description":"Send only: distinct follow-up prompts by subagent ID."},"wait":{"type":"string","enum":["none","any","all"],"description":"Spawn/inspect: when to return, default none."},"results":{"type":"boolean","description":"Inspect: include available results, default true."},"statuses":{"type":"array","items":{"type":"string","enum":["queued","working","sandbox","error","done","cancelled","stopped"]},"description":"Cancel only: restrict cancellation to these statuses."},"query":{"type":"string","description":"Models only: optional model ID filter."}},"required":["action"]}"#,
+        "subagent",
+        "Manage subagents through one bulk interface. agent names the agent profile to spawn (e.g. plan, build; default inherits the caller's model and thinking); model overrides the profile's default model. action=models: discover exact providers and model IDs. action=spawn: one subagent per tasks string (max 100, min 1); tasks accepts a single string or a list of strings (a string is treated as a one-item list), all share agent/model/thinking; result has session id; send new prompt to continue, cancel to stop. spawn requires at least one task. action=inspect: status snapshot and optional results for ids, batch_id, or all owned subagents. action=send: continue selected subagents with prompt, or distinct messages per subagent. action=cancel: stop selected. Every operation bulk-capable; prefer batch_id over many IDs. User can open subagent by clicking tool block or shift+down. No nested subagents, one level only.",
+        r#"{"type":"object","properties":{"action":{"type":"string","enum":["models","spawn","inspect","send","cancel"],"description":"Operation."},"agent":{"type":"string","description":"Spawn only: agent profile to call, e.g. plan or build. Omit to inherit the session's model and thinking."},"tasks":{"anyOf":[{"type":"string"},{"type":"array","minItems":1,"maxItems":100,"items":{"type":"string"}}],"description":"Spawn only: one prompt per new subagent; a single string is treated as a one-item list."},"provider":{"type":"string","description":"Spawn only: exact provider from action=models. Omit to inherit."},"model":{"type":"string","description":"Spawn only: exact model ID from action=models, optionally as provider/model. Overrides the agent profile's default model."},"thinking":{"type":"string","description":"Spawn/send reasoning_effort: none, low, high, or max."},"batch_id":{"type":"string","description":"Target every subagent from one spawn."},"ids":{"type":"array","items":{"type":"string"},"description":"Selected subagent IDs. Omit ids and batch_id to target all owned."},"prompt":{"type":"string","description":"Send only: follow-up prompt shared by all targets."},"messages":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"prompt":{"type":"string"}},"required":["id","prompt"]},"description":"Send only: distinct follow-up prompts by subagent ID."},"wait":{"type":"string","enum":["none","any","all"],"description":"Spawn/inspect: when to return, default none."},"results":{"type":"boolean","description":"Inspect: include available results, default true."},"statuses":{"type":"array","items":{"type":"string","enum":["queued","working","sandbox","error","done","cancelled","stopped"]},"description":"Cancel only: restrict cancellation to these statuses."},"query":{"type":"string","description":"Models only: optional model ID filter."}},"required":["action"]}"#,
     )
 }
 
@@ -171,7 +171,7 @@ mod tests {
                 "glob",
                 "visualize",
                 "bash",
-                "dispatch",
+                "subagent",
                 "skill",
                 "customize",
             ]
@@ -197,9 +197,9 @@ mod tests {
 
     #[test]
     fn without_tool_strips_and_is_idempotent() {
-        let tools = without_tool(&crate::tool_definitions(), "dispatch");
-        assert!(tools.iter().all(|t| t.function.name != "dispatch"));
-        assert_eq!(without_tool(&tools, "dispatch").len(), tools.len());
+        let tools = without_tool(&crate::tool_definitions(), "subagent");
+        assert!(tools.iter().all(|t| t.function.name != "subagent"));
+        assert_eq!(without_tool(&tools, "subagent").len(), tools.len());
         // Stripping everything but keeping order otherwise.
         let no_bash = without_tool(&crate::tool_definitions(), "bash");
         assert_eq!(no_bash.len(), 12);

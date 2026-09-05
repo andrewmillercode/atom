@@ -1164,6 +1164,21 @@ pub fn catalog_contains_model(model_id: &str) -> bool {
         .is_some()
 }
 
+/// providerForModel returns the models.dev provider id that lists the
+/// model id (preferred hosts first). Used to route a profile-pinned
+/// model id to a configured provider.
+pub fn provider_for_model(model_id: &str) -> Option<String> {
+    let cat = current_models_dev_catalog()?;
+    if model_id.is_empty() {
+        return None;
+    }
+    CATALOG_PREFERRED_PROVIDERS
+        .iter()
+        .map(|s| s.to_string())
+        .chain(cat.providers.iter().map(|e| e.id.to_string()))
+        .find(|provider_id| lookup_compact_model(&cat, provider_id, model_id).is_some())
+}
+
 /// modelSupportsImageInput reports whether the model accepts image
 /// input, per the models.dev catalog's `modalities.input`. Returns
 /// `Some(true)` when the model is multimodal, `Some(false)` when the

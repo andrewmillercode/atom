@@ -89,18 +89,16 @@ pub fn glob_def() -> ToolDef {
 pub fn visualize_def() -> ToolDef {
     def(
         "visualize",
-        r#"Render Mermaid diagram inline in atom TUI, high-density image at full block width; click opens pan/zoom browser viewer. Use for concept thinking, architecture, data flow, call graphs, sequence, state machines, ER. This is the ONLY way to deliver a diagram: whenever you are about to write a mermaid code fence or diagram-like ASCII/Unicode art in your reply, make this tool call instead — never paste diagram source into reply text. Not for math unless user asks. House style: muted colors, color on borders only — classDef fill:none plus colored stroke, never bright fills (dark background); compact landscape layout, flowchart LR, short labels, side-by-side subgraphs. Source is raw Mermaid, no fences, complete diagram in one call, short title (names browser tab and artifact file). Render failure names offending line — fix and retry, no giving up. Inline image needs kitty graphics terminal; else open named HTML file in browser.
+        r#"Render Mermaid diagram inline in atom TUI, high-density image at full block width; click opens pan/zoom browser viewer. Use for concept thinking, architecture, data flow, call graphs, sequence, state machines, ER. This is the ONLY way to deliver a diagram: whenever you are about to write a mermaid code fence or diagram-like ASCII/Unicode art in your reply, make this tool call instead — never paste diagram source into reply text. Not for math unless user asks. House style: the tool themes everything from the selected atom theme (square nodes in the palette fill, theme text, bordered edge labels) — do NOT add classDef, style, or themeVariables of your own. The only styling control is the label_colors argument: map edge-label text to a token blue|green|orange|pink. Compact landscape layout, flowchart LR, short labels, side-by-side subgraphs. Source is raw Mermaid, no fences, complete diagram in one call, short title (names browser tab and artifact file). Render failure names offending line — fix and retry, no giving up. Inline image needs kitty graphics terminal; else open named HTML file in browser.
 
-Few-shot, most render failures are unquoted labels. BAD (colon breaks parser, bright style fill off-style, TD wastes space):
+Few-shot, most render failures are unquoted labels. BAD (colon breaks parser, TD wastes space):
 A[Layer 1: static rules]
 GOOD:
 flowchart LR
   A[Tool call] --> B{"Layer 1<br/>static rules"}
   B -->|allow| C["run confined<br/>Seatbelt on"]
-  classDef plain fill:none,stroke:#8a919c
-  class A,B,C plain
-Rules: quote labels with punctuation, <br/> for line breaks, word-only labels may stay unquoted, one classDef per color role with fill:none + muted stroke, LR, short labels."#,
-        r#"{"type":"object","properties":{"code":{"type":"string","description":"Mermaid source, e.g. 'flowchart LR\\n  A[Start] --> B[Done]'"},"title":{"type":"string","description":"Short title, names browser tab and artifact file"}},"required":["code"]}"#,
+Rules: quote labels with punctuation, <br/> for line breaks, word-only labels may stay unquoted, LR, short labels."#,
+        r#"{"type":"object","properties":{"code":{"type":"string","description":"Mermaid source, e.g. 'flowchart LR\\n  A[Start] --> B[Done]'"},"title":{"type":"string","description":"Short title, names browser tab and artifact file"},"label_colors":{"type":"object","description":"Optional edge-label color tokens: { \"label text\": \"blue|green|orange|pink\" }; labels without an entry get blue"}},"required":["code"]}"#,
     )
 }
 

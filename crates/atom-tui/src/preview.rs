@@ -961,12 +961,22 @@ fn rasterize_svg(svg_data: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
     use resvg::tiny_skia;
     use resvg::usvg;
 
-    // Normalize edge-label geometry before parsing. Fresh artifacts are
-    // already normalized at write time (atom-tools visualize); this also
-    // covers pre-existing artifact files on disk and any renderer output
-    // that skips that path. Idempotent.
+    // Re-theme against the live palette before parsing. Fresh raw
+    // artifacts are unthemed SVGs (atom-tools visualize); themed legacy
+    // artifacts hit the theme pass's idempotency guard and keep their
+    // baked colors. Token-colored edge labels recover their colors from
+    // the injected data-atom-edge-colors attribute.
     let svg_data = match std::str::from_utf8(svg_data) {
-        Ok(s) => atom_core::render::mermaid::normalize_edge_labels(s).into_bytes(),
+        Ok(s) => {
+            let normalized = atom_core::render::mermaid::normalize_edge_labels(s);
+            let edge_colors = atom_core::render::mermaid::edge_colors_attribute(&normalized);
+            atom_core::render::mermaid::apply_diagram_theme(
+                &normalized,
+                &atom_core::render::mermaid::active_diagram_theme(),
+                &edge_colors,
+            )
+            .into_bytes()
+        }
         Err(_) => svg_data.to_vec(),
     };
 

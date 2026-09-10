@@ -1232,9 +1232,8 @@ impl App {
                 {
                     return effects;
                 }
-                // Render the sandbox approval inline as a tool block with
-                // clickable buttons. The block stays active (tool_done=false)
-                // until the user responds.
+                // The card replaces the pending tool block until answered;
+                // a standalone fallback covers prompts replayed on reconnect.
                 let sid = if ev.session_id.is_empty() {
                     self.session.id.clone()
                 } else {
@@ -1250,7 +1249,7 @@ impl App {
                     child_title: ev.child_title.clone(),
                     from_subagent: ev.from_subagent,
                 });
-                let mut inline = Some(blocks::InlineApproval {
+                let inline = blocks::InlineApproval {
                     id: ev.id.clone(),
                     session_id: sid,
                     command: ev.command.clone(),
@@ -1264,19 +1263,7 @@ impl App {
                     // accept-all prefix preview for `[a]`.
                     origin: ev.origin.clone(),
                     accept_all_preview: ev.accept_all_preview.clone(),
-                });
-                // Convert the bash tool block this approval is for in
-                // place, when one exists. The server emits the `tool`
-                // event just before requesting approval, so the most
-                // recent pending bash block with matching command text
-                // is the unambiguous target. Reusing it keeps the
-                // transcript to one block per tool call: header →
-                // sandbox approval card → sandbox result. Without the
-                // conversion we'd stack a fresh "Sandbox" block on top
-                // of the original "Bash" block, and the upcoming
-                // `tool_result` would attach to the new one (leaving
-                // the original Bash block as an empty dangling header
-                // and any later tool result overwriting the card).
+                };
                 let mut converted = false;
                 for b in self.blocks.iter_mut().rev() {
                     if b.kind == BlockKind::Tool
@@ -1285,7 +1272,7 @@ impl App {
                         && !b.tool_done
                     {
                         b.title = "Sandbox".to_string();
-                        b.approval = inline.take();
+                        b.approval = Some(inline.clone());
                         b.expanded = true;
                         b.lines = None;
                         converted = true;
@@ -1293,17 +1280,12 @@ impl App {
                     }
                 }
                 if !converted {
-                    // No matching bash block — happens only on
-                    // reconnect/replay where the `tool` event landed
-                    // before the local client subscribed. Fall back to
-                    // creating a fresh Sandbox block so the prompt is
-                    // never lost.
                     self.blocks.push(Block {
                         kind: BlockKind::Tool,
                         title: "Sandbox".to_string(),
                         tool_name: "sandbox".to_string(),
                         text: ev.command.clone(),
-                        approval: inline.take(),
+                        approval: Some(inline),
                         expanded: true,
                         ..Default::default()
                     });
@@ -4308,7 +4290,7 @@ impl App {
         };
         match decision {
             Some((wire, note)) => {
-                self.resolve_approval_block(&req.id, note);
+                self.dismiss_approval_block(&req.id);
                 self.approval = None;
                 self.copied_msg = format!("sandbox: {note}");
                 self.copied_at = Some(Instant::now());
@@ -4322,29 +4304,27 @@ impl App {
         }
     }
 
-    /// Clear the inline approval card (button row, child header) once
-    /// the user has answered the prompt. The block stays
-    /// `tool_done = false`: the tool hasn't actually returned yet — the
-    /// server is still running the command and will send a `tool_result`
-    /// event with the real output, which `attach_tool_result` needs a
-    /// non-done tool block to land on. Marking it done here would either
-    /// orphan the real result into its own block or attach it to a
-    /// previous still-open tool block, both of which break the transcript
-    /// and confuse the model loop.
-    fn resolve_approval_block(&mut self, approval_id: &str, note: &str) {
-        for b in self.blocks.iter_mut().rev() {
-            if b.kind == BlockKind::Tool {
-                if let Some(ref appr) = b.approval {
-                    if appr.id == approval_id {
-                        b.result = format!("sandbox: {note}");
-                        b.approval = None;
-                        b.lines = None;
-                        self.viewport_dirty = true;
-                        break;
-                    }
-                }
-            }
+    /// On answer, a converted card reverts to its tool block; a standalone
+    /// fallback card is removed. Either way only the tool call remains.
+    fn dismiss_approval_block(&mut self, approval_id: &str) {
+        let Some(idx) = self
+            .blocks
+            .iter()
+            .position(|b| b.approval.as_ref().is_some_and(|a| a.id == approval_id))
+        else {
+            return;
+        };
+        if self.blocks[idx].tool_name == "sandbox" {
+            self.blocks.remove(idx);
+        } else {
+            let b = &mut self.blocks[idx];
+            b.approval = None;
+            b.title = blocks::tool_display_name(&b.tool_name);
+            b.expanded = false;
+            b.result.clear();
+            b.lines = None;
         }
+        self.viewport_dirty = true;
     }
 
     /// Check if a click at viewport (x, y) lands anywhere on a visualize
@@ -4402,10 +4382,10 @@ impl App {
         None
     }
 
-    /// Handle clicking an approval button: resolve the block and emit the
+    /// Handle clicking an approval button: dismiss the card and emit the
     /// approval effect.
     fn resolve_approval_click(&mut self, bi: usize, decision: &str) -> Vec<Effect> {
-        let appr = match self.blocks[bi].approval.take() {
+        let appr = match self.blocks[bi].approval.clone() {
             Some(a) => a,
             None => return Vec::new(),
         };
@@ -4416,10 +4396,7 @@ impl App {
             "deny_always" => "denied",
             _ => "denied",
         };
-        self.blocks[bi].tool_done = true;
-        self.blocks[bi].result = format!("sandbox: {note}");
-        self.blocks[bi].lines = None;
-        self.viewport_dirty = true;
+        self.dismiss_approval_block(&appr.id);
         self.approval = None;
         self.copied_msg = format!("sandbox: {note}");
         self.copied_at = Some(Instant::now());
@@ -5463,6 +5440,111 @@ mod tests {
         let fx = app.handle_input("/compact");
         assert!(fx.is_empty());
         assert!(app.err_msg.contains("managed by their parent"));
+    }
+
+    #[test]
+    fn approval_card_is_ephemeral_and_result_lands_on_the_tool_block() {
+        // The approval card is its own block: answering it removes the
+        // card outright, and the underlying tool block (never folded
+        // into the card) receives the result by call id as usual.
+        let mut app = App::new_test(90, 30);
+        let cmd = "cargo test";
+        app.handle_stream_event(&parse_stream_event(&serde_json::json!({
+            "type": "tool",
+            "name": "bash",
+            "arguments": serde_json::json!({"command": cmd}).to_string(),
+            "call_id": "tc1",
+        })));
+        app.handle_stream_event(&parse_stream_event(&serde_json::json!({
+            "type": "approval_request",
+            "id": "req1",
+            "session_id": "sess1",
+            "command": cmd,
+            "cwd": "/work",
+            "rule_id": "r",
+            "reason": "r",
+        })));
+        assert!(app.approval.is_some());
+        // The card shows in place of the tool call: the pending bash
+        // block was converted, so there is exactly one tool block and
+        // it is the card.
+        let pending: Vec<_> = app
+            .blocks
+            .iter()
+            .filter(|b| b.kind == BlockKind::Tool)
+            .collect();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].title, "Sandbox");
+        assert!(pending[0].approval.is_some());
+
+        let req = app.approval.clone().unwrap();
+        let fx = app.approval_key(key(KeyCode::Char('a'), KeyModifiers::NONE), req);
+        assert!(
+            matches!(fx.as_slice(), [Effect::RespondApproval { decision, .. }] if decision == "allow_always")
+        );
+        assert!(app.approval.is_none(), "prompt cleared");
+        assert!(
+            app.blocks.iter().all(|b| b.approval.is_none()),
+            "card dismissed on response"
+        );
+
+        app.handle_stream_event(&parse_stream_event(&serde_json::json!({
+            "type": "tool_result",
+            "text": "test output",
+            "call_id": "tc1",
+        })));
+        let tools: Vec<_> = app
+            .blocks
+            .iter()
+            .filter(|b| b.kind == BlockKind::Tool)
+            .collect();
+        assert_eq!(tools.len(), 1, "one tool block, no leftover card");
+        assert_eq!(tools[0].tool_name, "bash");
+        assert_eq!(tools[0].title, "Bash");
+        assert!(tools[0].tool_done);
+        assert_eq!(tools[0].result, "test output");
+    }
+
+    #[test]
+    fn denied_approval_card_removed_and_tool_block_keeps_result() {
+        let mut app = App::new_test(90, 30);
+        app.handle_stream_event(&parse_stream_event(&serde_json::json!({
+            "type": "tool",
+            "name": "bash",
+            "arguments": serde_json::json!({"command": "cargo publish"}).to_string(),
+            "call_id": "tc1",
+        })));
+        app.handle_stream_event(&parse_stream_event(&serde_json::json!({
+            "type": "approval_request",
+            "id": "req1",
+            "session_id": "sess1",
+            "command": "cargo publish",
+            "cwd": "/work",
+            "rule_id": "r",
+            "reason": "r",
+        })));
+        let req = app.approval.clone().unwrap();
+        let fx = app.approval_key(key(KeyCode::Char('d'), KeyModifiers::NONE), req);
+        assert!(
+            matches!(fx.as_slice(), [Effect::RespondApproval { decision, .. }] if decision == "deny_always")
+        );
+        assert!(app.blocks.iter().all(|b| b.approval.is_none()));
+        // The tool block was restored (not removed) by the dismissal; the
+        // server's not-approved result lands on it.
+        app.handle_stream_event(&parse_stream_event(&serde_json::json!({
+            "type": "tool_result",
+            "text": "atom: not approved (r): r",
+            "call_id": "tc1",
+        })));
+        let tools: Vec<_> = app
+            .blocks
+            .iter()
+            .filter(|b| b.kind == BlockKind::Tool)
+            .collect();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].tool_name, "bash");
+        assert_eq!(tools[0].title, "Bash");
+        assert_eq!(tools[0].result, "atom: not approved (r): r");
     }
 
     #[test]

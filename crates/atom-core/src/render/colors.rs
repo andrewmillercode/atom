@@ -164,6 +164,12 @@ fn embedded_theme() -> Result<Theme, String> {
     theme_from_file(file)
 }
 
+/// Snapshot of the active theme palette (all roles at one generation).
+pub fn active_theme() -> Theme {
+    let theme = THEME.read().unwrap_or_else(|error| error.into_inner());
+    theme.clone()
+}
+
 pub fn theme_color(role: ThemeColor) -> String {
     let theme = THEME.read().unwrap_or_else(|error| error.into_inner());
     match role {

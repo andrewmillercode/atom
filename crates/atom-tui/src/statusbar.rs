@@ -137,8 +137,7 @@ fn status_head(app: &App) -> Head {
         // Provider first, in the muted style of the context meter.
         (!app.sel_provider.name.is_empty())
             .then(|| (app.sel_provider.name.clone(), ansi::style_dim())),
-        (!app.sel_model.is_empty())
-            .then(|| (app.sel_model.clone(), ansi::style_foreground())),
+        (!app.sel_model.is_empty()).then(|| (app.sel_model.clone(), ansi::style_foreground())),
         (!lvl.is_empty()).then(|| (lvl, ansi::style_primary())),
         (!profile.is_empty()).then(|| (profile, ansi::style_dim())),
     ]

@@ -90,6 +90,14 @@ cargo clippy --workspace
 
 Do not reformat unrelated files in the same commit; keep diffs minimal.
 
+## Comments
+
+Comments are a last resort. Prefer names and code structure that don't
+need them. When one is warranted, keep it to a single short line that
+says what the code can't — a constraint, a non-obvious why, or a signpost
+("all diagram styling; edit here"). No narration of what the next line
+does, no banner rules, no multi-paragraph essays.
+
 ## Binary name
 
 There are two binaries in `crates/atom/Cargo.toml`, plus dev aliases:

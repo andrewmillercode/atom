@@ -5,31 +5,32 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>__TITLE__</title>
 <style>
+  __CSS_VARS__
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  html, body { height: 100%; overflow: hidden; background: __BG__; color: __FG__; }
+  html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(--fg); }
   body { display: flex; flex-direction: column; font: 13px/1.4 -apple-system, "Segoe UI", sans-serif; }
   header { display: flex; align-items: center; gap: 12px; padding: 8px 14px;
-    border-bottom: 1px solid __BORDER__; user-select: none; z-index: 10; }
+    border-bottom: 1px solid var(--border); user-select: none; z-index: 10; }
   header .title { font-weight: 600; flex: 1; overflow: hidden;
     text-overflow: ellipsis; white-space: nowrap; }
-  header button { font: inherit; border: 1px solid __BORDER__;
-    background: __CARD__; color: __FG__; border-radius: 6px;
+  header button { font: inherit; border: 1px solid var(--border);
+    background: var(--card); color: var(--fg); border-radius: 6px;
     padding: 3px 10px; cursor: pointer; }
-  header button:hover { background: __BORDER__; }
+  header button:hover { background: var(--border); }
   #viewport { flex: 1; position: relative; overflow: hidden; cursor: grab;
     touch-action: none; user-select: none;
-    background-color: __BG__;
-    background-image: radial-gradient(circle, __MUTED_EXTRA__ 1px, transparent 1px);
+    background-color: var(--bg);
+    background-image: radial-gradient(circle, var(--dot) 1px, transparent 1px);
     background-size: 24px 24px; }
   #stage { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
   #stage svg { display: block; max-width: none; }
   details { position: fixed; right: 12px; bottom: 12px; max-width: min(640px, 80vw);
-    background: __CARD__; border: 1px solid __BORDER__;
+    background: var(--card); border: 1px solid var(--border);
     border-radius: 8px; padding: 8px 12px; font: 12px ui-monospace, monospace;
     box-shadow: 0 4px 16px rgba(0,0,0,.4); z-index: 10; }
-  details pre { max-height: 40vh; overflow: auto; white-space: pre-wrap; color: __MUTED__; }
-  summary { cursor: pointer; color: __MUTED__; }
-  span#pct { min-width: 3em; text-align: right; color: __MUTED__; }
+  details pre { max-height: 40vh; overflow: auto; white-space: pre-wrap; color: var(--muted); }
+  summary { cursor: pointer; color: var(--muted); }
+  span#pct { min-width: 3em; text-align: right; color: var(--muted); }
 </style>
 </head>
 <body>

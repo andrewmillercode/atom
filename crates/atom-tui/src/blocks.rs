@@ -659,7 +659,9 @@ fn truncate_bytes(s: &str, n: usize) -> String {
 ///
 /// Handles both the new SVG format:
 ///   `[atom-diagram] svg="..." html="..." width=N height=N`
-/// and the legacy PNG format (for old sessions):
+/// where `svg` is the raw (unthemed) artifact — the rasterizer applies
+/// the live palette theme at paint time — and the legacy PNG format
+/// (for old sessions):
 ///   `[atom-diagram] png="..." png-dark="..." html="..." width=N height=N`
 ///
 /// Returns (svg, png, png_dark, html, w, h).
@@ -1473,8 +1475,6 @@ fn render_tool_block_linked(
         let btn_line = approval_button_line();
         body.push(btn_line);
         body_links.push(Vec::new());
-    } else if !b.tool_done && b.tool_name == "sandbox" {
-        // Still pending but somehow approval was removed — shouldn't happen
     } else {
         let name = b.resolved_tool_name();
         let hidden = hidden_output_tool(&name);

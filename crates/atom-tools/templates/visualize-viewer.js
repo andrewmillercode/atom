@@ -22,20 +22,9 @@ function setSvg(svg) {
 
 setSvg(__SVG_JS__);
 
-const MERMAID_CDN = "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js";
-function renderWithMermaid() {
-  if (typeof mermaid === "undefined") return;
-  mermaid.initialize({
-    startOnLoad: false, theme: "dark", securityLevel: "loose",
-    themeVariables: { clusterBkg: "transparent", clusterBorder: "__BORDER__" }
-  });
-  mermaid.render("mmd-" + Date.now(), __CODE_JS__)
-    .then(({ svg }) => setSvg(svg))
-    .catch(() => {});
-}
-const s = document.createElement("script");
-s.src = MERMAID_CDN; s.onload = renderWithMermaid;
-document.head.appendChild(s);
+// The offline SVG is already themed and post-processed by atom; showing
+// it directly keeps the browser 1:1 with the TUI rasterization. The
+// mermaid source stays embedded for the download/copy panel.
 
 new ResizeObserver(() => fit()).observe(viewport);
 

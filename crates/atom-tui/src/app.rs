@@ -606,7 +606,14 @@ impl App {
         }
         let (provider_ref, model_id) = atom_core::profiles::model_ref(&profile.model);
         let provider = if model_id == self.sel_model {
-            None
+            // Same model id: switch only when an explicit provider
+            // prefix names a different provider than the current one.
+            provider_ref.and_then(|name| {
+                self.providers
+                    .iter()
+                    .find(|p| (p.name == name || p.id == name) && p.name != self.sel_provider.name)
+                    .cloned()
+            })
         } else {
             match provider_ref {
                 // An explicit provider prefix names the provider.
@@ -6494,6 +6501,62 @@ mod tests {
         let reply = app.blocks.last().unwrap();
         assert_eq!(reply.model, "model-b");
         assert_eq!(reply.turn_duration, Some(Duration::from_millis(134_600)));
+    }
+
+    #[test]
+    fn profile_pinned_model_switches_provider_when_ids_match() {
+        let mut app = App::new_test(90, 30);
+        app.providers = vec![
+            Provider {
+                name: "ollama".into(),
+                ..Default::default()
+            },
+            Provider {
+                name: "second".into(),
+                ..Default::default()
+            },
+        ];
+        app.sel_provider = app.providers[0].clone();
+        app.sel_model = "shared-model".into();
+        app.profiles = vec![
+            atom_core::profiles::AgentProfile::default(),
+            atom_core::profiles::AgentProfile {
+                name: "pinned".into(),
+                model: "second/shared-model".into(),
+                ..Default::default()
+            },
+        ];
+        app.profile_idx = 1;
+
+        app.apply_profile();
+
+        assert_eq!(app.sel_provider.name, "second");
+        assert_eq!(app.sel_model, "shared-model");
+    }
+
+    #[test]
+    fn profile_pinned_model_keeps_current_provider_when_it_matches() {
+        let mut app = App::new_test(90, 30);
+        app.providers = vec![Provider {
+            name: "ollama".into(),
+            ..Default::default()
+        }];
+        app.sel_provider = app.providers[0].clone();
+        app.sel_model = "shared-model".into();
+        app.profiles = vec![
+            atom_core::profiles::AgentProfile::default(),
+            atom_core::profiles::AgentProfile {
+                name: "pinned".into(),
+                model: "ollama/shared-model".into(),
+                ..Default::default()
+            },
+        ];
+        app.profile_idx = 1;
+
+        app.apply_profile();
+
+        assert_eq!(app.sel_provider.name, "ollama");
+        assert_eq!(app.sel_model, "shared-model");
     }
 
     #[test]

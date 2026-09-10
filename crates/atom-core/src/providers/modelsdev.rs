@@ -62,9 +62,6 @@ fn models_dev_base_url_fallback(id: &str) -> Option<&'static str> {
         "openai" => Some("https://api.openai.com/v1"),
         "anthropic" => Some("https://api.anthropic.com/v1"),
         "amazon-bedrock" => Some("https://bedrock-runtime.us-east-1.amazonaws.com"),
-        // Vercel AI Gateway: models.dev's entry has no api URL, but the
-        // gateway is OpenAI-compatible at a stable host (its REST
-        // endpoint is ai-gateway.vercel.sh/v1, chat completions + models).
         "vercel" => Some("https://ai-gateway.vercel.sh/v1"),
         _ => None,
     }

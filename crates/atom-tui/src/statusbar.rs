@@ -131,34 +131,28 @@ fn head_from_spans(text: String, spans: Vec<Span<'static>>) -> Head {
 fn status_head(app: &App) -> Head {
     let lvl = app.thinking_level();
     let profile = app.profile_name();
-    if lvl.is_empty() && profile.is_empty() {
-        head_from_spans(
-            app.sel_model.clone(),
-            vec![Span::styled(
-                app.sel_model.clone(),
-                ansi::style_foreground(),
-            )],
-        )
-    } else {
-        let mut text = app.sel_model.clone();
-        let mut spans = vec![Span::styled(
-            app.sel_model.clone(),
-            ansi::style_foreground(),
-        )];
-        for (label, style) in [
-            (!lvl.is_empty()).then(|| (lvl, ansi::style_primary())),
-            (!profile.is_empty()).then(|| (profile, ansi::style_dim())),
-        ]
-        .into_iter()
-        .flatten()
-        {
+    let mut text = String::new();
+    let mut spans = Vec::new();
+    for (label, style) in [
+        // Provider first, in the muted style of the context meter.
+        (!app.sel_provider.name.is_empty())
+            .then(|| (app.sel_provider.name.clone(), ansi::style_dim())),
+        (!app.sel_model.is_empty())
+            .then(|| (app.sel_model.clone(), ansi::style_foreground())),
+        (!lvl.is_empty()).then(|| (lvl, ansi::style_primary())),
+        (!profile.is_empty()).then(|| (profile, ansi::style_dim())),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !text.is_empty() {
             text.push(' ');
-            text.push_str(&label);
             spans.push(Span::styled(" ", ansi::style_dim()));
-            spans.push(Span::styled(label, style));
         }
-        head_from_spans(text, spans)
+        text.push_str(&label);
+        spans.push(Span::styled(label, style));
     }
+    head_from_spans(text, spans)
 }
 
 fn fitted_status_head(app: &App, width: usize, head: &Head) -> Head {
@@ -728,6 +722,24 @@ mod tests {
         assert_eq!(line.spans[1].content, " ");
         assert_eq!(line.spans[2].style, ansi::style_primary());
         assert_eq!(line.spans[2].content, "high");
+    }
+
+    #[test]
+    fn provider_shows_muted_before_model_in_head() {
+        let mut app = App::new_test(90, 24);
+        app.sel_provider.name = "OpenAI".into();
+        app.sel_model = "5.6-Sol".into();
+        app.thinking_levels = vec!["medium".to_string()];
+        app.thinking_idx = 0;
+        let line = &status_bar_lines(&app)[0];
+        assert_eq!(ansi::line_plain(line), "OpenAI 5.6-Sol medium");
+        // provider muted (context-meter style), model foreground, level primary
+        assert_eq!(line.spans[0].style, ansi::style_dim());
+        assert_eq!(line.spans[0].content, "OpenAI");
+        assert_eq!(line.spans[2].style, ansi::style_foreground());
+        assert_eq!(line.spans[2].content, "5.6-Sol");
+        assert_eq!(line.spans[4].style, ansi::style_primary());
+        assert_eq!(line.spans[4].content, "medium");
     }
 
     #[test]

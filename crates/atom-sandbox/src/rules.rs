@@ -3,7 +3,8 @@
 //! Commands are tokenized (quotes/escapes aware) and split into argv
 //! segments at top-level `&& || ; | &`. Each segment runs through the
 //! built-in rule table plus a path scan; the worst verdict wins
-//! (Deny > Ask > Allow), unknown commands default to Ask.
+//! (Ask > Allow) and unknown commands default to Ask. Guardrails don't
+//! deny — they flag the command so the gate always prompts.
 
 use glob::Pattern;
 use once_cell::sync::Lazy;
@@ -19,8 +20,6 @@ pub enum Verdict {
     Allow,
     #[serde(rename = "ask")]
     Ask,
-    #[serde(rename = "deny")]
-    Deny,
 }
 
 impl Verdict {
@@ -28,7 +27,6 @@ impl Verdict {
         match self {
             Verdict::Allow => "allow",
             Verdict::Ask => "ask",
-            Verdict::Deny => "deny",
         }
     }
 }
@@ -56,11 +54,21 @@ pub struct Analysis {
     pub uses_network: bool,
     /// Some argument resolves outside workspace_root.
     pub paths_outside_workspace: bool,
+    /// The resolved outside-workspace argument paths, deduped and in
+    /// first-seen order. The Seatbelt profile grants writes to these
+    /// when confining, so an approved cross-tree command still runs
+    /// under confinement.
+    #[serde(default)]
+    pub outside_paths: Vec<PathBuf>,
     /// Short human-readable explanation of which tier produced the
     /// verdict (e.g. "static allowlist", "arg veto", "guardrail",
     /// "unknown command"). Surfaced in the approval prompt so the user
     /// knows why the table landed where it did.
     pub tier_origin: String,
+    /// A guardrail fired (recursive delete, sudo, process kill, …):
+    /// the gate always prompts and never honors a session grant.
+    #[serde(default)]
+    pub flagged: bool,
 }
 
 /// One built-in permission rule. Matchers are globs evaluated against
@@ -84,6 +92,9 @@ pub struct Rule {
     pub max_args: usize,
     /// Rule involves network egress (sets Analysis::uses_network).
     pub network: bool,
+    /// Guardrail rule: sets Analysis::flagged, so the command always
+    /// prompts and never inherits a session grant.
+    pub flagged: bool,
 }
 
 macro_rules! rule {
@@ -98,6 +109,7 @@ macro_rules! rule {
             min_args: 0,
             max_args: usize::MAX,
             network: false,
+            flagged: false,
         }
     };
     ($id:expr, $reason:expr, $verdict:expr, $prog:expr, any: [$($a:expr),*]) => {
@@ -111,6 +123,7 @@ macro_rules! rule {
             min_args: 0,
             max_args: usize::MAX,
             network: false,
+            flagged: false,
         }
     };
     ($id:expr, $reason:expr, $verdict:expr, $prog:expr, net: true) => {
@@ -124,6 +137,7 @@ macro_rules! rule {
             min_args: 0,
             max_args: usize::MAX,
             network: true,
+            flagged: false,
         }
     };
     ($id:expr, $reason:expr, $verdict:expr, $prog:expr, any: [$($a:expr),*], net: true) => {
@@ -137,6 +151,7 @@ macro_rules! rule {
             min_args: 0,
             max_args: usize::MAX,
             network: true,
+            flagged: false,
         }
     };
     ($id:expr, $reason:expr, $verdict:expr, $prog:expr, all: [$($a:expr),*]) => {
@@ -150,6 +165,7 @@ macro_rules! rule {
             min_args: 0,
             max_args: usize::MAX,
             network: false,
+            flagged: false,
         }
     };
     ($id:expr, $reason:expr, $verdict:expr, $prog:expr, any: [$($a:expr),*], all: [$($b:expr),*]) => {
@@ -163,6 +179,7 @@ macro_rules! rule {
             min_args: 0,
             max_args: usize::MAX,
             network: false,
+            flagged: false,
         }
     };
     ($id:expr, $reason:expr, $verdict:expr, $prog:expr, min: $min:expr) => {
@@ -176,86 +193,99 @@ macro_rules! rule {
             min_args: $min,
             max_args: usize::MAX,
             network: false,
+            flagged: false,
         }
     };
 }
 
-/// The built-in rule table, ordered deny -> ask -> allow. All matching
+/// Like [`rule!`], but `Ask` + flagged: always prompts, never granted.
+macro_rules! guardrail {
+    ($id:expr, $reason:expr, $prog:expr) => {
+        Rule {
+            id: $id,
+            reason: $reason,
+            verdict: Verdict::Ask,
+            prog: $prog,
+            arg_any: &[],
+            arg_all: &[],
+            min_args: 0,
+            max_args: usize::MAX,
+            network: false,
+            flagged: true,
+        }
+    };
+    ($id:expr, $reason:expr, $prog:expr, any: [$($a:expr),*]) => {
+        Rule {
+            id: $id,
+            reason: $reason,
+            verdict: Verdict::Ask,
+            prog: $prog,
+            arg_any: &[$($a),*],
+            arg_all: &[],
+            min_args: 0,
+            max_args: usize::MAX,
+            network: false,
+            flagged: true,
+        }
+    };
+    ($id:expr, $reason:expr, $prog:expr, all: [$($a:expr),*]) => {
+        Rule {
+            id: $id,
+            reason: $reason,
+            verdict: Verdict::Ask,
+            prog: $prog,
+            arg_any: &[],
+            arg_all: &[$($a),*],
+            min_args: 0,
+            max_args: usize::MAX,
+            network: false,
+            flagged: true,
+        }
+    };
+}
+
+/// The built-in rule table, ordered guardrail -> ask -> allow. All matching
 /// rules fire per segment; the aggregated verdict takes the worst.
 pub static RULES: &[Rule] = &[
-    // --- destructive / system tampering: Deny ---
-    rule!("rm-root", "removes the filesystem root", Verdict::Deny, "rm",
+    // --- destructive / system tampering: guardrail (always prompts) ---
+    guardrail!("rm-root", "removes the filesystem root", "rm",
           any: ["/", "/*"]),
-    rule!("rm-home", "recursively deletes the home directory", Verdict::Deny, "rm",
+    guardrail!("rm-home", "recursively deletes the home directory", "rm",
           any: ["~", "~/*", "$HOME", "$HOME/*"]),
-    rule!(
-        "fork-bomb",
-        "classic fork-bomb shape (:(){ :|:& };:)",
-        Verdict::Deny,
-        ":"
-    ),
-    rule!(
-        "mkfs",
-        "creates a filesystem on a raw device",
-        Verdict::Deny,
-        "mkfs*"
-    ),
-    rule!("dd-device", "overwrites a raw device via dd of=/dev/*", Verdict::Deny, "dd",
+    guardrail!("fork-bomb", "classic fork-bomb shape (:(){ :|:& };:)", ":"),
+    guardrail!("mkfs", "creates a filesystem on a raw device", "mkfs*"),
+    guardrail!("dd-device", "overwrites a raw device via dd of=/dev/*", "dd",
           all: ["of=/dev/*"]),
-    rule!(
+    guardrail!(
         "shutdown-family",
         "shuts down or reboots the machine",
-        Verdict::Deny,
         "{shutdown,reboot,halt,poweroff,init,telinit}"
     ),
-    rule!(
+    guardrail!(
         "privilege-escalation",
         "switches to another user / superuser",
-        Verdict::Deny,
         "{sudo,su,doas,pfexec,dzdo}"
     ),
-    rule!(
+    guardrail!(
         "launchctl-mutate",
         "manages launchd services",
-        Verdict::Deny,
         "launchctl",
         any: ["load", "unload", "bootstrap", "bootout", "enable", "disable",
               "kickstart", "reboot", "start", "stop", "kill", "bless",
               "remove", "submit", "override", "print-cache"]
     ),
-    rule!(
-        "csrutil",
-        "toggles System Integrity Protection",
-        Verdict::Deny,
-        "csrutil"
-    ),
-    rule!("nvram", "writes firmware variables", Verdict::Deny, "nvram"),
-    rule!(
-        "pmset",
-        "changes power management settings",
-        Verdict::Deny,
-        "pmset"
-    ),
-    rule!(
+    guardrail!("csrutil", "toggles System Integrity Protection", "csrutil"),
+    guardrail!("nvram", "writes firmware variables", "nvram"),
+    guardrail!("pmset", "changes power management settings", "pmset"),
+    guardrail!(
         "kext",
         "loads or inspects kernel extensions",
-        Verdict::Deny,
         "{kextload,kextunload,kextutil}"
     ),
-    rule!(
-        "installer",
-        "runs system package installers",
-        Verdict::Deny,
-        "installer"
-    ),
-    rule!("dscl", "edits directory services", Verdict::Deny, "dscl"),
-    rule!(
-        "spctl",
-        "changes Gatekeeper assessment policy",
-        Verdict::Deny,
-        "spctl"
-    ),
-    rule!("disk-erase", "erases or reformats disks/volumes", Verdict::Deny,
+    guardrail!("installer", "runs system package installers", "installer"),
+    guardrail!("dscl", "edits directory services", "dscl"),
+    guardrail!("spctl", "changes Gatekeeper assessment policy", "spctl"),
+    guardrail!("disk-erase", "erases or reformats disks/volumes",
           "diskutil", any: ["erase*", "apfs*create*", "apfs*delete*",
                             "apfs*resize*", "apfs*add*", "apfs*erase*",
                             "hfs*create*"]),
@@ -265,32 +295,20 @@ pub static RULES: &[Rule] = &[
         Verdict::Ask,
         "{mount,umount}"
     ),
-    rule!(
-        "osascript",
-        "runs AppleScript automation",
-        Verdict::Deny,
-        "osascript"
-    ),
-    rule!(
-        "crontab",
-        "edits the system crontab",
-        Verdict::Deny,
-        "crontab"
-    ),
-    rule!(
+    guardrail!("osascript", "runs AppleScript automation", "osascript"),
+    guardrail!("crontab", "edits the system crontab", "crontab"),
+    guardrail!(
         "kill",
         "signals arbitrary processes (no safe subset)",
-        Verdict::Deny,
         "{kill,killall,pkill}"
     ),
-    rule!(
+    guardrail!(
         "security-keychain",
         "inspects the system keychain",
-        Verdict::Deny,
         "security",
         any: ["dump-keychain", "find-*", "add-*", "delete-*", "set-*"]
     ),
-    rule!("system-path-write", "writes into system directories", Verdict::Deny,
+    guardrail!("system-path-write", "writes into system directories",
           "{rm,mv,cp,chmod,chown,chgrp,ln,mkdir,touch,tee,truncate,install,rsync,dd}",
           any: ["/System/*", "/bin/*", "/sbin/*", "/usr/*", "/etc/*",
                 "/private/etc/*", "/boot/*"]),
@@ -879,15 +897,13 @@ pub fn analyze(cmd: &str, workspace_root: &Path) -> Analysis {
     analyze_in(cmd, workspace_root, workspace_root)
 }
 
-/// Analyze with explicit cwd for relative-token resolution. `strict`
-/// escalates outside-workspace writes from Ask to Deny.
+/// Analyze with an explicit cwd for relative-token resolution.
 pub fn analyze_in(cmd: &str, workspace_root: &Path, cwd: &Path) -> Analysis {
-    let strict = false;
-    analyze_full(cmd, workspace_root, cwd, strict)
+    analyze_full(cmd, workspace_root, cwd)
 }
 
 /// Full analysis entry point.
-pub fn analyze_full(cmd: &str, workspace_root: &Path, cwd: &Path, strict: bool) -> Analysis {
+pub fn analyze_full(cmd: &str, workspace_root: &Path, cwd: &Path) -> Analysis {
     let stripped = strip_heredocs(cmd);
     let mut out = Analysis {
         segments: tokenize(&stripped),
@@ -898,7 +914,7 @@ pub fn analyze_full(cmd: &str, workspace_root: &Path, cwd: &Path, strict: bool) 
     let home = dirs::home_dir();
 
     for seg in out.segments.clone() {
-        let seg_a = analyze_segment(&seg, &ws_norm, &cwd_norm, home.as_deref(), strict);
+        let seg_a = analyze_segment(&seg, &ws_norm, &cwd_norm, home.as_deref());
         if seg_a.verdict > out.verdict {
             out.verdict = seg_a.verdict;
         }
@@ -911,18 +927,14 @@ pub fn analyze_full(cmd: &str, workspace_root: &Path, cwd: &Path, strict: bool) 
         out.writes_git_hooks |= seg_a.writes_git_hooks;
         out.uses_network |= seg_a.uses_network;
         out.paths_outside_workspace |= seg_a.paths_outside_workspace;
+        extend_unique(&mut out.outside_paths, seg_a.outside_paths);
+        out.flagged |= seg_a.flagged;
     }
     out.matched_rules.sort();
     out
 }
 
-fn analyze_segment(
-    seg: &[String],
-    ws: &Path,
-    cwd: &Path,
-    home: Option<&Path>,
-    strict: bool,
-) -> Analysis {
+fn analyze_segment(seg: &[String], ws: &Path, cwd: &Path, home: Option<&Path>) -> Analysis {
     let mut a = Analysis::default();
     if seg.is_empty() {
         return a;
@@ -946,7 +958,7 @@ fn analyze_segment(
     // wrapper.
     if SHELLS.contains(&base) {
         if let Some(payload) = nested_shell_payload(&effective[1..]) {
-            let child = analyze_limited(payload, ws, cwd, home, strict, 3);
+            let child = analyze_limited(payload, ws, cwd, home, 3);
             a.verdict = child.verdict;
             a.matched_rules.push("shell-nested".to_string());
             a.matched_rules.extend(child.matched_rules);
@@ -954,6 +966,8 @@ fn analyze_segment(
             a.writes_git_hooks |= child.writes_git_hooks;
             a.uses_network |= child.uses_network;
             a.paths_outside_workspace |= child.paths_outside_workspace;
+            extend_unique(&mut a.outside_paths, child.outside_paths);
+            a.flagged |= child.flagged;
             return a;
         }
     }
@@ -962,7 +976,7 @@ fn analyze_segment(
     let mut matched_any_rule = false;
     let mut best_allow_id: Option<&'static str> = None;
     let mut best_ask_id: Option<&'static str> = None;
-    let mut best_deny_id: Option<&'static str> = None;
+    let mut best_flagged_id: Option<&'static str> = None;
 
     for cr in COMPILED_RULES.iter() {
         let count = args.len();
@@ -977,17 +991,15 @@ fn analyze_segment(
         if cr.rule.network {
             a.uses_network = true;
         }
+        if cr.rule.flagged {
+            a.flagged = true;
+            best_flagged_id = Some(cr.rule.id);
+        }
         match cr.rule.verdict {
-            Verdict::Deny => {
-                best_deny_id = Some(cr.rule.id);
-                if cr.rule.verdict > a.verdict {
-                    a.verdict = cr.rule.verdict;
-                }
-            }
             Verdict::Ask => {
                 best_ask_id = Some(cr.rule.id);
-                if cr.rule.verdict > a.verdict {
-                    a.verdict = cr.rule.verdict;
+                if a.verdict < Verdict::Ask {
+                    a.verdict = Verdict::Ask;
                 }
             }
             Verdict::Allow => {
@@ -1006,7 +1018,6 @@ fn analyze_segment(
     // whether it escapes the workspace.
     let mut force_write_next = false;
     let mut path_escape = false;
-    let mut guardrail = false;
     for tok in effective.iter().map(String::as_str) {
         let mut write_ctx = WRITE_PROGS.contains(&base);
 
@@ -1034,19 +1045,9 @@ fn analyze_segment(
         }
 
         let before = (a.verdict, a.matched_rules.len());
-        scan_path_token(target, write_ctx, ws, cwd, home, strict, &mut a);
+        scan_path_token(target, write_ctx, ws, cwd, home, &mut a);
         if a.matched_rules.len() != before.1 {
             path_escape = a.verdict > before.0;
-        }
-        if tok.starts_with("/System/")
-            || tok.starts_with("/bin/")
-            || tok.starts_with("/sbin/")
-            || tok.starts_with("/usr/")
-            || tok.starts_with("/etc/")
-            || tok.starts_with("/private/etc/")
-            || tok.starts_with("/boot/")
-        {
-            guardrail = true;
         }
     }
 
@@ -1054,24 +1055,22 @@ fn analyze_segment(
         a.matched_rules.push("unknown-command".to_string());
         a.verdict = Verdict::Ask;
     }
-    if a.writes_git_hooks && a.verdict < Verdict::Deny {
-        a.verdict = Verdict::Deny;
-        guardrail = true;
+    if a.writes_git_hooks {
+        if a.verdict < Verdict::Ask {
+            a.verdict = Verdict::Ask;
+        }
+        a.flagged = true;
     }
 
     a.tier_origin = match a.verdict {
-        Verdict::Deny => {
-            if guardrail {
-                "guardrail".into()
-            } else if let Some(id) = best_deny_id {
-                format!("static deny ({})", id)
-            } else {
-                "guardrail".into()
-            }
-        }
         Verdict::Ask => {
             if path_escape {
                 "path escape write".into()
+            } else if a.flagged {
+                match best_flagged_id {
+                    Some(id) => format!("guardrail ({})", id),
+                    None => "guardrail".into(),
+                }
             } else if let Some(id) = best_ask_id {
                 format!("static ask ({})", id)
             } else if a.matched_rules.iter().any(|r| r == "unknown-command") {
@@ -1094,14 +1093,7 @@ fn analyze_segment(
 
 /// Recursive analysis with a nesting budget so `bash -c 'bash -c ...'`
 /// terminates.
-fn analyze_limited(
-    cmd: &str,
-    ws: &Path,
-    cwd: &Path,
-    home: Option<&Path>,
-    strict: bool,
-    depth: u8,
-) -> Analysis {
+fn analyze_limited(cmd: &str, ws: &Path, cwd: &Path, home: Option<&Path>, depth: u8) -> Analysis {
     if depth == 0 {
         return Analysis {
             verdict: Verdict::Ask,
@@ -1116,7 +1108,7 @@ fn analyze_limited(
     };
     for seg in out.segments.clone() {
         // Inline copy of segment logic at reduced depth.
-        let seg_a = analyze_segment_limited(&seg, ws, cwd, home, strict, depth);
+        let seg_a = analyze_segment_limited(&seg, ws, cwd, home, depth);
         if seg_a.verdict > out.verdict {
             out.verdict = seg_a.verdict;
         }
@@ -1129,6 +1121,8 @@ fn analyze_limited(
         out.writes_git_hooks |= seg_a.writes_git_hooks;
         out.uses_network |= seg_a.uses_network;
         out.paths_outside_workspace |= seg_a.paths_outside_workspace;
+        extend_unique(&mut out.outside_paths, seg_a.outside_paths);
+        out.flagged |= seg_a.flagged;
     }
     out
 }
@@ -1138,7 +1132,6 @@ fn analyze_segment_limited(
     ws: &Path,
     cwd: &Path,
     home: Option<&Path>,
-    strict: bool,
     depth: u8,
 ) -> Analysis {
     if seg.is_empty() {
@@ -1151,7 +1144,7 @@ fn analyze_segment_limited(
         .unwrap_or(argv0);
     if SHELLS.contains(&base) {
         if let Some(payload) = nested_shell_payload(if seg.len() > 1 { &seg[1..] } else { &[] }) {
-            let child = analyze_limited(payload, ws, cwd, home, strict, depth - 1);
+            let child = analyze_limited(payload, ws, cwd, home, depth - 1);
             let mut a = child;
             a.matched_rules.push("shell-nested".to_string());
             return a;
@@ -1160,7 +1153,7 @@ fn analyze_segment_limited(
     // Delegate to the shared machinery for everything else by reusing
     // analyze_segment on this segment (depth no longer matters because
     // recursion above consumed it).
-    analyze_segment(seg, ws, cwd, home, strict)
+    analyze_segment(seg, ws, cwd, home)
 }
 
 fn looks_like_assignment(tok: &str) -> bool {
@@ -1185,7 +1178,6 @@ fn scan_path_token(
     ws: &Path,
     cwd: &Path,
     home: Option<&Path>,
-    strict: bool,
     a: &mut Analysis,
 ) {
     if raw.is_empty() {
@@ -1208,6 +1200,9 @@ fn scan_path_token(
     let under_ws = within(&norm, ws);
     if !under_ws {
         a.paths_outside_workspace = true;
+        if !a.outside_paths.contains(&norm) {
+            a.outside_paths.push(norm.clone());
+        }
     }
 
     if let Some(h) = home {
@@ -1219,9 +1214,18 @@ fn scan_path_token(
 
     if write_ctx && !under_ws {
         a.matched_rules.push("path-escape-write".to_string());
-        let escalate = if strict { Verdict::Deny } else { Verdict::Ask };
-        if escalate > a.verdict {
-            a.verdict = escalate;
+        a.flagged = true;
+        if a.verdict < Verdict::Ask {
+            a.verdict = Verdict::Ask;
+        }
+    }
+}
+
+/// Append paths not already present, preserving first-seen order.
+fn extend_unique(target: &mut Vec<PathBuf>, paths: Vec<PathBuf>) {
+    for path in paths {
+        if !target.contains(&path) {
+            target.push(path);
         }
     }
 }
@@ -1603,16 +1607,10 @@ mod tests {
         // split the segment into a phantom unknown-command argv0.
         assert_eq!(
             tokenize("cargo check 2>&1 | tail -30"),
-            vec![
-                vec!["cargo", "check", "2>&1"],
-                vec!["tail", "-30"],
-            ]
+            vec![vec!["cargo", "check", "2>&1"], vec!["tail", "-30"],]
         );
         // `>&2` opens a token (no cur yet) but stays glued.
-        assert_eq!(
-            tokenize("echo hi >&2"),
-            vec![vec!["echo", "hi", ">&2"]]
-        );
+        assert_eq!(tokenize("echo hi >&2"), vec![vec!["echo", "hi", ">&2"]]);
         // Bash combined redirect `&>file` is a token too.
         assert_eq!(
             tokenize("cargo build &> build.log"),
@@ -1620,10 +1618,7 @@ mod tests {
         );
         // zsh `|&` (stderr+stdout pipe) is a control operator, just
         // like `|`, and splits the pipeline into two segments.
-        assert_eq!(
-            tokenize("cmd1 |& cmd2"),
-            vec![vec!["cmd1"], vec!["cmd2"]]
-        );
+        assert_eq!(tokenize("cmd1 |& cmd2"), vec![vec!["cmd1"], vec!["cmd2"]]);
         // Standalone `&` (background) and `&&` (logical and) still
         // behave as control separators after the fix.
         assert_eq!(
@@ -1685,7 +1680,7 @@ mod tests {
     }
 
     #[test]
-    fn destructive_commands_deny() {
+    fn destructive_commands_flag_and_ask() {
         for cmd in [
             "rm -rf /",
             "rm -rf ~",
@@ -1700,8 +1695,22 @@ mod tests {
             "diskutil eraseDisk APFS Test disk1",
             "chmod 777 /usr/bin",
         ] {
-            assert_eq!(v(cmd), Verdict::Deny, "{cmd} should be Deny");
+            let a = analyze(cmd, Path::new("/tmp/ws"));
+            assert_eq!(a.verdict, Verdict::Ask, "{cmd} should be Ask");
+            assert!(a.flagged, "{cmd} should be flagged");
         }
+    }
+
+    #[test]
+    fn guardrail_rules_keep_ids_and_reasons() {
+        // The prompt needs the matched rule id / reason even though the
+        // verdict is no longer a hard deny.
+        let a = analyze("sudo make install", Path::new("/tmp/ws"));
+        assert!(a
+            .matched_rules
+            .contains(&"privilege-escalation".to_string()));
+        let b = analyze("rm -rf ~", Path::new("/tmp/ws"));
+        assert!(b.matched_rules.contains(&"rm-home".to_string()));
     }
 
     #[test]
@@ -1745,8 +1754,10 @@ mod tests {
 
     #[test]
     fn dd_arity_constraints() {
-        // dd with of=/dev/* denies...
-        assert_eq!(v("dd if=/dev/zero of=/dev/rdisk0"), Verdict::Deny);
+        // dd with of=/dev/* is a flagged guardrail...
+        let a = analyze("dd if=/dev/zero of=/dev/rdisk0", Path::new("/tmp/ws"));
+        assert_eq!(a.verdict, Verdict::Ask);
+        assert!(a.flagged);
         // ...but plain dd (no device target) only asks.
         assert_eq!(v("dd if=a of=b bs=1m"), Verdict::Ask);
         assert_eq!(v("dd"), Verdict::Ask);
@@ -1761,9 +1772,11 @@ mod tests {
     }
 
     #[test]
-    fn precedence_deny_beats_ask_beats_allow_across_segments() {
+    fn precedence_ask_beats_allow_across_segments() {
         assert_eq!(v("ls && curl example.com"), Verdict::Ask);
-        assert_eq!(v("ls && sudo rm x"), Verdict::Deny);
+        let a = analyze("ls && sudo rm x", Path::new("/tmp/ws"));
+        assert_eq!(a.verdict, Verdict::Ask);
+        assert!(a.flagged);
         assert_eq!(v("curl x; cat y"), Verdict::Ask);
         assert_eq!(v("cat y; ls -l | wc"), Verdict::Allow);
     }
@@ -1832,14 +1845,14 @@ mod tests {
     }
 
     #[test]
-    fn strict_mode_denies_write_escapes() {
+    fn write_escapes_are_flagged() {
         let a = analyze_full(
             "touch /tmp/x",
             Path::new("/Users/dev/proj"),
             Path::new("/Users/dev/proj"),
-            true,
         );
-        assert_eq!(a.verdict, Verdict::Deny);
+        assert_eq!(a.verdict, Verdict::Ask);
+        assert!(a.flagged);
     }
 
     #[test]
@@ -1848,22 +1861,23 @@ mod tests {
             "echo x > ../../../escape.txt",
             Path::new("/home/dev/proj"),
             Path::new("/home/dev/proj/sub/dir"),
-            false,
         );
         assert!(a.paths_outside_workspace);
         assert_eq!(a.verdict, Verdict::Ask);
     }
 
     #[test]
-    fn git_hooks_write_flagged_and_denied() {
+    fn git_hooks_write_flagged_and_asked() {
         let a = analyze("cp evil.sh .git/hooks/pre-commit", Path::new("/ws"));
         assert!(a.writes_git_hooks);
-        assert_eq!(a.verdict, Verdict::Deny);
+        assert_eq!(a.verdict, Verdict::Ask);
+        assert!(a.flagged);
         assert!(a.matched_rules.contains(&"git-hooks-write".to_string()));
 
         // Reading hook listings stays allowed.
         let b = analyze("ls .git/hooks/", Path::new("/ws"));
         assert!(!b.writes_git_hooks);
+        assert!(!b.flagged);
     }
 
     #[test]
@@ -1895,7 +1909,9 @@ mod tests {
     #[test]
     fn nested_shell_payload_recursed() {
         assert_eq!(v("bash -c 'ls -la'"), Verdict::Allow);
-        assert_eq!(v("sh -c \"sudo reboot\""), Verdict::Deny);
+        let a = analyze("sh -c \"sudo reboot\"", Path::new("/tmp/ws"));
+        assert_eq!(a.verdict, Verdict::Ask);
+        assert!(a.flagged);
         assert_eq!(v("zsh -lc 'curl example.com'"), Verdict::Ask);
     }
 
@@ -1918,7 +1934,6 @@ mod tests {
     #[test]
     fn verdict_ordering_matches_precedence() {
         assert!(Verdict::Allow < Verdict::Ask);
-        assert!(Verdict::Ask < Verdict::Deny);
     }
 
     #[test]

@@ -484,9 +484,11 @@ pub(crate) async fn gate_fs_write(ctx: &ToolCtx<'_>, abs: &Path) -> Result<(), S
                 session_id: ctx.session_id.clone(),
                 command: abs.display().to_string(),
                 cwd: ctx.cwd.clone(),
+                workspace_root: ctx.cwd.clone(),
                 rule_id: "protected_write".to_string(),
                 reason: "protected path (agent self-escalation floor)".to_string(),
                 accept_all_preview: None,
+                flagged: false,
             })
             .await;
         if decision.allows() {
@@ -503,9 +505,11 @@ pub(crate) async fn gate_fs_write(ctx: &ToolCtx<'_>, abs: &Path) -> Result<(), S
             session_id: ctx.session_id.clone(),
             command: abs.display().to_string(),
             cwd: ctx.cwd.clone(),
+            workspace_root: ctx.cwd.clone(),
             rule_id: "fs_write_outside".to_string(),
             reason: "writes outside the workspace directory".to_string(),
             accept_all_preview: None,
+            flagged: false,
         })
         .await;
     if decision.allows() {
@@ -565,6 +569,7 @@ fn outcome(text: String, diff: String) -> ToolOutcome {
         text: text_with_diff(text, &diff),
         images: Vec::new(),
         diff,
+        ..Default::default()
     }
 }
 

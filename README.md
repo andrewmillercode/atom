@@ -16,6 +16,14 @@ Atom runs agents in your terminal: they plan, edit code, run commands, and searc
 
 ## How do I install/use Atom?
 
+**Homebrew** (macOS, arm64):
+
+```sh
+brew install andrewmillercode/tap/atom
+```
+
+**Install script** (macOS, x86_64 + arm64):
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/andrewmillercode/atom/main/install.sh | bash
 ```

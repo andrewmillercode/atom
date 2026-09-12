@@ -462,6 +462,8 @@ where
     let mut reasoning = String::new();
     let mut usage: Option<StreamUsage> = None;
     let mut em = Emitter::new();
+    let stream_started_at = Instant::now();
+    let mut first_token_at: Option<Instant> = None;
     let mut item_kind: HashMap<String, String> = HashMap::new();
     let mut calls_by_item: HashMap<String, ToolCall> = HashMap::new();
     let mut call_order: Vec<String> = Vec::new();
@@ -554,9 +556,29 @@ where
             }
             _ => {}
         }
+        // First delta of any kind ends the time-to-first-token window;
+        // generation speed is measured from here to stream end.
+        if first_token_at.is_none()
+            && (!reply.is_empty() || !reasoning.is_empty() || !call_order.is_empty())
+        {
+            first_token_at = Some(Instant::now());
+        }
     }
     em.emit_reasoning_end(0);
 
+    let (ttft_ms, gen_ms) = match first_token_at {
+        Some(first) => (
+            first
+                .saturating_duration_since(stream_started_at)
+                .as_millis()
+                .min(i64::MAX as u128) as i64,
+            Instant::now()
+                .saturating_duration_since(first)
+                .as_millis()
+                .min(i64::MAX as u128) as i64,
+        ),
+        None => (0, 0),
+    };
     let mut calls = Vec::with_capacity(call_order.len());
     for id in &call_order {
         if let Some(mut tc) = calls_by_item.remove(id) {
@@ -575,6 +597,8 @@ where
             tool_calls: calls,
             usage,
             finish_reason: String::new(),
+            ttft_ms,
+            gen_ms,
         },
         events: em.events,
     })

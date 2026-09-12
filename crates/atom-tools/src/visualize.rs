@@ -5,15 +5,16 @@
 //!
 //! Rendering shells out to a browserless Mermaid CLI — `merman-cli`
 //! (native Rust, preferred) or the official `mmdc` (Node) — producing
-//! a single SVG. The TUI rasterizes this SVG at paint time (in the
-//! kitty graphics paint pass) using resvg with a proper card background
-//! matched to the terminal theme. The browser viewer re-renders with the
-//! real Mermaid.js from a CDN (theme-aware) and falls back to the SVG
-//! when offline.
+//! one raw SVG plus its themed form (`atom_core::render::mermaid`),
+//! both derived from the palette selected in config.json. The TUI
+//! rasterizes the raw SVG at paint time, re-applying the theme from the
+//! live palette so the preview follows theme changes; the browser
+//! viewer shows the themed SVG baked at render time.
 //!
 //! Artifacts are content-addressed under the app data dir
-//! (`<data>/atom/diagrams/<slug>-<hash8>.{svg,html}`): identical
-//! Mermaid sources reuse the same files across calls and sessions.
+//! (`<data>/atom/diagrams/<slug>-<hash8>-raw.svg` and
+//! `<slug>-<hash8>.{svg,html}`): identical Mermaid sources under the
+//! same theme reuse the same files across calls and sessions.
 //!
 //! The tool result embeds a single machine-readable marker line
 //! (`[atom-diagram] svg="…" html="…" width=… height=…`)
@@ -22,8 +23,89 @@
 //! contains a space on macOS.
 
 use crate::{ToolCtx, ToolOutcome};
-use atom_core::render::colors::COLOR_BORDER;
+use atom_core::render::colors::Theme;
 use std::path::PathBuf;
+
+// All diagram styling; edit here.
+mod style {
+    use atom_core::render::colors::{theme_snapshot, Theme};
+
+    pub const DOT_OPACITY: f64 = 0.5;
+
+    /// The palette selected in config.json, resolved for this process.
+    /// The visualize tool runs in the atoms server, where the TUI's live
+    /// theme registry is not updated; config carries the selected id.
+    pub fn theme() -> Theme {
+        let id = atom_core::config::load().theme;
+        id.as_deref().and_then(theme_snapshot).unwrap_or_default()
+    }
+
+    pub fn dot(theme: &Theme) -> String {
+        with_alpha(&theme.muted_extra, DOT_OPACITY)
+    }
+
+    /// Edge-label color tokens; palette accents (green has no theme role).
+    pub fn label_token_color(theme: &Theme, token: &str) -> Option<String> {
+        match token {
+            "blue" => Some(theme.primary.clone()),
+            "green" => Some("#96d1ae".to_string()),
+            "orange" => Some(theme.syntax_type.clone()),
+            "pink" => Some(theme.secondary.clone()),
+            _ => None,
+        }
+    }
+
+    /// Renderer themeVariables: everything mermaid bakes into its SVG.
+    pub fn mermaid_theme_variables(theme: &Theme) -> String {
+        format!(
+            r#"{{"clusterBkg":"transparent","clusterBorder":"{border}","mainBkg":"{fill}","nodeBorder":"{fill}","nodeTextColor":"{fg}","primaryTextColor":"{fg}","edgeLabelBackground":"transparent"}}"#,
+            border = theme.border,
+            fill = theme.muted_extra,
+            fg = theme.foreground,
+        )
+    }
+
+    /// The diagram-relevant palette slice, hashed into the artifact key
+    /// so a theme switch produces fresh artifacts.
+    pub fn theme_fingerprint(theme: &Theme) -> String {
+        format!(
+            "{}|{}|{}|{}|{}|{}",
+            theme.background,
+            theme.foreground,
+            theme.muted_extra,
+            theme.primary,
+            theme.border,
+            theme.card_dark
+        )
+    }
+
+    pub fn css_vars(theme: &Theme) -> String {
+        format!(
+            ":root {{ --bg: {BG}; --card: {CARD}; --border: {BORDER}; \
+             --fg: {FG}; --muted: {MUTED}; --dot: {DOT}; }}",
+            BG = theme.background,
+            CARD = theme.card_dark,
+            BORDER = theme.border,
+            FG = theme.foreground,
+            MUTED = theme.muted,
+            DOT = dot(theme)
+        )
+    }
+
+    fn with_alpha(hex: &str, alpha: f64) -> String {
+        let h = hex.trim_start_matches('#');
+        if h.len() == 6 {
+            if let (Ok(r), Ok(g), Ok(b)) = (
+                u8::from_str_radix(&h[0..2], 16),
+                u8::from_str_radix(&h[2..4], 16),
+                u8::from_str_radix(&h[4..6], 16),
+            ) {
+                return format!("rgba({r},{g},{b},{alpha})");
+            }
+        }
+        hex.to_string()
+    }
+}
 
 /// Which renderer binary is available ("merman-cli" or "mmdc").
 fn renderer() -> Option<PathBuf> {
@@ -62,31 +144,25 @@ fn slugify(title: &str) -> String {
     }
 }
 
-/// Builds the mermaid CLI `config.json`. Forces native SVG `<text>`
-/// labels (htmlLabels:false — resvg can't render `<foreignObject>`) and
-/// overrides the dark theme's default muted subgraph fill so clusters
-/// render as transparent boxes with a border. `themeVariables` only
-/// change the default cluster fill; explicit user-supplied
-/// `style ... fill:` directives are left untouched.
-fn mermaid_config() -> String {
+/// CLI config: native SVG text (resvg can't render foreignObject) plus
+/// the shared themeVariables. Diagram-level `style ... fill:` still wins.
+fn mermaid_config(theme: &atom_core::render::colors::Theme) -> String {
     format!(
-        r#"{{"flowchart":{{"htmlLabels":false}},"sequence":{{"htmlLabels":false}},"htmlLabels":false,"themeVariables":{{"clusterBkg":"transparent","clusterBorder":"{COLOR_BORDER}"}}}}"#
+        r#"{{"flowchart":{{"htmlLabels":false}},"sequence":{{"htmlLabels":false}},"htmlLabels":false,"themeVariables":{}}}"#,
+        style::mermaid_theme_variables(theme)
     )
 }
 
 /// Renders Mermaid `code` to SVG via the external CLI.
-/// Uses the dark theme so diagrams look native in atom's dark TUI.
-/// Forces native SVG text (htmlLabels:false) so resvg can render labels.
 async fn render_mermaid(code: &str, bin: &std::path::Path) -> Result<Vec<u8>, String> {
+    let theme = style::theme();
     let dir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
     let src = dir.path().join("diagram.mmd");
     std::fs::write(&src, code).map_err(|e| format!("write source: {e}"))?;
     let svg_path = dir.path().join("diagram.svg");
 
-    // Config that forces SVG <text> instead of <foreignObject> (which
-    // resvg can't render). htmlLabels:false is the key setting.
     let cfg_path = dir.path().join("config.json");
-    std::fs::write(&cfg_path, mermaid_config()).map_err(|e| format!("write config: {e}"))?;
+    std::fs::write(&cfg_path, mermaid_config(&theme)).map_err(|e| format!("write config: {e}"))?;
 
     let args: Vec<String> = vec![
         "-i".to_string(),
@@ -194,35 +270,15 @@ fn js_string(s: &str) -> String {
 const VIEWER_HTML: &str = include_str!("../templates/visualize-viewer.html");
 const VIEWER_JS: &str = include_str!("../templates/visualize-viewer.js");
 
-/// viewer_html builds the self-contained browser viewer. Dark theme with
-/// dot grid background, pan/zoom via pointer drag and wheel.
-/// Colors sourced from atom's palette (colors.rs constants).
-fn viewer_html(title: &str, slug: &str, svg: &str, code: &str) -> String {
-    // Pull colors from the palette at build time.
-    use atom_core::render::colors::*;
-    let bg = COLOR_BACKGROUND; // #111112
-    let card = COLOR_CARD_DARK; // #151516
-    let border = COLOR_BORDER; // #272b33
-    let muted_extra = COLOR_MUTED_EXTRA; // #3d3d3d
-    let muted = COLOR_MUTED; // #666666
-    let fg = COLOR_FOREGROUND; // #ced5d9
-
-    // Fill the JS template first so its `__BORDER__` is gone before the
-    // HTML pass runs (the HTML also has a `__BORDER__` for the CSS).
+fn viewer_html(title: &str, slug: &str, svg: &str, code: &str, theme: &Theme) -> String {
+    // JS first, then the HTML wraps it.
     let viewer_js = VIEWER_JS
-        .replace("__BORDER__", border)
-        .replace("__CODE_JS__", &js_string(code))
         .replace("__SVG_JS__", &js_string(svg))
         .replace("__SLUG__", slug);
 
     VIEWER_HTML
         .replace("__TITLE__", &escape_html(title))
-        .replace("__BG__", bg)
-        .replace("__CARD__", card)
-        .replace("__BORDER__", border)
-        .replace("__MUTED_EXTRA__", muted_extra)
-        .replace("__MUTED__", muted)
-        .replace("__FG__", fg)
+        .replace("__CSS_VARS__", &style::css_vars(theme))
         .replace("__CODE_HTML__", &escape_html(code))
         .replace("__VIEWER_JS__", &viewer_js)
 }
@@ -237,6 +293,9 @@ pub async fn execute_visualize(args_json: &str, _ctx: &ToolCtx<'_>) -> ToolOutco
         code: String,
         #[serde(default)]
         title: String,
+        /// Edge-label color tokens: label text -> blue|green|orange|pink.
+        #[serde(default)]
+        label_colors: Vec<(String, String)>,
     }
     if args_json.trim().is_empty() {
         return ToolOutcome::from_text(crate::exec::empty_arguments_msg("visualize"));
@@ -248,6 +307,18 @@ pub async fn execute_visualize(args_json: &str, _ctx: &ToolCtx<'_>) -> ToolOutco
     let code = args.code.trim().to_string();
     if code.is_empty() {
         return ToolOutcome::from_text("error: code (mermaid source) is required".into());
+    }
+    let mut edge_colors = Vec::with_capacity(args.label_colors.len());
+    let theme = style::theme();
+    for (label, token) in &args.label_colors {
+        match style::label_token_color(&theme, token.trim().to_lowercase().as_str()) {
+            Some(color) => edge_colors.push((label.trim().to_string(), color)),
+            None => {
+                return ToolOutcome::from_text(format!(
+                    "error: unknown label color token {token:?} (use blue, green, orange, pink)"
+                ));
+            }
+        }
     }
     let Some(bin) = renderer() else {
         return ToolOutcome::from_text(
@@ -272,23 +343,40 @@ pub async fn execute_visualize(args_json: &str, _ctx: &ToolCtx<'_>) -> ToolOutco
         Err(e) => return ToolOutcome::from_text(format!("error: {e}")),
     };
 
-    // Normalize edge-label geometry before the SVG goes anywhere: merman
-    // anchors edge-label text W/2 left of the edge midpoint (real Mermaid
-    // offsets the background rect instead). Without this the label slides
-    // under the source node when rasterized, and SVGs downloaded from the
-    // browser viewer are broken in other tools too. Idempotent; see
-    // atom_core::render::mermaid for the geometry.
+    // Normalize edge-label geometry, then apply the atom diagram theme
+    // (both passes idempotent; see atom_core::render::mermaid). The raw
+    // SVG is also written: the TUI rasterizer re-applies the theme from
+    // it at paint time, so the preview follows theme changes live.
+    let raw = atom_core::render::mermaid::inject_edge_colors(
+        &String::from_utf8_lossy(&svg),
+        &edge_colors,
+    );
     let svg = {
         let text = String::from_utf8_lossy(&svg).into_owned();
-        atom_core::render::mermaid::normalize_edge_labels(&text).into_bytes()
+        let normalized = atom_core::render::mermaid::normalize_edge_labels(&text);
+        let theme = atom_core::render::mermaid::diagram_theme_from(&style::theme());
+        atom_core::render::mermaid::apply_diagram_theme(&normalized, &theme, &edge_colors)
+            .into_bytes()
     };
 
     let Some((w, h)) = svg_size(&svg) else {
         return ToolOutcome::from_text("error: rendered SVG has no dimensions".into());
     };
 
-    // Content-addressed artifacts: identical sources reuse the same files.
-    let hash = atom_core::util::sha256_hash(code.as_bytes());
+    // Content-addressed artifacts: identical sources reuse the same
+    // files. The theme fingerprint keys the artifacts so a theme switch
+    // renders fresh ones.
+    let active = style::theme();
+    let hash = atom_core::util::sha256_hash(
+        format!(
+            "{}{}{}{:?}",
+            style::theme_fingerprint(&active),
+            style::mermaid_theme_variables(&active),
+            code,
+            edge_colors
+        )
+        .as_bytes(),
+    );
     let hash8: String = hash.chars().take(8).collect();
     let slug = slugify(title);
     let stem = format!("{slug}-{hash8}");
@@ -296,8 +384,12 @@ pub async fn execute_visualize(args_json: &str, _ctx: &ToolCtx<'_>) -> ToolOutco
     if let Err(e) = std::fs::create_dir_all(&dir) {
         return ToolOutcome::from_text(format!("error: create {}: {e}", dir.display()));
     }
+    let raw_path = dir.join(format!("{stem}-raw.svg"));
     let svg_path = dir.join(format!("{stem}.svg"));
     let html_path = dir.join(format!("{stem}.html"));
+    if let Err(e) = std::fs::write(&raw_path, &raw) {
+        return ToolOutcome::from_text(format!("error: write raw svg: {e}"));
+    }
     if let Err(e) = std::fs::write(&svg_path, &svg) {
         return ToolOutcome::from_text(format!("error: write svg: {e}"));
     }
@@ -305,15 +397,20 @@ pub async fn execute_visualize(args_json: &str, _ctx: &ToolCtx<'_>) -> ToolOutco
         Ok(s) => s,
         Err(_) => return ToolOutcome::from_text("error: svg is not valid utf-8".into()),
     };
-    if let Err(e) = std::fs::write(&html_path, viewer_html(title, &slug, svg_str, &code)) {
+    if let Err(e) = std::fs::write(
+        &html_path,
+        viewer_html(title, &slug, svg_str, &code, &active),
+    ) {
         return ToolOutcome::from_text(format!("error: write viewer: {e}"));
     }
 
     // The result is the bare machine-readable marker line: the block
     // header already shows the title and the diagram itself is rendered
-    // inline, so no human-readable prose is added around it.
+    // inline, so no human-readable prose is added around it. The svg
+    // path is the RAW artifact: the TUI re-themes it against the live
+    // palette at raster time.
     ToolOutcome::from_text(diagram_marker(
-        &svg_path.display().to_string(),
+        &raw_path.display().to_string(),
         &html_path.display().to_string(),
         w,
         h,
@@ -397,55 +494,85 @@ mod tests {
 
     #[test]
     fn viewer_html_embeds_source_and_fallback() {
+        let theme = Theme::default();
         let html = viewer_html(
             "Arch",
             "arch",
             "<svg id=\"x\"></svg>",
             "flowchart TD\nA --> B",
+            &theme,
         );
         assert!(html.contains("<title>Arch</title>"));
         assert!(html.contains(">Arch</div>"));
-        assert!(html.contains("flowchart TD\\nA --> B"));
         assert!(html.contains("flowchart TD\nA --&gt; B"));
         assert!(html.contains("svg id=\\\"x\\\""));
         assert!(html.contains("<\\/svg>"));
         assert!(html.contains("id=\"viewport\""));
         assert!(!html.contains("stage-container"));
-        assert!(html.contains("mermaid@11"));
         assert!(html.contains("a.download = \"arch.svg\""));
-        // ResizeObserver replaces old scheduleFit/setTimeout approach
         assert!(html.contains("ResizeObserver"));
         assert!(!html.contains("scheduleFit"));
+        // The viewer shows the offline SVG directly; no second renderer.
+        assert!(!html.contains("mermaid@11"));
     }
 
     #[test]
-    fn mermaid_config_renders_clusters_transparent_with_border() {
-        // Subgraph/group clusters should render as a bordered, empty
-        // (transparent) box rather than the dark theme's muted fill.
-        let cfg = mermaid_config();
-        assert!(cfg.contains("\"clusterBkg\":\"transparent\""), "cfg: {cfg}");
-        assert!(cfg.contains("\"clusterBorder\":\"#272b33\""), "cfg: {cfg}");
+    fn mermaid_config_uses_shared_theme_variables() {
+        let theme = Theme::default();
+        let cfg = mermaid_config(&theme);
         // Keep the native-SVG-text forcing resvg relies on.
         assert!(cfg.contains("\"htmlLabels\":false"), "cfg: {cfg}");
         assert!(cfg.contains("\"flowchart\""), "cfg: {cfg}");
         assert!(cfg.contains("\"sequence\""), "cfg: {cfg}");
+        let tv = style::mermaid_theme_variables(&theme);
+        assert!(cfg.contains(&tv), "cfg: {cfg}\ntv: {tv}");
     }
 
     #[test]
-    fn viewer_html_sets_cluster_theme_variables_for_mermaid_render() {
-        // The onload Mermaid.js re-render in the browser viewer must
-        // match the offline SVG: transparent cluster fill + border.
-        let html = viewer_html(
-            "Arch",
-            "arch",
-            "<svg id=\"x\"></svg>",
-            "flowchart TD\nsubgraph bins\nA\nend",
+    fn theme_variables_derive_from_the_palette() {
+        let theme = Theme::default();
+        let tv = style::mermaid_theme_variables(&theme);
+        // Defaults: muted card fill, theme foreground text.
+        assert!(tv.contains(r##""mainBkg":"#3d3d3d""##), "tv: {tv}");
+        assert!(tv.contains(r##""nodeTextColor":"#ced5d9""##), "tv: {tv}");
+        assert!(tv.contains(r#""clusterBkg":"transparent""#), "tv: {tv}");
+        assert!(tv.contains(r##""clusterBorder":"#272b33""##), "tv: {tv}");
+    }
+
+    #[test]
+    fn theme_variables_follow_a_changed_palette() {
+        let mut theme = Theme::default();
+        theme.muted_extra = "#123456".into();
+        theme.foreground = "#fedcba".into();
+        let tv = style::mermaid_theme_variables(&theme);
+        assert!(tv.contains(r##""mainBkg":"#123456""##), "tv: {tv}");
+        assert!(tv.contains(r##""nodeTextColor":"#fedcba""##), "tv: {tv}");
+    }
+
+    #[test]
+    fn label_tokens_cover_the_palette() {
+        let theme = Theme::default();
+        for token in ["blue", "green", "orange", "pink"] {
+            assert!(style::label_token_color(&theme, token).is_some());
+        }
+        assert!(style::label_token_color(&theme, "purple").is_none());
+        assert_eq!(
+            style::label_token_color(&theme, "blue"),
+            Some(theme.primary.clone())
         );
-        assert!(
-            html.contains(
-                "themeVariables: { clusterBkg: \"transparent\", clusterBorder: \"#272b33\" }"
-            ),
-            "html: {html}"
-        );
+    }
+
+    #[test]
+    fn dot_is_half_opacity() {
+        assert_eq!(style::dot(&Theme::default()), "rgba(61,61,61,0.5)");
+    }
+
+    #[test]
+    fn css_vars_cover_all_template_colors() {
+        let vars = style::css_vars(&Theme::default());
+        for name in ["--bg", "--card", "--border", "--fg", "--muted", "--dot"] {
+            assert!(vars.contains(name), "vars: {vars}");
+        }
+        assert!(vars.contains("--dot: rgba("), "vars: {vars}");
     }
 }

@@ -55,6 +55,38 @@ pub struct ProviderListEntry {
     pub connected: bool,
     /// auth.json or legacy file; disconnectable with d
     pub stored: bool,
+    /// Capabilities surfaced in the providers overlay's fixed badge
+    /// column: "Models", "Web Search", "Web Fetch".
+    pub caps: Vec<&'static str>,
+}
+
+/// webToolProviders are non-model backends that share the provider
+/// list and auth store but expose no /v1/models: pure web search /
+/// fetch services, keyed by their own API keys.
+pub const WEB_TOOL_PROVIDERS: [(&str, &str); 3] = [
+    ("tinyfish", "TinyFish"),
+    ("parallel", "Parallel"),
+    ("exa", "Exa"),
+];
+
+pub fn is_web_tool_provider(id: &str) -> bool {
+    WEB_TOOL_PROVIDERS.iter().any(|(wid, _)| *wid == id)
+}
+
+/// providerCaps reports what a provider id can be used for, read off
+/// the bundled capability tables: every models.dev provider lists
+/// models; the web-tool providers (and ollama-cloud, whose API hosts
+/// both) list search and fetch.
+pub fn provider_caps(id: &str) -> Vec<&'static str> {
+    let mut caps = Vec::new();
+    if !is_web_tool_provider(id) {
+        caps.push("Models");
+    }
+    if is_web_tool_provider(id) || matches!(id, "ollama-cloud" | "ollama") {
+        caps.push("Web Search");
+        caps.push("Web Fetch");
+    }
+    caps
 }
 
 /// providerByName returns the provider with the given display name, or
@@ -128,6 +160,41 @@ pub fn reasoning_field_for_url(url: &str) -> String {
     }
 }
 
+/// isVercelAiGateway reports whether a base URL is Vercel's AI Gateway
+/// (models.dev id "vercel", fallback host ai-gateway.vercel.sh/v1).
+pub fn is_vercel_ai_gateway(url: &str) -> bool {
+    url.contains("ai-gateway.vercel.sh")
+}
+
+/// applyGatewayProviderRouting adapts a serialized ChatRequest body for
+/// the Vercel AI Gateway Chat Completions API:
+/// - injects the top-level `provider` routing shorthand
+///   (providerOptions.gateway) with `sort: "tps"`, ranking the gateway's
+///   upstream providers for the model by median tokens-per-second
+///   (highest first) and falling through the sorted list on failure;
+/// - remaps `reasoning_effort` to `reasoning.effort`, the gateway's
+///   provider-agnostic reasoning-level form, which it bridges to the
+///   target model's native configuration (effort levels or token
+///   budgets).
+/// Other providers reject the unknown top-level `provider` key, so the
+/// body is only touched for the gateway host.
+pub fn apply_gateway_provider_routing(url: &str, body: &mut serde_json::Value) {
+    if !is_vercel_ai_gateway(url) {
+        return;
+    }
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    if !obj.contains_key("provider") {
+        obj.insert("provider".into(), serde_json::json!({ "sort": "tps" }));
+    }
+    if let Some(effort) = obj.remove("reasoning_effort") {
+        if effort.as_str().map(|s| !s.is_empty()).unwrap_or(false) {
+            obj.insert("reasoning".into(), serde_json::json!({ "effort": effort }));
+        }
+    }
+}
+
 fn get_env(name: &str) -> String {
     std::env::var(name).unwrap_or_default()
 }
@@ -143,6 +210,46 @@ pub fn ambient_aws_region() -> Option<String> {
         }
     }
     None
+}
+
+/// resolveProviderEndpoint maps a provider selection (models.dev id or
+/// display name, e.g. "anthropic") to its endpoint credentials. A
+/// provider with no stored key falls back to the Ollama shapes, then to
+/// its models.dev base URL.
+pub async fn resolve_provider_endpoint(selected: &str) -> Provider {
+    crate::providers::modelsdev::ensure_models_dev_catalog().await;
+    let providers = build_providers().await;
+    if let Some(provider) = providers
+        .iter()
+        .find(|provider| provider.name == selected || provider.id == selected)
+    {
+        return provider.clone();
+    }
+    if matches!(selected, "ollama" | "ollama-cloud") {
+        return Provider {
+            name: "ollama".into(),
+            id: "ollama-cloud".into(),
+            base_url: "https://ollama.com/v1".into(),
+            key: super::auth::load_provider_key("ollama-cloud").await,
+            reasoning_field: "reasoning".into(),
+        };
+    }
+    let base_url = crate::providers::modelsdev::models_dev_base_url(selected);
+    if base_url.is_empty() {
+        return Provider {
+            name: "ollama-local".into(),
+            base_url: "http://localhost:11434/v1".into(),
+            reasoning_field: "reasoning".into(),
+            ..Default::default()
+        };
+    }
+    Provider {
+        name: selected.into(),
+        id: selected.into(),
+        key: super::auth::load_provider_key(selected).await,
+        reasoning_field: reasoning_field_for_url(&base_url),
+        base_url,
+    }
 }
 
 /// buildProviders discovers providers whose credentials are available.
@@ -358,6 +465,18 @@ pub fn list_addable_providers() -> Vec<ProviderListEntry> {
         }
         entries.push(make_provider_list_entry(&id, &p, &store));
     }
+    // Web-tool providers (search/fetch only, no models) share the
+    // list so their API keys are manageable in the same place.
+    for (id, label) in WEB_TOOL_PROVIDERS {
+        let mut e = ProviderListEntry {
+            id: id.to_string(),
+            label: label.to_string(),
+            caps: provider_caps(id),
+            ..Default::default()
+        };
+        fill_connection_status(&mut e, &store);
+        entries.push(e);
+    }
     entries.sort_by(|a, b| {
         if a.connected != b.connected {
             return b.connected.cmp(&a.connected);
@@ -372,6 +491,8 @@ pub fn list_addable_providers() -> Vec<ProviderListEntry> {
     entries
 }
 
+/// makeProviderListEntry builds one overlay row for a models.dev
+/// provider: display name, connection status, and capability badges.
 fn make_provider_list_entry(
     id: &str,
     p: &super::modelsdev::ModelsDevProvider,
@@ -384,8 +505,22 @@ fn make_provider_list_entry(
         } else {
             p.name.clone()
         },
+        caps: provider_caps(id),
         ..Default::default()
     };
+    fill_connection_status(&mut e, store);
+    e
+}
+
+/// fillConnectionStatus sets connected/stored/status on an entry by
+/// resolving the provider's credential: auth.json (including builtin
+/// aliases like ollama-cloud <-> ollama), a legacy flat file, or an
+/// env var from the models.dev catalog.
+fn fill_connection_status(
+    e: &mut ProviderListEntry,
+    store: &HashMap<String, super::auth::AuthEntry>,
+) {
+    let id = e.id.as_str();
     let mut found: Option<super::auth::AuthEntry> = None;
     for k in super::auth::auth_ids_for(id) {
         if let Some(ae) = store.get(&k) {
@@ -402,28 +537,36 @@ fn make_provider_list_entry(
         e.connected = true;
         e.stored = true;
         e.status = format!("connected ({})", kind);
-        return e;
+        return;
     }
     if !super::auth::legacy_provider_key(id).is_empty() {
         e.connected = true;
         e.stored = true;
         e.status = "connected (api)".into();
-        return e;
+        return;
     }
-    if !catalog_env_key(id, p).is_empty() || !builtin_env_key(id).is_empty() {
+    if is_web_tool_provider(id) {
+        // Web-tool providers have no models.dev catalog entry, so no
+        // env-var list and no keyless public tier. The bundled
+        // hosted-MCP routes still work keylessly at the tool level,
+        // but the provider row reflects the keyed REST tier only.
+        e.status = "not connected".into();
+        return;
+    }
+    let p = super::modelsdev::models_dev_provider(id).unwrap_or_default();
+    if !catalog_env_key(id, &p).is_empty() || !builtin_env_key(id).is_empty() {
         e.connected = true;
         e.stored = false;
         e.status = "connected (api)".into();
-        return e;
+        return;
     }
     if id == "opencode" {
         e.connected = true;
         e.stored = false;
         e.status = "connected (public)".into();
-        return e;
+        return;
     }
     e.status = "not connected".into();
-    e
 }
 
 pub fn filter_provider_entries(
@@ -433,7 +576,15 @@ pub fn filter_provider_entries(
     let q = query.to_lowercase();
     entries
         .iter()
-        .filter(|e| entry_matches_query(&q, &e.id.to_lowercase(), &e.label.to_lowercase()))
+        .filter(|e| {
+            entry_matches_query(&q, &e.id.to_lowercase(), &e.label.to_lowercase())
+                // Capability badges are searchable too, so "web fetch",
+                // "web search", and "models" find the right rows.
+                || {
+                    let caps = e.caps.join(" ").to_lowercase();
+                    !caps.is_empty() && entry_matches_query(&q, "", &caps)
+                }
+        })
         .cloned()
         .collect()
 }
@@ -592,6 +743,7 @@ pub async fn stream_chat(
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let mut body_value = serde_json::to_value(&req)?;
     strip_internal_fields(&mut body_value, reasoning_field);
+    apply_gateway_provider_routing(base_url, &mut body_value);
     let body = serde_json::to_vec(&body_value)?;
     let resp = super::retry::do_http_with_retry(|| {
         let mut builder = super::retry::long_timeout_client()
@@ -962,6 +1114,40 @@ mod tests {
             reasoning_field_for_url("http://localhost:11434/v1"),
             "reasoning"
         );
+    }
+
+    /// Vercel AI Gateway requests carry the top-level `provider`
+    /// shorthand with sort: "tps" so routing picks the highest-throughput
+    /// upstream provider for the model, and reasoning_effort is remapped
+    /// to the gateway's reasoning.effort form; other base URLs are
+    /// untouched.
+    #[test]
+    fn gateway_provider_routing_sorted_by_tps() {
+        let mut body =
+            serde_json::json!({"model": "m", "messages": [], "reasoning_effort": "high"});
+        apply_gateway_provider_routing("https://ai-gateway.vercel.sh/v1", &mut body);
+        assert_eq!(body["provider"]["sort"], "tps");
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert!(body.get("reasoning_effort").is_none());
+
+        // Empty effort serializes as absent, so no reasoning key either.
+        let mut body = serde_json::json!({"model": "m", "messages": []});
+        apply_gateway_provider_routing("https://ai-gateway.vercel.sh/v1", &mut body);
+        assert_eq!(body["provider"]["sort"], "tps");
+        assert!(body.get("reasoning").is_none());
+
+        for url in [
+            "https://api.openai.com/v1",
+            "https://openrouter.ai/api/v1",
+            "http://localhost:11434/v1",
+        ] {
+            let mut body = serde_json::json!({"model": "m", "messages": []});
+            apply_gateway_provider_routing(url, &mut body);
+            assert!(
+                body.get("provider").is_none(),
+                "{url}: unexpected provider routing"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1399,6 +1585,8 @@ mod tests {
             tools: vec![],
             reasoning_effort: String::new(),
             stream_options: None,
+            temperature: None,
+            max_tokens: None,
         }
     }
 

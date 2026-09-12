@@ -38,9 +38,10 @@ pub use oauth::{
     run_openai_oauth, OpenAIOAuthFlow,
 };
 pub use providers::{
-    build_providers, entry_matches_query, filter_entries, filter_provider_entries,
-    find_provider_for_model, list_addable_providers, provider_by_name, provider_name_for_url,
-    reasoning_field_for_url, sse_data, stream_chat, ModelEntry, Provider, ProviderListEntry,
+    apply_gateway_provider_routing, build_providers, entry_matches_query, filter_entries,
+    filter_provider_entries, find_provider_for_model, list_addable_providers, provider_by_name,
+    provider_name_for_url, reasoning_field_for_url, sse_data, stream_chat, ModelEntry, Provider,
+    ProviderListEntry,
 };
 pub use responses::stream_responses;
 pub use retry::{

@@ -70,9 +70,54 @@ pub fn build_id() -> &'static str {
     env!("ATOM_BUILD_ID")
 }
 
+/// Marker file `make dev` leaves beside the atomdev/atomsdev copies
+/// (`.atomdev-source` in the install dir), containing the absolute path
+/// of the cargo target dir that feeds the install. Dev builds read it
+/// to detect and repair stale installs: `atomdev` warns when cargo has
+/// built a newer artifact, and `find_server_binary` refreshes the
+/// atomsdev copy before spawning it. Returns None when the marker is
+/// missing or dangling (release installs, plain `cargo run`) — callers
+/// treat that as "no source known" and skip the staleness logic.
+pub fn dev_target_dir(exe_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let txt = std::fs::read_to_string(exe_dir.join(".atomdev-source")).ok()?;
+    let dir = std::path::PathBuf::from(txt.trim());
+    dir.is_dir().then_some(dir)
+}
+
+/// The cargo-built debug artifact (`atom` or `atoms`) recorded by the
+/// `.atomdev-source` marker in `exe_dir`, when a dev install marker is
+/// present and its target dir exists.
+pub fn dev_debug_artifact(exe_dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    dev_target_dir(exe_dir).map(|t| t.join("debug").join(name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dev_target_dir_reads_marker_only_when_dir_exists() {
+        let dir = std::env::temp_dir().join(format!("atom-build-marker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // No marker: no source known.
+        assert!(dev_target_dir(&dir).is_none());
+
+        // Marker pointing at a real dir resolves to it (whitespace trimmed).
+        std::fs::write(dir.join(".atomdev-source"), format!("{}\n", dir.display())).unwrap();
+        assert_eq!(dev_target_dir(&dir).as_deref(), Some(dir.as_path()));
+        assert_eq!(
+            dev_debug_artifact(&dir, "atoms").as_deref(),
+            Some(dir.join("debug").join("atoms").as_path())
+        );
+
+        // Dangling marker (target dir deleted): treated as absent.
+        std::fs::write(dir.join(".atomdev-source"), "/nonexistent/target").unwrap();
+        assert!(dev_target_dir(&dir).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn names_follow_the_flavor() {

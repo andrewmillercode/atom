@@ -61,7 +61,41 @@ pub fn c_syntax_type() -> Color {
 }
 
 fn theme_color(role: atom_core::render::colors::ThemeColor) -> Color {
-    hex_color(&atom_core::render::colors::theme_color(role))
+    // Hot path: called for every style lookup on every frame. The parsed
+    // Color is cached per role and invalidated by the theme generation
+    // counter, so steady-state cost is one atomic load + RwLock read —
+    // no String clone, no hex parsing (profiler showed ~30% of draw
+    // time re-parsing the same 18 hex strings).
+    static CACHE: std::sync::OnceLock<
+        std::sync::RwLock<(
+            u64,
+            [Option<Color>; atom_core::render::colors::THEME_COLOR_COUNT],
+        )>,
+    > = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| {
+        std::sync::RwLock::new((
+            u64::MAX,
+            [None; atom_core::render::colors::THEME_COLOR_COUNT],
+        ))
+    });
+    let idx = role as usize;
+    let generation = atom_core::render::colors::theme_gen();
+    if let Ok(guard) = cache.read() {
+        if guard.0 == generation {
+            if let Some(c) = guard.1[idx] {
+                return c;
+            }
+        }
+    }
+    let c = hex_color(&atom_core::render::colors::theme_color(role));
+    if let Ok(mut guard) = cache.write() {
+        if guard.0 != generation {
+            guard.0 = generation;
+            guard.1 = [None; atom_core::render::colors::THEME_COLOR_COUNT];
+        }
+        guard.1[idx] = Some(c);
+    }
+    c
 }
 
 /// Mirrors tui.go's style block.
@@ -91,6 +125,14 @@ pub fn style_tool_name() -> Style {
 }
 pub fn style_tool_hint() -> Style {
     Style::new().fg(c_muted()).bg(c_card_dark())
+}
+/// Approval button key letter: foreground on the prompt-input card color.
+pub fn style_approval_key() -> Style {
+    Style::new().fg(c_foreground()).bg(c_card_light())
+}
+/// Approval button action word: muted on the prompt-input card color.
+pub fn style_approval_word() -> Style {
+    Style::new().fg(c_muted()).bg(c_card_light())
 }
 pub fn style_error() -> Style {
     Style::new().fg(c_secondary())
@@ -129,6 +171,16 @@ pub fn style_select() -> Style {
 /// The base frame style: app foreground/background on every cell.
 pub fn frame_style() -> Style {
     Style::new().fg(c_foreground()).bg(c_background())
+}
+
+/// Base frame style for the chat viewport when the transparent-background
+/// setting is on: theme foreground over the terminal's *default* background
+/// (`Color::Reset` emits `\x1b[49m`), so a terminal profile with no
+/// background color shows through. Spans that set their own bg (code
+/// cards, diff rows, the selection wash) still paint it; every other
+/// surface keeps `frame_style()`.
+pub fn frame_style_transparent() -> Style {
+    Style::new().fg(c_foreground()).bg(Color::Reset)
 }
 
 // ---------------------------------------------------------------------------

@@ -33,6 +33,10 @@ pub struct SandboxConfig {
     pub version: u32,
     #[serde(default)]
     pub rules: Rules,
+    /// Run local commands under Seatbelt confinement (macOS). Defaults
+    /// on; the escape hatch for a command the profile refuses.
+    #[serde(default = "default_confine")]
+    pub confine: bool,
     /// Path the config was loaded from (or the most-recent save
     /// target). Persisted calls use this so tests that pass a temp
     /// dir don't end up writing to the real data dir. Skipped from
@@ -43,6 +47,10 @@ pub struct SandboxConfig {
 
 fn default_version() -> u32 {
     VERSION
+}
+
+fn default_confine() -> bool {
+    true
 }
 
 /// User-maintained prefix rules. Order is not significant: an `allow` rule
@@ -60,6 +68,7 @@ impl Default for SandboxConfig {
         SandboxConfig {
             version: VERSION,
             rules: Rules::default(),
+            confine: true,
             path: None,
         }
     }
@@ -329,6 +338,7 @@ mod tests {
                 allow: vec!["cargo test *".into()],
                 deny: vec!["rm *".into()],
             },
+            confine: true,
             path: Some(p.clone()),
         };
         cfg.save_to(&p).unwrap();
@@ -439,6 +449,7 @@ mod tests {
                 allow: vec!["cargo test *".into()],
                 deny: vec!["rm *".into()],
             },
+            confine: true,
             path: None,
         };
         assert_eq!(

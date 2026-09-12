@@ -790,7 +790,7 @@ async fn record_pending_result(
     let mut content = if exit.killed {
         atom_tools::format_bash_cancelled(&exit)
     } else {
-        atom_tools::format_bash_exit(exit.exit_code, &exit.output)
+        atom_tools::format_bash_exit(exit.exit_code, &exit.output, exit.confined)
     };
     cap_tool_output(&mut content);
     // Slot resolution, most specific first: the exact entry the
@@ -1915,6 +1915,8 @@ pub async fn run_session_turn(
                 stream_options: Some(StreamOptions {
                     include_usage: true,
                 }),
+                temperature: None,
+                max_tokens: None,
             };
 
             let opened = await_round(
@@ -2318,7 +2320,34 @@ pub async fn run_session_turn(
         let assistant_idx = sess.messages.len() - 1;
         persist_session_now(state, sess, id).await;
 
-        // Execute each tool and feed the result back to the model.
+        // Execute each tool and feed the result back to the model. The
+        // reviewer's cache is shared across the turn's tool calls.
+        let reviewer_cache = crate::reviewer::VerdictCache::default();
+        // Reviewer verdicts ride the turn's own event path (the /send
+        // stream plus the session subscription), so the client that
+        // started the turn always sees what the reviewer decided.
+        let (review_tx, mut review_rx) = mpsc::unbounded_channel::<serde_json::Value>();
+        {
+            let state = state.clone();
+            let out = out.clone();
+            let session_id = id.to_string();
+            tokio::spawn(async move {
+                while let Some(ev) = review_rx.recv().await {
+                    emit(&state, &out, &session_id, &ev).await;
+                }
+            });
+        }
+        let emit_review: crate::reviewer::EventSink = Arc::new(move |event: &serde_json::Value| {
+            let _ = review_tx.send(event.clone());
+        });
+        let reviewer = crate::reviewer::TurnReviewer::new(
+            &sess.model,
+            &base_url,
+            &key,
+            &reasoning_field,
+            emit_review,
+        )
+        .await;
         for (tool_index, tc) in result.tool_calls.iter().enumerate() {
             let ev = event(vec![
                 ("type", json!("tool")),
@@ -2334,6 +2363,14 @@ pub async fn run_session_turn(
                 out.clone(),
                 Some(ctx.handle.cancel_token()),
             );
+            // Unflagged Tier-2 commands get a model verdict first —
+            // accept runs them, anything else falls through to the
+            // human prompt below.
+            let reviewer = reviewer.wrap(&approver, reviewer_cache.clone());
+            let approver: &dyn atom_sandbox::approvals::Approver = match &reviewer {
+                Some(reviewer) => reviewer,
+                None => &approver,
+            };
             let bridge = crate::dispatch::DispatchBridge::new(
                 state.clone(),
                 id.to_string(),
@@ -2350,7 +2387,7 @@ pub async fn run_session_turn(
                 base_url: base_url.clone(),
                 reasoning_field: reasoning_field.clone(),
                 sandbox_cfg: state.cfg.clone(),
-                approver: &approver,
+                approver,
                 spawner: Some(&bridge),
                 file_seen: Some(seen.as_ref()),
             };

@@ -52,6 +52,94 @@ pub struct WebFetchConfig {
     pub tool: String,
 }
 
+/// Auto-review settings. Empty `provider`/`model` means the reviewer
+/// runs on the session's own model.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewerConfig {
+    /// `None` means enabled (the default). Set to `false` to send every
+    /// Tier-2 command straight to the approval prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub model: String,
+    /// Reasoning effort for the review call. Clamped up to
+    /// [`REVIEWER_MIN_REASONING`] — a reviewer that does not think is
+    /// not worth the round trip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    /// Commands the reviewer should lean toward accepting, in plain
+    /// English. Steering, not enforcement: matching still reviews.
+    #[serde(default)]
+    pub allow_instructions: Vec<String>,
+    /// Commands the reviewer should lean toward denying, in plain
+    /// English. Steering, not enforcement: matching still reviews.
+    #[serde(default)]
+    pub block_instructions: Vec<String>,
+}
+
+impl ReviewerConfig {
+    pub fn resolved_enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+
+    /// Whether the reviewer runs on its own model instead of the
+    /// session's.
+    pub fn has_model_override(&self) -> bool {
+        !self.model.trim().is_empty()
+    }
+
+    /// The requested effort, floored at [`REVIEWER_MIN_REASONING`].
+    pub fn requested_reasoning(&self) -> String {
+        let requested = self.reasoning.clone().unwrap_or_default();
+        if requested.trim().is_empty() {
+            REVIEWER_MIN_REASONING.into()
+        } else {
+            requested
+        }
+    }
+}
+
+/// The reviewer must reason at least this hard; anything lower is
+/// raised to it (see [`clamp_reasoning`]).
+pub const REVIEWER_MIN_REASONING: &str = "low";
+
+/// The standard effort ladder. Unknown tokens rank below `none` so a
+/// provider-specific spelling is never silently rewritten.
+const REASONING_LADDER: [&str; 5] = ["none", "minimal", "low", "medium", "high"];
+
+fn reasoning_rank(level: &str) -> Option<usize> {
+    let level = level.trim().to_ascii_lowercase();
+    REASONING_LADDER.iter().position(|l| *l == level)
+}
+
+/// Raise `requested` to at least [`REVIEWER_MIN_REASONING`], preferring
+/// the model's own levels: the lowest available level at or above the
+/// floor wins, so `high`-only models get `high`, not an invalid
+/// `medium`. Unknown levels pass through untouched.
+pub fn clamp_reasoning(requested: &str, available: &[String]) -> String {
+    let requested = requested.trim();
+    let floor = reasoning_rank(REVIEWER_MIN_REASONING).expect("floor is on the ladder");
+    let Some(rank) = reasoning_rank(requested) else {
+        return if requested.is_empty() {
+            REVIEWER_MIN_REASONING.into()
+        } else {
+            requested.into()
+        };
+    };
+    if rank >= floor {
+        return requested.to_ascii_lowercase();
+    }
+    available
+        .iter()
+        .filter_map(|level| reasoning_rank(level).map(|r| (r, level)))
+        .filter(|(r, _)| *r >= floor)
+        .min_by_key(|(r, _)| *r)
+        .map(|(_, level)| level.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| REVIEWER_MIN_REASONING.into())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AtomConfig {
     #[serde(default = "config_version")]
@@ -64,6 +152,8 @@ pub struct AtomConfig {
     pub web_search: Option<WebSearchConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_fetch: Option<WebFetchConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer: Option<ReviewerConfig>,
     /// `None` means auto-update is enabled (the default). Set to `false`
     /// to disable the startup auto-updater.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -92,6 +182,7 @@ impl Default for AtomConfig {
             compaction: None,
             web_search: None,
             web_fetch: None,
+            reviewer: None,
             auto_update: None,
             theme: None,
             transparent_background: None,
@@ -141,6 +232,10 @@ impl AtomConfig {
                 .unwrap_or_default();
         }
         value
+    }
+
+    pub fn resolved_reviewer(&self) -> ReviewerConfig {
+        self.reviewer.clone().unwrap_or_default()
     }
 
     /// Whether the chat viewport renders on the terminal's default
@@ -367,6 +462,47 @@ pub fn save_to(path: &Path, config: &AtomConfig) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reviewer_defaults_to_session_model_and_on() {
+        let config = AtomConfig::default();
+        let reviewer = config.resolved_reviewer();
+        assert!(reviewer.resolved_enabled());
+        assert!(
+            !reviewer.has_model_override(),
+            "empty model = session model"
+        );
+        assert_eq!(reviewer.requested_reasoning(), REVIEWER_MIN_REASONING);
+    }
+
+    #[test]
+    fn reviewer_reasoning_is_floored_at_low() {
+        // Lower levels are raised to the model's lowest level at or
+        // above the floor.
+        for lower in ["none", "minimal", "NONE", " minimal "] {
+            assert_eq!(
+                clamp_reasoning(
+                    lower,
+                    &["none".into(), "low".into(), "medium".into(), "high".into()]
+                ),
+                "low",
+                "{lower}"
+            );
+        }
+        // A model without "low" gets its next level up, never an
+        // invalid one.
+        assert_eq!(
+            clamp_reasoning("none", &["none".into(), "high".into()]),
+            "high"
+        );
+        // At or above the floor is respected as-is.
+        assert_eq!(clamp_reasoning("high", &[]), "high");
+        assert_eq!(clamp_reasoning("medium", &[]), "medium");
+        assert_eq!(clamp_reasoning("low", &[]), "low");
+        // Unknown spellings pass through untouched; empty means the floor.
+        assert_eq!(clamp_reasoning("adaptive", &[]), "adaptive");
+        assert_eq!(clamp_reasoning("", &[]), "low");
+    }
 
     #[test]
     fn missing_fields_resolve_without_becoming_configured() {

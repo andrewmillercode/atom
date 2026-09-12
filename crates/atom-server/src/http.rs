@@ -450,6 +450,9 @@ async fn session_item(
                 .store_call(move |store| store.delete(&delete_id))
                 .await;
             state.remove_file_seen(id);
+            // The session is gone — drop its approval grants so the
+            // process-global store doesn't grow forever.
+            atom_sandbox::exec::approval_store().forget_session(id);
             no_content()
         }
         _ => error_resp(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"),
@@ -494,10 +497,10 @@ async fn handle_approval(state: &Arc<AppState>, req: &mut Request<Incoming>, sid
     };
     let decision = match body.decision.as_str() {
         "allow_once" => Decision::AllowOnce,
-        "allow_session" => Decision::AllowOnce,
-        "allow_global" | "allow_always" | "allow_all" => Decision::AllowAll,
-        "deny" | "deny_once" => Decision::DenyOnce,
-        "deny_always" | "deny_all" => Decision::DenyAll,
+        // Old strings map to the session-scoped grant; deny_always /
+        // deny_all degrade to deny-once (nothing is persisted).
+        "allow_session" | "allow_global" | "allow_always" | "allow_all" => Decision::AllowSession,
+        "deny" | "deny_once" | "deny_always" | "deny_all" => Decision::DenyOnce,
         _ => return error_resp(StatusCode::BAD_REQUEST, "invalid decision"),
     };
     if state.approvals.complete(sid, &body.id, decision) {

@@ -707,9 +707,11 @@ async fn approval_flow_round_trip_and_timeout() {
         session_id: sid.clone(),
         command: "curl https://example.com".into(),
         cwd: std::path::PathBuf::from("/tmp"),
+        workspace_root: std::path::PathBuf::from("/tmp"),
         rule_id: "curl".into(),
         reason: "network tool".into(),
         accept_all_preview: None,
+        flagged: false,
     };
     let waiter = {
         let approver = ServerApprover::new(state.clone(), sid.clone());
@@ -741,9 +743,11 @@ async fn approval_flow_round_trip_and_timeout() {
             session_id: sid.clone(),
             command: "wget x".into(),
             cwd: std::path::PathBuf::from("/tmp"),
+            workspace_root: std::path::PathBuf::from("/tmp"),
             rule_id: "wget".into(),
             reason: "r".into(),
             accept_all_preview: None,
+            flagged: false,
         })
         .await;
     assert_eq!(denied, Decision::DenyOnce);

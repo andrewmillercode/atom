@@ -1,18 +1,28 @@
 # Sandbox v2
 
-A rewrite of how atom gates bash commands. v1 prompts too often. v2 is generous by default, asks only when it has to, and keeps a hard deny floor that no setting can lower. No LLM review step.
+How atom gates bash commands. v1 prompted too often. v2 is generous by
+default: a wide static allowlist runs the reproducible commands, auto-review
+clears the routine ones, and the user is asked only for what is left.
 
-Status: spec. Not implemented.
+Status: implemented, except where a section says otherwise. The "Tier 1 —
+silent allowlist" and "Protected paths" sections describe the current code;
+the prompt, guardrail and auto-review sections reflect the current behavior.
 
 ## The idea
 
-The classifier is the rule table plus arg/path analysis. The only humans involved are the agent and the user. That removes the biggest prompt-injection surface in v1 (an LLM reviewer would have read attacker-controlled text) at the cost of more prompts for things the table doesn't recognize. The wide allowlist below is what makes that tradeoff pay off.
+The first classifier is the rule table plus arg/path analysis: no model call, no
+attacker-controlled text. What the table cannot decide goes to auto-review, which
+sees the command and cwd and nothing else — not tool output, not the transcript —
+so a prompt injection in a file or web page has no channel into the verdict. The
+wide allowlist below is what keeps that model call rare.
 
 ```
-Static table → Allow verdict  → run silently
-Guardrail    → Deny verdict   → blocked
-Static table → Ask verdict    → ask the user
-User prompt  → once / always / deny once / deny always
+Static table → Tier 1        → run silently
+             → flagged       → ask the user, every time
+             → Tier 2        → auto-review
+Auto-review  → accept        → run
+             → deny / error  → ask the user
+User prompt  → accept once / accept for the session / deny
 ```
 
 ## Tier 1 — silent allowlist
@@ -32,33 +42,126 @@ Categories:
 - **System read-only.** `ps top -l pgrep -l`, `lsof netstat ss ifconfig ip`, `mount` (no args), `diskutil list|info|apfs list`, `sysctl -n iostat vm_stat`, `uptime launchctl list` (read-only).
 - **Dev helpers.** `docker ps|images|logs|inspect|version|info`, `docker compose build|up|down|ps|logs|config`, `kubectl get|describe|logs|version|config view`, `nix build|develop|run|flake update`, `make -n`.
 
-Anything outside the table is Tier 2 (ask). The table is the default; users widen it through accept-all, never the other way.
+Anything outside the table is Tier 2: auto-review gets first look, and only a
+deny verdict (or an error) reaches the user. Hand-authored `allow` rules in
+`sandbox.json` still promote a command straight to Tier 1, but they never
+touch a flagged guardrail.
 
 ## Tier 2 — the prompt
 
-Decisions:
+Three buttons:
 
 - `[y]` accept once — run, no memory.
-- `[a]` accept always — run + save a prefix rule to `sandbox.json`.
-- `[n]` deny once — error back to the model.
-- `[d]` deny always — error now + save a deny rule.
-- `[esc]` cancel — error back, nothing saved.
+- `[a]` accept all — run + grant the command family for **this session only**
+  (approving `cargo test --release` grants `cargo test *` in memory).
+- `[n]` deny — refuse this run, no memory.
 
-Session-scoped grants are gone. `[a]` writes a **prefix rule** so the command family lands in Tier 1 forever (approving `cargo test --release` saves `cargo test *`); `[d]` writes a deny rule so the family never prompts again.
+Decisions never write rules: `sandbox.json` holds only hand-authored rules.
+A grant lives in the process-global approval store, dies with the session, and
+is dropped when the session is deleted. Grants never cover a flagged command.
 
 **Unspoofable prompt.** The prompt block is client-rendered scaffolding that lives in the viewport alongside tool output — the current TUI behavior, kept as-is. Any tool output that lands inside the block has its terminal escapes neutralized, so an injected session can't draw a fake approval row. Key presses always reach the real handler regardless of what output draws nearby.
 
 **Subagent prompts.** When the prompt comes from a dispatched subagent, the parent view surfaces it inline with `from_subagent` + `child_title`. The child waits indefinitely; cancel propagates up.
 
-**Accept-all preview.** `[a]` shows the resulting prefix before saving ("this would let all `cargo test` invocations run unprompted"). The user can adjust or back out. Dangerous heads (`rm`, `git push`, `sudo`, `chmod -R`, network-to-interpreter shapes) are flagged as a warning, not blocked — accepting still works.
+**Accept-all preview.** `[a]` shows the prefix the grant would cover
+("accept-all (this session): cargo test *"). Danger heads (`rm`, `git push`,
+`sudo`, `chmod -R`) are flagged, and a flagged command never becomes a grant —
+it prompts again next time.
 
 **Help line.** A dim line under the buttons lists every key binding, the prefix preview, and a "press ? for details" hint that expands each decision into its long form in a modal.
 
-**Audit.** Every prompt and decision is logged. `[a]` and `[d]` lines include the rule that was saved, so grants and denials can be reviewed.
+**Audit.** Every decision is logged to `dataDir()/sandbox-audit.log`
+(`allow_once` / `allow_session` / `deny_once`, plus a `flagged` bit). Reviewer
+verdicts go to `dataDir()/sandbox-reviewer.log` and appear in the transcript
+under the command they judged.
 
-## Guardrails — the deny floor
+## Auto-review
 
-Hardcoded patterns that override every other decision. A match is blocked outright, no prompt, even for a command the user already accepted. This is what makes the wide table safe.
+Unflagged Tier-2 commands go to a fast model verdict instead of the prompt.
+The reviewer sees the command as typed, the resolved segments that execute
+after shell-wrapper unwrapping, the cwd, and one static-analysis line listing
+what the segments touch (network egress, paths outside the workspace, paths
+under `$HOME`, `.git/hooks` writes). It never sees conversation, file
+contents, or tool output, so injected content has no channel into the
+verdict. It replies ACCEPT, or DENY with a short reason (`DENY: reason`) that
+reaches the log and the `auto_review` event, and has 6s before it is treated
+as an error.
+
+- **accept** — the command runs. No prompt, no grant.
+- **deny, error, timeout** — the human prompt runs exactly as it would without
+  a reviewer.
+- **flagged** — never reviewed; the user decides.
+
+Plain-English steering lives in `config.json` under `reviewer`:
+`allow_instructions` and `block_instructions` are folded into the reviewer's
+system prompt. Steering biases the verdict; it never bypasses the review.
+
+Settings live in `config.json` under `reviewer` and are editable from
+`/settings` ("Auto-Review", "Auto-Review model"):
+
+```json
+{
+  "reviewer": {
+    "enabled": true,
+    "provider": "",
+    "model": "",
+    "reasoning": "low",
+    "allow_instructions": [],
+    "block_instructions": ["Every AWS CLI command should go through approval first."]
+  }
+}
+```
+
+An empty `provider`/`model` means the session's own model; setting them points
+the reviewer at a cheaper model on any configured provider. `reasoning` is
+floored at `low`.
+
+**Verdict cache.** Verdicts are cached per (session, command), so a repeated
+command in the same turn does not re-bill. Errors are not cached — a transient
+failure retries.
+
+**Visibility.** Every verdict is appended to `dataDir()/sandbox-reviewer.log`
+(`cmd_sha256`, verdict, model, latency) and pushed to the session stream as an
+`auto_review` event, which the TUI renders under the command it judged
+("auto-review: accepted (312ms, model)"). A command with no such line was never
+reviewed — Tier 1, flagged, or the reviewer is off.
+
+## Seatbelt confinement
+
+On macOS, every unflagged command runs under a Seatbelt profile via
+`sandbox-exec`. The profile denies everything, then grants reads
+anywhere, writes inside the workspace, the per-session tmpdir, system
+temp, toolchain caches (`~/.cargo`, `~/.npm`, `Library/Caches`,
+Homebrew Cellar/opt/var, …), the command's own outside-workspace
+argument paths, and outbound network. Writes to `.git/hooks`,
+`.git/config`, every `$PATH` entry (`~/.cargo/bin`, `/opt/homebrew/bin`,
+`~/.local/bin`, …), `$HOME` paths the command did not name, and system
+roots fail at the syscall level. Confinement is what makes an
+unexpected command survivable: a command that slips past the string
+checks still cannot damage protected paths.
+
+Granting the command's own named paths is deliberate. Without it, any
+command that mentions an outside path would either fail or have to run
+unconfined, so an approved `cp report.csv ~/Desktop` would silently
+escape the profile. With it, the command runs confined and can reach
+exactly what it named, nothing else.
+
+- A privilege guardrail (`sudo`, `kill`, …) runs unconfined after the
+  user approves: those cannot work confined. A command flagged only
+  for writing outside the workspace still runs confined, with its
+  named paths granted.
+- A confined command that fails gets a note in its output naming the
+  sandbox and pointing at `"confine": false`; the audit log's
+  `confined` field reads `seatbelt` or `none`.
+- `"confine": false` in `sandbox.json` disables the layer.
+
+## Guardrails — the flagged floor
+
+Hardcoded patterns that no automatic path may clear. A match is flagged: it
+skips auto-review, skips session grants, skips hand-authored `allow` rules and
+always asks the user. It is not blocked outright — the user remains the only
+authority, and one click runs it. This is what makes the wide table safe.
 
 - Recursive deletes on `$HOME` or system roots: `rm -rf /`, `rm -rf ~`, fork-bomb `:(){ :|:& };:`
 - Disk-level: `dd of=/dev/*`, `mkfs*`, `diskutil erase*|apfs|hfs`, `mount` with a device
@@ -70,7 +173,9 @@ Hardcoded patterns that override every other decision. A match is blocked outrig
 - Network-to-interpreter: `curl … | sh|bash|zsh|python`, `wget -O - … | sh`
 - Path-escape writes: `touch mkdir cp mv rm ln tee truncate install rsync dd` targeting `/System`, `/bin`, `/sbin`, `/usr`, `/etc`, `/private/etc`, `/boot`, or any symlink that resolves there
 
-`[a]` and prefix rules never reduce a guardrail. Only a deny rule written by `[d]` can silence one, and only deliberately.
+Nothing silences a guardrail automatically: not a session grant, not a
+hand-authored allow rule, not an auto-review accept. The user answers every
+flagged prompt.
 
 ## Protected paths
 

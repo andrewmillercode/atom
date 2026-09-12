@@ -1120,9 +1120,11 @@ mod tests {
             session_id: child.id.clone(),
             command: "git push".into(),
             cwd: "/repo".into(),
+            workspace_root: "/repo".into(),
             rule_id: "git-push".into(),
             reason: "push to remote".into(),
             accept_all_preview: Some("git push *".into()),
+            flagged: false,
         };
 
         // A plain session's event carries no subagent identity.
@@ -1158,9 +1160,11 @@ mod tests {
             session_id: child.id.clone(),
             command: "rm -rf build".into(),
             cwd: "/work".into(),
+            workspace_root: "/work".into(),
             rule_id: "rm-rf".into(),
             reason: "clean build dir".into(),
             accept_all_preview: None,
+            flagged: false,
         };
         let (tx, _rx) = tokio::sync::oneshot::channel();
         state

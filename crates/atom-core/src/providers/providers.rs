@@ -212,6 +212,46 @@ pub fn ambient_aws_region() -> Option<String> {
     None
 }
 
+/// resolveProviderEndpoint maps a provider selection (models.dev id or
+/// display name, e.g. "anthropic") to its endpoint credentials. A
+/// provider with no stored key falls back to the Ollama shapes, then to
+/// its models.dev base URL.
+pub async fn resolve_provider_endpoint(selected: &str) -> Provider {
+    crate::providers::modelsdev::ensure_models_dev_catalog().await;
+    let providers = build_providers().await;
+    if let Some(provider) = providers
+        .iter()
+        .find(|provider| provider.name == selected || provider.id == selected)
+    {
+        return provider.clone();
+    }
+    if matches!(selected, "ollama" | "ollama-cloud") {
+        return Provider {
+            name: "ollama".into(),
+            id: "ollama-cloud".into(),
+            base_url: "https://ollama.com/v1".into(),
+            key: super::auth::load_provider_key("ollama-cloud").await,
+            reasoning_field: "reasoning".into(),
+        };
+    }
+    let base_url = crate::providers::modelsdev::models_dev_base_url(selected);
+    if base_url.is_empty() {
+        return Provider {
+            name: "ollama-local".into(),
+            base_url: "http://localhost:11434/v1".into(),
+            reasoning_field: "reasoning".into(),
+            ..Default::default()
+        };
+    }
+    Provider {
+        name: selected.into(),
+        id: selected.into(),
+        key: super::auth::load_provider_key(selected).await,
+        reasoning_field: reasoning_field_for_url(&base_url),
+        base_url,
+    }
+}
+
 /// buildProviders discovers providers whose credentials are available.
 /// OpenCode Zen's zero-cost public tier is always included; other remote
 /// providers require credentials from env or auth storage.
@@ -1545,6 +1585,8 @@ mod tests {
             tools: vec![],
             reasoning_effort: String::new(),
             stream_options: None,
+            temperature: None,
+            max_tokens: None,
         }
     }
 

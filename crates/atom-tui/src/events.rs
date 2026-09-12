@@ -55,6 +55,13 @@ pub struct StreamEvent {
     /// Prefix-rule preview for `[a] accept-all` (e.g. `"cargo test *"`).
     /// Pre-computed by the server; the TUI just renders it.
     pub accept_all_preview: Option<String>,
+    // auto_review fields — what the reviewer decided for a command.
+    /// "accept" | "deny" | "error".
+    pub review_decision: String,
+    /// Reviewer error text, empty for a clean verdict.
+    pub review_error: String,
+    /// Round-trip time of the review call, milliseconds.
+    pub review_ms: u64,
 }
 
 fn jstr(v: &Value, key: &str) -> String {
@@ -109,6 +116,9 @@ pub fn parse_stream_event(v: &Value) -> StreamEvent {
             .get("accept_all_preview")
             .and_then(Value::as_str)
             .map(|s| s.to_string()),
+        review_decision: jstr(v, "decision"),
+        review_error: jstr(v, "error"),
+        review_ms: v.get("ms").and_then(Value::as_u64).unwrap_or(0),
         ..Default::default()
     };
     let ms = jstr(v, "duration_ms").parse::<f64>().ok();

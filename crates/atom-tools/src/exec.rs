@@ -202,6 +202,7 @@ pub(crate) async fn execute_bash(args_json: &str, ctx: &ToolCtx<'_>) -> ToolOutc
     ToolOutcome::from_text(format_bash_exit(
         out.exit_code,
         &format!("{}{}", out.stdout, out.stderr),
+        out.confined,
     ))
 }
 
@@ -209,9 +210,16 @@ pub(crate) async fn execute_bash(args_json: &str, ctx: &ToolCtx<'_>) -> ToolOutc
 /// trimmed combined output, or "exit status N\n<output>" on failure.
 /// Shared by the inline path and the turn loop's parked-completion
 /// recording so the tool block fills identically either way.
-pub fn format_bash_exit(exit_code: i32, combined: &str) -> String {
+pub fn format_bash_exit(
+    exit_code: i32,
+    combined: &str,
+    confined: atom_sandbox::exec::ConfineKind,
+) -> String {
     if exit_code != 0 {
-        format!("exit status {exit_code}\n{combined}")
+        format!(
+            "exit status {exit_code}\n{combined}{}",
+            confined.failure_hint()
+        )
     } else {
         combined.trim().to_string()
     }
@@ -325,7 +333,10 @@ mod tests {
         let exit = proc
             .run_until_done(atom_core::cancel::CancelToken::new())
             .await;
-        assert_eq!(format_bash_exit(exit.exit_code, &exit.output), "hi");
+        assert_eq!(
+            format_bash_exit(exit.exit_code, &exit.output, exit.confined),
+            "hi"
+        );
         assert!(!exit.killed);
     }
 
@@ -338,7 +349,7 @@ mod tests {
         let exit = proc
             .run_until_done(atom_core::cancel::CancelToken::new())
             .await;
-        let text = format_bash_exit(exit.exit_code, &exit.output);
+        let text = format_bash_exit(exit.exit_code, &exit.output, exit.confined);
         assert!(text.starts_with("exit status 3\n"), "{}", text);
         assert!(text.contains("boom"), "{}", text);
     }

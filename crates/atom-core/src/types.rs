@@ -462,6 +462,12 @@ pub struct ChatRequest {
     pub reasoning_effort: String,
     #[serde(skip_serializing_if = "Option::is_none", rename = "stream_options")]
     pub stream_options: Option<StreamOptions>,
+    /// Reviewer-style one-shot calls pin these; normal turns leave both
+    /// None so the serialized body stays unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
 }
 
 /// streamResult is the outcome of one streaming turn.

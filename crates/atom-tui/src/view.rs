@@ -1265,9 +1265,9 @@ mod tests {
         let s = text(&term);
         assert!(s.contains("Sandbox"), "title visible: {s}");
         assert!(s.contains("curl https://x.co"), "command visible: {s}");
-        assert!(s.contains("A Always"), "buttons visible: {s}");
+        assert!(s.contains("A All"), "buttons visible: {s}");
         assert!(
-            s.contains("accept-all would let: curl *"),
+            s.contains("accept-all (this session): curl *"),
             "prefix preview visible: {s}"
         );
     }
@@ -1314,7 +1314,7 @@ mod tests {
             "subagent header visible: {s}"
         );
         assert!(s.contains("git push"), "command visible: {s}");
-        assert!(s.contains("A Always"), "buttons visible: {s}");
+        assert!(s.contains("A All"), "buttons visible: {s}");
     }
 
     #[test]
@@ -1355,7 +1355,7 @@ mod tests {
         let term = frame(&mut app, 40, 24);
         let s = text(&term);
         assert!(s.contains("Sandbox"), "title visible: {s}");
-        assert!(s.contains("A Always"), "buttons visible: {s}");
+        assert!(s.contains("A All"), "buttons visible: {s}");
     }
 
     #[test]

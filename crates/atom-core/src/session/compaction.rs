@@ -73,41 +73,7 @@ pub fn is_nothing_to_compact(err: &anyhow::Error) -> bool {
 /// Ollama; no preference is written implicitly.
 pub async fn compaction_target() -> CompactionTarget {
     let selected = crate::config::load().resolved_compaction();
-    crate::providers::modelsdev::ensure_models_dev_catalog().await;
-    let providers = crate::providers::providers::build_providers().await;
-    let provider = if let Some(provider) = providers
-        .iter()
-        .find(|provider| provider.name == selected.provider || provider.id == selected.provider)
-        .cloned()
-    {
-        provider
-    } else if matches!(selected.provider.as_str(), "ollama" | "ollama-cloud") {
-        crate::providers::providers::Provider {
-            name: "ollama".into(),
-            id: "ollama-cloud".into(),
-            base_url: "https://ollama.com/v1".into(),
-            key: crate::providers::auth::load_provider_key("ollama-cloud").await,
-            reasoning_field: "reasoning".into(),
-        }
-    } else {
-        let base_url = crate::providers::modelsdev::models_dev_base_url(&selected.provider);
-        if base_url.is_empty() {
-            crate::providers::providers::Provider {
-                name: "ollama-local".into(),
-                base_url: "http://localhost:11434/v1".into(),
-                reasoning_field: "reasoning".into(),
-                ..Default::default()
-            }
-        } else {
-            crate::providers::providers::Provider {
-                name: selected.provider.clone(),
-                id: selected.provider.clone(),
-                key: crate::providers::auth::load_provider_key(&selected.provider).await,
-                reasoning_field: crate::providers::providers::reasoning_field_for_url(&base_url),
-                base_url,
-            }
-        }
-    };
+    let provider = crate::providers::providers::resolve_provider_endpoint(&selected.provider).await;
     CompactionTarget {
         provider: if provider.id.is_empty() {
             provider.name.clone()
@@ -396,6 +362,8 @@ pub async fn compact_session(
             tools: vec![],
             reasoning_effort: thinking_off_value(&provider_name_for_url(base_url), model),
             stream_options: None,
+            temperature: None,
+            max_tokens: None,
         })?;
         crate::providers::providers::apply_gateway_provider_routing(base_url, &mut body_value);
         serde_json::to_vec(&body_value)?

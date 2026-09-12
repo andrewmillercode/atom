@@ -151,6 +151,10 @@ pub struct Block {
     pub images: Vec<PendingImage>,
     /// Rendered mermaid diagram (visualize tool results).
     pub diagram: Option<DiagramRef>,
+    /// What auto-review decided for this command, e.g.
+    /// "auto-review: accept (312ms)". Empty when the command was never
+    /// reviewed (Tier 1, flagged, or the reviewer is off).
+    pub review_note: String,
 
     // Render cache: wrapped lines at line_width. None is a miss.
     pub lines: Option<Vec<Arc<Line<'static>>>>,
@@ -189,6 +193,7 @@ impl Default for Block {
             tokens_per_sec: None,
             images: Vec::new(),
             diagram: None,
+            review_note: String::new(),
             lines: None,
             line_links: Vec::new(),
             line_width: 0,
@@ -1476,6 +1481,14 @@ fn render_tool_block_linked(
         body.push(btn_line);
         body_links.push(Vec::new());
     } else {
+        // Auto-review verdict for this command, when it was reviewed.
+        if !b.review_note.is_empty() {
+            body.push(Line::from(Span::styled(
+                b.review_note.clone(),
+                ansi::style_dim(),
+            )));
+            body_links.push(Vec::new());
+        }
         let name = b.resolved_tool_name();
         let hidden = hidden_output_tool(&name);
         if hidden {
@@ -1633,13 +1646,10 @@ fn approval_block_body(appr: &InlineApproval, width: usize) -> Vec<Line<'static>
         let truncated = atom_core::render::highlight::truncate_width(&text, width);
         lines.push(Line::from(Span::styled(truncated, ansi::style_dim())));
     }
-    // Prefix-rule preview: when the server sent an `accept_all_preview`
-    // (e.g. "cargo test *"), show the rule `[a]` would save. This is the
-    // v2 "this would let all `cargo test` invocations run unprompted"
-    // affordance from the spec.
+    // What Accept All would cover for the rest of the session.
     if let Some(preview) = appr.accept_all_preview.as_deref() {
         if !preview.is_empty() {
-            let text = format!("accept-all would let: {preview}");
+            let text = format!("accept-all (this session): {preview}");
             let truncated = atom_core::render::highlight::truncate_width(&text, width);
             lines.push(Line::from(Span::styled(truncated, ansi::style_dim())));
         }
@@ -1670,15 +1680,12 @@ fn approval_button_line() -> Line<'static> {
 /// Button layout constants for approval blocks. Column offsets are relative
 /// to the content area (after left pad).
 pub fn approval_buttons() -> Vec<ApprovalButton> {
-    // v2 spec: four buttons, no session-scoped grant.
-    //   Y Once   A Always   N Deny   D Never
-    // Each maps to one of the v2 Decision wire names
-    // (allow_once / allow_always / deny_once / deny_always).
+    // Buttons and their Decision wire names. Accept All grants the
+    // command family for this session only.
     let labels: &[(&str, &str)] = &[
         ("Y Once", "allow_once"),
-        ("A Always", "allow_always"),
+        ("A All", "allow_session"),
         ("N Deny", "deny_once"),
-        ("D Never", "deny_always"),
     ];
     let gap = 2usize;
     let mut col = 0;

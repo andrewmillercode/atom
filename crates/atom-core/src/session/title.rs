@@ -107,6 +107,8 @@ pub async fn generate_title(
                 model,
             ),
             stream_options: None,
+            temperature: None,
+            max_tokens: None,
         })?;
         crate::providers::providers::apply_gateway_provider_routing(base_url, &mut body_value);
         serde_json::to_vec(&body_value)?

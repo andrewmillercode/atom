@@ -1121,6 +1121,9 @@ impl App {
                     ..Default::default()
                 });
             }
+            "auto_review" => {
+                self.apply_review_note(&ev);
+            }
             "tool_result" => {
                 blocks::attach_tool_result(&mut self.blocks, &ev.call_id, &ev.text, "");
                 self.viewport_dirty = true;
@@ -3579,6 +3582,14 @@ impl App {
                         self.overlay_q.clear();
                         self.working_msg.clear();
                     }
+                    OverlayKind::Model
+                        if self.model_picker_purpose == overlays::ModelPickerPurpose::Reviewer =>
+                    {
+                        self.open_overlay(OverlayKind::Settings);
+                        self.overlay_sel = 6;
+                        self.overlay_q.clear();
+                        self.working_msg.clear();
+                    }
                     OverlayKind::Settings if self.settings_onboarding => {
                         self.accept_settings_defaults();
                         self.overlay = None;
@@ -4003,6 +4014,23 @@ impl App {
                 let Some(e) = overlays::selected_model(self) else {
                     return Vec::new();
                 };
+                if self.model_picker_purpose == overlays::ModelPickerPurpose::Reviewer {
+                    let mut reviewer = self.atom_config.resolved_reviewer();
+                    reviewer.provider = if e.provider.id.is_empty() {
+                        e.provider.name.clone()
+                    } else {
+                        e.provider.id.clone()
+                    };
+                    reviewer.model = e.model.clone();
+                    self.atom_config.reviewer = Some(reviewer);
+                    self.save_atom_config();
+                    self.model_picker_purpose = overlays::ModelPickerPurpose::Chat;
+                    self.open_overlay(OverlayKind::Settings);
+                    self.overlay_sel = 6;
+                    self.overlay_q.clear();
+                    self.working_msg.clear();
+                    return Vec::new();
+                }
                 if self.model_picker_purpose == overlays::ModelPickerPurpose::Compaction {
                     self.atom_config.compaction = Some(atom_core::config::CompactionConfig {
                         provider: if e.provider.id.is_empty() {
@@ -4185,6 +4213,22 @@ impl App {
                     self.save_atom_config();
                     Vec::new()
                 }
+                5 => {
+                    let mut reviewer = self.atom_config.resolved_reviewer();
+                    reviewer.enabled = Some(!reviewer.resolved_enabled());
+                    self.atom_config.reviewer = Some(reviewer);
+                    self.save_atom_config();
+                    Vec::new()
+                }
+                6 => {
+                    self.model_picker_purpose = overlays::ModelPickerPurpose::Reviewer;
+                    self.open_overlay(OverlayKind::Model);
+                    self.overlay_q.clear();
+                    self.overlay_sel = 0;
+                    self.overlay_scroll = 0;
+                    self.working_msg = "loading models...".into();
+                    vec![Effect::FetchModels]
+                }
                 _ => {
                     self.accept_settings_defaults();
                     self.overlay = None;
@@ -4269,19 +4313,43 @@ impl App {
         }
     }
 
+    /// Attach an auto-review verdict to the command it judged. The
+    /// reviewer runs while the command is being gated, so the newest
+    /// bash block is the one under review.
+    fn apply_review_note(&mut self, ev: &crate::events::StreamEvent) {
+        let note = match ev.review_decision.as_str() {
+            "accept" => format!("auto-review: accepted ({}ms, {})", ev.review_ms, ev.model),
+            "deny" => "auto-review: declined - asking you".to_string(),
+            _ => {
+                let why = if ev.review_error.is_empty() {
+                    "no verdict"
+                } else {
+                    ev.review_error.as_str()
+                };
+                format!("auto-review: unavailable ({why}) - asking you")
+            }
+        };
+        let Some(block) = self.blocks.iter_mut().rev().find(|b| {
+            b.kind == BlockKind::Tool && b.tool_name == "bash" && b.review_note.is_empty()
+        }) else {
+            return;
+        };
+        block.review_note = note;
+        block.lines = None;
+        self.viewport_dirty = true;
+    }
+
     // -- approval ----------------------------------------------------------
 
     fn approval_key(&mut self, k: KeyEvent, req: ApprovalPrompt) -> Vec<Effect> {
-        // v2 spec: four buttons, no session-scoped grant.
-        //   Y → allow_once, A → allow_always, N → deny_once,
-        //   D → deny_always (lowercase and the capital letters shown
-        //   on the buttons). Esc is intentionally not bound — the four
-        //   visible buttons are the only choices.
+        // Three buttons — Y allow once, A allow for the session, N deny.
+        // Esc is deliberately unbound: the buttons are the only choices.
         let decision = match k.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => Some(("allow_once", "allowed once")),
-            KeyCode::Char('a') | KeyCode::Char('A') => Some(("allow_always", "always allowed")),
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                Some(("allow_session", "allowed for this session"))
+            }
             KeyCode::Char('n') | KeyCode::Char('N') => Some(("deny_once", "denied")),
-            KeyCode::Char('d') | KeyCode::Char('D') => Some(("deny_always", "denied, rule saved")),
             KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.quitting = true;
                 return vec![Effect::Quit];
@@ -4370,9 +4438,9 @@ impl App {
         if content_row != button_row {
             return None;
         }
-        // Button layout: "  Y Once   A Always   N Deny   D Never  "
-        // Body rows are wrapped with a one-cell leading pad column,
-        // so a line-relative col c is button-relative c - 1.
+        // Button layout: "  Y Once   A All   N Deny  ". Body rows are
+        // wrapped with a one-cell leading pad, so a line-relative col c
+        // is button-relative c - 1.
         let buttons = blocks::approval_buttons();
         for btn in &buttons {
             if col > btn.col_start && col < btn.col_end + 1 {
@@ -4391,9 +4459,10 @@ impl App {
         };
         let note = match decision {
             "allow_once" => "allow once",
-            "allow_always" => "always allowed",
+            "allow_session" => "allowed for this session",
             "deny_once" => "denied",
-            "deny_always" => "denied",
+            // Legacy wire names from stale renders still resolve.
+            "allow_always" => "allowed for this session",
             _ => "denied",
         };
         self.dismiss_approval_block(&appr.id);
@@ -5084,14 +5153,58 @@ mod tests {
     }
 
     #[test]
+    fn auto_review_event_annotates_the_reviewed_command() {
+        let mut app = App::new_test(90, 30);
+        app.blocks.push(Block {
+            kind: BlockKind::Tool,
+            title: "Bash".into(),
+            tool_name: "bash".into(),
+            text: "npm install".into(),
+            ..Default::default()
+        });
+        app.handle_msg(AppMsg::SubEvent(serde_json::json!({
+            "type": "auto_review",
+            "session_id": "s1",
+            "decision": "accept",
+            "model": "session-model",
+            "ms": 312,
+        })));
+        assert_eq!(
+            app.blocks[0].review_note,
+            "auto-review: accepted (312ms, session-model)"
+        );
+
+        // A declined review says the prompt is on its way.
+        app.blocks[0].review_note.clear();
+        app.handle_msg(AppMsg::SubEvent(serde_json::json!({
+            "type": "auto_review",
+            "decision": "deny",
+        })));
+        assert_eq!(
+            app.blocks[0].review_note,
+            "auto-review: declined - asking you"
+        );
+
+        // Errors surface with their reason instead of being swallowed.
+        app.blocks[0].review_note.clear();
+        app.handle_msg(AppMsg::SubEvent(serde_json::json!({
+            "type": "auto_review",
+            "decision": "error",
+            "error": "timeout",
+        })));
+        assert_eq!(
+            app.blocks[0].review_note,
+            "auto-review: unavailable (timeout) - asking you"
+        );
+    }
+
+    #[test]
     fn approval_keys_map_to_wire_decisions() {
         let cases = [
-            // v2 spec: y/a/n/d map to the four decisions. Esc is not
-            // bound — the four visible buttons are the only choices.
+            // y/a/n map to the three decisions; Esc is not bound.
             (KeyCode::Char('y'), "allow_once"),
-            (KeyCode::Char('a'), "allow_always"),
+            (KeyCode::Char('a'), "allow_session"),
             (KeyCode::Char('n'), "deny_once"),
-            (KeyCode::Char('d'), "deny_always"),
         ];
         for (code, wire) in cases {
             let mut app = approval_app();
@@ -5480,7 +5593,7 @@ mod tests {
         let req = app.approval.clone().unwrap();
         let fx = app.approval_key(key(KeyCode::Char('a'), KeyModifiers::NONE), req);
         assert!(
-            matches!(fx.as_slice(), [Effect::RespondApproval { decision, .. }] if decision == "allow_always")
+            matches!(fx.as_slice(), [Effect::RespondApproval { decision, .. }] if decision == "allow_session")
         );
         assert!(app.approval.is_none(), "prompt cleared");
         assert!(
@@ -5524,9 +5637,9 @@ mod tests {
             "reason": "r",
         })));
         let req = app.approval.clone().unwrap();
-        let fx = app.approval_key(key(KeyCode::Char('d'), KeyModifiers::NONE), req);
+        let fx = app.approval_key(key(KeyCode::Char('n'), KeyModifiers::NONE), req);
         assert!(
-            matches!(fx.as_slice(), [Effect::RespondApproval { decision, .. }] if decision == "deny_always")
+            matches!(fx.as_slice(), [Effect::RespondApproval { decision, .. }] if decision == "deny_once")
         );
         assert!(app.blocks.iter().all(|b| b.approval.is_none()));
         // The tool block was restored (not removed) by the dismissal; the
@@ -5606,7 +5719,7 @@ mod tests {
         // Button line is the penultimate rendered row (bottom pad is last).
         let row = app.block_start[bi] + lines.len() - 2;
 
-        // Click the middle of "A Always" (button col + box pad cell).
+        // Click the middle of "A All" (button col + box pad cell).
         let btn = &blocks::approval_buttons()[1];
         let em = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -5619,7 +5732,7 @@ mod tests {
         assert!(
             matches!(
                 fx.first(),
-                Some(Effect::RespondApproval { decision, .. }) if decision == "allow_always"
+                Some(Effect::RespondApproval { decision, .. }) if decision == "allow_session"
             ),
             "click resolved approval: {fx:?}"
         );
@@ -5986,6 +6099,27 @@ mod tests {
                 tool: "web_fetch".into(),
             })
         );
+    }
+
+    #[test]
+    fn settings_rows_toggle_auto_review_and_open_its_model_picker() {
+        let mut app = App::new_test(80, 24);
+        app.overlay = Some(OverlayKind::Settings);
+
+        app.overlay_sel = 5;
+        assert!(app.confirm_overlay().is_empty());
+        assert!(!app.atom_config.resolved_reviewer().resolved_enabled());
+        app.confirm_overlay();
+        assert!(app.atom_config.resolved_reviewer().resolved_enabled());
+
+        app.overlay_sel = 6;
+        let fx = app.confirm_overlay();
+        assert_eq!(app.overlay, Some(OverlayKind::Model));
+        assert_eq!(
+            app.model_picker_purpose,
+            overlays::ModelPickerPurpose::Reviewer
+        );
+        assert!(matches!(fx.as_slice(), [Effect::FetchModels]), "{fx:?}");
     }
 
     #[test]

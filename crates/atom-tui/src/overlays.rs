@@ -45,6 +45,7 @@ pub enum ModelPickerPurpose {
     #[default]
     Chat,
     Compaction,
+    Reviewer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -430,7 +431,7 @@ pub fn overlay_count(app: &App) -> usize {
         )
         .len(),
         Some(OverlayKind::ProviderMethod) => 2,
-        Some(OverlayKind::Settings) => 6,
+        Some(OverlayKind::Settings) => settings_labels(app).len(),
         Some(OverlayKind::WebSearch) => web_search_rows(app).len(),
         Some(OverlayKind::WebFetch) => web_fetch_rows(app).len(),
         Some(OverlayKind::Theme) => filtered_theme_rows(app).len(),
@@ -444,6 +445,7 @@ pub fn settings_labels(app: &App) -> Vec<String> {
     let compaction = app.atom_config.resolved_compaction();
     let web = app.atom_config.resolved_web_search();
     let fetch = app.atom_config.resolved_web_fetch();
+    let reviewer = app.atom_config.resolved_reviewer();
     vec![
         format!(
             "Compaction model  {} / {}",
@@ -467,6 +469,22 @@ pub fn settings_labels(app: &App) -> Vec<String> {
                 "off"
             }
         ),
+        format!(
+            "Auto-Review  {}",
+            if reviewer.resolved_enabled() {
+                "on"
+            } else {
+                "off"
+            }
+        ),
+        if reviewer.has_model_override() {
+            format!(
+                "Auto-Review model  {} / {}",
+                reviewer.provider, reviewer.model
+            )
+        } else {
+            "Auto-Review model  session default".to_string()
+        },
         if app.settings_onboarding {
             "Continue with defaults / finish setup".into()
         } else {
@@ -2112,19 +2130,31 @@ mod tests {
         app.overlay = Some(OverlayKind::Settings);
 
         let labels = settings_labels(&app);
-        assert_eq!(labels.len(), 6);
-        assert_eq!(overlay_count(&app), 6);
+        assert_eq!(labels.len(), 8);
+        assert_eq!(overlay_count(&app), 8);
         assert_eq!(labels[4], "Transparent background  off");
+        // Auto-Review ships enabled, on the session's own model.
+        assert_eq!(labels[5], "Auto-Review  on");
+        assert_eq!(labels[6], "Auto-Review model  session default");
 
         // Done stays the last row in both modes.
-        assert_eq!(labels[5], "Done");
+        assert_eq!(labels[7], "Done");
         let app_on = App {
             atom_config: atom_core::config::AtomConfig {
                 transparent_background: Some(true),
+                reviewer: Some(atom_core::config::ReviewerConfig {
+                    provider: "anthropic".into(),
+                    model: "claude-sonnet-5".into(),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
             ..app
         };
         assert_eq!(settings_labels(&app_on)[4], "Transparent background  on");
+        assert_eq!(
+            settings_labels(&app_on)[6],
+            "Auto-Review model  anthropic / claude-sonnet-5"
+        );
     }
 }

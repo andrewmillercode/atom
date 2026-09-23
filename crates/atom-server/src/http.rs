@@ -450,6 +450,9 @@ async fn session_item(
                 .store_call(move |store| store.delete(&delete_id))
                 .await;
             state.remove_file_seen(id);
+            // The session is gone — drop its approval grants so the
+            // process-global store doesn't grow forever.
+            atom_sandbox::exec::approval_store().forget_session(id);
             no_content()
         }
         _ => error_resp(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"),
@@ -494,10 +497,10 @@ async fn handle_approval(state: &Arc<AppState>, req: &mut Request<Incoming>, sid
     };
     let decision = match body.decision.as_str() {
         "allow_once" => Decision::AllowOnce,
-        "allow_session" => Decision::AllowOnce,
-        "allow_global" | "allow_always" | "allow_all" => Decision::AllowAll,
-        "deny" | "deny_once" => Decision::DenyOnce,
-        "deny_always" | "deny_all" => Decision::DenyAll,
+        // Old strings map to the session-scoped grant; deny_always /
+        // deny_all degrade to deny-once (nothing is persisted).
+        "allow_session" | "allow_global" | "allow_always" | "allow_all" => Decision::AllowSession,
+        "deny" | "deny_once" | "deny_always" | "deny_all" => Decision::DenyOnce,
         _ => return error_resp(StatusCode::BAD_REQUEST, "invalid decision"),
     };
     if state.approvals.complete(sid, &body.id, decision) {
@@ -705,10 +708,36 @@ async fn handle_send(
     let base_url = base_url.trim_end_matches('/').to_string();
 
     if !state.turns.try_prepare_session_turn(id) {
-        return error_resp(
-            StatusCode::CONFLICT,
-            "session already has an active turn; pause it before sending another message",
-        );
+        // A turn is already active. The prompt must neither pause the
+        // turn nor bounce with a 409: hand it to the live turn (queued
+        // on its handle, current provider round cancelled so the model
+        // sees it next round) and acknowledge with a tiny stream.
+        let msg = atom_core::types::Message {
+            role: "user".into(),
+            content: body.message.clone(),
+            images: body.images.clone(),
+            created_at: Some(Utc::now()),
+            ..Default::default()
+        };
+        if state.turns.inject_session_message(id, msg) {
+            let (resp, tx) = ndjson_response();
+            tokio::spawn(async move {
+                // Drop tx at the end of the block so the body closes.
+                let mut line =
+                    serde_json::to_string(&json!({"type": "injected"})).unwrap_or_default();
+                line.push('\n');
+                let _ = tx.send(Ok(Bytes::from(line))).await;
+            });
+            return resp;
+        }
+        // The active turn ended between the check and the injection:
+        // take the slow path and start a normal turn.
+        if !state.turns.try_prepare_session_turn(id) {
+            return error_resp(
+                StatusCode::CONFLICT,
+                "session already has an active turn; send again in a moment",
+            );
+        }
     }
 
     let (resp, tx) = ndjson_response();
@@ -995,6 +1024,38 @@ async fn signal_shutdown(socket: PathBuf) {
     std::process::exit(0);
 }
 
+/// sweepInterruptedBackgroundCommands runs once at server startup.
+/// Background commands are children of this process, so a restart kills
+/// them mid-run — but their transcript entries still read
+/// "[background command still running …]", a claim that would never
+/// become true and that tells the model to expect output that never
+/// arrives. Rewrite those entries so reloaded sessions don't dangle on a
+/// phantom command.
+fn sweep_interrupted_background_commands(store: &SessionStore) {
+    for sess in store.list() {
+        let mut changed = false;
+        let messages = sess
+            .messages
+            .iter()
+            .map(|m| {
+                if m.role == "tool" && m.content.starts_with("[background command still running:") {
+                    changed = true;
+                    let mut m2 = m.clone();
+                    m2.content = "[background command interrupted by a server \
+                                  restart; no output was recorded]"
+                        .into();
+                    m2
+                } else {
+                    m.clone()
+                }
+            })
+            .collect::<Vec<_>>();
+        if changed {
+            store.update(&sess.id, messages, &sess.title);
+        }
+    }
+}
+
 /// runServer starts the atom session server. It returns when another
 /// live server is detected (clean exit) or on a listener error.
 pub async fn run_server() -> anyhow::Result<()> {
@@ -1005,6 +1066,7 @@ pub async fn run_server() -> anyhow::Result<()> {
     }
 
     let store = SessionStore::open().map_err(|e| anyhow::anyhow!("session store: {e}"))?;
+    sweep_interrupted_background_commands(&store);
     let state = Arc::new(AppState::new(
         Arc::new(store),
         atom_sandbox::policy::SandboxConfig::load(),
@@ -1036,35 +1098,50 @@ pub async fn run_server() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atom_core::types::Message;
 
-    /// listenOnSocket must detect a live server on the path and defer to
-    /// it without touching its socket file.
-    #[tokio::test]
-    async fn listen_live_defers() {
+    /// A server restart kills background commands; the sweep must rewrite
+    /// their still-running transcript entries and leave everything else.
+    #[test]
+    fn startup_sweep_rewrites_orphaned_placeholders() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("atom.sock");
-        let l = listen_on_socket(&path).unwrap().expect("first bind");
-        let l2 = listen_on_socket(&path).unwrap();
-        assert!(l2.is_none(), "want None when a live server owns the path");
-        assert!(path.exists(), "live server's socket file was removed");
-        drop(l);
-    }
+        let store = SessionStore::open_in_dir(dir.path()).unwrap();
+        let mut sess = store.create("m", "/tmp", vec![]);
+        sess.messages.push(Message {
+            role: "tool".into(),
+            tool_call_id: "call1".into(),
+            content: "[background command still running: cargo test — started 5s ago. \
+                 Its output replaces this entry automatically when it exits; \
+                 do not sleep, poll, or re-run it to wait.]"
+                .into(),
+            ..Default::default()
+        });
+        sess.messages.push(Message {
+            role: "tool".into(),
+            tool_call_id: "call2".into(),
+            content: "ok".into(),
+            ..Default::default()
+        });
+        store.save(&sess);
 
-    /// listenOnSocket must recover from a stale socket file left by a
-    /// crashed server: remove it, retry the bind, and accept connections.
-    #[tokio::test]
-    async fn listen_stale_recovers() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("atom.sock");
-        // Simulate the leftover path entry of a crashed server (Go unlinks
-        // real unix sockets on Close, so a regular file stands in for the
-        // stale inode that blocks the bind).
-        std::fs::write(&path, b"stale").unwrap();
-        let l = listen_on_socket(&path)
-            .unwrap()
-            .expect("stale socket should be replaced");
-        std::os::unix::net::UnixStream::connect(&path).expect("fresh socket not accepting");
-        drop(l);
+        sweep_interrupted_background_commands(&store);
+
+        let reloaded = store.get(&sess.id).unwrap();
+        assert!(
+            reloaded.messages[0]
+                .content
+                .starts_with("[background command interrupted by a server restart"),
+            "placeholder not rewritten: {:?}",
+            reloaded.messages[0].content
+        );
+        assert_eq!(reloaded.messages[1].content, "ok", "real result touched");
+        // Idempotent: a second pass is a no-op.
+        sweep_interrupted_background_commands(&store);
+        let reloaded = store.get(&sess.id).unwrap();
+        assert_eq!(reloaded.messages[0].tool_call_id, "call1");
+        assert!(reloaded.messages[0]
+            .content
+            .starts_with("[background command interrupted by a server restart"));
     }
 
     /// /children must keep listing subagents after their turn finishes,

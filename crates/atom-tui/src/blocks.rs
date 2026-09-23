@@ -125,6 +125,9 @@ pub struct Block {
     pub tool_done: bool,
     /// dispatch child session; empty for other tools
     pub session_id: String,
+    /// provider tool-call id this block was created for; results attach
+    /// by id so out-of-order completions land on the right block
+    pub call_id: String,
     /// Pending sandbox approval rendered inline as a tool block.
     /// Contains (approval_id, session_id, rule_id, reason, cwd, command).
     /// `None` for regular tool blocks.
@@ -139,12 +142,19 @@ pub struct Block {
     /// Completed-turn metadata shown under the final assistant reply.
     pub model: String,
     pub turn_duration: Option<Duration>,
+    /// Generation speed over the final round's first-token → end
+    /// window ("87 tok/s" in the footer); None when unknown.
+    pub tokens_per_sec: Option<f64>,
     /// Pasted images attached to a user message. Their [IMG n] markers
     /// in `text` render as kitty placeholder grids (or chip text on
     /// terminals without kitty support).
     pub images: Vec<PendingImage>,
     /// Rendered mermaid diagram (visualize tool results).
     pub diagram: Option<DiagramRef>,
+    /// What auto-review decided for this command, e.g.
+    /// "auto-review: accept (312ms)". Empty when the command was never
+    /// reviewed (Tier 1, flagged, or the reviewer is off).
+    pub review_note: String,
 
     // Render cache: wrapped lines at line_width. None is a miss.
     pub lines: Option<Vec<Arc<Line<'static>>>>,
@@ -154,6 +164,10 @@ pub struct Block {
     pub line_width: usize,
     pub line_show_r: bool,
     pub line_expanded: bool,
+    /// Rendered lines are stale (spinner tick on a live block) but kept:
+    /// the cached height still anchors the flat layout until the block
+    /// re-renders inside the viewport window.
+    pub stale: bool,
     /// Math-engine generation this block's lines were rendered under:
     /// 0 = rendered without math; otherwise a mismatch with
     /// `math::generation()` means a formula finished rendering and the
@@ -172,6 +186,7 @@ impl Default for Block {
             result: String::new(),
             tool_done: false,
             session_id: String::new(),
+            call_id: String::new(),
             approval: None,
             expanded: false,
             active: false,
@@ -179,13 +194,16 @@ impl Default for Block {
             dur: None,
             model: String::new(),
             turn_duration: None,
+            tokens_per_sec: None,
             images: Vec::new(),
             diagram: None,
+            review_note: String::new(),
             lines: None,
             line_links: Vec::new(),
             line_width: 0,
             line_show_r: true,
             line_expanded: false,
+            stale: false,
             line_formula_gen: 0,
         }
     }
@@ -279,23 +297,38 @@ pub fn messages_to_blocks(msgs: &[Message]) -> Vec<Block> {
     let mut blocks = Vec::new();
     for msg in msgs {
         match msg.role.as_str() {
-            "user" => blocks.push(Block {
-                kind: BlockKind::User,
-                text: msg.content.clone(),
-                images: msg
-                    .images
+            "user" => {
+                // Images match the [IMG n] markers in the message text,
+                // which are per message. Assign in marker order so older
+                // sessions with non-sequential numbers still line up.
+                let markers: Vec<usize> = split_user_segments(&msg.content)
                     .iter()
-                    .map(|img| PendingImage {
-                        img: img.clone(),
-                        name: String::new(),
-                        // num is reassigned later by assign_block_image_nums.
-                        num: 0,
-                        cols: preview::PREVIEW_COLS,
-                        rows: preview::PREVIEW_ROWS,
+                    .filter_map(|seg| match seg {
+                        UserSegment::Image(n) => Some(*n),
+                        UserSegment::Text(_) => None,
                     })
-                    .collect(),
-                ..Default::default()
-            }),
+                    .collect();
+                blocks.push(Block {
+                    kind: BlockKind::User,
+                    text: msg.content.clone(),
+                    images: msg
+                        .images
+                        .iter()
+                        .enumerate()
+                        .map(|(i, img)| PendingImage {
+                            img: img.clone(),
+                            name: String::new(),
+                            num: markers.get(i).copied().unwrap_or(i + 1),
+                            // Kitty ids are assigned later by
+                            // assign_block_image_nums.
+                            kit: 0,
+                            cols: preview::PREVIEW_COLS,
+                            rows: preview::PREVIEW_ROWS,
+                        })
+                        .collect(),
+                    ..Default::default()
+                })
+            }
             // Injected continue prompt after truncated reasoning; not shown.
             "nudge" => {}
             "compaction" => blocks.push(Block {
@@ -303,6 +336,7 @@ pub fn messages_to_blocks(msgs: &[Message]) -> Vec<Block> {
                 text: msg.content.clone(),
                 model: msg.model.clone(),
                 dur: (msg.duration_ms > 0).then(|| Duration::from_millis(msg.duration_ms as u64)),
+                tokens_per_sec: (msg.tokens_per_sec > 0.0).then_some(msg.tokens_per_sec),
                 ..Default::default()
             }),
             "error" => blocks.push(Block {
@@ -326,6 +360,7 @@ pub fn messages_to_blocks(msgs: &[Message]) -> Vec<Block> {
                         model: msg.model.clone(),
                         turn_duration: (msg.duration_ms > 0)
                             .then(|| Duration::from_millis(msg.duration_ms as u64)),
+                        tokens_per_sec: (msg.tokens_per_sec > 0.0).then_some(msg.tokens_per_sec),
                         ..Default::default()
                     });
                 }
@@ -335,11 +370,12 @@ pub fn messages_to_blocks(msgs: &[Message]) -> Vec<Block> {
                         title: tool_display_name(&tc.function.name),
                         tool_name: tc.function.name.clone(),
                         text: tool_action(&tc.function.name, &tc.function.arguments),
+                        call_id: tc.id.clone(),
                         ..Default::default()
                     });
                 }
             }
-            "tool" => attach_tool_result(&mut blocks, &msg.content, &msg.diff),
+            "tool" => attach_tool_result(&mut blocks, &msg.tool_call_id, &msg.content, &msg.diff),
             _ => {}
         }
     }
@@ -367,36 +403,40 @@ pub fn session_to_blocks(sess: &atom_core::session::store::Session) -> Vec<Block
     blocks
 }
 
-/// assignBlockImageNums assigns a unique kitty image id to every image
+/// assignBlockImageNums assigns a unique kitty graphics id to every image
 /// across the block list, skipping any ids already in use by the caller
-/// (e.g. the prompt's pending set). Renumbers from 1 upward so the
-/// kitty image protocol can safely reuse previously transmitted slots.
+/// (e.g. the prompt's pending previews). The per-message [IMG n] marker
+/// numbers (`num`) are untouched; ids wrap inside
+/// [1, MAX_KITTY_PREVIEW_ID] so the kitty image protocol can safely reuse
+/// previously transmitted slots.
 pub fn assign_block_image_nums(blocks: &mut [Block], reserved: &[usize]) {
     let mut used: std::collections::HashSet<usize> = reserved.iter().copied().collect();
-    let mut next = 1usize;
+    for block in blocks.iter() {
+        if block.kind != BlockKind::User {
+            continue;
+        }
+        for img in &block.images {
+            if img.kit != 0 {
+                used.insert(img.kit);
+            }
+        }
+    }
     for block in blocks.iter_mut() {
         if block.kind != BlockKind::User {
             continue;
         }
         for img in block.images.iter_mut() {
-            if img.num != 0 && used.contains(&img.num) {
-                // Collision with an in-use id; reassign to a fresh slot.
-                img.num = 0;
+            if img.kit != 0 {
+                continue;
             }
-            if img.num == 0 {
-                // Wrap at MAX_KITTY_PREVIEW_ID so paint_kitty_previews
-                // can still clean up orphaned slots after scrolls.
-                let mut guard = 0;
-                while used.contains(&next) && guard <= preview::MAX_KITTY_PREVIEW_ID {
-                    next = next % preview::MAX_KITTY_PREVIEW_ID + 1;
-                    guard += 1;
-                }
-                img.num = next;
-                used.insert(next);
+            let mut guard = 0;
+            let mut next = 1usize;
+            while used.contains(&next) && guard <= preview::MAX_KITTY_PREVIEW_ID {
                 next = next % preview::MAX_KITTY_PREVIEW_ID + 1;
-            } else {
-                used.insert(img.num);
+                guard += 1;
             }
+            img.kit = next;
+            used.insert(next);
         }
     }
 }
@@ -434,11 +474,11 @@ pub fn tool_display_name(name: &str) -> String {
     tool_display_name_for(name, &atom_core::config::load().resolved_web_search())
 }
 
-fn tool_display_name_for(name: &str, selected: &atom_core::config::WebSearchConfig) -> String {
-    if let Some(profile) = atom_core::config::bundled_web_search_profile(&selected.server) {
-        if name == profile.tool {
-            return profile.name.clone();
-        }
+fn tool_display_name_for(name: &str, _selected: &atom_core::config::WebSearchConfig) -> String {
+    // The fetch tool id is a single word; keep the two-word title so it
+    // pairs with "Web Search".
+    if name == "webfetch" {
+        return "Web Fetch".into();
     }
     name.split('_')
         .filter(|p| !p.is_empty())
@@ -472,6 +512,14 @@ pub fn tool_action(name: &str, arguments: &str) -> String {
             if let Some(q) = v.get("query").and_then(|q| q.as_str()) {
                 if !q.is_empty() {
                     return q.to_string();
+                }
+            }
+        }
+        "webfetch" => {
+            let v = ok(&args);
+            if let Some(u) = v.get("url").and_then(|u| u.as_str()) {
+                if !u.is_empty() {
+                    return u.to_string();
                 }
             }
         }
@@ -525,7 +573,7 @@ pub fn tool_action(name: &str, arguments: &str) -> String {
                 }
             }
         }
-        "dispatch" => {
+        "subagent" => {
             let v = ok(&args);
             let action = v.get("action").and_then(|a| a.as_str()).unwrap_or("");
             if action == "spawn" {
@@ -640,7 +688,9 @@ fn truncate_bytes(s: &str, n: usize) -> String {
 ///
 /// Handles both the new SVG format:
 ///   `[atom-diagram] svg="..." html="..." width=N height=N`
-/// and the legacy PNG format (for old sessions):
+/// where `svg` is the raw (unthemed) artifact — the rasterizer applies
+/// the live palette theme at paint time — and the legacy PNG format
+/// (for old sessions):
 ///   `[atom-diagram] png="..." png-dark="..." html="..." width=N height=N`
 ///
 /// Returns (svg, png, png_dark, html, w, h).
@@ -786,49 +836,62 @@ pub fn diagram_geometry(d: &mut DiagramRef, inner: usize) -> bool {
     true
 }
 
-/// call; an unmatched result becomes its own block.
-pub fn attach_tool_result(blocks: &mut Vec<Block>, content: &str, diff: &str) {
+/// attachToolResult fills the open tool block a result belongs to; an
+/// unmatched result becomes its own block.
+pub fn attach_tool_result(blocks: &mut Vec<Block>, call_id: &str, content: &str, diff: &str) {
     let id = atom_tools::parse_dispatch_session_id(content);
-    for b in blocks.iter_mut() {
-        if b.kind == BlockKind::Tool && !b.tool_done {
-            b.result = content.to_string();
-            b.tool_done = true;
-            // Diagram markers are only honored for visualize results. Any
-            // other tool output that happens to quote the marker line
-            // (a grep over this repo's source, for instance) must not
-            // hijack the block into a diagram card.
-            if b.tool_name == "visualize" && content.contains("[atom-diagram]") {
-                b.diagram =
-                    parse_diagram_marker(content).map(|(svg, png, png_dark, html, w, h)| {
-                        DiagramRef {
-                            svg,
-                            png,
-                            png_dark,
-                            html,
-                            w,
-                            h,
-                            ..Default::default()
-                        }
-                    });
-            }
-            if !diff.is_empty() {
-                b.diff = diff.to_string();
-            }
-            if !id.is_empty() {
-                b.session_id = id.clone();
-            }
-            b.lines = None;
-            return;
-        }
+    // Results must attach to the block of their own tool call: a turn can
+    // park on a background command while later tool calls complete, so
+    // "first open block" would cross-wire outputs between commands. Match
+    // by call id first; the open-block fallback covers events without an
+    // id (tests, legacy recorded sessions).
+    let pos = blocks
+        .iter()
+        .position(|b| {
+            b.kind == BlockKind::Tool && !b.tool_done && !call_id.is_empty() && b.call_id == call_id
+        })
+        .or_else(|| {
+            blocks
+                .iter()
+                .position(|b| b.kind == BlockKind::Tool && !b.tool_done && call_id.is_empty())
+        });
+    let Some(b) = pos.map(|i| &mut blocks[i]) else {
+        blocks.push(Block {
+            kind: BlockKind::Tool,
+            result: content.to_string(),
+            tool_done: true,
+            diff: diff.to_string(),
+            session_id: id,
+            call_id: call_id.to_string(),
+            ..Default::default()
+        });
+        return;
+    };
+    b.result = content.to_string();
+    b.tool_done = true;
+    // Diagram markers are only honored for visualize results. Any
+    // other tool output that happens to quote the marker line
+    // (a grep over this repo's source, for instance) must not
+    // hijack the block into a diagram card.
+    if b.tool_name == "visualize" && content.contains("[atom-diagram]") {
+        b.diagram =
+            parse_diagram_marker(content).map(|(svg, png, png_dark, html, w, h)| DiagramRef {
+                svg,
+                png,
+                png_dark,
+                html,
+                w,
+                h,
+                ..Default::default()
+            });
     }
-    blocks.push(Block {
-        kind: BlockKind::Tool,
-        result: content.to_string(),
-        tool_done: true,
-        diff: diff.to_string(),
-        session_id: id,
-        ..Default::default()
-    });
+    if !diff.is_empty() {
+        b.diff = diff.to_string();
+    }
+    if !id.is_empty() {
+        b.session_id = id.clone();
+    }
+    b.lines = None;
 }
 
 /// toolResultSummary strips an embedded unified diff from the result so
@@ -1055,21 +1118,34 @@ pub fn render_block_linked(
                 out.links.extend(parsed.links);
             }
             if !b.model.is_empty() {
-                let dur = b.turn_duration.map(format_turn_duration);
-                let plain = match &dur {
-                    Some(dur) => format!("{} {dur}", b.model),
+                // Footer tail: duration, tokens/sec, or both, e.g.
+                // "3.1s · 87 tok/s". The whole tail is extra-muted so it
+                // recedes behind the model id.
+                let mut tail_parts = Vec::new();
+                if let Some(dur) = b.turn_duration {
+                    tail_parts.push(format_turn_duration(dur));
+                }
+                if let Some(tps) = b.tokens_per_sec {
+                    tail_parts.push(format_tokens_per_sec(tps));
+                }
+                let tail = if tail_parts.is_empty() {
+                    None
+                } else {
+                    Some(tail_parts.join(" · "))
+                };
+                let plain = match &tail {
+                    Some(tail) => format!("{} {tail}", b.model),
                     None => b.model.clone(),
                 };
                 for row in crate::prompt::wrap_plain(&plain, width.max(1)) {
-                    // The duration is extra-muted so it recedes behind the
-                    // model id; wrap_plain may put it on its own row.
-                    let spans = match &dur {
-                        Some(dur) if row.ends_with(dur.as_str()) => {
-                            let head = row[..row.len() - dur.len()].trim_end();
+                    // wrap_plain may put the tail on its own row.
+                    let spans = match &tail {
+                        Some(tail) if row.ends_with(tail.as_str()) => {
+                            let head = row[..row.len() - tail.len()].trim_end();
                             vec![
                                 Span::styled(head.to_string(), ansi::style_reasoning()),
                                 Span::styled(
-                                    format!(" {dur}"),
+                                    format!(" {tail}"),
                                     ansi::style_reasoning().fg(ansi::c_muted_extra()),
                                 ),
                             ]
@@ -1141,6 +1217,55 @@ pub fn render_block_linked(
         }
     }
     out
+}
+
+/// O(1) row-count estimate for a block that has no rendered cache yet
+/// (loaded history outside the viewport window). Byte-length arithmetic
+/// only — no markdown/wrap work. Estimates feed the flat scroll layout
+/// until the block renders inside the viewport window, at which point
+/// the exact height replaces it and scroll anchoring absorbs the
+/// difference.
+pub fn estimate_lines(b: &Block, width: usize) -> usize {
+    let w = width.max(20);
+    // Wrapped-line lower bound: one row per ~w bytes, plus slack for
+    // paragraph gaps, headers, and box padding.
+    let wrap = |s: &str| (s.len() * 5 / 4) / w + 2;
+    match b.kind {
+        BlockKind::User => {
+            if b.expanded {
+                2 + wrap(&b.text) + b.images.len() * 4
+            } else {
+                USER_PREVIEW_LINES + 3
+            }
+        }
+        BlockKind::Assistant => {
+            if b.text.is_empty() {
+                0
+            } else {
+                3 + wrap(&b.text)
+            }
+        }
+        BlockKind::Reasoning => {
+            if b.expanded {
+                2 + wrap(&b.text)
+            } else {
+                1
+            }
+        }
+        BlockKind::Compaction => 2 + wrap(&b.text),
+        BlockKind::Error => 1 + wrap(&b.text),
+        BlockKind::Tool => {
+            if b.diagram.is_some() {
+                6
+            } else if !b.tool_done {
+                3
+            } else if b.expanded {
+                4 + wrap(&b.result) + wrap(&b.diff)
+            } else {
+                TOOL_RESULT_PREVIEW_LINES + 4
+            }
+        }
+    }
 }
 
 /// Splits text at `[IMG n]` markers. Each piece is either plain text or
@@ -1256,7 +1381,7 @@ fn render_user_body_linked(
             UserSegment::Image(num) => {
                 if let Some(img) = by_num.remove(&num) {
                     if preview::kitty_terminal() && img.cols > 0 && img.rows > 0 {
-                        let grid = preview::placeholder_grid(img.num, img.cols, img.rows);
+                        let grid = preview::placeholder_grid(img.kit, img.cols, img.rows);
                         let rows: Vec<Vec<Span<'static>>> = grid
                             .split('\n')
                             .map(|row| ansi::ansi_to_line(row).spans)
@@ -1295,6 +1420,16 @@ fn render_user_body_linked(
         }
     }
     out
+}
+
+/// formatTokensPerSec renders the footer speed: integers at 100+,
+/// one decimal below.
+fn format_tokens_per_sec(tps: f64) -> String {
+    if tps >= 100.0 {
+        format!("{tps:.0} tok/s")
+    } else {
+        format!("{tps:.1} tok/s")
+    }
 }
 
 fn format_turn_duration(duration: Duration) -> String {
@@ -1396,7 +1531,25 @@ fn render_tool_block_linked(
                 r
             }));
         } else {
-            left.push(Span::styled(action, ansi::style_tool()));
+            // Web tool headers (e.g. "web_fetch https://…") linkify
+            // bare URLs the same way path tools linkify their path.
+            let action_col: usize = left.iter().map(span_width).sum();
+            let linked = atom_core::render::links::linkify_urls(
+                &action,
+                atom_core::render::colors::COLOR_FOREGROUND,
+                atom_core::render::colors::COLOR_CARD_DARK,
+            );
+            if linked == action {
+                left.push(Span::styled(action, ansi::style_tool()));
+            } else {
+                let (spans, links) = split_ansi_spans_linked(&linked, ansi::style_tool());
+                left.extend(spans);
+                left_links.extend(links.into_iter().map(|mut r| {
+                    r.c0 += action_col;
+                    r.c1 += action_col;
+                    r
+                }));
+            }
         }
     }
     let left_w: usize = left.iter().map(span_width).sum();
@@ -1418,13 +1571,15 @@ fn render_tool_block_linked(
         let btn_line = approval_button_line();
         body.push(btn_line);
         body_links.push(Vec::new());
-        // Help line (v2 spec: dim list of every binding under the
-        // buttons, with a "press ? for details" pointer).
-        body.push(approval_help_line(inner));
-        body_links.push(Vec::new());
-    } else if !b.tool_done && b.tool_name == "sandbox" {
-        // Still pending but somehow approval was removed — shouldn't happen
     } else {
+        // Auto-review verdict for this command, when it was reviewed.
+        if !b.review_note.is_empty() {
+            body.push(Line::from(Span::styled(
+                b.review_note.clone(),
+                ansi::style_dim(),
+            )));
+            body_links.push(Vec::new());
+        }
         let name = b.resolved_tool_name();
         let hidden = hidden_output_tool(&name);
         if hidden {
@@ -1582,13 +1737,10 @@ fn approval_block_body(appr: &InlineApproval, width: usize) -> Vec<Line<'static>
         let truncated = atom_core::render::highlight::truncate_width(&text, width);
         lines.push(Line::from(Span::styled(truncated, ansi::style_dim())));
     }
-    // Prefix-rule preview: when the server sent an `accept_all_preview`
-    // (e.g. "cargo test *"), show the rule `[a]` would save. This is the
-    // v2 "this would let all `cargo test` invocations run unprompted"
-    // affordance from the spec.
+    // What Accept All would cover for the rest of the session.
     if let Some(preview) = appr.accept_all_preview.as_deref() {
         if !preview.is_empty() {
-            let text = format!("accept-all would let: {preview}");
+            let text = format!("accept-all (this session): {preview}");
             let truncated = atom_core::render::highlight::truncate_width(&text, width);
             lines.push(Line::from(Span::styled(truncated, ansi::style_dim())));
         }
@@ -1596,17 +1748,9 @@ fn approval_block_body(appr: &InlineApproval, width: usize) -> Vec<Line<'static>
     lines
 }
 
-/// Help line under the buttons. The buttons above already enumerate
-/// `y` / `a` / `n` / `d`; this line only carries the keys that aren't
-/// buttons — `esc` to cancel, and the width is just enough that a
-/// truncated terminal still shows the most important escape hatch.
-fn approval_help_line(width: usize) -> Line<'static> {
-    let text = "esc cancel";
-    let truncated = atom_core::render::highlight::truncate_width(text, width);
-    Line::from(Span::styled(truncated, ansi::style_dim()))
-}
-
-/// Produce the clickable button line for an approval block.
+/// Produce the clickable button line for an approval block. Each
+/// button renders as a two-span chip over the prompt-input card
+/// color: key letter in foreground, action word in muted.
 fn approval_button_line() -> Line<'static> {
     let buttons = approval_buttons();
     let mut spans = Vec::new();
@@ -1614,7 +1758,12 @@ fn approval_button_line() -> Line<'static> {
         if i > 0 {
             spans.push(Span::styled("  ", ansi::style_tool()));
         }
-        spans.push(Span::styled(btn.label.to_string(), ansi::style_tool_name()));
+        let (key, word) = btn.label.split_once(' ').unwrap_or((btn.label, ""));
+        spans.push(Span::styled(key.to_string(), ansi::style_approval_key()));
+        spans.push(Span::styled(
+            format!(" {word}"),
+            ansi::style_approval_word(),
+        ));
     }
     Line::from(spans)
 }
@@ -1622,15 +1771,12 @@ fn approval_button_line() -> Line<'static> {
 /// Button layout constants for approval blocks. Column offsets are relative
 /// to the content area (after left pad).
 pub fn approval_buttons() -> Vec<ApprovalButton> {
-    // v2 spec: four buttons, no session-scoped grant.
-    //   [y] once   [a] always   [n] deny   [d] never
-    // Each maps to one of the v2 Decision wire names
-    // (allow_once / allow_always / deny_once / deny_always).
+    // Buttons and their Decision wire names. Accept All grants the
+    // command family for this session only.
     let labels: &[(&str, &str)] = &[
-        ("[y] once", "allow_once"),
-        ("[a] always", "allow_always"),
-        ("[n] deny", "deny_once"),
-        ("[d] never", "deny_always"),
+        ("Y Once", "allow_once"),
+        ("A All", "allow_session"),
+        ("N Deny", "deny_once"),
     ];
     let gap = 2usize;
     let mut col = 0;
@@ -1743,6 +1889,9 @@ pub fn compaction_label(b: &Block, spinner_frame: &str) -> String {
     if let Some(duration) = b.dur.filter(|duration| *duration > Duration::ZERO) {
         parts.push(format_turn_duration(duration));
     }
+    if let Some(tps) = b.tokens_per_sec {
+        parts.push(format_tokens_per_sec(tps));
+    }
     parts.join(" | ")
 }
 
@@ -1831,7 +1980,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_display_name_uses_selected_web_search_provider() {
+    fn tool_display_name_hides_provider_name() {
         use atom_core::config::WebSearchConfig;
         let config = |server: &str| WebSearchConfig {
             server: server.into(),
@@ -1839,27 +1988,29 @@ mod tests {
         };
         assert_eq!(
             tool_display_name_for("web_search", &config("parallel")),
-            "Parallel Web Search"
+            "Web Search"
         );
         assert_eq!(
             tool_display_name_for("web_search", &config("ollama")),
-            "Ollama Web Search"
+            "Web Search"
         );
-        assert_eq!(
-            tool_display_name_for("web_search_exa", &config("exa")),
-            "Exa Web Search"
-        );
-        // An exa selection does not rename the generic parallel tool id,
-        // and unrelated tools keep their snake-case titles.
         assert_eq!(
             tool_display_name_for("web_search", &config("exa")),
             "Web Search"
         );
-        assert_eq!(tool_display_name_for("bash", &config("exa")), "Bash");
         assert_eq!(
-            tool_display_name_for("web_search", &config("custom-mcp")),
+            tool_display_name_for("web_search", &config("tinyfish")),
             "Web Search"
         );
+        assert_eq!(
+            tool_display_name_for("webfetch", &config("parallel")),
+            "Web Fetch"
+        );
+        assert_eq!(
+            tool_display_name_for("webfetch", &config("tinyfish")),
+            "Web Fetch"
+        );
+        assert_eq!(tool_display_name_for("bash", &config("exa")), "Bash");
     }
 
     #[test]
@@ -1943,12 +2094,20 @@ mod tests {
             "/tmp/x.go"
         );
         assert_eq!(
-            tool_action("dispatch", r#"{"model":"m","prompt":"Review scenes"}"#),
+            tool_action("webfetch", r#"{"url":"https://ness-health.com/"}"#),
+            "https://ness-health.com/"
+        );
+        assert_eq!(
+            tool_action("web_search", r#"{"query":"rust async traits"}"#),
+            "rust async traits"
+        );
+        assert_eq!(
+            tool_action("subagent", r#"{"model":"m","prompt":"Review scenes"}"#),
             "Review scenes"
         );
         assert_eq!(
             tool_action(
-                "dispatch",
+                "subagent",
                 r#"{"cancel":true,"session_id":"0123456789abcdef"}"#
             ),
             "cancel 0123456789abcdef"
@@ -1971,13 +2130,55 @@ mod tests {
                 ..Default::default()
             },
         ];
-        attach_tool_result(&mut blocks, "one", "");
-        attach_tool_result(&mut blocks, "two", "");
+        attach_tool_result(&mut blocks, "", "one", "");
+        attach_tool_result(&mut blocks, "", "two", "");
         assert_eq!(blocks[0].result, "one");
         assert_eq!(blocks[1].result, "two");
-        attach_tool_result(&mut blocks, "orphan", "");
+        attach_tool_result(&mut blocks, "", "orphan", "");
         assert_eq!(blocks.len(), 3);
         assert_eq!(blocks[2].result, "orphan");
+    }
+
+    /// Two background commands in flight, completing out of order: each
+    /// result must land on its own call's block, not whichever open block
+    /// comes first.
+    #[test]
+    fn attach_pairs_out_of_order_results_by_call_id() {
+        let mut blocks = vec![
+            Block {
+                kind: BlockKind::Tool,
+                title: "Bash".into(),
+                tool_name: "bash".into(),
+                call_id: "call-a".into(),
+                ..Default::default()
+            },
+            Block {
+                kind: BlockKind::Tool,
+                title: "Bash".into(),
+                tool_name: "bash".into(),
+                call_id: "call-b".into(),
+                ..Default::default()
+            },
+        ];
+        // call-b finishes first.
+        attach_tool_result(&mut blocks, "call-b", "sleep output", "");
+        assert!(!blocks[0].tool_done, "call-a block was claimed");
+        assert_eq!(blocks[1].result, "sleep output");
+        attach_tool_result(&mut blocks, "call-a", "cargo test output", "");
+        assert_eq!(blocks[0].result, "cargo test output");
+        assert!(blocks[0].tool_done && blocks[1].tool_done);
+        // A result with an unknown id becomes its own block, never steals
+        // an open one.
+        let mut blocks = vec![Block {
+            kind: BlockKind::Tool,
+            tool_name: "bash".into(),
+            call_id: "call-a".into(),
+            ..Default::default()
+        }];
+        attach_tool_result(&mut blocks, "call-x", "stray", "");
+        assert_eq!(blocks.len(), 2);
+        assert!(!blocks[0].tool_done);
+        assert_eq!(blocks[1].result, "stray");
     }
 
     #[test]
@@ -1998,8 +2199,8 @@ mod tests {
         assert!(running
             .iter()
             .any(|line| crate::ansi::line_plain(line).contains('*')));
-        attach_tool_result(&mut blocks, "", "");
-        attach_tool_result(&mut blocks, "done", "");
+        attach_tool_result(&mut blocks, "", "", "");
+        attach_tool_result(&mut blocks, "", "done", "");
         assert!(blocks[0].tool_done);
         assert!(blocks[0].result.is_empty());
         assert_eq!(blocks[1].result, "done");
@@ -2013,11 +2214,11 @@ mod tests {
     fn dispatch_result_sets_session_id() {
         let mut blocks = vec![Block {
             kind: BlockKind::Tool,
-            title: "Dispatch".into(),
-            tool_name: "dispatch".into(),
+            title: "Subagent".into(),
+            tool_name: "subagent".into(),
             ..Default::default()
         }];
-        attach_tool_result(&mut blocks, "id: 0123456789abcdef\nstarted", "");
+        attach_tool_result(&mut blocks, "", "id: 0123456789abcdef\nstarted", "");
         assert_eq!(blocks[0].session_id, "0123456789abcdef");
     }
 
@@ -2301,10 +2502,12 @@ mod tests {
         assert_eq!(blocks[0].text, "[IMG 1] hello");
         assert_eq!(blocks[0].images.len(), 1);
         assert_eq!(blocks[0].images[0].img.data, "AAAA");
-        // Assigning nums should give the unassigned image a unique id.
+        // The marker number is per message and carries over untouched;
+        // assigning ids only fills in the kitty slot.
         let mut blocks = blocks;
         assign_block_image_nums(&mut blocks, &[]);
         assert_eq!(blocks[0].images[0].num, 1);
+        assert_eq!(blocks[0].images[0].kit, 1);
     }
 
     #[test]
@@ -2398,6 +2601,7 @@ mod tests {
         }];
         attach_tool_result(
             &mut blocks,
+            "",
             "rendered diagram\n [atom-diagram] png=/a.png png-dark=/a-dark.png html=/a.html width=100 height=50",
             "",
         );
@@ -2409,7 +2613,7 @@ mod tests {
         assert_eq!((d.w, d.h), (100, 50));
         assert_eq!(d.id, 0, "ids are assigned later by the app");
         // Results without a marker leave the diagram empty.
-        attach_tool_result(&mut blocks, "plain", "");
+        attach_tool_result(&mut blocks, "", "plain", "");
         assert!(blocks[1].diagram.is_none());
     }
 
@@ -2426,7 +2630,7 @@ mod tests {
                 tool_name: name.into(),
                 ..Default::default()
             }];
-            attach_tool_result(&mut blocks, content, "");
+            attach_tool_result(&mut blocks, "", content, "");
             assert!(blocks[0].tool_done);
             assert!(
                 blocks[0].diagram.is_none(),
@@ -2808,6 +3012,7 @@ mod render_tests {
             cols: preview::PREVIEW_COLS,
             rows: preview::PREVIEW_ROWS,
             num,
+            kit: 0,
         }
     }
 
@@ -2965,46 +3170,41 @@ mod render_tests {
     }
 
     #[test]
-    fn assign_block_image_nums_avoids_reserved_and_renumbers_zero() {
+    fn assign_block_image_nums_assigns_kit_ids_skipping_reserved() {
         let mut blocks = vec![
             Block {
                 kind: BlockKind::User,
-                images: vec![fake_image(0), fake_image(2)],
+                images: vec![fake_image(1), fake_image(2)],
                 ..Default::default()
             },
             Block {
                 kind: BlockKind::User,
-                images: vec![fake_image(0)],
+                images: vec![fake_image(1)],
                 ..Default::default()
             },
         ];
-        // Reserved id 2 collides with the second image's existing num,
-        // so it gets reassigned to the next free slot.
+        // Per-message marker nums repeat across messages; kitty ids are
+        // globally unique and skip the reserved id.
         assign_block_image_nums(&mut blocks, &[2]);
+        let kits: Vec<usize> = blocks
+            .iter()
+            .flat_map(|b| b.images.iter().map(|i| i.kit))
+            .collect();
+        assert_eq!(kits, vec![1, 3, 4]);
         let nums: Vec<usize> = blocks
             .iter()
             .flat_map(|b| b.images.iter().map(|i| i.num))
             .collect();
-        assert_eq!(nums, vec![1, 3, 4]);
-        // Without the collision, an existing num is preserved and only
-        // the unassigned (zero) entries get fresh ids.
-        let mut blocks = vec![
-            Block {
-                kind: BlockKind::User,
-                images: vec![fake_image(0), fake_image(7)],
-                ..Default::default()
-            },
-            Block {
-                kind: BlockKind::User,
-                images: vec![fake_image(0)],
-                ..Default::default()
-            },
-        ];
-        assign_block_image_nums(&mut blocks, &[2]);
-        let nums: Vec<usize> = blocks
-            .iter()
-            .flat_map(|b| b.images.iter().map(|i| i.num))
-            .collect();
-        assert_eq!(nums, vec![1, 7, 3]);
+        assert_eq!(nums, vec![1, 2, 1]);
+        // Existing kitty ids are preserved and not handed out again.
+        let mut blocks = vec![Block {
+            kind: BlockKind::User,
+            images: vec![fake_image(0), fake_image(7)],
+            ..Default::default()
+        }];
+        blocks[0].images[1].kit = 7;
+        assign_block_image_nums(&mut blocks, &[]);
+        let kits: Vec<usize> = blocks[0].images.iter().map(|i| i.kit).collect();
+        assert_eq!(kits, vec![1, 7]);
     }
 }

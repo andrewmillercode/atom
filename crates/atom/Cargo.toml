@@ -7,23 +7,12 @@ edition.workspace = true
 name = "atom"
 path = "src/main.rs"
 
-[[bin]]
-name = "atoms"
-path = "src/atoms.rs"
-
-# Dev installs (`make dev`) run under the names atomdev/atomsdev.
-# These are real cargo binaries built from the same sources — not
-# Makefile symlinks — so `cargo build` emits all four and `ps` shows the
-# dev names with no link tricks. Flavor is keyed on
-# cfg!(debug_assertions), not the name: build these in the debug profile
-# only.
-[[bin]]
-name = "atomdev"
-path = "src/main.rs"
-
-[[bin]]
-name = "atomsdev"
-path = "src/atoms.rs"
+# One binary for client and server: `atom` is the TUI, `atom -serve`
+# (spawned by the client itself, guarded by a launch token) is the
+# background server. Dev installs (`make dev`) run the same debug
+# artifact as `atomdev` — client and server share the process name, so
+# a single pkill atomdev shuts everything down. Flavor is keyed on
+# cfg!(debug_assertions), not the name.
 
 [dependencies]
 atom-core = { workspace = true }

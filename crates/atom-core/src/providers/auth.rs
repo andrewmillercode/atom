@@ -356,6 +356,13 @@ mod tests {
     }
 
     #[test]
+    fn auth_ids_for_standalone_providers() {
+        assert_eq!(auth_ids_for("tinyfish"), vec!["tinyfish"]);
+        assert_eq!(auth_ids_for("parallel"), vec!["parallel"]);
+        assert_eq!(auth_ids_for("exa"), vec!["exa"]);
+    }
+
+    #[test]
     fn entry_json_matches_go_tags() {
         let e = AuthEntry {
             r#type: "oauth".into(),

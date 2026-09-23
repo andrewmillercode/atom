@@ -33,7 +33,9 @@ pub const MAX_KITTY_PREVIEW_ID: usize = 16;
 
 /// pendingImage is one pasted image waiting to be sent. cols=0 marks an
 /// image that couldn't be decoded (renders as a text row instead); num
-/// is the 1-based [IMG n] marker.
+/// is the 1-based [IMG n] marker within the current prompt and restarts
+/// at 1 for every message; kit is the globally unique kitty graphics id
+/// shared with images already rendered in the transcript.
 #[derive(Debug, Clone)]
 pub struct PendingImage {
     pub img: ImageData,
@@ -41,6 +43,7 @@ pub struct PendingImage {
     pub cols: usize,
     pub rows: usize,
     pub num: usize,
+    pub kit: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -531,18 +534,10 @@ pub fn image_marker(n: usize) -> String {
     format!("[IMG {n}]")
 }
 
-pub fn next_image_num(pending: &[PendingImage]) -> usize {
-    next_image_num_excluding(pending, &[])
-}
-
-/// nextImageNumExcluding allocates the next kitty image id, skipping any
-/// ids the caller reports as already in use (typically images already
-/// attached to a Block so we don't collide with sent messages). Ids
-/// wrap inside [1, MAX_KITTY_PREVIEW_ID] so paint_kitty_previews can
-/// clean up orphaned slots.
-pub fn next_image_num_excluding(pending: &[PendingImage], reserved: &[usize]) -> usize {
-    let mut used: std::collections::HashSet<usize> = pending.iter().map(|p| p.num).collect();
-    used.extend(reserved.iter().copied());
+/// nextKittyId allocates the next kitty graphics id from `used`, wrapping
+/// inside [1, MAX_KITTY_PREVIEW_ID] so paint_kitty_previews can clean up
+/// orphaned slots.
+fn next_kitty_id(used: &std::collections::HashSet<usize>) -> usize {
     for n in 1..=MAX_KITTY_PREVIEW_ID {
         if !used.contains(&n) {
             return n;
@@ -603,13 +598,18 @@ pub fn add_image_pending(app: &mut App, name: &str, mime: &str) -> anyhow::Resul
             atom_core::types::MAX_PENDING_IMAGES
         );
     }
-    let mut reserved: Vec<usize> = Vec::new();
+    let mut used: std::collections::HashSet<usize> = app.pending.iter().map(|p| p.kit).collect();
     for block in app.blocks.iter() {
         for img in &block.images {
-            reserved.push(img.num);
+            used.insert(img.kit);
         }
     }
-    let num = next_image_num_excluding(&app.pending, &reserved);
+    let kit = next_kitty_id(&used);
+    // Markers are per message: reuse the lowest free slot so a paste
+    // after a send (or after deleting a marker) is [IMG 1] again.
+    let num = (1..=atom_core::types::MAX_PENDING_IMAGES)
+        .find(|n| app.pending.iter().all(|p| p.num != *n))
+        .expect("pending length bounded below MAX_PENDING_IMAGES");
     app.pending.push(PendingImage {
         img: ImageData {
             mime: mime.to_string(),
@@ -619,6 +619,7 @@ pub fn add_image_pending(app: &mut App, name: &str, mime: &str) -> anyhow::Resul
         cols: 0,
         rows: 0,
         num,
+        kit,
     });
     app.preview_dirty = true;
     Ok(num)
@@ -961,12 +962,22 @@ fn rasterize_svg(svg_data: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
     use resvg::tiny_skia;
     use resvg::usvg;
 
-    // Normalize edge-label geometry before parsing. Fresh artifacts are
-    // already normalized at write time (atom-tools visualize); this also
-    // covers pre-existing artifact files on disk and any renderer output
-    // that skips that path. Idempotent.
+    // Re-theme against the live palette before parsing. Fresh raw
+    // artifacts are unthemed SVGs (atom-tools visualize); themed legacy
+    // artifacts hit the theme pass's idempotency guard and keep their
+    // baked colors. Token-colored edge labels recover their colors from
+    // the injected data-atom-edge-colors attribute.
     let svg_data = match std::str::from_utf8(svg_data) {
-        Ok(s) => atom_core::render::mermaid::normalize_edge_labels(s).into_bytes(),
+        Ok(s) => {
+            let normalized = atom_core::render::mermaid::normalize_edge_labels(s);
+            let edge_colors = atom_core::render::mermaid::edge_colors_attribute(&normalized);
+            atom_core::render::mermaid::apply_diagram_theme(
+                &normalized,
+                &atom_core::render::mermaid::active_diagram_theme(),
+                &edge_colors,
+            )
+            .into_bytes()
+        }
         Err(_) => svg_data.to_vec(),
     };
 

@@ -4,6 +4,7 @@
 
 use crate::cancel::CancelToken;
 use atom_core::session::store::SessionStore;
+use atom_core::types::Message;
 use atom_sandbox::approvals::{ApprovalRequest, Decision};
 use atom_sandbox::policy::SandboxConfig;
 use serde_json::Value;
@@ -193,6 +194,11 @@ struct RoundState {
     round_cancel: Option<CancelToken>,
     compact_queued: bool,
     compact_instr: String,
+    /// Prompts injected mid-turn (POST /send while a turn is active).
+    /// The turn loop drains this slot at the top of every round and
+    /// whenever a round-cancel fires, so the model sees the message at
+    /// the next provider round without pausing or killing anything.
+    pending: Vec<Message>,
 }
 
 /// One registered turn: its ID, the whole-turn cancel token (Esc /
@@ -214,6 +220,18 @@ impl TurnHandle {
         if let Some(c) = &self.round.lock().unwrap().round_cancel {
             c.cancel();
         }
+    }
+
+    /// queueMessage stashes a mid-turn prompt on the live turn. The
+    /// turn loop picks it up at the next round boundary (or immediately,
+    /// via the round cancel /send performs after queueing).
+    pub fn queue_message(&self, msg: Message) {
+        self.round.lock().unwrap().pending.push(msg);
+    }
+
+    /// Takes every queued prompt (oldest first), leaving the slot empty.
+    pub fn take_pending(&self) -> Vec<Message> {
+        std::mem::take(&mut self.round.lock().unwrap().pending)
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -279,6 +297,7 @@ impl TurnTable {
                 round_cancel: None,
                 compact_queued: false,
                 compact_instr: String::new(),
+                pending: Vec::new(),
             }),
         });
         let mut maps = self.0.lock().unwrap();
@@ -307,6 +326,24 @@ impl TurnTable {
         match turns {
             Some(t) if !t.is_empty() => {
                 t[t.len() - 1].queue_compact(instructions);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// injectSessionMessage hands a mid-turn prompt to the session's
+    /// live turn: it is queued on the handle and the current provider
+    /// round is cancelled (round cancel only — the turn and any running
+    /// tools are untouched) so the model sees the message next round.
+    /// Returns false when no turn is running.
+    pub fn inject_session_message(&self, id: &str, msg: Message) -> bool {
+        let turns = self.0.lock().unwrap().turns.get(id).cloned();
+        match turns {
+            Some(t) if !t.is_empty() => {
+                let handle = t[t.len() - 1].clone();
+                handle.queue_message(msg);
+                handle.cancel_round();
                 true
             }
             _ => false,
@@ -806,6 +843,35 @@ mod tests {
         assert_eq!(h.take_compact().as_deref(), Some("focus"));
         assert_eq!(h.take_compact(), None);
         tt.end_turn("x", &h);
+    }
+
+    #[test]
+    fn inject_message_queues_and_cancels_only_the_round() {
+        let tt = TurnTable::default();
+        let msg = || Message {
+            role: "user".into(),
+            content: "mid-turn prompt".into(),
+            ..Default::default()
+        };
+        assert!(!tt.inject_session_message("idle", msg()), "no turn running");
+
+        let h = tt.start_turn("s", "t");
+        let round = CancelToken::new();
+        h.set_round_cancel(Some(round.clone()));
+
+        assert!(tt.inject_session_message("s", msg()));
+        // Only the provider round was cancelled; the turn lives on.
+        assert!(round.is_cancelled());
+        assert!(!h.is_cancelled());
+
+        // The prompt is queued oldest-first and drained exactly once.
+        let pending = h.take_pending();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].content, "mid-turn prompt");
+        assert!(h.take_pending().is_empty());
+
+        tt.end_turn("s", &h);
+        assert!(!tt.inject_session_message("s", msg()), "turn is over");
     }
 
     #[test]

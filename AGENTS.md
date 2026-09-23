@@ -6,7 +6,8 @@ Guidelines for agents working on the atom codebase.
 
 This is the Rust rewrite of atom. It is a Cargo workspace under `crates/`:
 
-- `crates/atom` — the `atom` TUI client and `atoms` background server binaries.
+- `crates/atom` — the `atom` binary: TUI client, and background server
+  via `atom -serve`.
 - `crates/atom-server` — background session-server library used by `atom`.
 - `crates/atom-tui` — TUI implementation.
 - `crates/atom-core` — shared types and helpers.
@@ -20,7 +21,7 @@ validated with `cargo check` / `cargo test`, not a checked-in executable.
 To build the executable:
 
 ```sh
-cargo build --bin atom --bin atoms --bin atomdev --bin atomsdev
+cargo build
 ```
 
 To make `atom` available on your PATH during development:
@@ -29,11 +30,17 @@ To make `atom` available on your PATH during development:
 make dev
 ```
 
-This links the debug build into `~/.local/bin` as `atomdev` and
-`atomsdev` — `cargo build` emits real `atomdev`/`atomsdev` binaries
-(release installs keep the `atom`/`atoms` names). Make sure
-`~/.local/bin` is on your `PATH`. The client starts the `atomsdev`
-server automatically if it isn't already running.
+This installs the debug build into `~/.local/bin` as `atomdev` —
+a **real copy** of `target/debug/atom`, not a symlink. A copy is
+required because macOS 26 (Tahoe) derives process names (`ps comm`,
+Activity Monitor) from the fully resolved executable path: symlinks
+and hardlinks both resolve away, so a symlinked `atomdev` would
+display as `atom` and `pkill` could not tell the dev install from the
+release one. The client warns when cargo has built something newer
+than the copy (it is never refreshed behind your back — run `make dev`
+to pick up the new build, which silences the warning). Make sure
+`~/.local/bin` is on your `PATH`. The client starts its server
+process automatically if it isn't already running.
 
 Dev and release never mix: dev binaries and the auto-updater are
 gated on the debug build, and dev state lives in `atom-dev` data/
@@ -81,21 +88,30 @@ cargo clippy --workspace
 
 Do not reformat unrelated files in the same commit; keep diffs minimal.
 
+## Comments
+
+Comments are a last resort. Prefer names and code structure that don't
+need them. When one is warranted, keep it to a single short line that
+says what the code can't — a constraint, a non-obvious why, or a signpost
+("all diagram styling; edit here"). No narration of what the next line
+does, no banner rules, no multi-paragraph essays.
+
 ## Binary name
 
-There are two binaries in `crates/atom/Cargo.toml`, plus dev aliases:
+There is one binary in `crates/atom/Cargo.toml`, plus a dev alias:
 
-- **`atom`** — the TUI client. Automatically starts `atoms` if no server is
-  running.
-- **`atoms`** — the background session server. Cannot be launched directly;
-  it requires a launch token set by `atom` (`_ATOM_LAUNCH=managed`).
-- **`atomdev` / `atomsdev`** — dev aliases built from the same sources as
-  `atom`/`atoms` (see `crates/atom/Cargo.toml`). Real binaries, not
-  symlinks; meaningful only in the debug profile.
+- **`atom`** — the TUI client. Automatically starts the server if none is
+  running, by re-execing itself as `atom -serve` with a launch token
+  (`_ATOM_LAUNCH=managed`) that refuses direct invocation. One binary
+  means one process name: `pkill atom` (or `pkill atomdev`) shuts down
+  both client and server.
+- **`atomdev`** — dev alias: a real copy of the debug `atom` artifact,
+  created by `make dev` (see `crates/atom/Cargo.toml`). Meaningful only
+  in the debug profile; the dev/release flavor is keyed on
+  `cfg!(debug_assertions)`, not the name.
 
-All four are built by `cargo build` and installed together by
-`make dev` (as `atomdev`/`atomsdev`) or `make install` (as
-`atom`/`atoms`).
+One binary is built by `cargo build` and installed by `make dev` (as
+the `atomdev` copy) or `make install` (as `atom`).
 
 ## Bundled instructions
 
@@ -111,3 +127,55 @@ guidance), update its definition in `crates/atom-tools/src/defs.rs` in
 the same change so the model-facing instructions stay accurate.
 Behavior guidance that is not tool-specific belongs in
 `instructions/system-prompt.md`.
+
+## Build performance
+
+Measured on the reference M4 Pro (12 cores), 2026-09-01, after the
+profile/dependency changes below. Keep these numbers roughly true when
+touching the build config; re-measure if you add a heavy dependency.
+
+| Workflow                     | Time  | Notes                                   |
+|------------------------------|-------|-----------------------------------------|
+| Fresh full `cargo build`     | ~18s  | 415-crate graph, all 12 cores           |
+| Content edit → rebuild       | ~2s   | warm incremental (edit in any crate)    |
+| Link either bin              | ~0.5s | was 8s before dep-debuginfo was dropped |
+| `cargo test --no-run`        | ~11s  | 11 test binaries                        |
+| `cargo clippy` fresh         | ~8s   | check-only, no codegen                  |
+| `cargo fmt --check`          | 0.3s  |                                         |
+| `cargo build --release`      | ~49s  | thin LTO + 1 CGU, leave as is           |
+
+What makes this possible (do not casually revert):
+
+- `[profile.dev.package."*"] debug = false` in the workspace Cargo.toml:
+  dependencies carry no debuginfo; the six workspace crates keep
+  line tables via explicit overrides. This is what collapsed link time
+  (8.2s → 0.5s per binary) and the test build (53s → 11s). Dep rlibs
+  went from ~2.0GB to ~0.9GB per fresh build.
+- syntect uses `regex-fancy` (pure Rust), not `regex-onig` — no Oniguruma
+  C compile. Same API surface for what `render/highlight.rs` needs.
+- image codecs are limited to the two actually used: `png`, `jpeg`.
+  Re-add a codec only when code needs it.
+- Workspace crates form a serial chain core → sandbox → tools → server
+  → tui → bins. A public-API change in atom-core recompiles the whole
+  chain; internal changes ride the incremental green path (~2s). Keep
+  new code in the deepest crate that needs it, not in atom-core by
+  default.
+
+Operational notes:
+
+- Never run two cargo invocations on the same target dir concurrently
+  (they serialize on the build lock and look like multi-minute hangs).
+  Use `cargo check` for quick validation; it shares the lock but not
+  codegen. rust-analyzer should use a separate target dir
+  (`rust-analyzer.cargo.targetDir = true`) to stay out of the way.
+- If builds feel uniformly slow (even warm ones), check
+  `ls target/debug/deps | wc -l`. A healthy dir has a few thousand
+  files; tens of thousands means stale accumulation — `cargo clean`
+  (a fresh rebuild is only ~18s) after rustc updates.
+- macOS: running many freshly compiled build scripts is slow if the
+  terminal app is not registered as a Developer Tool
+  (System Settings → Privacy & Security → Developer Tools → add your
+  terminal). This alone can add minutes to fresh builds.
+- Nightly rustc's parallel frontend (`-Zthreads=8`) was measured at
+  ~10% on fresh builds and slightly slower on warm rebuilds — not
+  worth an extra toolchain; don't re-add it expecting more.

@@ -10,6 +10,7 @@ pub mod client;
 pub mod dispatch;
 pub mod http;
 pub mod instructions;
+pub mod reviewer;
 pub mod state;
 pub mod turn;
 

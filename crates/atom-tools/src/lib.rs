@@ -5,7 +5,9 @@
 //! The bash tool routes through [`atom_sandbox::exec::run`]; everything
 //! else mirrors Go's model-visible strings.
 
+pub mod auth_keys;
 pub mod clipboard;
+pub mod customize;
 pub mod defs;
 pub mod dispatch;
 pub mod exec;
@@ -17,13 +19,31 @@ pub mod search;
 pub mod skills;
 pub mod vector_search;
 pub mod visualize;
+pub mod web_chain_log;
 pub mod web_fetch;
 pub mod web_search;
 
 pub use dispatch::{is_dispatch_session_id, parse_dispatch_session_id, DispatchPlan};
-pub use exec::{execute_tool, SubagentHandle, ToolCtx, ToolOutcome};
+pub use exec::{
+    execute_tool, format_bash_cancelled, format_bash_exit, SubagentHandle, ToolCtx, ToolOutcome,
+};
 pub use file_edit::FileSeen;
 pub use mcp::{close_all_mcp, has_deferred_tools};
+
+/// Shared lock for tests that mutate process-global env vars: without
+/// it, parallel tests set/unset the same keys (EXA_API_KEY and friends)
+/// under each other's feet. Every env-mutating test must hold the
+/// guard for its whole body.
+#[cfg(test)]
+pub(crate) mod testutil {
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    pub fn env_lock() -> MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
 
 use atom_core::types::ToolDef;
 use std::path::Path;

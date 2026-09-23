@@ -593,64 +593,39 @@ fn data_dir_pid_path() -> PathBuf {
     atom_core::session::store::data_dir().join("server.pid")
 }
 
-/// Locate the `atoms` server binary (named `atomsdev` in dev builds —
-/// see atom_core::build). It lives next to the running `atom`
-/// executable (same directory), which works for both dev and release
-/// installs.
-fn find_server_binary() -> Result<PathBuf> {
-    let exe = std::env::current_exe().context("find own executable")?;
-    let dir = exe.parent().context("executable has no parent dir")?;
-    let name = atom_core::build::server_name();
-
-    // 1. Next to the running executable: the release install dir, or
-    //    the dev install dir — `make dev` links the real
-    //    cargo-built atomsdev binary into ~/.local/bin.
-    let candidate = dir.join(name);
-    if candidate.is_file() {
-        return Ok(candidate);
-    }
-    // 2. Fallback: look on PATH (handles `cargo install` putting both
-    //    binaries in ~/.cargo/bin which is already on PATH).
-    if let Some(found) = atom_core::deps::find_in_path(name) {
-        return Ok(found);
-    }
-    // 3. Dev builds: plain `cargo run` with no make symlinks — fall back
-    //    to the `atoms` artifact beside the canonicalized executable.
-    //    Canonicalizing matters on macOS, where current_exe keeps the
-    //    atomdev symlink path: resolving it lands in target/debug, whose
-    //    sibling `atoms` is the matching dev server. The unresolved dir
-    //    is deliberately not searched: it can hold a release `atoms`
-    //    that serves the release socket, which a dev client can't use.
-    if atom_core::build::is_dev() {
-        if let Ok(canon) = exe.canonicalize() {
-            if let Some(parent) = canon.parent() {
-                let sibling = parent.join("atoms");
-                if sibling.is_file() {
-                    return Ok(sibling);
-                }
-            }
-        }
-    }
-    let hint = if atom_core::build::is_dev() {
-        " — dev builds expect the atomdev/atomsdev binaries; run `make dev`"
+/// Read the background server's PID from the pid file the server
+/// writes on startup. Returns None when the file is missing, unreadable,
+/// or contains garbage — the caller treats that as "server pid not
+/// known" instead of crashing /profile.
+pub fn running_server_pid() -> Option<i32> {
+    let raw = std::fs::read_to_string(data_dir_pid_path()).ok()?;
+    let pid = raw.trim().parse::<i32>().ok()?;
+    if pid > 0 {
+        Some(pid)
     } else {
-        ""
-    };
-    Err(anyhow!(
-        "cannot find `{name}` server binary (looked in {} and PATH){hint}",
-        dir.display()
-    ))
+        None
+    }
+}
+
+/// The server executable: this same binary. Client and server are one
+/// executable — the client spawns itself with `-serve` (guarded by the
+/// `_ATOM_LAUNCH` token), so there is no separate server binary to
+/// locate, and nothing to rebuild or refresh when the install changes.
+fn server_executable() -> Result<PathBuf> {
+    std::env::current_exe().context("find own executable")
 }
 
 /// runningServerIsExpected reports whether the live server process (the
-/// pid in server.pid) is the exact server binary this client would
-/// spawn — find_server_binary(). ensure_server recycles on mismatch so
-/// a leftover `atoms` process cannot keep serving clients that expect
-/// `atomsdev` (same version, same data dir, wrong binary). Deliberately
-/// lenient: if the pid file, the process, or the expected binary cannot
-/// be resolved, the running server stays up.
+/// pid in server.pid) is the same executable this client would spawn —
+/// server_executable(). ensure_server recycles on mismatch so a server
+/// left over from a different install (e.g. a `cargo run` binary still
+/// bound to the dev socket while this client runs from ~/.local/bin)
+/// cannot keep serving clients that expect a different binary. Same
+/// version and data dir, wrong binary. Deliberately lenient: if the
+/// pid file, the process, or the expected binary cannot be resolved,
+/// the running server stays up.
 fn running_server_is_expected() -> bool {
-    let expected = match find_server_binary() {
+    let expected = match server_executable() {
         Ok(p) => p,
         Err(_) => return true,
     };
@@ -668,9 +643,11 @@ fn running_server_is_expected() -> bool {
 }
 
 /// The executable path behind a pid: /proc/<pid>/exe on Linux; on macOS
-/// `ps -o comm` reports the argv[0] path the process was exec'd with
-/// (the client always spawns the server by full path, so that is the
-/// binary's path).
+/// `ps -o comm` (proc_pidpath) reports the fully RESOLVED executable
+/// path — on macOS 26 it resolves symlinks and hardlinks and ignores
+/// argv[0] (probed 2026-09), which is why the dev install is a real
+/// file named atomdev. The client spawns the server (itself, -serve)
+/// by full path, so the resolved path is that file.
 fn running_exe(pid: i32) -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     {
@@ -714,17 +691,18 @@ pub async fn ensure_server() -> Result<()> {
         }
         // Recycle when the running server either lacks APIs this client
         // needs (an older build), or is not the binary this client would
-        // spawn — e.g. an `atoms` leftover from a plain `cargo run`
-        // still bound to the dev socket while this client expects
-        // `atomsdev`. Same version and data dir, wrong binary: replace
-        // it so client and server stay a matched pair.
+        // spawn — e.g. an `atom` from a plain `cargo run` still bound to
+        // the dev socket while this client runs from ~/.local/bin.
+        // Same version and data dir, wrong binary: replace it so client
+        // and server stay a matched pair.
         stop_background_server().await;
     }
 
-    // Start the server as a detached background process using the
-    // dedicated `atoms` binary. The kernel names the process from the
-    // executable filename, so Activity Monitor / ps show "atoms".
-    let server_exe = find_server_binary()?;
+    // Start the server as a detached background process by re-execing
+    // this same binary with -serve — one executable for client and
+    // server, so ps shows both under the same name (`atom`, `atomdev`
+    // for dev installs) and a single pkill shuts both down.
+    let server_exe = server_executable()?;
     let log_dir = atom_core::session::store::data_dir();
     let log_file = log_dir.join("server.log");
     let log_f = std::fs::OpenOptions::new()
@@ -733,7 +711,12 @@ pub async fn ensure_server() -> Result<()> {
         .open(&log_file)
         .context("open log file")?;
     let mut cmd = std::process::Command::new(&server_exe);
+    cmd.args(["-serve"]);
     cmd.env("_ATOM_LAUNCH", "managed");
+    // The server outlives the terminal it was launched from; an inherited tty
+    // fd 0 turns into a revoked descriptor and poisons children that inherit
+    // stdin (Python tools die at init_sys_streams).
+    cmd.stdin(std::process::Stdio::null());
     use std::os::unix::process::CommandExt;
     cmd.stdout(std::process::Stdio::from(
         log_f.try_clone().context("clone log file handle")?,
@@ -746,7 +729,7 @@ pub async fn ensure_server() -> Result<()> {
             Ok(())
         });
     }
-    let child = cmd.spawn().context("start atoms server")?;
+    let child = cmd.spawn().context("start atom server")?;
 
     // Prevent macOS from sleeping while the server is alive. caffeinate
     // -i (user-idle) -w <pid> exits automatically when the server does.
@@ -813,25 +796,25 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("atom-client-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let real = dir.join("atomsdev");
+        let real = dir.join("atomdev");
         std::fs::write(&real, b"server").unwrap();
         std::os::unix::fs::symlink(&real, dir.join("install-link")).unwrap();
-        std::fs::write(dir.join("atoms"), b"server").unwrap();
+        std::fs::write(dir.join("target-debug-atom"), b"server").unwrap();
         dir
     }
 
     #[test]
     fn same_server_binary_accepts_symlink_spellings() {
         let dir = scratch();
-        let real = dir.join("atomsdev");
+        let real = dir.join("atomdev");
         let link = dir.join("install-link");
-        let other = dir.join("atoms");
+        let other = dir.join("target-debug-atom");
         assert!(same_server_binary(&real, &real));
         assert!(
             same_server_binary(&link, &real),
             "install symlink must match the real binary"
         );
-        assert!(!same_server_binary(&real, &other), "atoms is not atomsdev");
+        assert!(!same_server_binary(&real, &other), "distinct files differ");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

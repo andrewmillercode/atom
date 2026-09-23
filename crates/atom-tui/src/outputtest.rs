@@ -40,7 +40,7 @@ pub const OUTPUT_TEST_TRANSCRIPT: &[&str] = &[
     r#"{"type":"tool","name":"vector_search","arguments":"{\"query\":\"render blocks in the tui\"}"}"#,
     r#"{"type":"tool_result","text":"tui.go:3829 renderBlock renders one conversation block, wrapped to width.\ntui.go:3898 renderBlocks renders the conversation blocks into the viewport text.\ntui.go:3901 refreshViewport updates the viewport from cached per-block lines."}"#,
     r#"{"type":"content","text":"Confirmed. I'll dispatch a subagent to double-check the scene ordering while I finalize.\n"}"#,
-    r#"{"type":"tool","name":"dispatch","arguments":"{\"model\":\"deepseek-v4-flash:cloud\",\"prompt\":\"Review the output-test scene ordering in tui.go\"}"}"#,
+    r#"{"type":"tool","name":"subagent","arguments":"{\"model\":\"deepseek-v4-flash:cloud\",\"prompt\":\"Review the output-test scene ordering in tui.go\"}"}"#,
     r#"{"type":"tool_result","text":"Subagent started (model deepseek-v4-flash:cloud). It is reviewing the output-test scene ordering and will report back with any issues."}"#,
     r#"{"type":"content","text":"While that runs, load the anti-ai skill to check the skill block renders with its description.\n"}"#,
     r#"{"type":"tool","name":"skill","arguments":"{\"name\":\"anti-ai\"}"}"#,
@@ -142,6 +142,10 @@ pub fn output_test_app(hot_state_path: Option<std::path::PathBuf>) -> App {
         sel_model: "output-test".into(),
         session,
         hot_state_path,
+        started_at: None,
+        started_instant: None,
+        server_pid: None,
+        profile: String::new(),
     });
     m.test_mode = true;
     m.test_scene = OUTPUT_TEST_SCENE_WORKING;

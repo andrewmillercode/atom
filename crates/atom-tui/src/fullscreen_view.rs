@@ -46,6 +46,10 @@ pub struct ViewItem {
     /// Hex colors rendered as small chips after the label (theme
     /// swatches). Each chip is two cells wide plus a one-cell gap.
     pub swatch: Vec<String>,
+    /// Capability badges shown in a fixed-offset column to the right
+    /// of the label ("Models", "Web Search", ...). Rendered dim,
+    /// joined with " · ", wrapped within the remaining width.
+    pub badges: Vec<String>,
 }
 
 impl ViewItem {
@@ -57,6 +61,7 @@ impl ViewItem {
             meta: String::new(),
             marker: String::new(),
             swatch: Vec::new(),
+            badges: Vec::new(),
         }
     }
 }
@@ -135,6 +140,10 @@ pub struct ViewSpec<'a> {
     pub loading: Option<&'a str>,
     /// Spinner frame for the loading state.
     pub spinner_frame: usize,
+    /// Suppress the "nothing here yet" / "no matches" empty-state row
+    /// for input-only views (e.g. the provider API-key prompt) where an
+    /// empty list is expected, not an anomaly.
+    pub hide_empty_state: bool,
 }
 
 /// Renders a fullscreen view into terminal lines. The output fits in the
@@ -181,6 +190,9 @@ pub fn render_view(spec: &ViewSpec<'_>, width: usize) -> Vec<Line<'static>> {
     out.push(Line::from(""));
     if !spec.rows.is_empty() {
         out.extend(render_rows(spec.rows, spec.selected, width, spec.scroll));
+    } else if spec.hide_empty_state {
+        // Input-only view (e.g. provider key prompt): no rows by
+        // design, so no placeholder either.
     } else if spec.search_query.is_empty() {
         out.push(header_line("nothing here yet"));
     } else {
@@ -514,6 +526,10 @@ fn render_rows(
                 } else {
                     ansi::style_inactive()
                 };
+                if !item.badges.is_empty() {
+                    out.extend(render_badged_item(item, &indicator, style, width));
+                    continue;
+                }
                 let swatch_w = item.swatch.len() * SWATCH_CELL_W;
                 let trailing_w = unicode_width::UnicodeWidthStr::width(item.trailing.as_str());
                 let suffix_w = swatch_w + trailing_w;
@@ -568,6 +584,75 @@ fn render_rows(
 /// Cells per swatch chip: 2 colored cells + 1 gap.
 const SWATCH_CELL_W: usize = 3;
 
+/// Fixed cell offset (from row start) where the capability badge
+/// column begins for badge-carrying rows (providers overlay). Names
+/// wrap inside this column; badges wrap inside the remainder.
+pub const BADGE_COL: usize = 34;
+
+fn str_width(s: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(s)
+}
+
+/// Renders a row whose capability badges occupy a fixed-offset column:
+///
+/// ```text
+/// ▸ Ollama Cloud        Models · Web Search · connected (api)
+///                       Web Fetch
+/// ```
+///
+/// The label wraps within `[0, BADGE_COL)`; the badge text wraps in
+/// the remainder (reserving room for the right-aligned status tag);
+/// every line after the first hangs the badge column at BADGE_COL so
+/// the column edge stays fixed while rows grow taller.
+fn render_badged_item(
+    item: &ViewItem,
+    indicator: &str,
+    style: Style,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let badge_col = BADGE_COL.min(width.saturating_sub(4)).max(2);
+    let trailing_w = str_width(&item.trailing);
+    let trailing_reserve = usize::from(!item.trailing.is_empty()) * (trailing_w + 1);
+    let badge_avail = width.saturating_sub(badge_col + trailing_reserve).max(1);
+    let badge_lines = wrap_plain(&item.badges.join(" · "), badge_avail);
+    let label_lines = wrap_plain(&format!("{indicator}{}", item.label), badge_col);
+    let total = label_lines.len().max(badge_lines.len());
+    let mut out = Vec::with_capacity(total);
+    for li in 0..total {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let label = label_lines.get(li);
+        let mut used = 0;
+        if let Some(l) = label {
+            used = str_width(l);
+            spans.push(Span::styled(l.clone(), style));
+        }
+        if used < badge_col {
+            let pad = badge_col - used;
+            spans.push(Span::styled(" ".repeat(pad), style));
+        }
+        if let Some(b) = badge_lines.get(li) {
+            spans.push(Span::styled(b.clone(), ansi::style_dim()));
+            // Status tag rides right-aligned on the first badge line.
+            if li == 0 && !item.trailing.is_empty() {
+                let badge_w = str_width(b);
+                let gap = width
+                    .saturating_sub(badge_col + badge_w + trailing_reserve)
+                    .max(1);
+                spans.push(Span::styled(" ".repeat(gap), style));
+                spans.push(Span::styled(item.trailing.clone(), ansi::style_dim()));
+            }
+        }
+        out.push(Line::from(spans));
+    }
+    if !item.meta.is_empty() {
+        out.push(Line::from(Span::styled(
+            format!("    {}", item.meta),
+            ansi::style_dim(),
+        )));
+    }
+    out
+}
+
 fn swatch_spans(hex: &str) -> Vec<Span<'static>> {
     let (r, g, b) = atom_core::render::colors::hex_to_rgb(hex);
     vec![
@@ -591,6 +676,24 @@ pub fn row_line_counts(rows: &[ViewRow], width: usize) -> Vec<usize> {
             }
             ViewRow::Item(item) => {
                 let swatch_w = item.swatch.len() * SWATCH_CELL_W;
+                if !item.badges.is_empty() {
+                    // Mirror render_badged_item: label lines wrap in
+                    // BADGE_COL; badge lines wrap in the remainder
+                    // (reserving the right-aligned tag).
+                    let badge_col = BADGE_COL.min(width.saturating_sub(4)).max(2);
+                    let trailing_w = str_width(&item.trailing);
+                    let trailing_reserve =
+                        usize::from(!item.trailing.is_empty()) * (trailing_w + 1);
+                    let badge_avail = width.saturating_sub(badge_col + trailing_reserve).max(1);
+                    let badge_lines = wrap_plain(&item.badges.join(" · "), badge_avail)
+                        .len()
+                        .max(1);
+                    let label_lines = wrap_plain(&format!("▸ {}", item.label), badge_col)
+                        .len()
+                        .max(1);
+                    let meta_extra = usize::from(!item.meta.is_empty());
+                    return label_lines.max(badge_lines) + meta_extra;
+                }
                 let trailing_w = unicode_width::UnicodeWidthStr::width(item.trailing.as_str());
                 let avail = width.saturating_sub(swatch_w + trailing_w + 1).max(1);
                 let n = wrap_plain(&format!("▸ {}", item.label), avail).len();
@@ -672,6 +775,7 @@ mod tests {
             meta: String::new(),
             marker: String::new(),
             swatch: Vec::new(),
+            badges: Vec::new(),
         })
     }
 
@@ -695,6 +799,7 @@ mod tests {
             footer: "1/1 user messages",
             loading: None,
             spinner_frame: 0,
+            hide_empty_state: false,
         };
         let lines = render_view(&spec, 80);
         let plain: Vec<String> = lines.iter().map(|l| crate::ansi::line_plain(l)).collect();
@@ -724,6 +829,7 @@ mod tests {
             footer: "",
             loading: None,
             spinner_frame: 0,
+            hide_empty_state: false,
         };
         let lines = render_view(&spec, 40);
         let joined: String = lines
@@ -759,6 +865,7 @@ mod tests {
             footer: "",
             loading: None,
             spinner_frame: 0,
+            hide_empty_state: false,
         };
         let width = 80;
         let top = list_top(&spec, width);
@@ -786,6 +893,7 @@ mod tests {
             footer: "",
             loading: None,
             spinner_frame: 0,
+            hide_empty_state: false,
         };
         // y=0 lands on the title.
         assert!(hit_test(&spec, 0, 80, 24).is_none());
@@ -807,6 +915,7 @@ mod tests {
             footer: "1/1",
             loading: Some("loading session..."),
             spinner_frame: 2,
+            hide_empty_state: false,
         };
         let plain: Vec<String> = render_view(&spec, 60)
             .into_iter()
@@ -832,6 +941,7 @@ mod tests {
             footer: "",
             loading: None,
             spinner_frame: 0,
+            hide_empty_state: false,
         };
         let lines = render_view(&spec, 60);
         let plain: Vec<String> = lines.iter().map(|l| crate::ansi::line_plain(l)).collect();
@@ -854,6 +964,7 @@ mod tests {
             footer: "",
             loading: None,
             spinner_frame: 0,
+            hide_empty_state: false,
         };
         let lines = render_view(&spec, 40);
         // The top border row must not exceed the width (40 columns).
@@ -875,6 +986,7 @@ mod tests {
             meta: "14:02".into(),
             marker: String::new(),
             swatch: Vec::new(),
+            badges: Vec::new(),
         })];
         let spec = ViewSpec {
             title: "t".to_string(),
@@ -889,6 +1001,7 @@ mod tests {
             footer: "",
             loading: None,
             spinner_frame: 0,
+            hide_empty_state: false,
         };
         let lines = render_view(&spec, 40);
         let plain: Vec<String> = lines.iter().map(|l| crate::ansi::line_plain(l)).collect();
@@ -913,6 +1026,7 @@ mod tests {
             footer: "",
             loading: None,
             spinner_frame: 0,
+            hide_empty_state: false,
         };
         let lines = render_view(&spec, 40);
         // Layout: title(+esc), blank, blank, search row, blank,
@@ -968,6 +1082,7 @@ mod tests {
             footer: "",
             loading: None,
             spinner_frame: 0,
+            hide_empty_state: false,
         };
         let lines = render_view(&spec, 40);
         let search = crate::ansi::line_plain(&lines[3]);
@@ -993,6 +1108,7 @@ mod tests {
             footer: "",
             loading: None,
             spinner_frame: 0,
+            hide_empty_state: false,
         };
         let lines = render_view(&spec, 40);
         let search_line = &lines[3];
@@ -1023,6 +1139,7 @@ mod tests {
             footer: "",
             loading: None,
             spinner_frame: 0,
+            hide_empty_state: false,
         };
         let lines = render_view(&spec, 40);
         assert!(

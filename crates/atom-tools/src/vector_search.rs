@@ -29,6 +29,9 @@ impl SembleRunner for RealSemble {
     async fn run(&self, cwd: &Path, args: &[String]) -> Result<Vec<u8>, RunError> {
         let mut cmd = tokio::process::Command::new("uvx");
         cmd.args(args).current_dir(cwd);
+        // tokio's output() pipes stdout/stderr but, unlike std, leaves stdin
+        // inherited; null it so uvx's Python children never see a bad fd 0.
+        cmd.stdin(std::process::Stdio::null());
         match tokio::time::timeout(SEMBLE_SEARCH_TIMEOUT, cmd.output()).await {
             Err(_) => Err(RunError::TimedOut),
             Ok(Err(e)) => Err(RunError::Failed {

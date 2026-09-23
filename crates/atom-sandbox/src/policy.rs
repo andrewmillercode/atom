@@ -33,6 +33,10 @@ pub struct SandboxConfig {
     pub version: u32,
     #[serde(default)]
     pub rules: Rules,
+    /// Run local commands under Seatbelt confinement (macOS). Defaults
+    /// on; the escape hatch for a command the profile refuses.
+    #[serde(default = "default_confine")]
+    pub confine: bool,
     /// Path the config was loaded from (or the most-recent save
     /// target). Persisted calls use this so tests that pass a temp
     /// dir don't end up writing to the real data dir. Skipped from
@@ -43,6 +47,10 @@ pub struct SandboxConfig {
 
 fn default_version() -> u32 {
     VERSION
+}
+
+fn default_confine() -> bool {
+    true
 }
 
 /// User-maintained prefix rules. Order is not significant: an `allow` rule
@@ -60,6 +68,7 @@ impl Default for SandboxConfig {
         SandboxConfig {
             version: VERSION,
             rules: Rules::default(),
+            confine: true,
             path: None,
         }
     }
@@ -329,6 +338,7 @@ mod tests {
                 allow: vec!["cargo test *".into()],
                 deny: vec!["rm *".into()],
             },
+            confine: true,
             path: Some(p.clone()),
         };
         cfg.save_to(&p).unwrap();
@@ -386,15 +396,13 @@ mod tests {
     fn add_rule_dedupes_and_persists() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("sandbox.json");
-        // Use load_from so the config knows about its on-disk path
-        // via subsequent save() calls; tests that want a controlled
-        // path use save_to explicitly.
-        let mut cfg = SandboxConfig::default();
+        // with_path pins save() to the temp file — the default config
+        // would persist to the user's real sandbox.json.
+        let mut cfg = SandboxConfig::default().with_path(p.clone());
         cfg.add_rule(RuleKind::Allow, "cargo test *").unwrap();
         cfg.add_rule(RuleKind::Allow, "cargo test *").unwrap();
         cfg.add_rule(RuleKind::Allow, "cargo build *").unwrap();
         assert_eq!(cfg.rules.allow.len(), 2);
-        cfg.save_to(&p).unwrap();
         let on_disk = SandboxConfig::load_from(&p);
         assert_eq!(on_disk.rules.allow.len(), 2);
     }
@@ -439,6 +447,7 @@ mod tests {
                 allow: vec!["cargo test *".into()],
                 deny: vec!["rm *".into()],
             },
+            confine: true,
             path: None,
         };
         assert_eq!(

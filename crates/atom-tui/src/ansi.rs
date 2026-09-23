@@ -61,7 +61,41 @@ pub fn c_syntax_type() -> Color {
 }
 
 fn theme_color(role: atom_core::render::colors::ThemeColor) -> Color {
-    hex_color(&atom_core::render::colors::theme_color(role))
+    // Hot path: called for every style lookup on every frame. The parsed
+    // Color is cached per role and invalidated by the theme generation
+    // counter, so steady-state cost is one atomic load + RwLock read —
+    // no String clone, no hex parsing (profiler showed ~30% of draw
+    // time re-parsing the same 18 hex strings).
+    static CACHE: std::sync::OnceLock<
+        std::sync::RwLock<(
+            u64,
+            [Option<Color>; atom_core::render::colors::THEME_COLOR_COUNT],
+        )>,
+    > = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| {
+        std::sync::RwLock::new((
+            u64::MAX,
+            [None; atom_core::render::colors::THEME_COLOR_COUNT],
+        ))
+    });
+    let idx = role as usize;
+    let generation = atom_core::render::colors::theme_gen();
+    if let Ok(guard) = cache.read() {
+        if guard.0 == generation {
+            if let Some(c) = guard.1[idx] {
+                return c;
+            }
+        }
+    }
+    let c = hex_color(&atom_core::render::colors::theme_color(role));
+    if let Ok(mut guard) = cache.write() {
+        if guard.0 != generation {
+            guard.0 = generation;
+            guard.1 = [None; atom_core::render::colors::THEME_COLOR_COUNT];
+        }
+        guard.1[idx] = Some(c);
+    }
+    c
 }
 
 /// Mirrors tui.go's style block.
@@ -91,6 +125,14 @@ pub fn style_tool_name() -> Style {
 }
 pub fn style_tool_hint() -> Style {
     Style::new().fg(c_muted()).bg(c_card_dark())
+}
+/// Approval button key letter: foreground on the prompt-input card color.
+pub fn style_approval_key() -> Style {
+    Style::new().fg(c_foreground()).bg(c_card_light())
+}
+/// Approval button action word: muted on the prompt-input card color.
+pub fn style_approval_word() -> Style {
+    Style::new().fg(c_muted()).bg(c_card_light())
 }
 pub fn style_error() -> Style {
     Style::new().fg(c_secondary())
@@ -129,6 +171,16 @@ pub fn style_select() -> Style {
 /// The base frame style: app foreground/background on every cell.
 pub fn frame_style() -> Style {
     Style::new().fg(c_foreground()).bg(c_background())
+}
+
+/// Base frame style for the chat viewport when the transparent-background
+/// setting is on: theme foreground over the terminal's *default* background
+/// (`Color::Reset` emits `\x1b[49m`), so a terminal profile with no
+/// background color shows through. Spans that set their own bg (code
+/// cards, diff rows, the selection wash) still paint it; every other
+/// surface keeps `frame_style()`.
+pub fn frame_style_transparent() -> Style {
+    Style::new().fg(c_foreground()).bg(Color::Reset)
 }
 
 // ---------------------------------------------------------------------------
@@ -670,12 +722,10 @@ mod tests {
 
     #[test]
     fn wrapped_link_is_clickable_on_every_row() {
-        // Bare URLs in prose are not auto-linked under the new policy
-        // (only markdown `[label](url)` and `<url>` autolinks are).
-        // The markdown layer produces OSC 8; covered by
-        // `markdown::tests::links_carry_osc8_targets`. This test
-        // asserts that bare URLs flowing through `wrap_linked` stay
-        // plain text on every wrapped row.
+        // Bare URLs flowing through `wrap_linked` become OSC 8 regions
+        // (linkify_urls), including on every wrapped continuation row:
+        // the wrapper never re-emits the open sequence, so the region
+        // threading in `ansi_to_lines_linked` carries the URI across.
         use atom_core::render::links::wrap_linked;
         let body = wrap_linked(
             "prose before and then https://example.com/very/long/url and some prose after",
@@ -684,12 +734,17 @@ mod tests {
             "",
         );
         let linked = ansi_to_lines_linked(&body);
+        let mut url_rows = 0usize;
         for row_links in &linked.links {
-            assert!(
-                row_links.is_empty(),
-                "wrap_linked leaked an OSC 8 region into wrapped prose: {row_links:?}"
-            );
+            for r in row_links {
+                assert_eq!(r.uri, "https://example.com/very/long/url");
+                url_rows += 1;
+            }
         }
+        assert!(
+            url_rows >= 2,
+            "wrapped URL must span multiple rows, got {url_rows}"
+        );
         let plain: String = linked
             .lines
             .iter()
@@ -700,6 +755,23 @@ mod tests {
             plain.contains("https://example.com/very/long/url"),
             "URL dropped from visible output: {plain:?}"
         );
+    }
+
+    #[test]
+    fn wrap_linked_leaves_paths_plain() {
+        // Paths keep the v0.1.3 policy: no OSC 8 outside tool headers.
+        use atom_core::render::links::wrap_linked;
+        for in_text in [
+            "see crates/foo.rs for details",
+            "open ~/.config/atom/AGENTS.md",
+            "config at /etc/hosts is plain",
+        ] {
+            let out = wrap_linked(in_text, 80, "", "");
+            assert!(
+                !out.contains("\x1b]8;;"),
+                "wrap_linked({in_text:?}) leaked OSC 8: {out:?}"
+            );
+        }
     }
 
     #[test]

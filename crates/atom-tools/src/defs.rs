@@ -20,7 +20,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDef> {
     vec![
         def(
             "web_search",
-            "Search web for current info. Returns titles, URLs, snippets. Use when user asks about current events or info not in training data. Keep query concise, then answer from results.",
+            "Search web for current info. Returns titles, URLs, snippets. Use when user asks about current events or info not in training data. Keep query concise, then answer from results. Providers are tried in order (selected first, then parallel, exa, tinyfish, ollama); parallel and exa fall back to their free keyless hosted-MCP routes, so keyless setups still search.",
             r#"{"type":"object","properties":{"query":{"type":"string","description":"Search query"}},"required":["query"]}"#,
         ),
         webfetch_def(),
@@ -45,18 +45,19 @@ pub fn builtin_tool_definitions() -> Vec<ToolDef> {
         visualize_def(),
         def(
             "bash",
-            "Run commands needing shell: tests, builds, git, package managers. Last resort — only when no other builtin tool can do the job. Never use bash to search files or web: use glob and grep instead; file reads and changes belong in read_file, write_file, edit_file.",
+            "Run commands needing shell: tests, builds, git, package managers. Last resort — only when no other builtin tool can do the job. Long commands simply run until done: the turn waits and the tool result arrives when the command finishes, however long that takes (the user's Esc stops a command). The user may send prompts mid-run — you will see them between rounds and can reply without stopping the command. Never use bash to search files or web: use glob and grep instead; file reads and changes belong in read_file, write_file, edit_file.",
             r#"{"type":"object","properties":{"command":{"type":"string","description":"Command to run from session workspace"}},"required":["command"]}"#,
         ),
-        dispatch_def(),
+        subagent_def(),
         skill_def(),
+        customize_def(),
     ]
 }
 
 pub fn webfetch_def() -> ToolDef {
     def(
         "webfetch",
-        "Fetch a single URL and return its content. Format: markdown (default), text, or html. Use when you already have the URL and want its content; use web_search to find URLs first. Read-only. 5MB max, 30s default timeout (max 120s). Bot-challenged sites (Cloudflare, Anubis) may still block.",
+        "Fetch a single URL and return its content. Format: markdown (default), text, or html. Use when you already have the URL and want its content; use web_search to find URLs first. Read-only. 5MB max, 30s default timeout (max 120s). Bot-challenged sites (Cloudflare, Anubis) may still block. Provider selection lives in Settings; the tool always dispatches through the configured fetch provider with fallback (REST route when a key resolves, then the provider's free hosted-MCP route for parallel and exa), then a direct fetch.",
         r#"{"type":"object","properties":{"url":{"type":"string","description":"The URL to fetch (http or https)"},"format":{"type":"string","enum":["markdown","text","html"],"description":"Output format. Default markdown."},"timeout":{"type":"integer","description":"Timeout in seconds, max 120. Default 30."}},"required":["url"]}"#,
     )
 }
@@ -88,26 +89,24 @@ pub fn glob_def() -> ToolDef {
 pub fn visualize_def() -> ToolDef {
     def(
         "visualize",
-        r#"Render Mermaid diagram inline in atom TUI, high-density image at full block width; click opens pan/zoom browser viewer. Use for concept thinking, architecture, data flow, call graphs, sequence, state machines, ER. This is the ONLY way to deliver a diagram: whenever you are about to write a mermaid code fence or diagram-like ASCII/Unicode art in your reply, make this tool call instead — never paste diagram source into reply text. Not for math unless user asks. House style: muted colors, color on borders only — classDef fill:none plus colored stroke, never bright fills (dark background); compact landscape layout, flowchart LR, short labels, side-by-side subgraphs. Source is raw Mermaid, no fences, complete diagram in one call, short title (names browser tab and artifact file). Render failure names offending line — fix and retry, no giving up. Inline image needs kitty graphics terminal; else open named HTML file in browser.
+        r#"Render Mermaid diagram inline in atom TUI, high-density image at full block width; click opens pan/zoom browser viewer. Use for concept thinking, architecture, data flow, call graphs, sequence, state machines, ER. This is the ONLY way to deliver a diagram: whenever you are about to write a mermaid code fence or diagram-like ASCII/Unicode art in your reply, make this tool call instead — never paste diagram source into reply text. Not for math unless user asks. House style: the tool themes everything from the selected atom theme (square nodes in the palette fill, theme text, bordered edge labels) — do NOT add classDef, style, or themeVariables of your own. The only styling control is the label_colors argument: map edge-label text to a token blue|green|orange|pink. Compact landscape layout, flowchart LR, short labels, side-by-side subgraphs. Source is raw Mermaid, no fences, complete diagram in one call, short title (names browser tab and artifact file). Render failure names offending line — fix and retry, no giving up. Inline image needs kitty graphics terminal; else open named HTML file in browser.
 
-Few-shot, most render failures are unquoted labels. BAD (colon breaks parser, bright style fill off-style, TD wastes space):
+Few-shot, most render failures are unquoted labels. BAD (colon breaks parser, TD wastes space):
 A[Layer 1: static rules]
 GOOD:
 flowchart LR
   A[Tool call] --> B{"Layer 1<br/>static rules"}
   B -->|allow| C["run confined<br/>Seatbelt on"]
-  classDef plain fill:none,stroke:#8a919c
-  class A,B,C plain
-Rules: quote labels with punctuation, <br/> for line breaks, word-only labels may stay unquoted, one classDef per color role with fill:none + muted stroke, LR, short labels."#,
-        r#"{"type":"object","properties":{"code":{"type":"string","description":"Mermaid source, e.g. 'flowchart LR\\n  A[Start] --> B[Done]'"},"title":{"type":"string","description":"Short title, names browser tab and artifact file"}},"required":["code"]}"#,
+Rules: quote labels with punctuation, <br/> for line breaks, word-only labels may stay unquoted, LR, short labels."#,
+        r#"{"type":"object","properties":{"code":{"type":"string","description":"Mermaid source, e.g. 'flowchart LR\\n  A[Start] --> B[Done]'"},"title":{"type":"string","description":"Short title, names browser tab and artifact file"},"label_colors":{"type":"object","description":"Optional edge-label color tokens: { \"label text\": \"blue|green|orange|pink\" }; labels without an entry get blue"}},"required":["code"]}"#,
     )
 }
 
-pub fn dispatch_def() -> ToolDef {
+pub fn subagent_def() -> ToolDef {
     def(
-        "dispatch",
-        "Manage subagents through one bulk interface. action=models: discover exact providers and model IDs. action=spawn: one subagent per tasks string (max 100, min 1); tasks accepts a single string or a list of strings (a string is treated as a one-item list), all share provider/model/thinking; result has session id; send new prompt to continue, cancel to stop. spawn requires at least one task. action=inspect: status snapshot and optional results for ids, batch_id, or all owned subagents. action=send: continue selected subagents with prompt, or distinct messages per subagent. action=cancel: stop selected. Every operation bulk-capable; prefer batch_id over many IDs. User can open subagent by clicking tool block or shift+down. No nested dispatch, one level only.",
-        r#"{"type":"object","properties":{"action":{"type":"string","enum":["models","spawn","inspect","send","cancel"],"description":"Operation."},"tasks":{"anyOf":[{"type":"string"},{"type":"array","minItems":1,"maxItems":100,"items":{"type":"string"}}],"description":"Spawn only: one prompt per new subagent; a single string is treated as a one-item list."},"provider":{"type":"string","description":"Spawn only: exact provider from action=models. Omit to inherit."},"model":{"type":"string","description":"Spawn only: exact model ID from action=models. Omit to inherit."},"thinking":{"type":"string","description":"Spawn/send reasoning_effort: none, low, high, or max."},"batch_id":{"type":"string","description":"Target every subagent from one spawn."},"ids":{"type":"array","items":{"type":"string"},"description":"Selected subagent IDs. Omit ids and batch_id to target all owned."},"prompt":{"type":"string","description":"Send only: follow-up prompt shared by all targets."},"messages":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"prompt":{"type":"string"}},"required":["id","prompt"]},"description":"Send only: distinct follow-up prompts by subagent ID."},"wait":{"type":"string","enum":["none","any","all"],"description":"Spawn/inspect: when to return, default none."},"results":{"type":"boolean","description":"Inspect: include available results, default true."},"statuses":{"type":"array","items":{"type":"string","enum":["queued","working","sandbox","error","done","cancelled","stopped"]},"description":"Cancel only: restrict cancellation to these statuses."},"query":{"type":"string","description":"Models only: optional model ID filter."}},"required":["action"]}"#,
+        "subagent",
+        "Manage subagents through one bulk interface. agent names the agent profile to spawn (e.g. plan, build; default inherits the caller's model and thinking); model overrides the profile's default model. action=models: discover exact providers and model IDs. action=spawn: one subagent per tasks string (max 100, min 1); tasks accepts a single string or a list of strings (a string is treated as a one-item list), all share agent/model/thinking; result has session id; send new prompt to continue, cancel to stop. spawn requires at least one task. action=inspect: status snapshot and optional results for ids, batch_id, or all owned subagents. action=send: continue selected subagents with prompt, or distinct messages per subagent. action=cancel: stop selected. Every operation bulk-capable; prefer batch_id over many IDs. User can open subagent by clicking tool block or shift+down. No nested subagents, one level only.",
+        r#"{"type":"object","properties":{"action":{"type":"string","enum":["models","spawn","inspect","send","cancel"],"description":"Operation."},"agent":{"type":"string","description":"Spawn only: agent profile to call, e.g. plan or build. Omit to inherit the session's model and thinking."},"tasks":{"anyOf":[{"type":"string"},{"type":"array","minItems":1,"maxItems":100,"items":{"type":"string"}}],"description":"Spawn only: one prompt per new subagent; a single string is treated as a one-item list."},"provider":{"type":"string","description":"Spawn only: exact provider from action=models. Omit to inherit."},"model":{"type":"string","description":"Spawn only: exact model ID from action=models, optionally as provider/model. Overrides the agent profile's default model."},"thinking":{"type":"string","description":"Spawn/send reasoning_effort: none, low, high, or max."},"batch_id":{"type":"string","description":"Target every subagent from one spawn."},"ids":{"type":"array","items":{"type":"string"},"description":"Selected subagent IDs. Omit ids and batch_id to target all owned."},"prompt":{"type":"string","description":"Send only: follow-up prompt shared by all targets."},"messages":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"prompt":{"type":"string"}},"required":["id","prompt"]},"description":"Send only: distinct follow-up prompts by subagent ID."},"wait":{"type":"string","enum":["none","any","all"],"description":"Spawn/inspect: when to return, default none."},"results":{"type":"boolean","description":"Inspect: include available results, default true."},"statuses":{"type":"array","items":{"type":"string","enum":["queued","working","sandbox","error","done","cancelled","stopped"]},"description":"Cancel only: restrict cancellation to these statuses."},"query":{"type":"string","description":"Models only: optional model ID filter."}},"required":["action"]}"#,
     )
 }
 
@@ -116,6 +115,14 @@ pub fn skill_def() -> ToolDef {
         "skill",
         "Load skill instructions by exact name from skills catalog (system prompt lists name + description only). Call when request matches listed skill, then follow instructions. Never load irrelevant skill.",
         r#"{"type":"object","properties":{"name":{"type":"string","description":"Exact skill name from catalog"}},"required":["name"]}"#,
+    )
+}
+
+pub fn customize_def() -> ToolDef {
+    def(
+        "customize",
+        "Inject a reference of every way to customize atom (skills, MCP servers, AGENTS.md, config, themes, bundled prompt) into the session. Call when the user asks how to customize, configure, extend, or change atom — including adding skills, wiring MCP servers, dropping project rules, picking themes, or editing the bundled prompt. Takes no arguments.",
+        r#"{"type":"object","properties":{}}"#,
     )
 }
 
@@ -162,11 +169,12 @@ mod tests {
                 "glob",
                 "visualize",
                 "bash",
-                "dispatch",
+                "subagent",
                 "skill",
+                "customize",
             ]
         );
-        assert_eq!(crate::tool_definitions().len(), 12);
+        assert_eq!(crate::tool_definitions().len(), 13);
     }
 
     #[test]
@@ -187,12 +195,12 @@ mod tests {
 
     #[test]
     fn without_tool_strips_and_is_idempotent() {
-        let tools = without_tool(&crate::tool_definitions(), "dispatch");
-        assert!(tools.iter().all(|t| t.function.name != "dispatch"));
-        assert_eq!(without_tool(&tools, "dispatch").len(), tools.len());
+        let tools = without_tool(&crate::tool_definitions(), "subagent");
+        assert!(tools.iter().all(|t| t.function.name != "subagent"));
+        assert_eq!(without_tool(&tools, "subagent").len(), tools.len());
         // Stripping everything but keeping order otherwise.
         let no_bash = without_tool(&crate::tool_definitions(), "bash");
-        assert_eq!(no_bash.len(), 11);
+        assert_eq!(no_bash.len(), 12);
         assert_eq!(no_bash[4].function.name, "edit_file");
     }
 }

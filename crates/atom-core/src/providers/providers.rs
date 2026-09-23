@@ -7,8 +7,60 @@
 use crate::types::{self, ChatRequest};
 use futures::{FutureExt, StreamExt};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
+
+/// OpenCode's Zen and Go gateways require OpenCode-client identity
+/// headers on every model request. `x-opencode-session` identifies a
+/// conversation for cache affinity (400 MissingSessionID without it), so
+/// its value is stable across a conversation's turns — derived by hashing
+/// the session id. The free tier additionally rejects clients that do not
+/// look like the official CLI (403 FreeTierError), so we also send the
+/// client/UA/project/request headers it checks for. Returns an empty vec
+/// for other hosts.
+pub fn opencode_headers(base_url: &str, conversation_key: &str) -> Vec<(String, String)> {
+    if !base_url.contains("opencode.ai") {
+        return Vec::new();
+    }
+    let mut headers = vec![
+        ("x-opencode-client".to_string(), "cli".to_string()),
+        (
+            "User-Agent".to_string(),
+            "opencode/latest/1.3.15/cli".to_string(),
+        ),
+    ];
+    if !conversation_key.is_empty() {
+        let hex: String = Sha256::digest(conversation_key.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        headers.push(("x-opencode-session".into(), format!("ses_{}", &hex[..32])));
+    }
+    headers.push((
+        "x-opencode-project".into(),
+        format!("prj_{}", &id_hash(&project_key())[..32]),
+    ));
+    let bytes: [u8; 16] = rand::random();
+    headers.push(("x-opencode-request".into(), hex::encode(bytes)));
+    headers
+}
+
+/// id_hash is the hex SHA-256 used for the session and project ids.
+fn id_hash(input: &str) -> String {
+    Sha256::digest(input.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// project_key identifies the current project the way opencode's project
+/// id does: a stable hash of the working directory.
+fn project_key() -> String {
+    std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
 
 /// provider is one model backend: its display name, OpenAI-compatible base
 /// URL, and API key (empty when no key is needed, e.g. local Ollama).
@@ -55,6 +107,38 @@ pub struct ProviderListEntry {
     pub connected: bool,
     /// auth.json or legacy file; disconnectable with d
     pub stored: bool,
+    /// Capabilities surfaced in the providers overlay's fixed badge
+    /// column: "Models", "Web Search", "Web Fetch".
+    pub caps: Vec<&'static str>,
+}
+
+/// webToolProviders are non-model backends that share the provider
+/// list and auth store but expose no /v1/models: pure web search /
+/// fetch services, keyed by their own API keys.
+pub const WEB_TOOL_PROVIDERS: [(&str, &str); 3] = [
+    ("tinyfish", "TinyFish"),
+    ("parallel", "Parallel"),
+    ("exa", "Exa"),
+];
+
+pub fn is_web_tool_provider(id: &str) -> bool {
+    WEB_TOOL_PROVIDERS.iter().any(|(wid, _)| *wid == id)
+}
+
+/// providerCaps reports what a provider id can be used for, read off
+/// the bundled capability tables: every models.dev provider lists
+/// models; the web-tool providers (and ollama-cloud, whose API hosts
+/// both) list search and fetch.
+pub fn provider_caps(id: &str) -> Vec<&'static str> {
+    let mut caps = Vec::new();
+    if !is_web_tool_provider(id) {
+        caps.push("Models");
+    }
+    if is_web_tool_provider(id) || matches!(id, "ollama-cloud" | "ollama") {
+        caps.push("Web Search");
+        caps.push("Web Fetch");
+    }
+    caps
 }
 
 /// providerByName returns the provider with the given display name, or
@@ -128,6 +212,41 @@ pub fn reasoning_field_for_url(url: &str) -> String {
     }
 }
 
+/// isVercelAiGateway reports whether a base URL is Vercel's AI Gateway
+/// (models.dev id "vercel", fallback host ai-gateway.vercel.sh/v1).
+pub fn is_vercel_ai_gateway(url: &str) -> bool {
+    url.contains("ai-gateway.vercel.sh")
+}
+
+/// applyGatewayProviderRouting adapts a serialized ChatRequest body for
+/// the Vercel AI Gateway Chat Completions API:
+/// - injects the top-level `provider` routing shorthand
+///   (providerOptions.gateway) with `sort: "tps"`, ranking the gateway's
+///   upstream providers for the model by median tokens-per-second
+///   (highest first) and falling through the sorted list on failure;
+/// - remaps `reasoning_effort` to `reasoning.effort`, the gateway's
+///   provider-agnostic reasoning-level form, which it bridges to the
+///   target model's native configuration (effort levels or token
+///   budgets).
+/// Other providers reject the unknown top-level `provider` key, so the
+/// body is only touched for the gateway host.
+pub fn apply_gateway_provider_routing(url: &str, body: &mut serde_json::Value) {
+    if !is_vercel_ai_gateway(url) {
+        return;
+    }
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    if !obj.contains_key("provider") {
+        obj.insert("provider".into(), serde_json::json!({ "sort": "tps" }));
+    }
+    if let Some(effort) = obj.remove("reasoning_effort") {
+        if effort.as_str().map(|s| !s.is_empty()).unwrap_or(false) {
+            obj.insert("reasoning".into(), serde_json::json!({ "effort": effort }));
+        }
+    }
+}
+
 fn get_env(name: &str) -> String {
     std::env::var(name).unwrap_or_default()
 }
@@ -143,6 +262,46 @@ pub fn ambient_aws_region() -> Option<String> {
         }
     }
     None
+}
+
+/// resolveProviderEndpoint maps a provider selection (models.dev id or
+/// display name, e.g. "anthropic") to its endpoint credentials. A
+/// provider with no stored key falls back to the Ollama shapes, then to
+/// its models.dev base URL.
+pub async fn resolve_provider_endpoint(selected: &str) -> Provider {
+    crate::providers::modelsdev::ensure_models_dev_catalog().await;
+    let providers = build_providers().await;
+    if let Some(provider) = providers
+        .iter()
+        .find(|provider| provider.name == selected || provider.id == selected)
+    {
+        return provider.clone();
+    }
+    if matches!(selected, "ollama" | "ollama-cloud") {
+        return Provider {
+            name: "ollama".into(),
+            id: "ollama-cloud".into(),
+            base_url: "https://ollama.com/v1".into(),
+            key: super::auth::load_provider_key("ollama-cloud").await,
+            reasoning_field: "reasoning".into(),
+        };
+    }
+    let base_url = crate::providers::modelsdev::models_dev_base_url(selected);
+    if base_url.is_empty() {
+        return Provider {
+            name: "ollama-local".into(),
+            base_url: "http://localhost:11434/v1".into(),
+            reasoning_field: "reasoning".into(),
+            ..Default::default()
+        };
+    }
+    Provider {
+        name: selected.into(),
+        id: selected.into(),
+        key: super::auth::load_provider_key(selected).await,
+        reasoning_field: reasoning_field_for_url(&base_url),
+        base_url,
+    }
 }
 
 /// buildProviders discovers providers whose credentials are available.
@@ -234,6 +393,18 @@ pub async fn build_providers() -> Vec<Provider> {
         seen.insert(id);
     }
 
+    // Local Ollama (http://localhost:11434/v1): included only when a
+    // server is actually answering, so the model picker lists installed
+    // models without adding a dead provider.
+    if probe_ollama_local().await {
+        providers.push(Provider {
+            name: "ollama-local".into(),
+            base_url: "http://localhost:11434/v1".into(),
+            reasoning_field: "reasoning".into(),
+            ..Default::default()
+        });
+    }
+
     providers
 }
 
@@ -309,6 +480,40 @@ pub async fn fetch_models(p: &Provider) -> anyhow::Result<Vec<String>> {
     }
 }
 
+#[cfg(test)]
+static OLLAMA_LOCAL_PROBE_FOR_TEST: std::sync::RwLock<Option<bool>> = std::sync::RwLock::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_ollama_local_probe_for_test(v: Option<bool>) {
+    *OLLAMA_LOCAL_PROBE_FOR_TEST.write().unwrap() = v;
+}
+
+/// probeOllamaLocal reports whether an Ollama server is answering on
+/// localhost:11434. Connection-refused returns instantly; the timeout
+/// only guards a hung listener. Tests force the result rather than
+/// probing the developer's machine.
+#[allow(unreachable_code)]
+pub async fn probe_ollama_local() -> bool {
+    #[cfg(test)]
+    return OLLAMA_LOCAL_PROBE_FOR_TEST.read().unwrap().unwrap_or(false);
+
+    static CLIENT: once_cell::sync::Lazy<reqwest::Client> = once_cell::sync::Lazy::new(|| {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(1))
+            .build()
+            .expect("reqwest client")
+    });
+    match CLIENT
+        .get("http://localhost:11434/v1/models")
+        .timeout(Duration::from_secs(1))
+        .send()
+        .await
+    {
+        Ok(resp) => resp.status().as_u16() == 200,
+        Err(_) => false,
+    }
+}
+
 async fn fetch_models_http(p: &Provider) -> anyhow::Result<Vec<String>> {
     static CLIENT: once_cell::sync::Lazy<reqwest::Client> = once_cell::sync::Lazy::new(|| {
         reqwest::Client::builder()
@@ -358,6 +563,18 @@ pub fn list_addable_providers() -> Vec<ProviderListEntry> {
         }
         entries.push(make_provider_list_entry(&id, &p, &store));
     }
+    // Web-tool providers (search/fetch only, no models) share the
+    // list so their API keys are manageable in the same place.
+    for (id, label) in WEB_TOOL_PROVIDERS {
+        let mut e = ProviderListEntry {
+            id: id.to_string(),
+            label: label.to_string(),
+            caps: provider_caps(id),
+            ..Default::default()
+        };
+        fill_connection_status(&mut e, &store);
+        entries.push(e);
+    }
     entries.sort_by(|a, b| {
         if a.connected != b.connected {
             return b.connected.cmp(&a.connected);
@@ -372,6 +589,8 @@ pub fn list_addable_providers() -> Vec<ProviderListEntry> {
     entries
 }
 
+/// makeProviderListEntry builds one overlay row for a models.dev
+/// provider: display name, connection status, and capability badges.
 fn make_provider_list_entry(
     id: &str,
     p: &super::modelsdev::ModelsDevProvider,
@@ -384,8 +603,22 @@ fn make_provider_list_entry(
         } else {
             p.name.clone()
         },
+        caps: provider_caps(id),
         ..Default::default()
     };
+    fill_connection_status(&mut e, store);
+    e
+}
+
+/// fillConnectionStatus sets connected/stored/status on an entry by
+/// resolving the provider's credential: auth.json (including builtin
+/// aliases like ollama-cloud <-> ollama), a legacy flat file, or an
+/// env var from the models.dev catalog.
+fn fill_connection_status(
+    e: &mut ProviderListEntry,
+    store: &HashMap<String, super::auth::AuthEntry>,
+) {
+    let id = e.id.as_str();
     let mut found: Option<super::auth::AuthEntry> = None;
     for k in super::auth::auth_ids_for(id) {
         if let Some(ae) = store.get(&k) {
@@ -402,28 +635,36 @@ fn make_provider_list_entry(
         e.connected = true;
         e.stored = true;
         e.status = format!("connected ({})", kind);
-        return e;
+        return;
     }
     if !super::auth::legacy_provider_key(id).is_empty() {
         e.connected = true;
         e.stored = true;
         e.status = "connected (api)".into();
-        return e;
+        return;
     }
-    if !catalog_env_key(id, p).is_empty() || !builtin_env_key(id).is_empty() {
+    if is_web_tool_provider(id) {
+        // Web-tool providers have no models.dev catalog entry, so no
+        // env-var list and no keyless public tier. The bundled
+        // hosted-MCP routes still work keylessly at the tool level,
+        // but the provider row reflects the keyed REST tier only.
+        e.status = "not connected".into();
+        return;
+    }
+    let p = super::modelsdev::models_dev_provider(id).unwrap_or_default();
+    if !catalog_env_key(id, &p).is_empty() || !builtin_env_key(id).is_empty() {
         e.connected = true;
         e.stored = false;
         e.status = "connected (api)".into();
-        return e;
+        return;
     }
     if id == "opencode" {
         e.connected = true;
         e.stored = false;
         e.status = "connected (public)".into();
-        return e;
+        return;
     }
     e.status = "not connected".into();
-    e
 }
 
 pub fn filter_provider_entries(
@@ -433,7 +674,15 @@ pub fn filter_provider_entries(
     let q = query.to_lowercase();
     entries
         .iter()
-        .filter(|e| entry_matches_query(&q, &e.id.to_lowercase(), &e.label.to_lowercase()))
+        .filter(|e| {
+            entry_matches_query(&q, &e.id.to_lowercase(), &e.label.to_lowercase())
+                // Capability badges are searchable too, so "web fetch",
+                // "web search", and "models" find the right rows.
+                || {
+                    let caps = e.caps.join(" ").to_lowercase();
+                    !caps.is_empty() && entry_matches_query(&q, "", &caps)
+                }
+        })
         .cloned()
         .collect()
 }
@@ -588,15 +837,21 @@ pub async fn stream_chat(
     api_key: &str,
     req: ChatRequest,
     reasoning_field: &str,
+    session_key: &str,
 ) -> anyhow::Result<impl futures::Stream<Item = anyhow::Result<types::StreamChunk>>> {
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let mut body_value = serde_json::to_value(&req)?;
     strip_internal_fields(&mut body_value, reasoning_field);
+    apply_gateway_provider_routing(base_url, &mut body_value);
     let body = serde_json::to_vec(&body_value)?;
+    let opencode_headers = opencode_headers(base_url, session_key);
     let resp = super::retry::do_http_with_retry(|| {
         let mut builder = super::retry::long_timeout_client()
             .post(url.clone())
             .header("Content-Type", "application/json");
+        for (name, value) in &opencode_headers {
+            builder = builder.header(name, value);
+        }
         if !api_key.is_empty() {
             builder = builder.header("Authorization", format!("Bearer {}", api_key));
         }
@@ -740,6 +995,21 @@ pub(crate) mod testutil {
     pub fn inject_models_dev(cat: crate::providers::modelsdev::ModelsDevCatalog) -> CatalogGuard {
         super::super::modelsdev::set_models_dev_catalog_for_test(Some(cat));
         CatalogGuard
+    }
+
+    /// Forces the localhost Ollama probe result, restoring auto-probe on
+    /// drop (tests never probe the developer's real server).
+    pub struct OllamaLocalProbeGuard;
+
+    impl Drop for OllamaLocalProbeGuard {
+        fn drop(&mut self) {
+            super::set_ollama_local_probe_for_test(None);
+        }
+    }
+
+    pub fn set_ollama_local_probe(v: bool) -> OllamaLocalProbeGuard {
+        super::set_ollama_local_probe_for_test(Some(v));
+        OllamaLocalProbeGuard
     }
 
     /// Minimal raw-HTTP stub server serving a fixed number of connections.
@@ -964,6 +1234,40 @@ mod tests {
         );
     }
 
+    /// Vercel AI Gateway requests carry the top-level `provider`
+    /// shorthand with sort: "tps" so routing picks the highest-throughput
+    /// upstream provider for the model, and reasoning_effort is remapped
+    /// to the gateway's reasoning.effort form; other base URLs are
+    /// untouched.
+    #[test]
+    fn gateway_provider_routing_sorted_by_tps() {
+        let mut body =
+            serde_json::json!({"model": "m", "messages": [], "reasoning_effort": "high"});
+        apply_gateway_provider_routing("https://ai-gateway.vercel.sh/v1", &mut body);
+        assert_eq!(body["provider"]["sort"], "tps");
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert!(body.get("reasoning_effort").is_none());
+
+        // Empty effort serializes as absent, so no reasoning key either.
+        let mut body = serde_json::json!({"model": "m", "messages": []});
+        apply_gateway_provider_routing("https://ai-gateway.vercel.sh/v1", &mut body);
+        assert_eq!(body["provider"]["sort"], "tps");
+        assert!(body.get("reasoning").is_none());
+
+        for url in [
+            "https://api.openai.com/v1",
+            "https://openrouter.ai/api/v1",
+            "http://localhost:11434/v1",
+        ] {
+            let mut body = serde_json::json!({"model": "m", "messages": []});
+            apply_gateway_provider_routing(url, &mut body);
+            assert!(
+                body.get("provider").is_none(),
+                "{url}: unexpected provider routing"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn build_providers_from_auth_json() {
         let _g = test_lock();
@@ -1066,6 +1370,7 @@ mod tests {
         let _g = test_lock();
         let _d = isolate_data_dir("prov-public-zen");
         let _e = clear_builtin_provider_env();
+        let _p = set_ollama_local_probe(false);
         crate::providers::modelsdev::set_models_dev_catalog_for_test(None);
         let ps = build_providers().await;
         let p = provider_by_name(&ps, "opencode-zen").expect("public Zen always available");
@@ -1075,8 +1380,22 @@ mod tests {
         assert_eq!(p.reasoning_field, "reasoning_content");
         assert!(
             provider_by_name(&ps, "ollama-local").is_none(),
-            "ollama-local must not be included automatically"
+            "ollama-local must not be included when nothing answers on :11434"
         );
+    }
+
+    #[tokio::test]
+    async fn build_providers_includes_local_ollama_when_running() {
+        let _g = test_lock();
+        let _d = isolate_data_dir("prov-local-ollama");
+        let _e = clear_builtin_provider_env();
+        let _p = set_ollama_local_probe(true);
+        crate::providers::modelsdev::set_models_dev_catalog_for_test(None);
+        let ps = build_providers().await;
+        let p = provider_by_name(&ps, "ollama-local").expect("running local Ollama missing");
+        assert_eq!(p.base_url, "http://localhost:11434/v1");
+        assert_eq!(p.key, "", "local Ollama needs no API key");
+        assert_eq!(p.reasoning_field, "reasoning");
     }
 
     #[tokio::test]
@@ -1379,6 +1698,32 @@ mod tests {
         assert_eq!(sse_data(""), None);
     }
 
+    #[test]
+    fn opencode_headers_are_stable_and_host_gated() {
+        let headers = opencode_headers("https://opencode.ai/zen/v1", "session-1");
+        assert!(headers.contains(&("x-opencode-client".to_string(), "cli".to_string())));
+        let session = |hs: &[(String, String)]| {
+            hs.iter()
+                .find(|(n, _)| n == "x-opencode-session")
+                .map(|(_, v)| v.clone())
+        };
+        let v1 = session(&headers).unwrap();
+        let v1_go = session(&opencode_headers("https://opencode.ai/zen/go/v1", "session-1"))
+            .unwrap();
+        assert_eq!(v1, v1_go);
+        let v2 = session(&opencode_headers("https://opencode.ai/zen/v1", "session-2")).unwrap();
+        assert_ne!(v1, v2);
+        assert!(v1.starts_with("ses_") && v1.len() == 36);
+        assert!(opencode_headers("https://api.openai.com/v1", "session-1").is_empty());
+        assert!(session(&opencode_headers("https://opencode.ai/zen/v1", "")).is_none());
+        let ua = headers
+            .iter()
+            .find(|(n, _)| n == "User-Agent")
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        assert!(ua.starts_with("opencode/"));
+    }
+
     fn sse_response(body: &str) -> String {
         format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -1399,6 +1744,8 @@ mod tests {
             tools: vec![],
             reasoning_effort: String::new(),
             stream_options: None,
+            temperature: None,
+            max_tokens: None,
         }
     }
 
@@ -1406,7 +1753,7 @@ mod tests {
         base: &str,
         key: &str,
     ) -> Vec<anyhow::Result<crate::types::StreamChunk>> {
-        let stream = stream_chat(base, key, test_chat_request(), "reasoning")
+        let stream = stream_chat(base, key, test_chat_request(), "reasoning", "test-session")
             .await
             .unwrap();
         stream.collect::<Vec<_>>().await
@@ -1514,7 +1861,14 @@ mod tests {
                 .to_string()
         });
         let req = test_chat_request();
-        let res = stream_chat(&format!("http://{}/v1", srv.addr), "", req, "reasoning").await;
+        let res = stream_chat(
+            &format!("http://{}/v1", srv.addr),
+            "",
+            req,
+            "reasoning",
+            "test-session",
+        )
+        .await;
         let err = match res {
             Ok(_) => panic!("expected error"),
             Err(e) => e,

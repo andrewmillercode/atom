@@ -73,6 +73,7 @@ pub fn execute_read_file(arguments: &str, ctx: &ToolCtx<'_>) -> ToolOutcome {
             text: format!("Image file: {} ({} bytes)", args.path, out.len()),
             images: vec![img],
             diff: String::new(),
+            ..Default::default()
         };
     }
     let text = String::from_utf8_lossy(&content).to_string();
@@ -80,6 +81,7 @@ pub fn execute_read_file(arguments: &str, ctx: &ToolCtx<'_>) -> ToolOutcome {
         text: file_edit::read_file_output(&text, args.offset, args.limit),
         images: Vec::new(),
         diff: String::new(),
+        ..Default::default()
     }
 }
 

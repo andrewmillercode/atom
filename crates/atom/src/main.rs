@@ -64,6 +64,11 @@ const USAGE: &str = "usage: atom [-model id] [-key key] [-url base] [-session id
        atom uninstall [-y]
                      # remove atom binaries, state, and the install.sh PATH line";
 
+/// The launch token `atom` sets when it spawns itself with -serve to run
+/// the server. Not a security boundary — just a guard against accidental
+/// invocation.
+pub const LAUNCH_TOKEN: &str = "managed";
+
 fn help_text() -> String {
     format!(
         "{USAGE}\n\nversion: {}\nbuild: {}",
@@ -83,6 +88,7 @@ struct Args {
     hot: bool,
     hot_state: Option<String>,
     no_deps: bool,
+    serve: bool,
 }
 
 fn parse_args() -> Result<Args> {
@@ -97,6 +103,7 @@ fn parse_args() -> Result<Args> {
         hot: false,
         hot_state: None,
         no_deps: false,
+        serve: false,
     };
     // -key defaults to $OLLAMA_API_KEY like the Go flag does.
     a.key = std::env::var("OLLAMA_API_KEY").unwrap_or_default();
@@ -125,6 +132,7 @@ fn parse_args() -> Result<Args> {
             "hot" => a.hot = true,
             "hot-state" => a.hot_state = Some(next_val()?),
             "no-deps" => a.no_deps = true,
+            "serve" => a.serve = true,
             "h" | "help" => {
                 println!("{}", help_text());
                 std::process::exit(0);
@@ -171,11 +179,26 @@ async fn run() -> Result<()> {
 
     let args = parse_args()?;
 
+    // Server mode: the client spawns ITSELF with -serve and a launch
+    // token, so client and server are one binary — one pkill shuts both
+    // down, and there is no separate server build to locate or repair.
+    // Direct invocation without the token is refused.
+    if args.serve {
+        if std::env::var("_ATOM_LAUNCH").as_deref() != Ok(LAUNCH_TOKEN) {
+            eprintln!("atom -serve: this process is managed by `atom` and cannot be run directly.");
+            eprintln!(
+                "             use `atom` to start a session — the server launches automatically."
+            );
+            std::process::exit(1);
+        }
+        // Clear the token so child processes don't inherit it.
+        std::env::remove_var("_ATOM_LAUNCH");
+        return run_server().await;
+    }
+
     // Dev installs (`make dev`) are real copies of the cargo artifacts;
-    // if `cargo build` has since produced something newer, the copies
-    // are stale — say so before anyone debugs yesterday's code. The
-    // server copy is repaired automatically (find_server_binary); the
-    // client copy cannot replace itself, so it just warns.
+    // if `cargo build` has since produced something newer, the copy is
+    // stale — say so before anyone debugs yesterday's code.
     warn_stale_dev_install();
 
     // Interactive launch (everything but stats/output-test/hot): print a
@@ -454,13 +477,30 @@ fn zero_session() -> atom_core::session::store::SessionInfo {
     }
 }
 
+/// Server mode body, moved here from the old `atoms` binary entry
+/// point. Kept deliberately minimal: no updater, no TUI, no interactive
+/// deps install — this process is a background daemon.
+async fn run_server() -> Result<()> {
+    // Deps check: headless mode, warn only.
+    atom_core::deps::ensure_on_startup(false, &atom_core::deps::RealInstaller).await;
+
+    // Warm the models.dev catalog in the background so turn routing
+    // (api_protocol_for), context windows, and dispatch validation read
+    // an in-memory copy instead of racing a disk parse. This never
+    // blocks startup: ensure serves a disk cache of any age instantly
+    // and only revalidates over the network in the background.
+    tokio::spawn(atom_core::providers::modelsdev::ensure_models_dev_catalog());
+
+    atom_server::http::run_server().await
+}
+
 fn is_terminal() -> bool {
     unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 }
 }
 
-/// Warn when the dev install (`make dev` copies of the cargo artifacts)
+/// Warn when the dev install (`make dev` copy of the cargo artifact)
 /// is older than what cargo has since built, per the `.atomdev-source`
-/// marker the Makefile leaves next to the copies. No-op for release
+/// marker the Makefile leaves next to the copy. No-op for release
 /// installs and for running straight out of target/debug (no marker
 /// there, and the artifact is the binary itself).
 fn warn_stale_dev_install() {

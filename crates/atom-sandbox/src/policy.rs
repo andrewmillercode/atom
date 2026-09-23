@@ -396,15 +396,13 @@ mod tests {
     fn add_rule_dedupes_and_persists() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("sandbox.json");
-        // Use load_from so the config knows about its on-disk path
-        // via subsequent save() calls; tests that want a controlled
-        // path use save_to explicitly.
-        let mut cfg = SandboxConfig::default();
+        // with_path pins save() to the temp file — the default config
+        // would persist to the user's real sandbox.json.
+        let mut cfg = SandboxConfig::default().with_path(p.clone());
         cfg.add_rule(RuleKind::Allow, "cargo test *").unwrap();
         cfg.add_rule(RuleKind::Allow, "cargo test *").unwrap();
         cfg.add_rule(RuleKind::Allow, "cargo build *").unwrap();
         assert_eq!(cfg.rules.allow.len(), 2);
-        cfg.save_to(&p).unwrap();
         let on_disk = SandboxConfig::load_from(&p);
         assert_eq!(on_disk.rules.allow.len(), 2);
     }

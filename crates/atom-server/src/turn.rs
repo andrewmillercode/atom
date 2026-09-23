@@ -1519,7 +1519,15 @@ pub async fn run_session_turn(
             // SSE events into the shared OpenAI-delta shape, so the
             // relay below is unchanged.
             let opened = await_round(
-                stream_anthropic(&base_url, &key, &sess.model, &msgs, &tools, &opts.thinking),
+                stream_anthropic(
+                    &base_url,
+                    &key,
+                    &sess.model,
+                    &msgs,
+                    &tools,
+                    &opts.thinking,
+                    id,
+                ),
                 &turn_cancel,
                 &ctx.parent,
                 &round_cancel,
@@ -1664,7 +1672,15 @@ pub async fn run_session_turn(
             && openai_codex_auth_for_key(&key).is_none()
         {
             let opened = await_round(
-                stream_responses(&base_url, &key, &sess.model, &msgs, &tools, &opts.thinking),
+                stream_responses(
+                    &base_url,
+                    &key,
+                    &sess.model,
+                    &msgs,
+                    &tools,
+                    &opts.thinking,
+                    id,
+                ),
                 &turn_cancel,
                 &ctx.parent,
                 &round_cancel,
@@ -1920,7 +1936,7 @@ pub async fn run_session_turn(
             };
 
             let opened = await_round(
-                stream_chat(&base_url, &key, req_body, &reasoning_field),
+                stream_chat(&base_url, &key, req_body, &reasoning_field, id),
                 &turn_cancel,
                 &ctx.parent,
                 &round_cancel,

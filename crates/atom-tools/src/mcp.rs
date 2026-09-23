@@ -89,6 +89,9 @@ fn server_deferred(cfg: &MCPServerConfig, tool_count: usize) -> bool {
 pub struct McpToolRef {
     pub server: String,
     pub name: String,
+    /// The tool's declared inputSchema, kept so arguments can be coerced
+    /// to the server's expected types before the call.
+    pub input_schema: Option<serde_json::Value>,
 }
 
 /// One listed remote tool before name conversion.
@@ -289,10 +292,95 @@ pub fn convert_mcp_tools(
             McpToolRef {
                 server: server.to_string(),
                 name: t.name.clone(),
+                input_schema: t.input_schema.clone(),
             },
         );
     }
     (out, mapping)
+}
+
+// ---------------------------------------------------------------------------
+// Argument type coercion.
+// ---------------------------------------------------------------------------
+
+/// Coerce model-supplied arguments to the types a tool's inputSchema
+/// declares. Provider layers may serialize every tool-call parameter as
+/// a JSON string; strict MCP servers (zod-based ones especially) then
+/// reject `"100"` for a number, `"true"` for a boolean, or `"{...}"`
+/// for an object parameter. Only converts values whose declared type
+/// disagrees with string and that parse cleanly; everything else passes
+/// through untouched.
+pub(crate) fn coerce_args_to_schema(
+    args: serde_json::Value,
+    schema: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let Some(schema) = schema else {
+        return args;
+    };
+    let Some(props) = schema.get("properties").and_then(|p| p.as_object()) else {
+        return args;
+    };
+    let mut args = args;
+    if let Some(obj) = args.as_object_mut() {
+        for (key, val) in obj.iter_mut() {
+            if let Some(prop_schema) = props.get(key) {
+                coerce_value(val, prop_schema);
+            }
+        }
+    }
+    args
+}
+
+fn schema_type_names(schema: &serde_json::Value) -> Vec<&str> {
+    match schema.get("type") {
+        Some(serde_json::Value::String(t)) => vec![t.as_str()],
+        Some(serde_json::Value::Array(names)) => names.iter().filter_map(|t| t.as_str()).collect(),
+        _ => vec![],
+    }
+}
+
+fn coerce_value(val: &mut serde_json::Value, schema: &serde_json::Value) {
+    let types = schema_type_names(schema);
+    // A bare string is always acceptable when the schema allows strings
+    // or declares no type at all — leave those alone.
+    if !types.is_empty() && !types.iter().any(|t| *t == "string") {
+        let parsed = match val {
+            serde_json::Value::String(s) => serde_json::from_str::<serde_json::Value>(s).ok(),
+            _ => None,
+        };
+        if let Some(parsed) = parsed {
+            let fits = types.iter().any(|t| match *t {
+                "object" => parsed.is_object(),
+                "array" => parsed.is_array(),
+                "integer" => parsed.as_i64().is_some() || parsed.as_u64().is_some(),
+                "number" => parsed.is_number(),
+                "boolean" => parsed.is_boolean(),
+                _ => false,
+            });
+            if fits {
+                *val = parsed;
+            }
+        }
+    }
+    match val {
+        serde_json::Value::Object(map) => {
+            if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
+                for (k, v) in map.iter_mut() {
+                    if let Some(ps) = props.get(k) {
+                        coerce_value(v, ps);
+                    }
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            if let Some(item_schema) = schema.get("items") {
+                for item in items.iter_mut() {
+                    coerce_value(item, item_schema);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1225,6 +1313,11 @@ pub async fn execute_mcp_selection(
     };
     match tokio::time::timeout(MCP_CALL_TIMEOUT, async {
         let (session, tools) = connect_and_list(server, &cwd_str, &cfg).await?;
+        let schema = tools
+            .iter()
+            .find(|candidate| candidate.name == tool)
+            .and_then(|t| t.input_schema.clone());
+        let arguments = coerce_args_to_schema(arguments, schema.as_ref());
         if !tools.iter().any(|candidate| candidate.name == tool) {
             return Err(format!("server \"{server}\" has no tool \"{tool}\""));
         }
@@ -1256,6 +1349,7 @@ pub async fn execute_mcp_tool(name: &str, arguments: &str, cwd: &Path) -> String
             Err(e) => return format!("error parsing arguments: {e}"),
         }
     };
+    let args = coerce_args_to_schema(args, ref_.input_schema.as_ref());
     let call = tokio::time::timeout(MCP_CALL_TIMEOUT, async move {
         let mut guard = session.lock().await;
         guard.call_tool(&ref_.name, args).await
@@ -1325,8 +1419,52 @@ mod tests {
     }
 
     #[test]
+    fn coerces_strings_to_declared_schema_types() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer"},
+                "flag": {"type": "boolean"},
+                "selector": {"type": "object"},
+                "ids": {"type": "array", "items": {"type": ["string", "number"]}},
+                "text": {"type": "string"}
+            }
+        });
+        let args = serde_json::json!({
+            "limit": "100",
+            "flag": "true",
+            "selector": "{\"conditions\": []}",
+            "ids": ["1", "abc"],
+            "text": "42"
+        });
+        let got = coerce_args_to_schema(args, Some(&schema));
+        assert_eq!(got["limit"], serde_json::json!(100));
+        assert_eq!(got["flag"], serde_json::json!(true));
+        assert_eq!(got["selector"]["conditions"], serde_json::json!([]));
+        // items type union allows strings: values pass through unchanged.
+        assert_eq!(got["ids"], serde_json::json!(["1", "abc"]));
+        // Strings declared as strings stay strings.
+        assert_eq!(got["text"], serde_json::json!("42"));
+    }
+
+    #[test]
+    fn coercion_leaves_unparseable_values_alone() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"count": {"type": "integer"}}
+        });
+        let args = serde_json::json!({"count": "not-a-number"});
+        let got = coerce_args_to_schema(args.clone(), Some(&schema));
+        assert_eq!(got, args);
+    }
+
+    #[test]
     fn expands_env_refs() {
-        std::env::set_var("ASA_CLIENT_ID_TEST_TOOLS", "cid-1");
+        let _env = crate::testutil::env_lock();
+        let prev = std::env::var_os("ASA_CLIENT_ID_TEST_TOOLS");
+        unsafe {
+            std::env::set_var("ASA_CLIENT_ID_TEST_TOOLS", "cid-1");
+        }
         assert_eq!(expand_env_refs("{env:ASA_CLIENT_ID_TEST_TOOLS}"), "cid-1");
         let mut m = BTreeMap::new();
         m.insert(
@@ -1339,6 +1477,10 @@ mod tests {
         assert_eq!(m["plain"], "x");
         // Unclosed token passes through untouched (like Go).
         assert_eq!(expand_env_refs("{env:NOPE_X"), "{env:NOPE_X");
+        match prev {
+            Some(v) => unsafe { std::env::set_var("ASA_CLIENT_ID_TEST_TOOLS", v) },
+            None => unsafe { std::env::remove_var("ASA_CLIENT_ID_TEST_TOOLS") },
+        }
     }
 
     #[test]
@@ -1495,6 +1637,9 @@ mod tests {
 
     #[tokio::test]
     async fn stdio_roundtrip_against_fake_server() {
+        // The default hub is process-global: a parallel hub test calling
+        // close_all() would drop this test's live connection mid-flight.
+        let _env = crate::testutil::env_lock();
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("fake-mcp.sh");
         std::fs::write(
@@ -1604,6 +1749,8 @@ done
 
     #[tokio::test]
     async fn deferred_server_hides_tools_until_find_tool() {
+        // Shared default hub — serialize against the other hub test.
+        let _env = crate::testutil::env_lock();
         let dir = tempfile::tempdir().unwrap();
         let mut tools = Vec::new();
         for i in 1..=21 {

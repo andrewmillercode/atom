@@ -36,7 +36,7 @@ Categories:
 - **Package installs.** Accepts postinstall risk. `cargo add|update|install`, `npm i|install|add|update|ci` (not `publish`), `pnpm i|install|add|update`, `yarn install|add`, `bun install|add`, `pip pip3 pipx`, `uv pip|add|sync|run`, `poetry install|add|update|run`, `gem install`, `bundle install`, `go get|install`, `brew install|upgrade|reinstall|tap`, `apt|apt-get aptitude install|update|upgrade`, `yum dnf zypper pacman apk add`, `asdf install`, `nix profile install`. Publishes (`cargo publish`, `npm publish`, `dotnet nuget push`) prompt.
 - **Network fetches.** Bytes in, no execution. `curl wget http httpie`, `gh api glab api`, `ping traceroute mtr`, `dig host nslookup whois`, `ssh-keyscan`, `git fetch`.
 - **Local VCS.** Additive or reversible. `git status|log|diff|show|blame|branch|tag|remote|config --get|reflog|ls-files|worktree|help|version`, `git add`, `git rm --cached`, `git mv`, `git commit` (no `--amend`), `git checkout -b`, `git switch -c`, `git stash|apply|pop`, `git tag`, `git init`, `git revert`, `git merge` (no force), `git rebase` (no force). `git push`, `git reset --hard`, `git clean -fd`, `git branch -D` prompt.
-- **Filesystem adds.** Within cwd, `$TMPDIR`, or `/tmp`. `mkdir -p`, `touch`, `cp ln mv install rsync truncate tee`, `tar -c zip -r gzip bzip2 xz zstd`, `git init`. Writes outside these prompt.
+- **Filesystem adds.** Within cwd, `$TMPDIR`, or `/tmp`. `mkdir -p`, `touch`, `cp ln mv install rsync truncate tee`, `tar -c zip -r gzip bzip2 xz zstd`, `git init`. Writes outside these are Tier 2 (auto-review first, then the prompt on a deny). Redirects to device files (`2>/dev/null`) are not writes: the scan and the Seatbelt profile agree on the harmless set (`/dev/null`, `/dev/stdout`, …) so a noise redirect never escalates a read-only command.
 
   `/tmp` and `$TMPDIR` are Tier 1 by design — every major coding agent (Codex, Cursor, Claude Code, Gemini CLI, Aider, Devin, OpenHands) allows writes to `/tmp` by default, and toolchains (cargo, go, npm, vitest, wrangler, sccache, v8, gcc) reach for it with hard-coded paths the agent can't redirect. The guardrail list still blocks writes to system roots (`/etc`, `/usr`, `/System`, `/private/etc`, `/boot`) and protected-path writes still protect `$PATH`, `.ssh`, `.git/hooks`, and shell startup files wherever they live — adding `/tmp` to Tier 1 doesn't punch through anything the floor is supposed to catch. Sticky-bit semantics on `/tmp` already prevent cross-user stomping. Multi-agent collision is handled by the per-session tmpdir below, not by restricting `/tmp`.
 - **System read-only.** `ps top -l pgrep -l`, `lsof netstat ss ifconfig ip`, `mount` (no args), `diskutil list|info|apfs list`, `sysctl -n iostat vm_stat`, `uptime launchctl list` (read-only).
@@ -148,9 +148,9 @@ escape the profile. With it, the command runs confined and can reach
 exactly what it named, nothing else.
 
 - A privilege guardrail (`sudo`, `kill`, …) runs unconfined after the
-  user approves: those cannot work confined. A command flagged only
-  for writing outside the workspace still runs confined, with its
-  named paths granted.
+  user approves: those cannot work confined. A command that writes
+  outside the workspace still runs confined, with its named paths
+  granted.
 - A confined command that fails gets a note in its output naming the
   sandbox and pointing at `"confine": false`; the audit log's
   `confined` field reads `seatbelt` or `none`.

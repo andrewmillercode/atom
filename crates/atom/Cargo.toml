@@ -7,21 +7,12 @@ edition.workspace = true
 name = "atom"
 path = "src/main.rs"
 
-[[bin]]
-name = "atoms"
-path = "src/atoms.rs"
-
-# Dev installs (`make dev`) run under the names atomdev/atomsdev. These
-# are not separate cargo binaries: `make dev` copies the debug atom/atoms
-# artifacts into ~/.local/bin as atomdev/atomsdev. Copies, not symlinks:
-# macOS 26 names processes by the fully resolved executable path, so a
-# symlinked atomsdev would display as "atoms" in ps / Activity Monitor.
-# The copies self-heal (see the Makefile's .atomdev-source marker and
-# find_server_binary): the client warns when cargo has built something
-# newer, and the atomsdev copy is refreshed before the server spawns.
-# Flavor is keyed on cfg!(debug_assertions), not the name — a dev
-# install IS the debug binary — so duplicate bin targets would only
-# double linking on every cargo build/test for no behavioral difference.
+# One binary for client and server: `atom` is the TUI, `atom -serve`
+# (spawned by the client itself, guarded by a launch token) is the
+# background server. Dev installs (`make dev`) run the same debug
+# artifact as `atomdev` — client and server share the process name, so
+# a single pkill atomdev shuts everything down. Flavor is keyed on
+# cfg!(debug_assertions), not the name.
 
 [dependencies]
 atom-core = { workspace = true }

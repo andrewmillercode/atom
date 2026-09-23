@@ -722,12 +722,10 @@ mod tests {
 
     #[test]
     fn wrapped_link_is_clickable_on_every_row() {
-        // Bare URLs in prose are not auto-linked under the new policy
-        // (only markdown `[label](url)` and `<url>` autolinks are).
-        // The markdown layer produces OSC 8; covered by
-        // `markdown::tests::links_carry_osc8_targets`. This test
-        // asserts that bare URLs flowing through `wrap_linked` stay
-        // plain text on every wrapped row.
+        // Bare URLs flowing through `wrap_linked` become OSC 8 regions
+        // (linkify_urls), including on every wrapped continuation row:
+        // the wrapper never re-emits the open sequence, so the region
+        // threading in `ansi_to_lines_linked` carries the URI across.
         use atom_core::render::links::wrap_linked;
         let body = wrap_linked(
             "prose before and then https://example.com/very/long/url and some prose after",
@@ -736,12 +734,17 @@ mod tests {
             "",
         );
         let linked = ansi_to_lines_linked(&body);
+        let mut url_rows = 0usize;
         for row_links in &linked.links {
-            assert!(
-                row_links.is_empty(),
-                "wrap_linked leaked an OSC 8 region into wrapped prose: {row_links:?}"
-            );
+            for r in row_links {
+                assert_eq!(r.uri, "https://example.com/very/long/url");
+                url_rows += 1;
+            }
         }
+        assert!(
+            url_rows >= 2,
+            "wrapped URL must span multiple rows, got {url_rows}"
+        );
         let plain: String = linked
             .lines
             .iter()
@@ -752,6 +755,23 @@ mod tests {
             plain.contains("https://example.com/very/long/url"),
             "URL dropped from visible output: {plain:?}"
         );
+    }
+
+    #[test]
+    fn wrap_linked_leaves_paths_plain() {
+        // Paths keep the v0.1.3 policy: no OSC 8 outside tool headers.
+        use atom_core::render::links::wrap_linked;
+        for in_text in [
+            "see crates/foo.rs for details",
+            "open ~/.config/atom/AGENTS.md",
+            "config at /etc/hosts is plain",
+        ] {
+            let out = wrap_linked(in_text, 80, "", "");
+            assert!(
+                !out.contains("\x1b]8;;"),
+                "wrap_linked({in_text:?}) leaked OSC 8: {out:?}"
+            );
+        }
     }
 
     #[test]

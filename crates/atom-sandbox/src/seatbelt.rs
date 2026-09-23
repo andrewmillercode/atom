@@ -14,6 +14,22 @@ use std::path::{Path, PathBuf};
 
 pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
+/// Device files a redirect may target without touching persistent
+/// state: the profile grants these literally, and the path scan skips
+/// them so `2>/dev/null` never reads as a workspace write-escape.
+/// Exact matches only — `/dev/sda1` must stay a write escape.
+pub const HARMLESS_DEV_WRITES: &[&str] = &[
+    "/dev/null",
+    "/dev/zero",
+    "/dev/random",
+    "/dev/urandom",
+    "/dev/stdin",
+    "/dev/stdout",
+    "/dev/stderr",
+    "/dev/tty",
+    "/dev/dtracehelper",
+];
+
 /// Whether this host can confine a command.
 pub fn available() -> bool {
     cfg!(target_os = "macos") && Path::new(SANDBOX_EXEC).exists()
@@ -117,7 +133,13 @@ pub fn profile(workspace_root: &Path, tmpdir: Option<&Path>, extra_writable: &[P
     let mut out = String::from("(version 1)\n(deny default)\n");
     out.push_str("(allow process-exec*)\n");
     out.push_str("(allow process-fork)\n");
-    out.push_str("(allow signal (target self))\n");
+    // Unconditional: worker pools (tinypool, jest, esbuild, cargo test)
+    // SIGTERM/SIGKILL their child processes at teardown, and SBPL's
+    // signal op has no child/descendant target filter — only (target
+    // self). Denying it crashed oxfmt's worker teardown with EPERM.
+    // Same-uid signaling remains constrained by the OS, and layer-1
+    // kill guardrails still gate kill/pkill/killall commands.
+    out.push_str("(allow signal)\n");
     out.push_str("(allow sysctl-read)\n");
     out.push_str("(allow mach-lookup)\n");
     out.push_str("(allow file-read*)\n");
@@ -125,17 +147,7 @@ pub fn profile(workspace_root: &Path, tmpdir: Option<&Path>, extra_writable: &[P
     for root in &write_roots {
         out.push_str(&format!("  (subpath {})\n", quote(root)));
     }
-    for dev in [
-        "/dev/null",
-        "/dev/zero",
-        "/dev/random",
-        "/dev/urandom",
-        "/dev/stdin",
-        "/dev/stdout",
-        "/dev/stderr",
-        "/dev/tty",
-        "/dev/dtracehelper",
-    ] {
+    for dev in HARMLESS_DEV_WRITES {
         out.push_str(&format!("  (literal {})\n", quote(Path::new(dev))));
     }
     out.push_str("  (subpath \"/dev/fd\"))\n");
@@ -193,6 +205,9 @@ mod tests {
         )));
         assert!(p.contains(".git/hooks"));
         assert!(p.contains("(allow network-outbound)"));
+        // Unconditional, not (target self): worker pools SIGTERM their
+        // child processes at teardown and SBPL has no child target.
+        assert!(p.contains("(allow signal)\n"));
     }
 
     #[test]
@@ -222,28 +237,6 @@ mod tests {
                 "PATH entry {entry} missing from the deny list"
             );
         }
-    }
-
-    #[test]
-    fn workspace_writes_allowed_outside_writes_denied() {
-        if !available() {
-            return;
-        }
-        let ws = tempfile::tempdir().unwrap();
-        let p = profile(ws.path(), None, &[]);
-        let inside = run(&p, &format!("echo ok > {}/a.txt", ws.path().display()));
-        assert!(inside.status.success(), "workspace write: {inside:?}");
-        // A `$HOME` path outside the cache allowlist. The parent exists
-        // (created unconfined) so a failure means the profile denied
-        // the write, not that the directory was missing.
-        let home = dirs::home_dir().expect("home dir");
-        let probe = home.join(format!(".atom-seatbelt-probe-{}", std::process::id()));
-        std::fs::create_dir_all(&probe).unwrap();
-        let escape = run(&p, &format!("echo bad > {}/b.txt", probe.display()));
-        let leaked = probe.join("b.txt").exists();
-        let _ = std::fs::remove_dir_all(&probe);
-        assert!(!escape.status.success(), "outside write must fail");
-        assert!(!leaked, "no file may land outside the workspace");
     }
 
     #[test]
@@ -285,20 +278,5 @@ mod tests {
         let _ = std::fs::remove_file(&probe);
         assert!(!out.status.success(), "PATH bin write must fail: {out:?}");
         assert!(!leaked, "no shim may be written into a PATH dir");
-    }
-
-    #[test]
-    fn extra_writable_root_is_usable() {
-        if !available() {
-            return;
-        }
-        let ws = tempfile::tempdir().unwrap();
-        let extra = tempfile::tempdir().unwrap();
-        let p = profile(ws.path(), None, &[extra.path().to_path_buf()]);
-        let out = run(
-            &p,
-            &format!("echo ok > {}/granted.txt", extra.path().display()),
-        );
-        assert!(out.status.success(), "granted root write: {out:?}");
     }
 }

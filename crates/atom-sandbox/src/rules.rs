@@ -438,6 +438,7 @@ pub static RULES: &[Rule] = &[
         Verdict::Allow,
         "{which,type,whereis,whence,command}"
     ),
+    rule!("cd", "changes directory", Verdict::Allow, "cd"),
     rule!(
         "identity-info",
         "prints user/system identity",
@@ -541,10 +542,12 @@ pub static RULES: &[Rule] = &[
         "js-ts-tools",
         "runs JS/TS toolchain",
         Verdict::Allow,
-        "{tsc,ts-node,tsx,node}"
+        "{tsc,ts-node,tsx}"
     ),
-    rule!("bun-test", "runs bun tests/build", Verdict::Allow, "bun",
-          any: ["test", "run", "build"]),
+    rule!("node-script", "runs a named JS/TS file, not -e code", Verdict::Allow,
+          "node", any: ["*.js", "*.mjs", "*.cjs", "*.ts", "*.mts", "*.cts"]),
+    rule!("bun-test", "runs bun scripts/tests/builds", Verdict::Allow, "bun",
+          any: ["test", "run", "build", "format", "lint", "start"]),
     rule!("pnpm-run", "runs pnpm scripts", Verdict::Allow, "pnpm",
           any: ["run", "test", "build", "exec", "dlx"]),
     rule!("yarn-run", "runs yarn scripts", Verdict::Allow, "yarn",
@@ -573,7 +576,7 @@ pub static RULES: &[Rule] = &[
         "js-formatters",
         "formats JS/TS source",
         Verdict::Allow,
-        "{prettier,gofmt,shellcheck,shfmt}"
+        "{prettier,oxfmt,oxlint,biome,gofmt,shellcheck,shfmt}"
     ),
     rule!(
         "make-build",
@@ -917,6 +920,9 @@ pub fn analyze_full(cmd: &str, workspace_root: &Path, cwd: &Path) -> Analysis {
         let seg_a = analyze_segment(&seg, &ws_norm, &cwd_norm, home.as_deref());
         if seg_a.verdict > out.verdict {
             out.verdict = seg_a.verdict;
+            out.tier_origin = seg_a.tier_origin;
+        } else if out.tier_origin.is_empty() {
+            out.tier_origin = seg_a.tier_origin.clone();
         }
         for id in seg_a.matched_rules {
             if !out.matched_rules.contains(&id) {
@@ -960,6 +966,7 @@ fn analyze_segment(seg: &[String], ws: &Path, cwd: &Path, home: Option<&Path>) -
         if let Some(payload) = nested_shell_payload(&effective[1..]) {
             let child = analyze_limited(payload, ws, cwd, home, 3);
             a.verdict = child.verdict;
+            a.tier_origin = child.tier_origin;
             a.matched_rules.push("shell-nested".to_string());
             a.matched_rules.extend(child.matched_rules);
             a.touches_home |= child.touches_home;
@@ -978,12 +985,29 @@ fn analyze_segment(seg: &[String], ws: &Path, cwd: &Path, home: Option<&Path>) -
     let mut best_ask_id: Option<&'static str> = None;
     let mut best_flagged_id: Option<&'static str> = None;
 
+    // A specific arg-constrained Allow rule (bun test, node app.js)
+    // beats the blanket interpreters catch-all for the same program;
+    // otherwise every dedicated interpreter runner rule is dead
+    // because the worst verdict always wins.
+    let specific_allow = COMPILED_RULES.iter().any(|cr| {
+        cr.rule.verdict == Verdict::Allow
+            && cr.rule.id != "interpreters"
+            && (!cr.rule.arg_any.is_empty() || !cr.rule.arg_all.is_empty() || cr.rule.min_args > 0)
+            && args.len() >= cr.rule.min_args
+            && args.len() <= cr.rule.max_args
+            && prog_matches(cr, argv0)
+            && args_match(cr, args)
+    });
+
     for cr in COMPILED_RULES.iter() {
         let count = args.len();
         if count < cr.rule.min_args || count > cr.rule.max_args {
             continue;
         }
         if !prog_matches(cr, argv0) || !args_match(cr, args) {
+            continue;
+        }
+        if cr.rule.id == "interpreters" && specific_allow {
             continue;
         }
         matched_any_rule = true;
@@ -1197,6 +1221,12 @@ fn scan_path_token(
         a.matched_rules.push("git-hooks-write".to_string());
     }
 
+    // Redirects to the profile's always-writable device files carry no
+    // state: not a write escape, not an outside path worth granting.
+    if write_ctx && crate::seatbelt::HARMLESS_DEV_WRITES.contains(&norm_str.as_str()) {
+        return;
+    }
+
     let under_ws = within(&norm, ws);
     if !under_ws {
         a.paths_outside_workspace = true;
@@ -1214,7 +1244,6 @@ fn scan_path_token(
 
     if write_ctx && !under_ws {
         a.matched_rules.push("path-escape-write".to_string());
-        a.flagged = true;
         if a.verdict < Verdict::Ask {
             a.verdict = Verdict::Ask;
         }
@@ -1753,6 +1782,40 @@ mod tests {
     }
 
     #[test]
+    fn js_ts_toolchain_allow_shapes() {
+        // Dedicated runner rules must beat the blanket interpreters
+        // catch-all, or the worst-verdict-wins aggregation makes them
+        // dead letters: every bun/node command would prompt.
+        for cmd in [
+            "bun test",
+            "bun run format",
+            "bun format",
+            "bun run check",
+            "bun --cwd ./packages/api run build",
+            "oxfmt .",
+            "oxfmt --check .",
+            "oxlint .",
+            "prettier --check .",
+            "tsc --noEmit",
+            "node script.js",
+            "node --watch app.mjs",
+        ] {
+            assert_eq!(v(cmd), Verdict::Allow, "{cmd} should be Allow");
+        }
+        // Arbitrary interpreter code still prompts.
+        for cmd in [
+            "bun install",
+            "bunx oxfmt --check .",
+            "node -e 'process.exit(0)'",
+            "node",
+            "python -c 'print(1)'",
+            "deno run -A x.ts",
+        ] {
+            assert_eq!(v(cmd), Verdict::Ask, "{cmd} should be Ask");
+        }
+    }
+
+    #[test]
     fn dd_arity_constraints() {
         // dd with of=/dev/* is a flagged guardrail...
         let a = analyze("dd if=/dev/zero of=/dev/rdisk0", Path::new("/tmp/ws"));
@@ -1845,14 +1908,88 @@ mod tests {
     }
 
     #[test]
-    fn write_escapes_are_flagged() {
+    fn write_escapes_ask_and_review_without_guardrail_flag() {
+        // An outside write is a normal Tier-2 event: it asks, the
+        // reviewer sees it, and an answer can grant the family. Only
+        // true guardrails (sudo, recursive rm of home, …) carry the
+        // flagged bit.
         let a = analyze_full(
             "touch /tmp/x",
             Path::new("/Users/dev/proj"),
             Path::new("/Users/dev/proj"),
         );
         assert_eq!(a.verdict, Verdict::Ask);
-        assert!(a.flagged);
+        assert!(a.matched_rules.contains(&"path-escape-write".to_string()));
+        assert!(!a.flagged, "outside writes are reviewable, not guardrail");
+    }
+
+    #[test]
+    fn dev_null_redirects_are_not_write_escapes() {
+        // The profile already allowlists these device files; the scan
+        // must agree or every `2>/dev/null` flags the command.
+        for cmd in [
+            "grep -rn foo src 2>/dev/null | head",
+            "ls -la ~/.config 2>/dev/null; echo done",
+            "cargo test -p atom-tui 2>&1 | tail -5",
+            "make check &> /dev/null",
+            "cat /etc/hosts > /dev/null",
+        ] {
+            let a = analyze_full(
+                cmd,
+                Path::new("/Users/dev/proj"),
+                Path::new("/Users/dev/proj"),
+            );
+            assert_eq!(a.verdict, Verdict::Allow, "{cmd}");
+            assert!(!a.flagged, "{cmd}");
+            assert!(
+                !a.matched_rules.contains(&"path-escape-write".to_string()),
+                "{cmd}: {:?}",
+                a.matched_rules
+            );
+        }
+        // A device path outside the allowlist is still an escape.
+        let raw = analyze_full(
+            "echo x > /dev/sda",
+            Path::new("/Users/dev/proj"),
+            Path::new("/Users/dev/proj"),
+        );
+        assert!(raw.matched_rules.contains(&"path-escape-write".to_string()));
+    }
+
+    #[test]
+    fn cd_allows_but_never_launders_the_rest_of_the_line() {
+        for cmd in ["cd /tmp", "cd", "cd packages/mobile && ls src"] {
+            assert_eq!(v(cmd), Verdict::Allow, "{cmd}");
+        }
+        // The fear case: cd must not launder what follows it. Every
+        // segment is judged on its own; the worst verdict wins.
+        let shell = analyze("cd /tmp && bash evil.sh", Path::new("/ws"));
+        assert_eq!(shell.verdict, Verdict::Ask, "nested shell still asks");
+        let script = analyze("cd /tmp && ./evil.sh", Path::new("/ws"));
+        assert_eq!(script.verdict, Verdict::Ask, "unreviewed script still asks");
+        assert!(script
+            .matched_rules
+            .contains(&"script-execution".to_string()));
+        let unknown = analyze("cd /tmp && totally-unknown-binary", Path::new("/ws"));
+        assert_eq!(unknown.verdict, Verdict::Ask, "unknown binary still asks");
+        assert_eq!(v("cd /tmp && curl http://x.co"), Verdict::Ask);
+        // And the compound the allow rule exists for.
+        assert_eq!(v("cd packages/api && cargo test"), Verdict::Allow);
+    }
+
+    #[test]
+    fn tier_origin_names_the_worst_segment() {
+        let a = analyze("ls && curl http://x.co", Path::new("/ws"));
+        assert_eq!(a.tier_origin, "static ask (curl)");
+        let b = analyze("grep -rn foo src | head", Path::new("/ws"));
+        assert!(b.tier_origin.contains("grep-search"), "{}", b.tier_origin);
+        let c = analyze_full(
+            "grep -rn foo src > /tmp/out",
+            Path::new("/Users/dev/proj"),
+            Path::new("/Users/dev/proj"),
+        );
+        assert_eq!(c.verdict, Verdict::Ask);
+        assert_eq!(c.tier_origin, "path escape write");
     }
 
     #[test]

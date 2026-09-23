@@ -369,7 +369,7 @@ pub async fn compact_session(
         serde_json::to_vec(&body_value)?
     };
     let started_at = Instant::now();
-    let raw = post_chat_completion(&client, base_url, key, &req_body).await?;
+    let raw = post_chat_completion(&client, base_url, key, &req_body, &sess.id).await?;
     let duration_ms = started_at.elapsed().as_millis().min(i64::MAX as u128) as i64;
 
     let parsed: ChatCompletionResponse =
@@ -536,17 +536,26 @@ pub(crate) async fn post_chat_completion(
     base_url: &str,
     key: &str,
     body: &[u8],
+    session_key: &str,
 ) -> anyhow::Result<Vec<u8>> {
     const RETRY_DELAYS_MS: [u64; 10] =
         [670, 1200, 1400, 2000, 2400, 2600, 3000, 5000, 10000, 15000];
     const MAX_BODY: usize = 1 << 20;
 
+    let mut request = client
+        .post(format!("{base_url}/chat/completions"))
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {key}"));
+    for (name, value) in
+        crate::providers::providers::opencode_headers(base_url, session_key)
+    {
+        request = request.header(name, value);
+    }
     let mut attempt = 0usize;
     loop {
-        let mut resp = client
-            .post(format!("{base_url}/chat/completions"))
-            .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {key}"))
+        let mut resp = request
+            .try_clone()
+            .expect("request builder is cloneable pre-body")
             .body(body.to_vec())
             .send()
             .await

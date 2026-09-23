@@ -164,6 +164,10 @@ pub struct Block {
     pub line_width: usize,
     pub line_show_r: bool,
     pub line_expanded: bool,
+    /// Rendered lines are stale (spinner tick on a live block) but kept:
+    /// the cached height still anchors the flat layout until the block
+    /// re-renders inside the viewport window.
+    pub stale: bool,
     /// Math-engine generation this block's lines were rendered under:
     /// 0 = rendered without math; otherwise a mismatch with
     /// `math::generation()` means a formula finished rendering and the
@@ -199,6 +203,7 @@ impl Default for Block {
             line_width: 0,
             line_show_r: true,
             line_expanded: false,
+            stale: false,
             line_formula_gen: 0,
         }
     }
@@ -292,23 +297,38 @@ pub fn messages_to_blocks(msgs: &[Message]) -> Vec<Block> {
     let mut blocks = Vec::new();
     for msg in msgs {
         match msg.role.as_str() {
-            "user" => blocks.push(Block {
-                kind: BlockKind::User,
-                text: msg.content.clone(),
-                images: msg
-                    .images
+            "user" => {
+                // Images match the [IMG n] markers in the message text,
+                // which are per message. Assign in marker order so older
+                // sessions with non-sequential numbers still line up.
+                let markers: Vec<usize> = split_user_segments(&msg.content)
                     .iter()
-                    .map(|img| PendingImage {
-                        img: img.clone(),
-                        name: String::new(),
-                        // num is reassigned later by assign_block_image_nums.
-                        num: 0,
-                        cols: preview::PREVIEW_COLS,
-                        rows: preview::PREVIEW_ROWS,
+                    .filter_map(|seg| match seg {
+                        UserSegment::Image(n) => Some(*n),
+                        UserSegment::Text(_) => None,
                     })
-                    .collect(),
-                ..Default::default()
-            }),
+                    .collect();
+                blocks.push(Block {
+                    kind: BlockKind::User,
+                    text: msg.content.clone(),
+                    images: msg
+                        .images
+                        .iter()
+                        .enumerate()
+                        .map(|(i, img)| PendingImage {
+                            img: img.clone(),
+                            name: String::new(),
+                            num: markers.get(i).copied().unwrap_or(i + 1),
+                            // Kitty ids are assigned later by
+                            // assign_block_image_nums.
+                            kit: 0,
+                            cols: preview::PREVIEW_COLS,
+                            rows: preview::PREVIEW_ROWS,
+                        })
+                        .collect(),
+                    ..Default::default()
+                })
+            }
             // Injected continue prompt after truncated reasoning; not shown.
             "nudge" => {}
             "compaction" => blocks.push(Block {
@@ -383,36 +403,40 @@ pub fn session_to_blocks(sess: &atom_core::session::store::Session) -> Vec<Block
     blocks
 }
 
-/// assignBlockImageNums assigns a unique kitty image id to every image
+/// assignBlockImageNums assigns a unique kitty graphics id to every image
 /// across the block list, skipping any ids already in use by the caller
-/// (e.g. the prompt's pending set). Renumbers from 1 upward so the
-/// kitty image protocol can safely reuse previously transmitted slots.
+/// (e.g. the prompt's pending previews). The per-message [IMG n] marker
+/// numbers (`num`) are untouched; ids wrap inside
+/// [1, MAX_KITTY_PREVIEW_ID] so the kitty image protocol can safely reuse
+/// previously transmitted slots.
 pub fn assign_block_image_nums(blocks: &mut [Block], reserved: &[usize]) {
     let mut used: std::collections::HashSet<usize> = reserved.iter().copied().collect();
-    let mut next = 1usize;
+    for block in blocks.iter() {
+        if block.kind != BlockKind::User {
+            continue;
+        }
+        for img in &block.images {
+            if img.kit != 0 {
+                used.insert(img.kit);
+            }
+        }
+    }
     for block in blocks.iter_mut() {
         if block.kind != BlockKind::User {
             continue;
         }
         for img in block.images.iter_mut() {
-            if img.num != 0 && used.contains(&img.num) {
-                // Collision with an in-use id; reassign to a fresh slot.
-                img.num = 0;
+            if img.kit != 0 {
+                continue;
             }
-            if img.num == 0 {
-                // Wrap at MAX_KITTY_PREVIEW_ID so paint_kitty_previews
-                // can still clean up orphaned slots after scrolls.
-                let mut guard = 0;
-                while used.contains(&next) && guard <= preview::MAX_KITTY_PREVIEW_ID {
-                    next = next % preview::MAX_KITTY_PREVIEW_ID + 1;
-                    guard += 1;
-                }
-                img.num = next;
-                used.insert(next);
+            let mut guard = 0;
+            let mut next = 1usize;
+            while used.contains(&next) && guard <= preview::MAX_KITTY_PREVIEW_ID {
                 next = next % preview::MAX_KITTY_PREVIEW_ID + 1;
-            } else {
-                used.insert(img.num);
+                guard += 1;
             }
+            img.kit = next;
+            used.insert(next);
         }
     }
 }
@@ -1195,6 +1219,55 @@ pub fn render_block_linked(
     out
 }
 
+/// O(1) row-count estimate for a block that has no rendered cache yet
+/// (loaded history outside the viewport window). Byte-length arithmetic
+/// only — no markdown/wrap work. Estimates feed the flat scroll layout
+/// until the block renders inside the viewport window, at which point
+/// the exact height replaces it and scroll anchoring absorbs the
+/// difference.
+pub fn estimate_lines(b: &Block, width: usize) -> usize {
+    let w = width.max(20);
+    // Wrapped-line lower bound: one row per ~w bytes, plus slack for
+    // paragraph gaps, headers, and box padding.
+    let wrap = |s: &str| (s.len() * 5 / 4) / w + 2;
+    match b.kind {
+        BlockKind::User => {
+            if b.expanded {
+                2 + wrap(&b.text) + b.images.len() * 4
+            } else {
+                USER_PREVIEW_LINES + 3
+            }
+        }
+        BlockKind::Assistant => {
+            if b.text.is_empty() {
+                0
+            } else {
+                3 + wrap(&b.text)
+            }
+        }
+        BlockKind::Reasoning => {
+            if b.expanded {
+                2 + wrap(&b.text)
+            } else {
+                1
+            }
+        }
+        BlockKind::Compaction => 2 + wrap(&b.text),
+        BlockKind::Error => 1 + wrap(&b.text),
+        BlockKind::Tool => {
+            if b.diagram.is_some() {
+                6
+            } else if !b.tool_done {
+                3
+            } else if b.expanded {
+                4 + wrap(&b.result) + wrap(&b.diff)
+            } else {
+                TOOL_RESULT_PREVIEW_LINES + 4
+            }
+        }
+    }
+}
+
 /// Splits text at `[IMG n]` markers. Each piece is either plain text or
 /// a marker referencing one of the block's images.
 enum UserSegment {
@@ -1308,7 +1381,7 @@ fn render_user_body_linked(
             UserSegment::Image(num) => {
                 if let Some(img) = by_num.remove(&num) {
                     if preview::kitty_terminal() && img.cols > 0 && img.rows > 0 {
-                        let grid = preview::placeholder_grid(img.num, img.cols, img.rows);
+                        let grid = preview::placeholder_grid(img.kit, img.cols, img.rows);
                         let rows: Vec<Vec<Span<'static>>> = grid
                             .split('\n')
                             .map(|row| ansi::ansi_to_line(row).spans)
@@ -1458,7 +1531,25 @@ fn render_tool_block_linked(
                 r
             }));
         } else {
-            left.push(Span::styled(action, ansi::style_tool()));
+            // Web tool headers (e.g. "web_fetch https://…") linkify
+            // bare URLs the same way path tools linkify their path.
+            let action_col: usize = left.iter().map(span_width).sum();
+            let linked = atom_core::render::links::linkify_urls(
+                &action,
+                atom_core::render::colors::COLOR_FOREGROUND,
+                atom_core::render::colors::COLOR_CARD_DARK,
+            );
+            if linked == action {
+                left.push(Span::styled(action, ansi::style_tool()));
+            } else {
+                let (spans, links) = split_ansi_spans_linked(&linked, ansi::style_tool());
+                left.extend(spans);
+                left_links.extend(links.into_iter().map(|mut r| {
+                    r.c0 += action_col;
+                    r.c1 += action_col;
+                    r
+                }));
+            }
         }
     }
     let left_w: usize = left.iter().map(span_width).sum();
@@ -2411,10 +2502,12 @@ mod tests {
         assert_eq!(blocks[0].text, "[IMG 1] hello");
         assert_eq!(blocks[0].images.len(), 1);
         assert_eq!(blocks[0].images[0].img.data, "AAAA");
-        // Assigning nums should give the unassigned image a unique id.
+        // The marker number is per message and carries over untouched;
+        // assigning ids only fills in the kitty slot.
         let mut blocks = blocks;
         assign_block_image_nums(&mut blocks, &[]);
         assert_eq!(blocks[0].images[0].num, 1);
+        assert_eq!(blocks[0].images[0].kit, 1);
     }
 
     #[test]
@@ -2919,6 +3012,7 @@ mod render_tests {
             cols: preview::PREVIEW_COLS,
             rows: preview::PREVIEW_ROWS,
             num,
+            kit: 0,
         }
     }
 
@@ -3076,46 +3170,41 @@ mod render_tests {
     }
 
     #[test]
-    fn assign_block_image_nums_avoids_reserved_and_renumbers_zero() {
+    fn assign_block_image_nums_assigns_kit_ids_skipping_reserved() {
         let mut blocks = vec![
             Block {
                 kind: BlockKind::User,
-                images: vec![fake_image(0), fake_image(2)],
+                images: vec![fake_image(1), fake_image(2)],
                 ..Default::default()
             },
             Block {
                 kind: BlockKind::User,
-                images: vec![fake_image(0)],
+                images: vec![fake_image(1)],
                 ..Default::default()
             },
         ];
-        // Reserved id 2 collides with the second image's existing num,
-        // so it gets reassigned to the next free slot.
+        // Per-message marker nums repeat across messages; kitty ids are
+        // globally unique and skip the reserved id.
         assign_block_image_nums(&mut blocks, &[2]);
+        let kits: Vec<usize> = blocks
+            .iter()
+            .flat_map(|b| b.images.iter().map(|i| i.kit))
+            .collect();
+        assert_eq!(kits, vec![1, 3, 4]);
         let nums: Vec<usize> = blocks
             .iter()
             .flat_map(|b| b.images.iter().map(|i| i.num))
             .collect();
-        assert_eq!(nums, vec![1, 3, 4]);
-        // Without the collision, an existing num is preserved and only
-        // the unassigned (zero) entries get fresh ids.
-        let mut blocks = vec![
-            Block {
-                kind: BlockKind::User,
-                images: vec![fake_image(0), fake_image(7)],
-                ..Default::default()
-            },
-            Block {
-                kind: BlockKind::User,
-                images: vec![fake_image(0)],
-                ..Default::default()
-            },
-        ];
-        assign_block_image_nums(&mut blocks, &[2]);
-        let nums: Vec<usize> = blocks
-            .iter()
-            .flat_map(|b| b.images.iter().map(|i| i.num))
-            .collect();
-        assert_eq!(nums, vec![1, 7, 3]);
+        assert_eq!(nums, vec![1, 2, 1]);
+        // Existing kitty ids are preserved and not handed out again.
+        let mut blocks = vec![Block {
+            kind: BlockKind::User,
+            images: vec![fake_image(0), fake_image(7)],
+            ..Default::default()
+        }];
+        blocks[0].images[1].kit = 7;
+        assign_block_image_nums(&mut blocks, &[]);
+        let kits: Vec<usize> = blocks[0].images.iter().map(|i| i.kit).collect();
+        assert_eq!(kits, vec![1, 7]);
     }
 }

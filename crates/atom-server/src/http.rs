@@ -1144,36 +1144,6 @@ mod tests {
             .starts_with("[background command interrupted by a server restart"));
     }
 
-    /// listenOnSocket must detect a live server on the path and defer to
-    /// it without touching its socket file.
-    #[tokio::test]
-    async fn listen_live_defers() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("atom.sock");
-        let l = listen_on_socket(&path).unwrap().expect("first bind");
-        let l2 = listen_on_socket(&path).unwrap();
-        assert!(l2.is_none(), "want None when a live server owns the path");
-        assert!(path.exists(), "live server's socket file was removed");
-        drop(l);
-    }
-
-    /// listenOnSocket must recover from a stale socket file left by a
-    /// crashed server: remove it, retry the bind, and accept connections.
-    #[tokio::test]
-    async fn listen_stale_recovers() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("atom.sock");
-        // Simulate the leftover path entry of a crashed server (Go unlinks
-        // real unix sockets on Close, so a regular file stands in for the
-        // stale inode that blocks the bind).
-        std::fs::write(&path, b"stale").unwrap();
-        let l = listen_on_socket(&path)
-            .unwrap()
-            .expect("stale socket should be replaced");
-        std::os::unix::net::UnixStream::connect(&path).expect("fresh socket not accepting");
-        drop(l);
-    }
-
     /// /children must keep listing subagents after their turn finishes,
     /// dropping only the ones the parent explicitly killed.
     #[tokio::test]

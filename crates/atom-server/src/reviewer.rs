@@ -158,6 +158,11 @@ pub struct LiveReviewer {
     pub system_prompt: String,
 }
 
+/// Every review shares one upstream conversation key — stable across
+/// calls (the OpenCode session header wants that) and distinct from
+/// main-session keys.
+const REVIEWER_SESSION_KEY: &str = "atom-reviewer";
+
 #[async_trait]
 impl ReviewClient for LiveReviewer {
     async fn review(&self, user_content: &str) -> Result<String, String> {
@@ -191,6 +196,7 @@ impl ReviewClient for LiveReviewer {
                 &msgs,
                 &[],
                 &self.reasoning_effort,
+                REVIEWER_SESSION_KEY,
             ))
             .await
         } else if api_protocol_for(&provider_name_for_url(&self.base_url), &self.model)
@@ -203,6 +209,7 @@ impl ReviewClient for LiveReviewer {
                 &msgs,
                 &[],
                 &self.reasoning_effort,
+                REVIEWER_SESSION_KEY,
             ))
             .await
         } else {
@@ -221,6 +228,7 @@ impl ReviewClient for LiveReviewer {
                 &self.api_key,
                 req,
                 &self.reasoning_field,
+                REVIEWER_SESSION_KEY,
             ))
             .await
         }
@@ -948,7 +956,9 @@ mod tests {
         );
         let out = atom_sandbox::exec::run_tool_with(
             data.path(),
-            "rm -rf /tmp/atom-e2e-nonexistent",
+            // A true guardrail: privilege escalation flags the command,
+            // so it skips the reviewer however routine it looks.
+            "sudo rm -rf /tmp/atom-e2e-nonexistent",
             ws.path(),
             ws.path(),
             "e2e-flagged",

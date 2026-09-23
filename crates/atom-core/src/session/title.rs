@@ -113,7 +113,7 @@ pub async fn generate_title(
         crate::providers::providers::apply_gateway_provider_routing(base_url, &mut body_value);
         serde_json::to_vec(&body_value)?
     };
-    let raw = post_chat_completion(&client, base_url, key, &req_body).await?;
+    let raw = post_chat_completion(&client, base_url, key, &req_body, &sess.id).await?;
 
     #[derive(serde::Deserialize)]
     struct Parsed {

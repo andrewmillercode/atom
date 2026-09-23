@@ -117,6 +117,15 @@ pub struct ForkUserMessage {
     pub timestamp: String,
 }
 
+/// Shared empty row backing virtualized placeholder slices: pending
+/// blocks render to blank rows until they enter the scroll window, so
+/// one Arc serves all of them.
+fn blank_line() -> Arc<Line<'static>> {
+    static BLANK: once_cell::sync::Lazy<Arc<Line<'static>>> =
+        once_cell::sync::Lazy::new(|| Arc::new(Line::default()));
+    Arc::clone(&BLANK)
+}
+
 pub struct App {
     // session and provider state
     pub providers: Vec<Provider>,
@@ -148,6 +157,12 @@ pub struct App {
     pub following: bool,
     /// viewport YOffset analog
     pub scroll_y: usize,
+
+    /// Flat layout is virtualized: blocks render lazily inside the
+    /// scroll window. This is the first block whose slice in
+    /// content_lines may be out of sync (bulk invalidation or block-list
+    /// replacement); None when the flat cache is fully in sync.
+    pub flat_dirty: Option<usize>,
 
     // scrollbar mouse interaction
     pub scrollbar_dragging: bool,
@@ -343,6 +358,7 @@ impl App {
             content_width: 0,
             following: true,
             scroll_y: 0,
+            flat_dirty: None,
             scrollbar_dragging: false,
             viewport_dirty: true,
             sel_anchor: None,
@@ -800,25 +816,27 @@ impl App {
 
     // -- viewport cache ------------------------------------------------------
 
-    /// Drops caches the spinner invalidates: collapsed reasoning labels,
-    /// active compaction rows, running tool headers.
+    /// Marks live blocks stale (collapsed reasoning labels, active
+    /// compaction rows, running tool headers) so they re-render inside
+    /// the viewport window. Cached lines are kept: their height anchors
+    /// the flat layout, so off-screen invalidations never shift scroll.
     pub fn invalidate_live_blocks(&mut self) {
         for b in self.blocks.iter_mut() {
             match b.kind {
                 BlockKind::Reasoning => {
                     if b.active {
-                        b.lines = None;
+                        b.stale = true;
                         self.viewport_dirty = true;
                     }
                 }
                 BlockKind::Compaction => {
                     if b.active {
-                        b.lines = None;
+                        b.stale = true;
                         self.viewport_dirty = true;
                     }
                 }
                 BlockKind::Tool if !b.tool_done => {
-                    b.lines = None;
+                    b.stale = true;
                     self.viewport_dirty = true;
                 }
                 _ => {}
@@ -829,8 +847,67 @@ impl App {
     pub fn invalidate_all_blocks(&mut self) {
         for block in &mut self.blocks {
             block.lines = None;
+            block.stale = false;
         }
+        self.flat_dirty = Some(0);
         self.viewport_dirty = true;
+    }
+
+    /// Flat layout snapshot: each block's slice start in content_lines
+    /// (post-separator), body height (rendered cache, or an estimate for
+    /// blocks that have never rendered), and the total line count.
+    fn flat_layout(&self, width: usize) -> (Vec<usize>, Vec<usize>, usize) {
+        let n = self.blocks.len();
+        let mut starts = Vec::with_capacity(n);
+        let mut heights = Vec::with_capacity(n);
+        let mut pos = 0;
+        let mut any_vis = false;
+        for b in &self.blocks {
+            let h = match &b.lines {
+                Some(lines) => {
+                    if lines
+                        .iter()
+                        .any(|l| l.spans.iter().any(|s| !s.content.is_empty()))
+                    {
+                        lines.len()
+                    } else {
+                        0
+                    }
+                }
+                None => blocks::estimate_lines(b, width),
+            };
+            if h > 0 && any_vis {
+                pos += 1; // separator row before this block
+            }
+            starts.push(pos);
+            if h > 0 {
+                pos += h;
+                any_vis = true;
+            }
+            heights.push(h);
+        }
+        (starts, heights, pos)
+    }
+
+    /// Renders block `i` into its line cache. Returns the visible flat
+    /// body height actually produced (0 when nothing renders).
+    fn render_block_cache(&mut self, i: usize, width: usize, frame: &str) -> usize {
+        let show_r = self.show_reasoning;
+        let cwd = self.cwd.clone();
+        let b = &mut self.blocks[i];
+        let rendered = blocks::render_block_linked(b, width, show_r, frame, &cwd);
+        let lines: Vec<Arc<Line<'static>>> = rendered.lines.into_iter().map(Arc::new).collect();
+        let visible = lines
+            .iter()
+            .any(|l| l.spans.iter().any(|s| !s.content.is_empty()));
+        let h = if visible { lines.len() } else { 0 };
+        b.lines = Some(lines);
+        b.line_links = rendered.links;
+        b.line_width = width;
+        b.line_show_r = show_r;
+        b.line_expanded = b.expanded;
+        b.stale = false;
+        h
     }
 
     pub fn refresh_viewport(&mut self) {
@@ -839,26 +916,87 @@ impl App {
             width = 10;
         }
         if width != self.content_width {
-            for b in self.blocks.iter_mut() {
-                b.lines = None;
-            }
             self.content_width = width;
-            self.rebuild_content_from(0, width);
-        } else if self.viewport_dirty || self.block_start.len() != self.blocks.len() {
-            let first = self
-                .blocks
-                .iter()
-                .position(|b| !b.lines_valid(width, self.show_reasoning));
-            match first {
-                Some(i) => self.rebuild_content_from(i, width),
-                None => {
-                    if self.block_start.len() != self.blocks.len() {
-                        self.rebuild_content_from(0, width);
+            self.invalidate_all_blocks();
+        }
+
+        // First block whose content_lines slice may be out of sync:
+        // bulk invalidation, block-list shrink, or append.
+        let mut d = self.flat_dirty.take().unwrap_or(usize::MAX);
+        if self.block_start.len() > self.blocks.len() {
+            self.block_start.truncate(self.blocks.len());
+            d = 0;
+            if self.block_start.is_empty() {
+                // Every block vanished (/new): the flat rows they owned
+                // are orphans now, and the d >= blocks.len() early-break
+                // below would otherwise keep them forever.
+                self.content_lines.clear();
+                self.link_lines.clear();
+            }
+        } else if self.block_start.len() < self.blocks.len() {
+            d = d.min(self.block_start.len());
+        }
+
+        let vp = self.content_viewport_height().max(1);
+        // Render window padding: one viewport on each side, so page
+        // scrolls and session loads land inside rendered blocks.
+        let margin = vp.max(8);
+        let frame = MINIDOT_FRAMES[self.spinner_frame % MINIDOT_FRAMES.len()].to_string();
+
+        // Pass 1 renders the window around the scroll target and splices;
+        // pass 2 re-checks after estimate→actual corrections moved the
+        // target (usually a no-op scan).
+        for _ in 0..2 {
+            let (starts, heights, total) = self.flat_layout(width);
+            if self.following {
+                self.scroll_y = total.saturating_sub(vp);
+            } else {
+                self.scroll_y = self.scroll_y.min(total.saturating_sub(vp));
+            }
+            let anchor = if d > 0 && !self.following && !starts.is_empty() {
+                let bi = starts
+                    .partition_point(|&s| s <= self.scroll_y)
+                    .saturating_sub(1);
+                Some((bi, starts[bi]))
+            } else {
+                None
+            };
+            let lo = self.scroll_y.saturating_sub(margin);
+            let hi = self.scroll_y + vp + margin;
+            let mut min_rendered = usize::MAX;
+            for i in 0..self.blocks.len() {
+                if starts[i] >= hi {
+                    break;
+                }
+                if starts[i] + heights[i] <= lo {
+                    continue;
+                }
+                let need = {
+                    let b = &self.blocks[i];
+                    b.lines.is_none() || b.stale || !b.lines_valid(width, self.show_reasoning)
+                };
+                if need {
+                    self.render_block_cache(i, width, &frame);
+                    min_rendered = min_rendered.min(i);
+                }
+            }
+            d = d.min(min_rendered);
+            if d >= self.blocks.len() {
+                break;
+            }
+            let any_vis_before = heights[..d].iter().any(|&h| h > 0);
+            self.sync_flat_from(d, width, any_vis_before);
+            if let Some((bi, old_start)) = anchor {
+                if let Some(&new_start) = self.block_start.get(bi) {
+                    let delta = new_start as i64 - old_start as i64;
+                    if delta != 0 {
+                        self.scroll_y = (self.scroll_y as i64 + delta).max(0) as usize;
                     }
                 }
             }
+            d = usize::MAX;
         }
-        self.viewport_dirty = false;
+
         let max_scroll = self
             .content_lines
             .len()
@@ -868,85 +1006,71 @@ impl App {
         } else {
             self.scroll_y = self.scroll_y.min(max_scroll);
         }
+        self.viewport_dirty = false;
     }
 
-    pub fn rebuild_content_from(&mut self, idx: usize, width: usize) {
-        let frame = MINIDOT_FRAMES[self.spinner_frame % MINIDOT_FRAMES.len()].to_string();
-
-        // Re-render any blocks whose cached lines are stale.
-        for i in idx..self.blocks.len() {
-            let show_r = self.show_reasoning;
-            let b = &mut self.blocks[i];
-            if !b.lines_valid(width, show_r) {
-                let rendered = blocks::render_block_linked(b, width, show_r, &frame, &self.cwd);
-                let lines = rendered.lines.into_iter().map(Arc::new).collect();
-                b.lines = Some(lines);
-                b.line_links = rendered.links;
-                b.line_width = width;
-                b.line_show_r = show_r;
-                b.line_expanded = b.expanded;
-            }
-        }
-
-        // Incremental content_lines assembly: truncate back to `idx` and
-        // rebuild only the tail.  For the common streaming case (only the
-        // last block changed) this avoids re-cloning thousands of Arc lines.
-        if idx > 0 && idx <= self.block_start.len() {
-            // block_start[idx] is where block idx's content begins.
-            // The separator line between block idx-1 and block idx (if any)
-            // sits one position before that, so we truncate to the end of
-            // block idx-1's content (i.e. where block idx's separator would
-            // start).  We detect the separator by checking the slot just
-            // before block_start[idx].
-            let raw = if idx < self.block_start.len() {
-                self.block_start[idx]
-            } else {
-                self.content_lines.len()
-            };
-            // Remove the separator line that was inserted before block idx.
-            let keep_lines = if raw > 0
-                && idx < self.block_start.len()
+    /// Rebuilds content_lines/link_lines/block_start from block `d`
+    /// onward. Blocks before `d` keep their slices; unrendered blocks
+    /// contribute shared blank placeholder rows so the flat index space
+    /// (scroll position, scrollbar, hit tests) stays stable until they
+    /// render inside the window.
+    fn sync_flat_from(&mut self, d: usize, width: usize, any_vis_before: bool) {
+        let keep = if d < self.block_start.len() {
+            // Drop block d's slice — and the separator emitted before it,
+            // if any; everything from here is rebuilt.
+            let s = self.block_start[d];
+            let had_sep = d > 0
+                && s > 0
                 && self
                     .content_lines
-                    .get(raw.wrapping_sub(1))
-                    .is_some_and(|l| l.spans.is_empty())
-            {
-                raw - 1
-            } else {
-                raw
-            };
-            self.content_lines.truncate(keep_lines);
-            self.link_lines.truncate(keep_lines);
-            self.block_start.truncate(idx);
+                    .get(s.wrapping_sub(1))
+                    .is_some_and(|l| l.spans.is_empty());
+            s - if had_sep { 1 } else { 0 }
         } else {
-            self.content_lines.clear();
-            self.link_lines.clear();
-            self.block_start.clear();
-        }
+            self.content_lines.len()
+        };
+        self.content_lines.truncate(keep);
+        self.link_lines.truncate(keep);
+        self.block_start.resize(self.blocks.len(), 0);
 
-        let start_block = if self.block_start.is_empty() { 0 } else { idx };
-        let mut has_visible_block = !self.content_lines.is_empty();
-        for i in start_block..self.blocks.len() {
-            let block = &self.blocks[i];
-            let lines = block.lines.as_deref().unwrap_or_default();
-            let visible = lines
-                .iter()
-                .any(|line| line.spans.iter().any(|span| !span.content.is_empty()));
-            if !visible {
-                self.block_start.push(self.content_lines.len());
-                self.link_lines.push(Vec::new());
+        let mut any_vis = any_vis_before && !self.content_lines.is_empty();
+        for i in d..self.blocks.len() {
+            let b = &self.blocks[i];
+            let (h, cached): (usize, Option<&[Arc<Line<'static>>]>) = match &b.lines {
+                Some(ls)
+                    if ls
+                        .iter()
+                        .any(|l| l.spans.iter().any(|s| !s.content.is_empty())) =>
+                {
+                    (ls.len(), Some(ls))
+                }
+                Some(_) => (0, None),
+                None => (blocks::estimate_lines(b, width), None),
+            };
+            if h == 0 {
+                self.block_start[i] = self.content_lines.len();
                 continue;
             }
-            if has_visible_block {
-                self.content_lines.push(Arc::new(Line::from("")));
+            if any_vis {
+                self.content_lines.push(Arc::new(Line::default()));
                 self.link_lines.push(Vec::new());
             }
-            self.block_start.push(self.content_lines.len());
-            self.content_lines.extend(lines.iter().cloned());
-            self.link_lines.extend(
-                (0..lines.len()).map(|i| block.line_links.get(i).cloned().unwrap_or_default()),
-            );
-            has_visible_block = true;
+            self.block_start[i] = self.content_lines.len();
+            match cached {
+                Some(ls) => {
+                    self.content_lines.extend(ls.iter().cloned());
+                    let links = &self.blocks[i].line_links;
+                    self.link_lines
+                        .extend((0..ls.len()).map(|j| links.get(j).cloned().unwrap_or_default()));
+                }
+                None => {
+                    for _ in 0..h {
+                        self.content_lines.push(blank_line());
+                        self.link_lines.push(Vec::new());
+                    }
+                }
+            }
+            any_vis = true;
         }
     }
 
@@ -2597,12 +2721,15 @@ impl App {
         }
         let prev = std::mem::take(&mut self.blocks);
         self.blocks = blocks::session_to_blocks(&sess);
+        // Wholesale block replacement: the flat cache rebuilds from
+        // scratch and the viewport window renders lazily.
+        self.flat_dirty = Some(0);
         for block in &mut self.blocks {
             if block.kind == BlockKind::Reasoning {
                 block.expanded = self.show_reasoning;
             }
         }
-        let reserved: Vec<usize> = self.pending.iter().map(|p| p.num).collect();
+        let reserved: Vec<usize> = self.pending.iter().map(|p| p.kit).collect();
         blocks::assign_block_image_nums(&mut self.blocks, &reserved);
         if blocks::assign_block_diagram_ids(&mut self.blocks) {
             self.preview_dirty = true;
@@ -5137,6 +5264,104 @@ mod tests {
         KeyEvent::new(code, mods)
     }
 
+    #[test]
+    fn new_then_first_message_rebuilds_flat_cache() {
+        let mut app = App::new_test(90, 30);
+        // Lengthy session: far more blocks than the render window.
+        for i in 0..200 {
+            app.blocks.push(Block {
+                kind: BlockKind::Assistant,
+                text: format!("message {i} — {}", "lorem ipsum ".repeat(40)),
+                ..Default::default()
+            });
+        }
+        app.flat_dirty = Some(0);
+        app.refresh_viewport();
+
+        // Variant: the user scrolled up into history before /new, so the
+        // transcript tail sits in unrendered placeholder rows.
+        app.following = false;
+        app.scroll_y = 1000;
+        app.refresh_viewport();
+
+        // /new
+        let mut fresh = empty_session_info();
+        fresh.id = "fresh".into();
+        app.handle_msg(AppMsg::CreatedSession(Box::new(fresh)));
+        assert!(
+            app.content_lines.is_empty(),
+            "old transcript must be flushed on /new, got {} lines",
+            app.content_lines.len()
+        );
+
+        // Send the first message in the fresh session.
+        app.input.set_value("hello");
+        let text = app.input.value.trim().to_string();
+        let fx = app.handle_input(&text);
+        assert!(fx.iter().any(|e| matches!(e, Effect::SendTurn(_))));
+        app.refresh_viewport();
+
+        let (_starts, _heights, total) = app.flat_layout(app.content_width);
+        assert_eq!(app.block_start.len(), app.blocks.len());
+        assert_eq!(
+            total,
+            app.content_lines.len(),
+            "flat cache must match blocks"
+        );
+        let vp = app.content_viewport_height();
+        let visible: Vec<bool> = ((app.scroll_y)..(app.scroll_y + vp))
+            .map(|i| {
+                app.content_lines
+                    .get(i)
+                    .is_some_and(|l| l.spans.iter().any(|s| !s.content.is_empty()))
+            })
+            .collect();
+        let visible_nonblank = visible.iter().filter(|v| **v).count();
+        assert!(
+            visible_nonblank > 0,
+            "viewport must show the new message, not stale or blank rows"
+        );
+        assert_eq!(
+            app.block_start[0], 0,
+            "the fresh session's first block must start at the top of the flat cache"
+        );
+
+        // The turn completes; the server's "saved" event triggers a
+        // session reload with the persisted transcript.
+        let mut saved = atom_core::session::store::Session::default();
+        saved.id = "fresh".into();
+        saved.messages.push(atom_core::types::Message {
+            role: "user".into(),
+            content: "hello".into(),
+            ..Default::default()
+        });
+        saved.messages.push(atom_core::types::Message {
+            role: "assistant".into(),
+            content: "hi there".into(),
+            ..Default::default()
+        });
+        app.handle_msg(AppMsg::SessionLoaded(Box::new(saved)));
+        app.refresh_viewport();
+        let vp = app.content_viewport_height();
+        let visible_nonblank = (app.scroll_y..(app.scroll_y + vp))
+            .filter(|i| {
+                app.content_lines
+                    .get(*i)
+                    .is_some_and(|l| l.spans.iter().any(|s| !s.content.is_empty()))
+            })
+            .count();
+        assert!(
+            visible_nonblank > 0,
+            "viewport must show the reloaded turn, not stale or blank rows"
+        );
+        let (_starts, _heights, total) = app.flat_layout(app.content_width);
+        assert_eq!(
+            total,
+            app.content_lines.len(),
+            "flat cache must match blocks after reload"
+        );
+    }
+
     fn approval_app() -> App {
         let mut app = App::new_test(90, 30);
         app.approval = Some(ApprovalPrompt {
@@ -6584,6 +6809,51 @@ mod tests {
     }
 
     #[test]
+    fn click_on_bare_url_in_tool_result_opens() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = App::new_test(80, 40);
+        app.blocks.push(Block {
+            kind: BlockKind::Tool,
+            title: "Search".into(),
+            tool_name: "web_search".into(),
+            text: "rust async".into(),
+            result: "1. Ollama\n   https://ollama.com/\n   Run model docs.".into(),
+            tool_done: true,
+            expanded: true,
+            ..Default::default()
+        });
+        app.refresh_viewport();
+        let line_idx = app
+            .content_lines
+            .iter()
+            .position(|l| crate::ansi::line_plain(l).contains("https://ollama.com/"))
+            .expect("URL in tool result");
+        let col = crate::ansi::line_plain(&app.content_lines[line_idx])
+            .find("https://ollama.com/")
+            .unwrap() as u16;
+
+        let press = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: TUI_HPAD as u16 + col + 2,
+            row: (VIEWPORT_VPAD + line_idx - app.scroll_y) as u16,
+            modifiers: KeyModifiers::empty(),
+        };
+        let _ = app.mouse(press);
+        assert_eq!(
+            app.link_pending.as_deref(),
+            Some("https://ollama.com/"),
+            "bare URL in tool output must arm the link"
+        );
+        let effects = app.mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            ..press
+        });
+        assert!(effects
+            .iter()
+            .any(|e| matches!(e, Effect::OpenLink { uri } if uri == "https://ollama.com/")));
+    }
+
+    #[test]
     fn click_toggles_only_the_reasoning_header() {
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
         let mut app = App::new_test(80, 40);
@@ -7344,10 +7614,92 @@ mod tests {
 
         app.blocks[4].title = "Updated".into();
         app.blocks[4].lines = None;
-        app.rebuild_content_from(4, app.content_width);
+        app.refresh_viewport();
         let tool = app.block_start[4];
         assert!(app.content_lines[tool - 1].spans.is_empty());
         assert!(!app.content_lines[tool - 2].spans.is_empty());
+    }
+
+    #[test]
+    fn bench_load_5000_blocks() {
+        let mut app = App::new_test(80, 24);
+        for i in 0..5000 {
+            app.blocks.push(Block {
+                kind: BlockKind::Assistant,
+                text: format!("message {i} — {}", "lorem ipsum ".repeat(40)),
+                ..Default::default()
+            });
+        }
+        app.flat_dirty = Some(0);
+        let t = std::time::Instant::now();
+        app.refresh_viewport();
+        let lazy = t.elapsed();
+        let rendered = app.blocks.iter().filter(|b| b.lines.is_some()).count();
+        // eager path for comparison
+        for b in app.blocks.iter_mut() {
+            b.lines = None;
+        }
+        app.flat_dirty = Some(0);
+        app.viewport_dirty = true;
+        // force full render by faking a huge viewport window: not easy; instead render all via refresh loop
+        let t2 = std::time::Instant::now();
+        let mut y = app.content_lines.len();
+        while y > 0 {
+            app.scroll_y = y;
+            app.refresh_viewport();
+            if app.scroll_y == 0 {
+                break;
+            }
+            y = app.scroll_y.saturating_sub(1);
+        }
+        let eager = t2.elapsed();
+        println!("LAZY first refresh: {lazy:?}, blocks rendered: {rendered}");
+        println!("EAGER scroll-through full render: {eager:?}");
+    }
+
+    #[test]
+    fn session_load_renders_only_the_viewport_window() {
+        let mut app = App::new_test(80, 24);
+        for i in 0..200 {
+            app.blocks.push(Block {
+                kind: BlockKind::Assistant,
+                text: format!("message {i} — {}", "lorem ipsum ".repeat(40)),
+                ..Default::default()
+            });
+        }
+        app.flat_dirty = Some(0);
+        app.refresh_viewport();
+
+        // Only the bottom window renders eagerly; the rest stay pending
+        // placeholder slices.
+        let rendered = app.blocks.iter().filter(|b| b.lines.is_some()).count();
+        assert!(rendered < 30, "rendered {rendered} of 200 blocks");
+        assert!(
+            app.blocks.last().unwrap().lines.is_some(),
+            "the followed bottom edge renders first"
+        );
+        // Flat cache in sync: rendered slices fit inside content_lines.
+        for (i, start) in app.block_start.iter().enumerate() {
+            if app.blocks[i].lines.as_ref().is_some_and(|l| !l.is_empty()) {
+                assert!(*start <= app.content_lines.len());
+            }
+        }
+
+        // Scrolling through the transcript renders on demand; after a
+        // full pass every block has real lines and the flat length
+        // matches the fully rendered layout.
+        app.following = false;
+        while app.scroll_y > 0 {
+            app.scroll_y = app.scroll_y.saturating_sub(10);
+            app.refresh_viewport();
+        }
+        assert!(
+            app.blocks.iter().all(|b| b.lines.is_some()),
+            "scrolling to the top renders every block"
+        );
+        let (starts, _heights, total) = app.flat_layout(app.content_width);
+        assert_eq!(starts.len(), app.blocks.len());
+        assert_eq!(total, app.content_lines.len());
     }
 
     #[test]
@@ -7563,6 +7915,47 @@ mod tests {
     }
 
     #[test]
+    fn image_markers_restart_at_1_per_message() {
+        const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        let mut app = App::new_test(90, 30);
+        app.session.id = "sess1".into();
+        app.sel_provider.base_url = "http://test:11434/v1".into();
+
+        let prepare = |app: &mut App| {
+            crate::preview::paste_image(app, "shot.png", PNG).unwrap();
+            let num = app.pending.last().unwrap().num;
+            crate::preview::finalize_pending_image(
+                app,
+                num,
+                crate::preview::PreparedImage {
+                    name: "shot.png".into(),
+                    mime: "image/png".into(),
+                    data_b64: "AAAA".into(),
+                    cols: crate::preview::PREVIEW_COLS,
+                    rows: crate::preview::PREVIEW_ROWS,
+                },
+            );
+        };
+
+        prepare(&mut app);
+        prepare(&mut app);
+        assert_eq!(
+            app.pending.iter().map(|p| p.num).collect::<Vec<_>>(),
+            [1, 2]
+        );
+
+        let text = app.input.value.trim().to_string();
+        app.handle_input(&text);
+        assert!(app.pending.is_empty());
+
+        // A fresh paste after the send is [IMG 1] again, not [IMG 3],
+        // and its kitty id avoids the sent block's ids.
+        prepare(&mut app);
+        assert_eq!(app.pending[0].num, 1);
+        assert_eq!(app.pending[0].kit, 3);
+    }
+
+    #[test]
     fn submit_attaches_pending_images_to_user_block() {
         let mut app = App::new_test(90, 30);
         app.session.id = "sess1".into();
@@ -7578,6 +7971,7 @@ mod tests {
             cols: crate::preview::PREVIEW_COLS,
             rows: crate::preview::PREVIEW_ROWS,
             num: 1,
+            kit: 1,
         });
 
         app.input.set_value("look at this [IMG 1]");

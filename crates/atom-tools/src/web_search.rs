@@ -1105,11 +1105,7 @@ mod tests {
 
     #[test]
     fn resolve_provider_key_used_for_parallel_and_exa() {
-        // Serialized against any future env-mutating tests in this crate.
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::testutil::env_lock();
 
         std::env::set_var("PARALLEL_API_KEY", "parallel-env-key");
         std::env::set_var("EXA_API_KEY", "exa-env-key");
@@ -1148,8 +1144,11 @@ mod tests {
     /// the chain instead of stopping with `search error: tinyfish: HTTP 401`.
     #[tokio::test]
     async fn tinyfish_401_falls_back_to_parallel() {
+        let _env = crate::testutil::env_lock();
         // Both REST adapters are keyed now; inject keys so both routes
         // actually run (same env-injection pattern as the auth tests).
+        let prev_tinyfish = std::env::var_os("TINYFISH_API_KEY");
+        let prev_parallel = std::env::var_os("PARALLEL_API_KEY");
         std::env::set_var("TINYFISH_API_KEY", "chain-test-tinyfish-key");
         std::env::set_var("PARALLEL_API_KEY", "chain-test-parallel-key");
         let tinyfish_endpoint = serve(
@@ -1182,19 +1181,34 @@ mod tests {
             "1. Parallel\n   https://parallel.ai/\n   The search API. Beta."
         );
         assert_eq!(got.1, "parallel");
-        std::env::remove_var("TINYFISH_API_KEY");
-        std::env::remove_var("PARALLEL_API_KEY");
+        match prev_tinyfish {
+            Some(v) => std::env::set_var("TINYFISH_API_KEY", v),
+            None => std::env::remove_var("TINYFISH_API_KEY"),
+        }
+        match prev_parallel {
+            Some(v) => std::env::set_var("PARALLEL_API_KEY", v),
+            None => std::env::remove_var("PARALLEL_API_KEY"),
+        }
     }
 
     #[tokio::test]
     async fn chain_exhausted_when_all_providers_auth_fail() {
+        let _env = crate::testutil::env_lock();
         // Stub dispatch (web_fetch parity): a stubbed attempt lets the
         // test exercise the walk without depending on which keys exist
         // in the local auth store (exa/ollama availability varies).
         // Clear the bundled keys so "tinyfish" is availability-skipped
-        // even when run concurrently with the env-injecting tests.
+        // even when a key sits in the on-disk auth store (point
+        // XDG_DATA_HOME at an empty scratch dir).
+        let prev_tinyfish = std::env::var_os("TINYFISH_API_KEY");
+        let prev_exa = std::env::var_os("EXA_API_KEY");
         std::env::remove_var("TINYFISH_API_KEY");
         std::env::remove_var("EXA_API_KEY");
+        let xdg = std::env::temp_dir().join(format!("atom-tools-xdg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&xdg);
+        std::fs::create_dir_all(&xdg).unwrap();
+        let prev_xdg = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_DATA_HOME", &xdg);
         let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
         let calls_c = calls.clone();
         let result = try_search_chain(&["mystery", "tinyfish", "parallel"], move |id| {
@@ -1218,6 +1232,19 @@ mod tests {
             panic!("expected exhaustion");
         };
         assert_eq!(fallbacks, vec!["parallel: HTTP 429: slow down".to_string()]);
+        match prev_tinyfish {
+            Some(v) => std::env::set_var("TINYFISH_API_KEY", v),
+            None => std::env::remove_var("TINYFISH_API_KEY"),
+        }
+        match prev_exa {
+            Some(v) => std::env::set_var("EXA_API_KEY", v),
+            None => std::env::remove_var("EXA_API_KEY"),
+        }
+        match prev_xdg {
+            Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&xdg);
     }
 
     #[tokio::test]

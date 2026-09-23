@@ -6,7 +6,8 @@ Guidelines for agents working on the atom codebase.
 
 This is the Rust rewrite of atom. It is a Cargo workspace under `crates/`:
 
-- `crates/atom` — the `atom` TUI client and `atoms` background server binaries.
+- `crates/atom` — the `atom` binary: TUI client, and background server
+  via `atom -serve`.
 - `crates/atom-server` — background session-server library used by `atom`.
 - `crates/atom-tui` — TUI implementation.
 - `crates/atom-core` — shared types and helpers.
@@ -29,20 +30,17 @@ To make `atom` available on your PATH during development:
 make dev
 ```
 
-This installs the debug build into `~/.local/bin` as `atomdev` and
-`atomsdev` — **real copies** of `target/debug/atom` and
-`target/debug/atoms`, not symlinks. Copies are required because macOS
-26 (Tahoe) derives process names (`ps comm`, Activity Monitor) from the
-fully resolved executable path: symlinks and hardlinks both resolve
-away, so a symlinked `atomsdev` would display as `atoms` and `pkill`
-could not tell the dev server from the release one. The copies
-self-heal: `make dev` leaves a `.atomdev-source` marker naming the
-cargo target dir, the client warns when cargo has built something
-newer than the install, and `find_server_binary` refreshes the
-`atomsdev` copy before spawning the server. Re-run `make dev` after a
-plain `cargo build` to silence the warning. Make sure `~/.local/bin`
-is on your `PATH`. The client starts the `atomsdev` server
-automatically if it isn't already running.
+This installs the debug build into `~/.local/bin` as `atomdev` —
+a **real copy** of `target/debug/atom`, not a symlink. A copy is
+required because macOS 26 (Tahoe) derives process names (`ps comm`,
+Activity Monitor) from the fully resolved executable path: symlinks
+and hardlinks both resolve away, so a symlinked `atomdev` would
+display as `atom` and `pkill` could not tell the dev install from the
+release one. The client warns when cargo has built something newer
+than the copy (it is never refreshed behind your back — run `make dev`
+to pick up the new build, which silences the warning). Make sure
+`~/.local/bin` is on your `PATH`. The client starts its server
+process automatically if it isn't already running.
 
 Dev and release never mix: dev binaries and the auto-updater are
 gated on the debug build, and dev state lives in `atom-dev` data/
@@ -100,20 +98,20 @@ does, no banner rules, no multi-paragraph essays.
 
 ## Binary name
 
-There are two binaries in `crates/atom/Cargo.toml`, plus dev aliases:
+There is one binary in `crates/atom/Cargo.toml`, plus a dev alias:
 
-- **`atom`** — the TUI client. Automatically starts `atoms` if no server is
-  running.
-- **`atoms`** — the background session server. Cannot be launched directly;
-  it requires a launch token set by `atom` (`_ATOM_LAUNCH=managed`).
-- **`atomdev` / `atomsdev`** — dev aliases: plain symlinks to the debug
-  `atom`/`atoms` artifacts, created by `make dev` (see
-  `crates/atom/Cargo.toml`). Meaningful only in the debug profile; the
-  dev/release flavor is keyed on `cfg!(debug_assertions)`, not the name.
+- **`atom`** — the TUI client. Automatically starts the server if none is
+  running, by re-execing itself as `atom -serve` with a launch token
+  (`_ATOM_LAUNCH=managed`) that refuses direct invocation. One binary
+  means one process name: `pkill atom` (or `pkill atomdev`) shuts down
+  both client and server.
+- **`atomdev`** — dev alias: a real copy of the debug `atom` artifact,
+  created by `make dev` (see `crates/atom/Cargo.toml`). Meaningful only
+  in the debug profile; the dev/release flavor is keyed on
+  `cfg!(debug_assertions)`, not the name.
 
-Two binaries are built by `cargo build` and installed by `make dev`
-(as `atomdev`/`atomsdev` symlinks) or `make install` (as
-`atom`/`atoms`).
+One binary is built by `cargo build` and installed by `make dev` (as
+the `atomdev` copy) or `make install` (as `atom`).
 
 ## Bundled instructions
 

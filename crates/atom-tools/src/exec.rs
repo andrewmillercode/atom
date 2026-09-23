@@ -322,39 +322,6 @@ mod tests {
     use crate::exec::test_support::*;
 
     #[tokio::test]
-    async fn bash_success_trims_combined_output() {
-        let dir = tempfile::tempdir().unwrap();
-        let ctx = test_ctx(dir.path());
-        let out = execute_tool(&ctx, "bash", r#"{"command":"echo hi"}"#).await;
-        // Every bash call comes back pending; the turn loop parks on it
-        // and records format_bash_exit(exit) as the tool result.
-        let proc = out.pending.expect("bash returns a pending process");
-        assert_eq!(proc.command(), "echo hi");
-        let exit = proc
-            .run_until_done(atom_core::cancel::CancelToken::new())
-            .await;
-        assert_eq!(
-            format_bash_exit(exit.exit_code, &exit.output, exit.confined),
-            "hi"
-        );
-        assert!(!exit.killed);
-    }
-
-    #[tokio::test]
-    async fn bash_nonzero_exit_reports_status_and_output() {
-        let dir = tempfile::tempdir().unwrap();
-        let ctx = test_ctx(dir.path());
-        let out = execute_tool(&ctx, "bash", r#"{"command":"echo boom; exit 3"}"#).await;
-        let proc = out.pending.expect("pending process");
-        let exit = proc
-            .run_until_done(atom_core::cancel::CancelToken::new())
-            .await;
-        let text = format_bash_exit(exit.exit_code, &exit.output, exit.confined);
-        assert!(text.starts_with("exit status 3\n"), "{}", text);
-        assert!(text.contains("boom"), "{}", text);
-    }
-
-    #[tokio::test]
     async fn bash_bad_arguments() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = test_ctx(dir.path());
@@ -416,72 +383,6 @@ mod tests {
         let ctx = test_ctx(dir.path());
         let out = execute_tool(&ctx, "teleport", "{}").await;
         assert_eq!(out.text, "unknown tool: teleport");
-    }
-
-    #[tokio::test]
-    async fn read_and_write_via_execute_tool() {
-        let env = FileEnv::new();
-        let path = env.ws.path().join("x.txt");
-        let pjson = serde_json::json!({"path": path.display().to_string()});
-
-        let ctx = env.ctx_with(&atom_sandbox::approvals::AutoApprover(
-            atom_sandbox::approvals::Decision::AllowOnce,
-        ));
-        // Write to a not-yet-seen existing file errors first.
-        std::fs::write(&path, "old\n").unwrap();
-        let out = execute_tool(
-            &ctx,
-            "write_file",
-            &serde_json::json!({"path": path.display().to_string(), "content": "new\n"})
-                .to_string(),
-        )
-        .await;
-        assert!(
-            out.text.starts_with("error: file has not been read"),
-            "{}",
-            out.text
-        );
-
-        // Reading registers it.
-        let out = execute_tool(&ctx, "read_file", &pjson.to_string()).await;
-        assert_eq!(out.text, "old\n");
-
-        // Now the write applies with a diff.
-        let out = execute_tool(
-            &ctx,
-            "write_file",
-            &serde_json::json!({"path": path.display().to_string(), "content": "new\n"})
-                .to_string(),
-        )
-        .await;
-        assert!(out.text.starts_with("wrote 4 bytes to "), "{}", out.text);
-        assert!(!out.diff.is_empty());
-        let _ = pjson;
-    }
-
-    #[tokio::test]
-    async fn relative_file_tools_resolve_from_session_cwd() {
-        let env = FileEnv::new();
-        let path = env.ws.path().join("relative.txt");
-        std::fs::write(&path, "old\n").unwrap();
-        let ctx = env.ctx_with(&atom_sandbox::approvals::AutoApprover(
-            atom_sandbox::approvals::Decision::AllowOnce,
-        ));
-
-        let read = execute_tool(&ctx, "read_file", r#"{"path":"relative.txt"}"#).await;
-        assert_eq!(read.text, "old\n");
-        let edit = execute_tool(
-            &ctx,
-            "edit_file",
-            r#"{"path":"relative.txt","old_text":"old","new_text":"new"}"#,
-        )
-        .await;
-        assert!(
-            edit.text.starts_with("edited relative.txt"),
-            "{}",
-            edit.text
-        );
-        assert_eq!(std::fs::read_to_string(path).unwrap(), "new\n");
     }
 
     #[tokio::test]

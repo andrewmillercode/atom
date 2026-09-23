@@ -2,12 +2,13 @@
 //! machine without touching each other.
 //!
 //! Dev builds (`cargo build`, `cargo run`, `make dev` — the
-//! debug profile) run as `atomdev` / `atomsdev` and keep their state in
+//! debug profile) run as `atomdev` and keep their state in
 //! `atom-dev` data/config directories. Release builds (`cargo build
-//! --release`, `make install`, install.sh) run as `atom` / `atoms` with
+//! --release`, `make install`, install.sh) run as `atom` with
 //! the plain `atom` directories. Everything that names a binary or a
 //! state directory goes through this module so the two flavors never
-//! mix.
+//! mix. Client and server are one binary (the client spawns itself
+//! with `-serve`), so there is no separate server name.
 
 /// True when built with the debug profile.
 pub const fn is_dev() -> bool {
@@ -31,15 +32,6 @@ pub const fn client_name() -> &'static str {
         "atomdev"
     } else {
         "atom"
-    }
-}
-
-/// The server binary name: `atomsdev` in dev builds, `atoms` in release.
-pub const fn server_name() -> &'static str {
-    if is_dev() {
-        "atomsdev"
-    } else {
-        "atoms"
     }
 }
 
@@ -70,21 +62,21 @@ pub fn build_id() -> &'static str {
     env!("ATOM_BUILD_ID")
 }
 
-/// Marker file `make dev` leaves beside the atomdev/atomsdev copies
+/// Marker file `make dev` leaves beside the atomdev copy
 /// (`.atomdev-source` in the install dir), containing the absolute path
 /// of the cargo target dir that feeds the install. Dev builds read it
-/// to detect and repair stale installs: `atomdev` warns when cargo has
-/// built a newer artifact, and `find_server_binary` refreshes the
-/// atomsdev copy before spawning it. Returns None when the marker is
-/// missing or dangling (release installs, plain `cargo run`) — callers
-/// treat that as "no source known" and skip the staleness logic.
+/// to detect stale installs: `atomdev` warns when cargo has built a
+/// newer artifact than the running binary. Returns None when the
+/// marker is missing or dangling (release installs, plain `cargo run`)
+/// — callers treat that as "no source known" and skip the staleness
+/// logic.
 pub fn dev_target_dir(exe_dir: &std::path::Path) -> Option<std::path::PathBuf> {
     let txt = std::fs::read_to_string(exe_dir.join(".atomdev-source")).ok()?;
     let dir = std::path::PathBuf::from(txt.trim());
     dir.is_dir().then_some(dir)
 }
 
-/// The cargo-built debug artifact (`atom` or `atoms`) recorded by the
+/// The cargo-built debug artifact (`atom`) recorded by the
 /// `.atomdev-source` marker in `exe_dir`, when a dev install marker is
 /// present and its target dir exists.
 pub fn dev_debug_artifact(exe_dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
@@ -108,8 +100,8 @@ mod tests {
         std::fs::write(dir.join(".atomdev-source"), format!("{}\n", dir.display())).unwrap();
         assert_eq!(dev_target_dir(&dir).as_deref(), Some(dir.as_path()));
         assert_eq!(
-            dev_debug_artifact(&dir, "atoms").as_deref(),
-            Some(dir.join("debug").join("atoms").as_path())
+            dev_debug_artifact(&dir, "atom").as_deref(),
+            Some(dir.join("debug").join("atom").as_path())
         );
 
         // Dangling marker (target dir deleted): treated as absent.
@@ -126,7 +118,6 @@ mod tests {
         // ones under test; the release branch is compiled out here.
         if is_dev() {
             assert_eq!(client_name(), "atomdev");
-            assert_eq!(server_name(), "atomsdev");
             assert_eq!(dir_leaf(), "atom-dev");
             assert_eq!(
                 version_label(),
@@ -134,7 +125,6 @@ mod tests {
             );
         } else {
             assert_eq!(client_name(), "atom");
-            assert_eq!(server_name(), "atoms");
             assert_eq!(dir_leaf(), "atom");
             assert_eq!(version_label(), env!("CARGO_PKG_VERSION"));
         }

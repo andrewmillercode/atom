@@ -30,6 +30,21 @@ pub use exec::{
 pub use file_edit::FileSeen;
 pub use mcp::{close_all_mcp, has_deferred_tools};
 
+/// Shared lock for tests that mutate process-global env vars: without
+/// it, parallel tests set/unset the same keys (EXA_API_KEY and friends)
+/// under each other's feet. Every env-mutating test must hold the
+/// guard for its whole body.
+#[cfg(test)]
+pub(crate) mod testutil {
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    pub fn env_lock() -> MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
 use atom_core::types::ToolDef;
 use std::path::Path;
 

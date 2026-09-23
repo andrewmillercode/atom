@@ -1572,14 +1572,16 @@ mod tests {
 
     #[test]
     fn provider_available_env_keys_and_mcp_routes() {
+        let _env = crate::testutil::env_lock();
         let old = std::env::var("EXA_API_KEY").ok();
         // Restore base below; positive paths only (see note).
         std::env::remove_var("EXA_API_KEY");
 
-        // Note: the keyless path can't be asserted here — the suite
-        // mutates these env vars concurrently, so "without" is racy.
-        // Positive paths only: an explicit env key always makes the
-        // keyed REST adapters available.
+        // Note: the keyless path can't be asserted here — tests that
+        // don't hold the lock may run between the set and the assert
+        // in future additions, so "without" stays fragile. Positive
+        // paths only: an explicit env key always makes the keyed REST
+        // adapters available.
         std::env::set_var("EXA_API_KEY", "test-key-123");
         let with_exa = provider_available("exa");
         std::env::set_var("TINYFISH_API_KEY", "test-key-123");
@@ -1695,7 +1697,17 @@ mod tests {
 
     #[tokio::test]
     async fn chain_skips_keyless_provider_without_mcp_route() {
+        let _env = crate::testutil::env_lock();
+        let prev = std::env::var_os("TINYFISH_API_KEY");
         std::env::remove_var("TINYFISH_API_KEY");
+        // tinyfish's availability also falls back to the on-disk auth
+        // store; point XDG_DATA_HOME at an empty scratch dir so the
+        // test is hermetic (its key, if saved, would defeat the skip).
+        let xdg = std::env::temp_dir().join(format!("atom-tools-xdg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&xdg);
+        std::fs::create_dir_all(&xdg).unwrap();
+        let prev_xdg = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_DATA_HOME", &xdg);
         let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
         let calls_c = calls.clone();
         let result = try_provider_chain(&["tinyfish", "exa"], move |id| {
@@ -1721,6 +1733,15 @@ mod tests {
         };
         assert_eq!(outcome.text, "mcp fell through");
         assert_eq!(provider, "mcp:exa");
+        match prev {
+            Some(v) => std::env::set_var("TINYFISH_API_KEY", v),
+            None => std::env::remove_var("TINYFISH_API_KEY"),
+        }
+        match prev_xdg {
+            Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&xdg);
     }
 
     #[tokio::test]

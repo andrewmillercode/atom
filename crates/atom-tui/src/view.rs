@@ -915,7 +915,7 @@ fn render_previews(app: &App) -> Vec<Line<'static>> {
         .map(|p| Item {
             cols: p.cols,
             rows: p.rows,
-            lines: preview::placeholder_grid(p.num, p.cols, p.rows)
+            lines: preview::placeholder_grid(p.kit, p.cols, p.rows)
                 .split('\n')
                 .map(str::to_string)
                 .collect(),

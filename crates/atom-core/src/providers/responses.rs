@@ -289,6 +289,7 @@ pub async fn stream_responses(
     msgs: &[Message],
     tools: &[ToolDef],
     thinking: &str,
+    session_key: &str,
 ) -> anyhow::Result<impl futures::Stream<Item = anyhow::Result<StreamChunk>>> {
     let url = format!("{}/responses", base_url.trim_end_matches('/'));
     let max_output_tokens = derive_max_output_tokens(super::context_window_tokens("", model));
@@ -299,10 +300,14 @@ pub async fn stream_responses(
         thinking,
         max_output_tokens,
     )?)?;
+    let opencode_headers = super::providers::opencode_headers(base_url, session_key);
     let resp = retry::do_http_with_retry(|| {
         let mut builder = retry::long_timeout_client()
             .post(url.clone())
             .header("Content-Type", "application/json");
+        for (name, value) in &opencode_headers {
+            builder = builder.header(name, value);
+        }
         if !api_key.is_empty() {
             builder = builder.header("Authorization", format!("Bearer {}", api_key));
         }

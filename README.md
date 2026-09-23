@@ -12,7 +12,7 @@ Most harnesses that I've tried personally use too much memory/cpu, look ugly, or
 
 ## What can Atom do?
 
-Atom runs agents in your terminal: they plan, edit code, run commands, and search the web. It ships sandboxed bash with approval prompts, file tools, semantic code search over your repo, subagent spawning, and inline rendering of mermaid diagrams and LaTeX math. The TUI is just a client — a background server (`atoms`) keeps sessions running, so you can detach and come back without losing a turn.
+Atom runs agents in your terminal: they plan, edit code, run commands, and search the web. It ships sandboxed bash with approval prompts, file tools, semantic code search over your repo, subagent spawning, and inline rendering of mermaid diagrams and LaTeX math. The TUI is just a client — a background server (the same binary run as `atom -serve`) keeps sessions running, so you can detach and come back without losing a turn.
 
 ## How do I install/use Atom?
 
@@ -28,7 +28,7 @@ brew install andrewmillercode/tap/atom
 curl -fsSL https://raw.githubusercontent.com/andrewmillercode/atom/main/install.sh | bash
 ```
 
-That installs `atom` (the TUI) and `atoms` (the session server) into `~/.local/bin`, adds them to your PATH, and checks the runtime deps (`rg`, `uv`, `merman-cli`). Then just run `atom` in a repo — it starts the server for you. To build from source instead, use `make install` (or `make dev` for a separate `atomdev`/`atomsdev` setup).
+That installs `atom` — one binary serving as both the TUI and the background session server — into `~/.local/bin`, adds it to your PATH, and checks the runtime deps (`rg`, `uv`, `merman-cli`). Then just run `atom` in a repo — it starts the server for you. To build from source instead, use `make install` (or `make dev` for a separate `atomdev` setup).
 
 ## Contributions
 

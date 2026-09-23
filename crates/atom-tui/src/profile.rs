@@ -154,7 +154,7 @@ fn parse_ps_row(text: &str) -> Option<ProcessInfo> {
     // earlier fixed columns).
     let rest: String = parts.collect::<Vec<_>>().join(" ");
     // ps truncates command at the rightmost column width; basename it
-    // so the overlay shows `atoms` rather than the full path.
+    // so the overlay shows `atom`/`atomdev` rather than the full path.
     let name = std::path::Path::new(rest.trim())
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())

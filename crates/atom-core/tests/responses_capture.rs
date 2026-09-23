@@ -122,6 +122,7 @@ async fn captured_muse_spark_stream_parses_into_text_and_tool_call() {
         &msgs,
         &tools,
         "high",
+        "test-session",
     )
     .await
     .expect("stream opens");

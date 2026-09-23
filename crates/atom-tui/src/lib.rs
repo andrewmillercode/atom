@@ -1124,21 +1124,21 @@ async fn run_effects(
                 for p in app.pending.iter().filter(|p| p.cols > 0) {
                     if let Ok(data) = base64::engine::general_purpose::STANDARD.decode(&p.img.data)
                     {
-                        entries.push((p.num, data));
+                        entries.push((p.kit, data));
                     }
                 }
                 for block in app.blocks.iter() {
                     if block.kind != crate::blocks::BlockKind::User {
                         continue;
                     }
-                    for p in block.images.iter().filter(|p| p.cols > 0 && p.num > 0) {
-                        if entries.iter().any(|(n, _)| *n == p.num) {
+                    for p in block.images.iter().filter(|p| p.cols > 0 && p.kit > 0) {
+                        if entries.iter().any(|(n, _)| *n == p.kit) {
                             continue;
                         }
                         if let Ok(data) =
                             base64::engine::general_purpose::STANDARD.decode(&p.img.data)
                         {
-                            entries.push((p.num, data));
+                            entries.push((p.kit, data));
                         }
                     }
                 }

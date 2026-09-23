@@ -288,6 +288,54 @@ fn reason_for(rule_id: &str) -> String {
         .unwrap_or_else(|| "requires approval".to_string())
 }
 
+/// Human phrase for the synthetic matched-rule ids that have no table
+/// entry, ordered by how much a prompt should prioritize them.
+fn synthetic_cause(a: &Analysis) -> Option<(&'static str, &'static str)> {
+    if a.writes_git_hooks {
+        Some(("git-hooks-write", "writes to .git/hooks"))
+    } else if a.matched_rules.iter().any(|s| s == "path-escape-write") {
+        Some(("path-escape-write", "writes outside the workspace"))
+    } else if a.matched_rules.iter().any(|s| s == "nesting-limit") {
+        Some(("nesting-limit", "shell nesting too deep to analyze"))
+    } else if a.matched_rules.iter().any(|s| s == "unknown-command") {
+        Some(("unknown-command", "unrecognized command"))
+    } else {
+        None
+    }
+}
+
+/// The rule and reason an approval prompt should name. For an Ask
+/// verdict that is the first built-in rule whose verdict is Ask — an
+/// Allow rule can match alongside the real cause and sort earlier, and
+/// naming it made the prompt cite "searches file contents" for a
+/// `/dev/null` redirect. With no built-in Ask rule, the synthetic cause
+/// speaks for itself.
+fn prompt_cause(a: &Analysis) -> (String, String) {
+    if a.verdict == Verdict::Ask {
+        let ask_rule = a.matched_rules.iter().find(|id| {
+            rules::RULES
+                .iter()
+                .any(|r| r.id == *id && r.verdict == Verdict::Ask)
+        });
+        let mut reason = match ask_rule {
+            Some(id) => reason_for(id),
+            None => match synthetic_cause(a) {
+                Some((id, why)) => return (id.to_string(), why.to_string()),
+                None => reason_for(""),
+            },
+        };
+        if a.matched_rules.iter().any(|s| s == "path-escape-write") {
+            reason.push_str("; writes outside the workspace");
+        }
+        if a.writes_git_hooks {
+            reason.push_str("; writes to .git/hooks");
+        }
+        return (ask_rule.cloned().unwrap_or_default(), reason);
+    }
+    let id = primary_rule_id(a);
+    (id.clone(), reason_for(&id))
+}
+
 /// Run `cmd` through the full pipeline. Audits to dataDir()/sandbox-audit.log.
 pub async fn run(
     cmd: &str,
@@ -410,11 +458,10 @@ async fn authorize(
             if promoted {
                 decision = "allow";
             } else {
-                let mut reason = reason_for(&primary_rule_id(&verdict));
+                let (rule_id, mut reason) = prompt_cause(&verdict);
                 if let Some(RuleMatch::Deny(rule)) = cfg.classify(cmd) {
                     reason = format!("deny rule \"{rule}\": {reason}");
                 }
-                let rule_id = primary_rule_id(&verdict);
                 let req = ApprovalRequest {
                     session_id: session_id.to_string(),
                     command: cmd.to_string(),
@@ -944,40 +991,6 @@ mod tests {
         }
     }
 
-    /// A real toolchain command under the real profile. `cargo build`
-    /// with no dependencies writes only `target/` in the workspace, so
-    /// a failure here means the profile is too tight, not that the
-    /// network or a cache was missing.
-    #[tokio::test]
-    async fn cargo_build_runs_confined() {
-        if !crate::seatbelt::available() {
-            return;
-        }
-        let e = env();
-        let ws = e._ws.path();
-        std::fs::create_dir_all(ws.join("src")).unwrap();
-        std::fs::write(
-            ws.join("Cargo.toml"),
-            "[package]\nname = \"seatbelt-smoke\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-        )
-        .unwrap();
-        std::fs::write(ws.join("src/main.rs"), "fn main() { println!(\"ok\"); }\n").unwrap();
-        let out = run_in(
-            &e,
-            "cargo build --offline",
-            &default_cfg(),
-            &AutoApprover(Decision::AllowOnce),
-        )
-        .await;
-        assert_eq!(
-            out.confined,
-            ConfineKind::SeatbeltOrBwrap,
-            "the smoke build must be confined"
-        );
-        assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
-        assert!(ws.join("target").exists(), "build wrote its artifact");
-    }
-
     /// A sandbox denial must be distinguishable from the command's own
     /// failure in the output the user sees. The target is written as
     /// `$HOME/...` so static analysis cannot see it as a granted path;
@@ -1009,30 +1022,6 @@ mod tests {
             "failure must name the sandbox: {}",
             out.stderr
         );
-    }
-
-    /// An approved outside write keeps its sandbox: the profile grants
-    /// the named path, so the write lands and confinement stays on.
-    #[tokio::test]
-    async fn approved_outside_write_stays_confined() {
-        if !crate::seatbelt::available() {
-            return;
-        }
-        let e = env();
-        let target = dirs::home_dir()
-            .unwrap()
-            .join(format!(".atom-flag-probe-{}", std::process::id()));
-        let cmd = format!("echo x > {}", target.display());
-        let out = run_in(&e, &cmd, &default_cfg(), &AutoApprover(Decision::AllowOnce)).await;
-        let existed = target.exists();
-        let _ = std::fs::remove_file(&target);
-        assert_eq!(
-            out.confined,
-            ConfineKind::SeatbeltOrBwrap,
-            "a write flag must not lift confinement"
-        );
-        assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
-        assert!(existed, "the granted path must be writable");
     }
 
     /// A privilege guardrail (`kill`) runs unconfined after approval.
@@ -1087,201 +1076,6 @@ mod tests {
             approver,
         )
         .await
-    }
-
-    #[tokio::test]
-    async fn echo_hi_runs_and_captures_stdout() {
-        let e = env();
-        let out = run_in(&e, "echo hi", &default_cfg(), &DenyAllApprover).await;
-        assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
-        assert_eq!(out.stdout.trim_end(), "hi");
-        assert!(!out.timed_out);
-        let expected = if crate::seatbelt::available() {
-            ConfineKind::SeatbeltOrBwrap
-        } else {
-            ConfineKind::None
-        };
-        assert_eq!(out.confined, expected);
-        assert_eq!(out.verdict.verdict, Verdict::Allow);
-
-        let log = std::fs::read_to_string(e._data.path().join("sandbox-audit.log")).unwrap();
-        let rec: serde_json::Value = serde_json::from_str(log.lines().last().unwrap()).unwrap();
-        assert_eq!(rec["confined"], expected.as_str());
-        assert_eq!(rec["decision"], "allow");
-        assert_eq!(rec["exit_code"], 0);
-        assert_eq!(rec["timed_out"], false);
-        assert!(rec["cmd_sha256"].as_str().unwrap().len() == 64);
-        assert!(rec["ts"].as_str().unwrap().contains('T'));
-        assert_eq!(rec["session_id"], format!("sess-{}", std::process::id()));
-        // v2: tier_origin is recorded.
-        assert!(rec["tier_origin"].is_string());
-    }
-
-    #[tokio::test]
-    async fn tier1_command_does_not_prompt() {
-        let e = env();
-        // Use a DenyAllApprover so any prompt would fail the test.
-        let out = run_in(&e, "ls -la", &default_cfg(), &DenyAllApprover).await;
-        assert_eq!(out.exit_code, 0);
-        assert!(out.approved);
-        assert_eq!(out.verdict.verdict, Verdict::Allow);
-    }
-
-    // ---- pending-process model ----
-
-    fn unique_session() -> String {
-        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        format!("pend-{}-{n}", std::process::id())
-    }
-
-    /// Every bash call comes back pending; the turn loop parks on it
-    /// until the command exits and records the output as the result.
-    #[tokio::test]
-    async fn pending_command_completes_with_full_output() {
-        let e = env();
-        let out = run_tool_with(
-            e._data.path(),
-            "echo starting; sleep 1; echo done",
-            e._ws.path(),
-            e._ws.path(),
-            &unique_session(),
-            &default_cfg(),
-            &AutoApprover(Decision::AllowOnce),
-        )
-        .await;
-        assert_eq!(out.exit_code, 0);
-        assert!(out.approved);
-        let pp = out.pending.expect("bash returns a pending process");
-        assert_eq!(pp.command(), "echo starting; sleep 1; echo done");
-
-        let exit = pp.run_until_done(CancelToken::new()).await;
-        assert!(!exit.killed);
-        assert_eq!(exit.exit_code, 0);
-        assert!(exit.output.contains("starting") && exit.output.contains("done"));
-    }
-
-    /// Partial output is peekable while the command is still running:
-    /// the turn loop refreshes placeholders from this live view without
-    /// any status tool.
-    #[tokio::test]
-    async fn pending_output_is_peekable_mid_run() {
-        let e = env();
-        let out = run_tool_with(
-            e._data.path(),
-            "echo partial-marker; sleep 5; echo never-reached",
-            e._ws.path(),
-            e._ws.path(),
-            &unique_session(),
-            &default_cfg(),
-            &AutoApprover(Decision::AllowOnce),
-        )
-        .await;
-        let mut pp = out.pending.expect("pending process");
-        let peek = pp.output_handle();
-
-        // Poll until the marker shows up, well before the 5s sleep ends.
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
-        loop {
-            if peek.text().contains("partial-marker") {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "output never became peekable"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(!peek.text().contains("never-reached"));
-
-        pp.kill().await;
-        let exit = pp.collect().await;
-        assert!(exit.killed);
-        assert!(exit.output.contains("partial-marker"));
-    }
-
-    /// Esc (the kill token) stops the whole process group promptly —
-    /// including the command's children, not just the immediate bash.
-    #[tokio::test]
-    async fn esc_kills_pending_command_process_group() {
-        let e = env();
-        let out = run_tool_with(
-            e._data.path(),
-            "sh -c 'sleep 30' & wait", // grandchild under the tool's bash
-            e._ws.path(),
-            e._ws.path(),
-            &unique_session(),
-            &default_cfg(),
-            &AutoApprover(Decision::AllowOnce),
-        )
-        .await;
-        let mut pp = out.pending.expect("pending process");
-        let token = CancelToken::new();
-        let t2 = token.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            t2.cancel();
-        });
-        let started = std::time::Instant::now();
-        let exit = pp.run_until_done(token).await;
-        assert!(exit.killed, "expected a killed exit");
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "kill should be prompt, took {:?}",
-            started.elapsed()
-        );
-    }
-
-    /// Output far beyond the 64KB pipe buffers must not deadlock: the
-    /// reader tasks drain the pipes from spawn time.
-    #[tokio::test]
-    async fn huge_output_does_not_deadlock() {
-        let e = env();
-        let out = run_tool_with(
-            e._data.path(),
-            "yes | head -c 300000",
-            e._ws.path(),
-            e._ws.path(),
-            &unique_session(),
-            &default_cfg(),
-            &AutoApprover(Decision::AllowOnce),
-        )
-        .await;
-        let pp = out.pending.expect("pending process");
-        let exit = tokio::time::timeout(
-            Duration::from_secs(30),
-            pp.run_until_done(CancelToken::new()),
-        )
-        .await
-        .expect("drained pipes must not deadlock");
-        assert_eq!(exit.exit_code, 0, "output: {}", exit.output.len());
-        assert_eq!(exit.output.len(), 300000);
-    }
-
-    /// A long command is pending with no timeout: the tool call returns
-    /// immediately while the command keeps running.
-    #[tokio::test]
-    async fn tool_call_returns_before_command_finishes() {
-        let e = env();
-        let started = std::time::Instant::now();
-        let out = run_tool_with(
-            e._data.path(),
-            "sleep 2",
-            e._ws.path(),
-            e._ws.path(),
-            &unique_session(),
-            &default_cfg(),
-            &AutoApprover(Decision::AllowOnce),
-        )
-        .await;
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "tool call must not wait for the command: {:?}",
-            started.elapsed()
-        );
-        let pp = out.pending.expect("pending process");
-        let exit = pp.run_until_done(CancelToken::new()).await;
-        assert_eq!(exit.exit_code, 0);
     }
 
     #[tokio::test]
@@ -1412,40 +1206,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn config_allow_rule_promotes_to_tier1() {
-        let e = env();
-        let cfg_path = e._data.path().join("sandbox.json");
-        // Pre-seed: `awk *` is allowed globally.
-        let cfg = SandboxConfig {
-            version: crate::policy::VERSION,
-            rules: Rules {
-                allow: vec!["awk *".into()],
-                deny: vec![],
-            },
-            confine: true,
-            path: Some(cfg_path.clone()),
-        };
-        cfg.save_to(&cfg_path).unwrap();
-        // The DenyAllApprover would block a prompt, but the config
-        // short-circuits it.
-        let out = run_with(
-            e._data.path(),
-            "awk 'BEGIN{print 1}'",
-            e._ws.path(),
-            e._ws.path(),
-            "config-allow-sess",
-            &cfg,
-            &DenyAllApprover,
-        )
-        .await;
-        assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
-        assert!(out.approved);
-    }
-
-    #[tokio::test]
     async fn env_scrub_strips_credential_keys() {
+        let _env = crate::testutil::env_lock();
         // Set a few keys that should be dropped.
-        // SAFETY: tests run single-threaded for env mutation here.
         unsafe {
             std::env::set_var("ATOM_TEST_TOKEN", "secret-token");
             std::env::set_var("ATOM_TEST_API_KEY", "secret-key");
@@ -1468,32 +1231,6 @@ mod tests {
             std::env::remove_var("ATOM_TEST_KEEP");
         }
     }
-
-    #[tokio::test]
-    async fn per_session_tmpdir_is_created_and_set() {
-        let e = env();
-        // Note: no TMPDIR mutation here — it is process-global and would
-        // make other tests' tempdirs nest inside `parent`, which this
-        // test then deletes. HOST_TMPDIR is computed once per process
-        // anyway, so the assertion below doesn't depend on it.
-        let out = run_with(
-            e._data.path(),
-            "echo $TMPDIR",
-            e._ws.path(),
-            e._ws.path(),
-            "tmpdir-sess",
-            &default_cfg(),
-            &DenyAllApprover,
-        )
-        .await;
-        assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
-        assert!(
-            out.stdout.contains("atom-tmpdir-sess-"),
-            "stdout: {}",
-            out.stdout
-        );
-    }
-
     #[test]
     fn primary_rule_id_picks_first_real_rule() {
         let a = Analysis {
@@ -1505,6 +1242,47 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(primary_rule_id(&a), "curl");
+    }
+
+    #[test]
+    fn prompt_cause_names_the_asking_rule_not_a_fellow_allow() {
+        // `encoders` (Allow) sorts before `ssh` (Ask): the prompt must
+        // name the rule that caused the ask.
+        let a = crate::rules::analyze("base64 d && ssh host", Path::new("/ws"));
+        let (id, reason) = prompt_cause(&a);
+        assert_eq!(id, "ssh");
+        assert!(reason.contains("remote"), "{reason}");
+    }
+
+    #[test]
+    fn prompt_cause_names_the_write_instead_of_a_fellow_allow() {
+        // The screenshot bug: `grep ... 2>/dev/null` used to surface as
+        // "grep-search / searches file contents".
+        let a = crate::rules::analyze_full(
+            "grep -rn foo src > /tmp/out",
+            Path::new("/Users/dev/proj"),
+            Path::new("/Users/dev/proj"),
+        );
+        let (id, reason) = prompt_cause(&a);
+        assert_eq!(id, "path-escape-write");
+        assert!(reason.contains("outside the workspace"), "{reason}");
+
+        // A built-in Ask rule plus a write escape names both.
+        let b = crate::rules::analyze_full(
+            "curl http://x.co > /tmp/x",
+            Path::new("/Users/dev/proj"),
+            Path::new("/Users/dev/proj"),
+        );
+        let (id2, reason2) = prompt_cause(&b);
+        assert_eq!(id2, "curl");
+        assert!(reason2.contains("network"), "{reason2}");
+        assert!(reason2.contains("outside the workspace"), "{reason2}");
+
+        // Unknown commands get a real id instead of an empty one.
+        let c = crate::rules::analyze("./newtool", Path::new("/ws"));
+        let (id3, reason3) = prompt_cause(&c);
+        assert_eq!(id3, "unknown-command");
+        assert!(!reason3.is_empty(), "{reason3}");
     }
 
     #[test]

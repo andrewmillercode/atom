@@ -43,16 +43,61 @@ use tokio::sync::mpsc;
 /// "I'm mid-implementation".
 pub const MAX_TOOL_ROUNDS: usize = 500;
 pub const MAX_TOOL_OUTPUT_BYTES: usize = 128 * 1024;
-fn cap_tool_output(text: &mut String) {
+/// Head/tail bytes kept inline when a tool result overflows the context
+/// cap; the full output goes to a file the agent can read or grep.
+const TOOL_OUTPUT_EXCERPT_BYTES: usize = 2048;
+
+/// capToolOutput keeps one tool result from flooding every later request.
+/// Oversized output is written whole to a file under the session's data
+/// dir; the inline text keeps the head and tail plus the path, so nothing
+/// is lost (the old head-only truncation silently dropped the end, where
+/// errors and summaries live). File-write failures fall back to plain
+/// head truncation.
+fn cap_tool_output(session_id: &str, text: &mut String) {
     if text.len() <= MAX_TOOL_OUTPUT_BYTES {
         return;
     }
-    let mut end = MAX_TOOL_OUTPUT_BYTES;
-    while !text.is_char_boundary(end) {
+    let path = atom_core::session::store::data_dir()
+        .join("tool-outputs")
+        .join(session_id)
+        .join(format!(
+            "{}.txt",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+    let spilled = std::fs::create_dir_all(path.parent().expect("parent exists")).is_ok()
+        && std::fs::write(&path, text.as_bytes()).is_ok();
+    if !spilled {
+        let mut end = MAX_TOOL_OUTPUT_BYTES;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push_str("\n... truncated at tool output byte limit");
+        return;
+    }
+    let total = text.len();
+    let head = &text[..take_char_boundary(text, TOOL_OUTPUT_EXCERPT_BYTES)];
+    let tail = &text[take_char_boundary(text, total - TOOL_OUTPUT_EXCERPT_BYTES)..];
+    *text = format!(
+        "{}\n...[{} bytes total; full output saved to {} — read it with \
+         read_file or search it with grep]...\n{}",
+        head,
+        total,
+        path.display(),
+        tail
+    );
+}
+
+/// The largest char boundary at or below `at`, for slicing a UTF-8 string.
+fn take_char_boundary(s: &str, at: usize) -> usize {
+    let mut end = at.min(s.len());
+    while !s.is_char_boundary(end) {
         end -= 1;
     }
-    text.truncate(end);
-    text.push_str("\n... truncated at tool output byte limit");
+    end
 }
 
 // ---------------------------------------------------------------------------
@@ -791,7 +836,7 @@ async fn record_pending_result(
     } else {
         atom_tools::format_bash_exit(exit.exit_code, &exit.output, exit.confined)
     };
-    cap_tool_output(&mut content);
+    cap_tool_output(id, &mut content);
     // Slot resolution, most specific first: the exact entry the
     // placeholder occupied (verified — a fold can shift indexes), then
     // any other tool entry for this call, then re-anchor next to the
@@ -2408,7 +2453,7 @@ pub async fn run_session_turn(
             let mut outcome =
                 atom_tools::execute_tool(&tool_ctx, &tc.function.name, &tc.function.arguments)
                     .await;
-            cap_tool_output(&mut outcome.text);
+            cap_tool_output(id, &mut outcome.text);
 
             // A bash command: the tool call returns immediately with the
             // running process. The turn parks below — the model says
@@ -2800,5 +2845,37 @@ mod token_efficiency_tests {
             !ser2.iter().any(|s| s.contains("10:00")),
             "stale note must not linger in history"
         );
+    }
+
+    #[test]
+    fn small_tool_output_passes_through() {
+        let mut text = "short output".to_string();
+        cap_tool_output("sess", &mut text);
+        assert_eq!(text, "short output");
+    }
+
+    #[test]
+    fn oversized_tool_output_spills_to_file_with_head_and_tail() {
+        let tag = format!("atom-server-cap-{}", std::process::id());
+        let dir = std::env::temp_dir().join(&tag);
+        std::env::set_var("XDG_DATA_HOME", &dir);
+        let body = format!("{}\nUNIQUE_TAIL_MARKER\n", "x".repeat(200_000));
+        let mut text = body.clone();
+        cap_tool_output("captest", &mut text);
+        assert!(text.len() < 10_000, "inline text must be the excerpt");
+        assert!(text.starts_with("xxxx"));
+        assert!(text.contains("UNIQUE_TAIL_MARKER"), "tail must survive");
+        assert!(text.contains("bytes total; full output saved to "));
+        // The saved file exists and carries the whole body.
+        let saved = text
+            .split("saved to ")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .unwrap()
+            .to_string();
+        let written = std::fs::read_to_string(&saved).unwrap();
+        std::env::remove_var("XDG_DATA_HOME");
+        let _ = std::fs::remove_dir_all(dir);
+        assert_eq!(written, body);
     }
 }

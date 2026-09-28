@@ -26,7 +26,7 @@ use atom_core::types::{
 };
 use atom_sandbox::exec::PendingExit;
 use atom_tools::defs::without_tool;
-use chrono::{Local, Utc};
+use chrono::Utc;
 use futures::{FutureExt, Stream, StreamExt};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -1294,11 +1294,6 @@ pub async fn run_session_turn(
     let mut running: Vec<PendingCmd> = Vec::new();
     let (done_tx, mut done_rx) = mpsc::channel::<(String, PendingExit)>(16);
     let mut empty_response_attempt: usize = 0;
-    // The "current time" system note is captured once per turn, not per
-    // round: it is folded into the system prefix of every request, and a
-    // per-minute regeneration would rewrite that prefix each round,
-    // invalidating the provider's prompt cache for the whole conversation.
-    let now_note = Local::now().format("%D,%H:%M").to_string();
     'rounds: for _round in 0..MAX_TOOL_ROUNDS {
         // Stop immediately when the turn was paused.
         if ctx.err() {
@@ -1385,13 +1380,6 @@ pub async fn run_session_turn(
         // them); the API rejects requests containing them with 400
         // "invalid tool call arguments".
         let mut msgs = llm_messages(sess);
-        // Per-turn volatile value: it must ride at the END of the request.
-        // Placed before the conversation it diverged from the previous
-        // turn's cached prefix there, re-reading the whole history
-        // uncached; user role because an inline system message folds into
-        // the Anthropic system block (and some OpenAI-compatible
-        // endpoints reject non-leading system messages).
-        append_time_note(&mut msgs, &now_note);
         // A text-only model rejects any request carrying an image with a
         // 400 ("this model does not support image input"). When the
         // models.dev catalog explicitly lists the selected model as
@@ -2700,16 +2688,6 @@ async fn sleep_ctx(turn: CancelToken, parent: &CancelToken, delay: Duration) -> 
     }
 }
 
-/// append_time_note pushes the per-turn timestamp as the final user
-/// message (call site explains the placement).
-fn append_time_note(msgs: &mut Vec<Message>, note: &str) {
-    msgs.push(Message {
-        role: "user".into(),
-        content: format!("Current time: {note}"),
-        ..Default::default()
-    });
-}
-
 #[cfg(test)]
 mod tokens_per_sec_tests {
     use super::tokens_per_sec;
@@ -2763,89 +2741,6 @@ mod tokens_per_sec_tests {
 mod token_efficiency_tests {
     use super::*;
     use atom_core::types::Message;
-
-    #[test]
-    fn time_note_is_trailing_user_message() {
-        let mut msgs = vec![
-            Message {
-                role: "system".into(),
-                content: "instructions".into(),
-                ..Default::default()
-            },
-            Message {
-                role: "user".into(),
-                content: "hello".into(),
-                ..Default::default()
-            },
-        ];
-        append_time_note(&mut msgs, "09/23/26,14:27");
-        let last = msgs.last().unwrap();
-        assert_eq!(last.role, "user");
-        assert_eq!(last.content, "Current time: 09/23/26,14:27");
-        // Never inserted before the conversation: the whole prior prefix
-        // must stay byte-identical for the provider's prompt cache.
-        assert_eq!(msgs[0].content, "instructions");
-        assert_eq!(msgs[1].content, "hello");
-    }
-
-    #[test]
-    fn time_note_keeps_cross_turn_prefix_byte_identical() {
-        // The cache invariant the placement exists for: everything a turn
-        // N+1 request sends before its new content must serialize
-        // byte-identically to what turn N sent, so the provider's prompt
-        // cache serves the whole prior prefix.
-        let instr = vec![Message {
-            role: "system".into(),
-            content: "Instructions from: instructions/system-prompt.md\nbe terse".into(),
-            ..Default::default()
-        }];
-        let mut sess = Session {
-            instructions: instr,
-            ..Default::default()
-        };
-        sess.messages.push(Message {
-            role: "user".into(),
-            content: "turn one question".into(),
-            ..Default::default()
-        });
-        let mut req1 = llm_messages(&sess);
-        append_time_note(&mut req1, "09/23/26,10:00");
-
-        sess.messages.push(Message {
-            role: "assistant".into(),
-            content: "turn one answer".into(),
-            ..Default::default()
-        });
-        sess.messages.push(Message {
-            role: "user".into(),
-            content: "turn two question".into(),
-            ..Default::default()
-        });
-        let mut req2 = llm_messages(&sess);
-        append_time_note(&mut req2, "09/23/26,10:05");
-
-        // req1 minus its trailing note is a leading subsequence of req2
-        // minus its trailing note: the provider caches the longest common
-        // prefix, so turn 2 re-reads nothing but its new content.
-        let prefix1 = &req1[..req1.len() - 1];
-        let prefix2 = &req2[..req2.len() - 1];
-        let ser1: Vec<String> = prefix1
-            .iter()
-            .map(|m| serde_json::to_string(m).unwrap())
-            .collect();
-        let ser2: Vec<String> = prefix2
-            .iter()
-            .map(|m| serde_json::to_string(m).unwrap())
-            .collect();
-        assert!(
-            ser2.len() > ser1.len() && ser2[..ser1.len()] == ser1[..],
-            "prior prefix must not change across turns"
-        );
-        assert!(
-            !ser2.iter().any(|s| s.contains("10:00")),
-            "stale note must not linger in history"
-        );
-    }
 
     #[test]
     fn small_tool_output_passes_through() {

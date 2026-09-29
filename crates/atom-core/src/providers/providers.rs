@@ -1708,8 +1708,11 @@ mod tests {
                 .map(|(_, v)| v.clone())
         };
         let v1 = session(&headers).unwrap();
-        let v1_go = session(&opencode_headers("https://opencode.ai/zen/go/v1", "session-1"))
-            .unwrap();
+        let v1_go = session(&opencode_headers(
+            "https://opencode.ai/zen/go/v1",
+            "session-1",
+        ))
+        .unwrap();
         assert_eq!(v1, v1_go);
         let v2 = session(&opencode_headers("https://opencode.ai/zen/v1", "session-2")).unwrap();
         assert_ne!(v1, v2);

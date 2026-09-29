@@ -134,8 +134,11 @@ pub fn load_mcp_configs_in(
     }
     let dirs = crate::skills::walk_project_dirs_in(cwd, home);
     for d in dirs.iter().rev() {
-        merge_mcp_file(&mut out, &d.join(".atom").join("mcp.json"));
+        // Within a dir, later merges win: the shared Claude Code file
+        // first, tool-specific configs last.
+        merge_mcp_file(&mut out, &d.join(".mcp.json"));
         merge_mcp_file(&mut out, &d.join(".cursor").join("mcp.json"));
+        merge_mcp_file(&mut out, &d.join(".atom").join("mcp.json"));
     }
     out
 }
@@ -168,22 +171,54 @@ fn merge_mcp_file(out: &mut BTreeMap<String, MCPServerConfig>, path: &Path) {
     }
 }
 
-/// expandEnvRefs replaces OpenCode-style {env:NAME} tokens with the
-/// matching process environment value.
+/// expand_env_refs replaces OpenCode-style {env:NAME} tokens and the
+/// Claude/Devin-style ${VAR}, ${env:VAR}, and ${VAR:-default} tokens
+/// with the matching process environment value. An unset ${VAR} without
+/// a default stays literal; {env:NAME} expands to empty when unset.
 pub fn expand_env_refs(s: &str) -> String {
-    let mut s = s.to_string();
-    loop {
-        let Some(i) = s.find("{env:") else {
-            return s;
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while !rest.is_empty() {
+        let start = match (rest.find("{env:"), rest.find("${")) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (None, None) => {
+                out.push_str(rest);
+                break;
+            }
         };
-        let Some(rel) = s[i..].find('}') else {
-            return s;
+        let Some(rel) = rest[start..].find('}') else {
+            out.push_str(rest);
+            break;
         };
-        let j = i + rel;
-        let name = &s[i + 5..j];
-        let value = std::env::var(name).unwrap_or_default();
-        s = format!("{}{}{}", &s[..i], value, &s[j + 1..]);
+        let close = start + rel;
+        out.push_str(&rest[..start]);
+        // "${VAR" / "{env:VAR" between the token start and the closing
+        // brace; drop the "$"/"{" prefix characters.
+        let token = rest[start..close].trim_start_matches(['$', '{']);
+        if let Some(name) = token.strip_prefix("env:") {
+            out.push_str(&std::env::var(name).unwrap_or_default());
+        } else {
+            let (name, default) = match token.split_once(":-") {
+                Some((n, d)) => (n, Some(d)),
+                None => (token, None),
+            };
+            let (set, value) = match std::env::var(name) {
+                Ok(v) => (true, v),
+                Err(_) => (false, String::new()),
+            };
+            if set && !value.is_empty() {
+                out.push_str(&value);
+            } else if let Some(d) = default.filter(|_| !set || value.is_empty()) {
+                out.push_str(d);
+            } else if !set {
+                out.push_str(&rest[start..=close]);
+            }
+        }
+        rest = &rest[close + 1..];
     }
+    out
 }
 
 pub fn expand_env_map(in_map: &BTreeMap<String, String>) -> BTreeMap<String, String> {
@@ -776,7 +811,7 @@ async fn connect_transport(
     }
     match typ.as_str() {
         "local" => typ = "stdio".to_string(),
-        "remote" => typ = "http".to_string(),
+        "remote" | "streamable-http" => typ = "http".to_string(),
         _ => {}
     }
     if typ.is_empty() {
@@ -1484,6 +1519,44 @@ mod tests {
     }
 
     #[test]
+    fn expands_claude_style_env_tokens() {
+        let _env = crate::testutil::env_lock();
+        let prev = std::env::var_os("ATOM_MCP_TEST_VAR");
+        unsafe {
+            std::env::set_var("ATOM_MCP_TEST_VAR", "val1");
+        }
+        assert_eq!(expand_env_refs("${ATOM_MCP_TEST_VAR}"), "val1");
+        assert_eq!(expand_env_refs("x${ATOM_MCP_TEST_VAR}y"), "xval1y");
+        // Both syntaxes mix in one string.
+        assert_eq!(
+            expand_env_refs("{env:ATOM_MCP_TEST_VAR}/${ATOM_MCP_TEST_VAR}"),
+            "val1/val1"
+        );
+        // Devin's ${env:VAR} form expands like {env:NAME}.
+        assert_eq!(expand_env_refs("${env:ATOM_MCP_TEST_VAR}"), "val1");
+        // Default applies when unset; the value wins when set.
+        assert_eq!(
+            expand_env_refs("${ATOM_MCP_TEST_UNSET:-fallback}"),
+            "fallback"
+        );
+        assert_eq!(expand_env_refs("${ATOM_MCP_TEST_VAR:-fallback}"), "val1");
+        // Unset without a default stays literal.
+        assert_eq!(
+            expand_env_refs("${ATOM_MCP_TEST_UNSET}"),
+            "${ATOM_MCP_TEST_UNSET}"
+        );
+        // Unclosed tokens pass through untouched.
+        assert_eq!(
+            expand_env_refs("${ATOM_MCP_TEST_VAR"),
+            "${ATOM_MCP_TEST_VAR"
+        );
+        match prev {
+            Some(v) => unsafe { std::env::set_var("ATOM_MCP_TEST_VAR", v) },
+            None => unsafe { std::env::remove_var("ATOM_MCP_TEST_VAR") },
+        }
+    }
+
+    #[test]
     fn parses_and_merges_configs_with_override_order() {
         let home = tempfile::tempdir().unwrap();
         let xdg = home.path().join("xdg");
@@ -1520,6 +1593,81 @@ mod tests {
         );
         assert_eq!(cfgs["github"].command, "other", "project overrides user");
         assert_eq!(cfgs["remote"].url, "https://example.com/mcp");
+    }
+
+    #[test]
+    fn shared_mcp_json_loses_to_tool_specific_files() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = home.path().join("proj");
+        std::fs::create_dir_all(cwd.join(".atom")).unwrap();
+        std::fs::write(
+            cwd.join(".mcp.json"),
+            r#"{"mcpServers":{
+                "a":{"command":"shared"},
+                "b":{"command":"shared-only"}
+            }}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cwd.join(".atom").join("mcp.json"),
+            r#"{"mcpServers":{"a":{"command":"atom-file"}}}"#,
+        )
+        .unwrap();
+
+        let cfgs = load_mcp_configs_in(&cwd.display().to_string(), None, Some(home.path()));
+        assert_eq!(cfgs["a"].command, "atom-file", ".atom beats .mcp.json");
+        assert_eq!(cfgs["b"].command, "shared-only");
+    }
+
+    #[test]
+    fn closest_project_dir_wins_for_shared_mcp_json() {
+        let home = tempfile::tempdir().unwrap();
+        let parent = home.path().join("proj");
+        let child = parent.join("sub");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(
+            parent.join(".mcp.json"),
+            r#"{"mcpServers":{"a":{"command":"parent-shared"},"b":{"command":"parent-only"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            child.join(".mcp.json"),
+            r#"{"mcpServers":{"a":{"command":"child-shared"}}}"#,
+        )
+        .unwrap();
+        // Within the parent dir, .atom beats that dir's shared file too.
+        std::fs::create_dir_all(parent.join(".atom")).unwrap();
+        std::fs::write(
+            parent.join(".atom").join("mcp.json"),
+            r#"{"mcpServers":{"b":{"command":"parent-atom"}}}"#,
+        )
+        .unwrap();
+
+        let cfgs = load_mcp_configs_in(&child.display().to_string(), None, Some(home.path()));
+        assert_eq!(cfgs["a"].command, "child-shared", "closest dir wins");
+        assert_eq!(cfgs["b"].command, "parent-atom");
+    }
+
+    #[test]
+    fn streamable_http_alias_maps_to_http() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            // The alias dispatches to the http branch: same "missing url"
+            // error an http-typed server gets, not "unsupported type".
+            match connect_transport(
+                "x",
+                "/",
+                &MCPServerConfig {
+                    typ: "streamable-http".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            {
+                Err(e) => assert_eq!(e, "missing url"),
+                Ok(_) => panic!("expected error missing url"),
+            }
+        });
     }
 
     #[test]

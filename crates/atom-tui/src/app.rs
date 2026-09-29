@@ -13,7 +13,7 @@ use ratatui::text::Line;
 
 use atom_core::providers::auth::{self, AuthEntry};
 use atom_core::providers::modelsdev;
-use atom_core::providers::providers::{self, Provider, ProviderListEntry};
+use atom_core::providers::providers::{self, ModelEntry, Provider, ProviderListEntry};
 use atom_core::session::context_breakdown::ContextRow;
 use atom_core::session::stats::StatsReport;
 use atom_core::session::store::SessionInfo;
@@ -82,9 +82,6 @@ pub struct RunOptions {
     /// server isn't reachable, so the profile overlay can show "no
     /// server pid known" instead of crashing.
     pub server_pid: Option<i32>,
-    /// Name of the agent profile persisted from the last run; empty
-    /// restores the default (no profile) state.
-    pub profile: String,
 }
 
 #[derive(Debug, Clone)]
@@ -137,10 +134,6 @@ pub struct App {
     pub thinking_levels: Vec<String>,
     pub thinking_idx: usize,
     pub thinking_pref: String,
-
-    // agent profiles (index 0 = implicit default, hidden in the UI)
-    pub profiles: Vec<atom_core::profiles::AgentProfile>,
-    pub profile_idx: usize,
 
     /// whether reasoning blocks are rendered; toggled with /thinking.
     pub show_reasoning: bool,
@@ -221,6 +214,12 @@ pub struct App {
     pub overlay_profile: Option<crate::profile::ProfileReport>,
     pub stats_days: i64,
     pub overlay_providers: Vec<ProviderListEntry>,
+    /// Per-agent ACP session config options (model / thought_level
+    /// selectors), fetched once per picker cycle.
+    pub acp_configs: std::collections::HashMap<String, Vec<atom_tools::acp::ConfigOption>>,
+    pub acp_configs_loaded: bool,
+    /// The provider catalog rows before ACP agent rows are merged in.
+    pub model_entries_base: Vec<ModelEntry>,
     pub overlay_auth_id: String,
     pub overlay_auth_type: String,
     pub picker_settings: crate::settings::PickerSettings,
@@ -348,8 +347,6 @@ impl App {
             thinking_levels: Vec::new(),
             thinking_idx: 0,
             thinking_pref: String::new(),
-            profiles: Vec::new(),
-            profile_idx: 0,
             show_reasoning: true,
             blocks: Vec::new(),
             content_lines: Vec::new(),
@@ -392,6 +389,9 @@ impl App {
             overlay_profile: None,
             stats_days: 0,
             overlay_providers: Vec::new(),
+            acp_configs: std::collections::HashMap::new(),
+            acp_configs_loaded: false,
+            model_entries_base: Vec::new(),
             overlay_auth_id: String::new(),
             overlay_auth_type: String::new(),
             picker_settings: crate::settings::load(),
@@ -448,14 +448,6 @@ impl App {
         };
         m.refresh_thinking_levels();
         m.apply_thinking(&m.session.thinking.clone());
-        // Restore the persisted agent profile by name. Its model and
-        // thinking presets are already baked into the restored model.
-        if !opts.profile.is_empty() {
-            m.profiles = atom_core::profiles::load_profiles();
-            if let Some(idx) = m.profiles.iter().position(|p| p.name == opts.profile) {
-                m.profile_idx = idx;
-            }
-        }
         // Apply the persisted theme after any dev hot-theme load so the
         // user's selection wins in normal runs (hot reload only runs in
         // --hot mode, which layers on top of this afterwards).
@@ -488,7 +480,6 @@ impl App {
             started_at: None,
             started_instant: None,
             server_pid: None,
-            profile: String::new(),
         });
         app.width = width;
         app.height = height;
@@ -555,6 +546,20 @@ impl App {
     // -- thinking levels ---------------------------------------------------
 
     pub fn refresh_thinking_levels(&mut self) {
+        if self.sel_provider.name == atom_tools::acp::ACP_PROVIDER_NAME {
+            // ACP thought_level config options are the thinking ladder.
+            let agent = self.sel_model.split('/').next().unwrap_or("");
+            self.thinking_levels = self
+                .acp_configs
+                .get(agent)
+                .and_then(|opts| atom_tools::acp::config_option_for_category(opts, "thought_level"))
+                .map(|o| o.options.iter().map(|v| v.value.clone()).collect())
+                .unwrap_or_default();
+            if !self.thinking_levels.is_empty() && self.thinking_idx >= self.thinking_levels.len() {
+                self.thinking_idx = modelsdev::default_thinking_index(&self.thinking_levels);
+            }
+            return;
+        }
         self.thinking_levels =
             modelsdev::reasoning_levels_for(&self.sel_provider.name, &self.sel_model)
                 .unwrap_or_default();
@@ -582,104 +587,10 @@ impl App {
         self.thinking_pref = self.thinking_levels[self.thinking_idx].clone();
     }
 
-    // -- agent profiles ----------------------------------------------------
-
-    /// Label of the selected profile; empty for the implicit default
-    /// (the no-profile state), which stays hidden in the status bar.
-    pub fn profile_name(&self) -> String {
-        self.profiles
-            .get(self.profile_idx)
-            .map(|p| p.name.clone())
-            .unwrap_or_default()
-    }
-
-    /// cycleProfile advances default -> plan -> build -> ... -> default,
-    /// applying each profile's model and thinking preset. Returns the
-    /// effects of any session model/thinking patch.
-    pub fn cycle_profile(&mut self) -> Vec<Effect> {
-        if self.profiles.is_empty() {
-            self.profiles = atom_core::profiles::load_profiles();
-        }
-        if self.profiles.len() <= 1 {
-            return Vec::new(); // only the implicit default exists
-        }
-        self.profile_idx = (self.profile_idx + 1) % self.profiles.len();
-        self.apply_profile()
-    }
-
-    fn apply_profile(&mut self) -> Vec<Effect> {
-        let Some(profile) = self.profiles.get(self.profile_idx) else {
-            return Vec::new();
-        };
-        if profile.name.is_empty() {
-            return Vec::new(); // default: the no-profile state, nothing to apply
-        }
-        let want_thinking = (!profile.thinking.is_empty()).then(|| profile.thinking.clone());
-        if profile.model.is_empty() {
-            // No model switch: only the thinking preset changes.
-            self.apply_profile_thinking(want_thinking);
-            return self.commit_thinking();
-        }
-        let (provider_ref, model_id) = atom_core::profiles::model_ref(&profile.model);
-        let provider = if model_id == self.sel_model {
-            // Same model id: switch only when an explicit provider
-            // prefix names a different provider than the current one.
-            provider_ref.and_then(|name| {
-                self.providers
-                    .iter()
-                    .find(|p| (p.name == name || p.id == name) && p.name != self.sel_provider.name)
-                    .cloned()
-            })
-        } else {
-            match provider_ref {
-                // An explicit provider prefix names the provider.
-                Some(name) => self
-                    .providers
-                    .iter()
-                    .find(|p| p.name == name || p.id == name)
-                    .cloned(),
-                None => self.provider_for_profile_model(model_id),
-            }
-        };
-        match provider {
-            Some(provider) => self.use_model(provider, model_id.to_string(), want_thinking),
-            // Unknown provider for the pinned model: keep the current
-            // model so validation reports it at send time.
-            None => {
-                self.apply_profile_thinking(want_thinking);
-                self.commit_thinking()
-            }
-        }
-    }
-
-    /// Overrides the thinking level with the profile preset when it is
-    /// valid for the current model.
-    fn apply_profile_thinking(&mut self, want: Option<String>) {
-        let Some(level) = want else {
-            return;
-        };
-        self.refresh_thinking_levels();
-        if let Some(idx) = self.thinking_levels.iter().position(|l| *l == level) {
-            self.thinking_idx = idx;
-            self.thinking_pref = level;
-        }
-    }
-
-    /// Resolves a profile-pinned model id to a configured provider via
-    /// the models.dev catalog; falls back to the current provider.
-    fn provider_for_profile_model(&self, model: &str) -> Option<Provider> {
-        let catalog_id = modelsdev::provider_for_model(model)?;
-        self.providers
-            .iter()
-            .find(|p| modelsdev::provider_catalog_id(p) == catalog_id)
-            .cloned()
-    }
-
     /// use_model switches the session's model (and optionally the
     /// thinking level), patching a live session or seeding the next
-    /// session creation. Shared by the model picker and profile cycling;
-    /// `want_thinking` overrides the session's saved level (agent
-    /// profiles), otherwise it is preserved.
+    /// session creation; `want_thinking` overrides the session's saved
+    /// level, otherwise it is preserved.
     fn use_model(
         &mut self,
         provider: Provider,
@@ -699,6 +610,7 @@ impl App {
         self.session.thinking = self.thinking_level();
         self.persist_defaults();
 
+        let acp_selected = self.acp_selected_for_current();
         if !self.session.id.is_empty() {
             // Mid-session switch: update the model in place.
             let provider = self.sel_provider.name.clone();
@@ -710,6 +622,7 @@ impl App {
                 provider,
                 model,
                 thinking,
+                acp_selected,
             }];
         }
         // No session yet: create one with the selected model.
@@ -718,7 +631,27 @@ impl App {
             model: self.sel_model.clone(),
             cwd: self.cwd.clone(),
             thinking: self.thinking_level(),
+            acp_selected,
         }]
+    }
+
+    /// acp_selected_for_current maps the picked model (`agent/value`)
+    /// onto the agent's `model` config option id; Null for non-ACP
+    /// providers and agents without model options.
+    fn acp_selected_for_current(&self) -> serde_json::Value {
+        if self.sel_provider.name != atom_tools::acp::ACP_PROVIDER_NAME {
+            return serde_json::Value::Null;
+        }
+        let Some((agent, value)) = self.sel_model.split_once('/') else {
+            return serde_json::Value::Null;
+        };
+        let Some(options) = self.acp_configs.get(agent) else {
+            return serde_json::Value::Null;
+        };
+        match atom_tools::acp::config_option_for_category(options, "model") {
+            Some(option) => serde_json::json!({ option.id: value }),
+            None => serde_json::Value::Null,
+        }
     }
 
     fn thinking_index_of(levels: &[String], saved: &str) -> i32 {
@@ -774,12 +707,7 @@ impl App {
         if thinking.is_empty() {
             thinking = self.session.thinking.clone();
         }
-        save_last_model_state(
-            &self.sel_provider.name,
-            &self.sel_model,
-            &thinking,
-            &self.profile_name(),
-        );
+        save_last_model_state(&self.sel_provider.name, &self.sel_model, &thinking);
     }
 
     pub fn commit_thinking(&mut self) -> Vec<Effect> {
@@ -1898,7 +1826,7 @@ impl App {
                 self.overlay_sel = 0;
                 self.overlay_auth_id.clear();
                 self.overlay_auth_type.clear();
-                self.overlay_providers = providers::list_addable_providers();
+                self.overlay_providers = self.providers_overlay_entries();
                 self.working_msg.clear();
                 Vec::new()
             }
@@ -1907,11 +1835,13 @@ impl App {
                 let model = self.sel_model.clone();
                 let cwd = self.cwd.clone();
                 let thinking = self.thinking_level();
+                let acp_selected = self.acp_selected_for_current();
                 vec![Effect::CreateSession {
                     provider,
                     model,
                     cwd,
                     thinking,
+                    acp_selected,
                 }]
             }
             "/sessions" | "/resume" => {
@@ -2193,12 +2123,40 @@ impl App {
                 if self.overlay != Some(OverlayKind::Model) {
                     return Vec::new();
                 }
-                self.overlay_entries = entries;
+                self.model_entries_base = entries;
+                self.rebuild_overlay_entries();
+                let fetch_acp = !self.acp_configs_loaded
+                    && !atom_tools::acp::load_acp_configs(&self.cwd).is_empty();
                 self.overlay_sel = overlays::first_model_row(self);
                 self.overlay_scroll = 0;
                 overlays::sync_model_scroll(self);
                 self.pending_model_provider.clear();
                 self.working_msg.clear();
+                if fetch_acp {
+                    vec![Effect::FetchAcpConfigs]
+                } else {
+                    Vec::new()
+                }
+            }
+            AppMsg::AcpConfigsLoaded(results) => {
+                self.acp_configs_loaded = true;
+                for (name, result) in results {
+                    match result {
+                        Ok(options) => {
+                            self.acp_configs.insert(name, options);
+                        }
+                        Err(err) => {
+                            self.acp_configs.remove(&name);
+                            self.err_msg = format!("acp {name}: {err}");
+                        }
+                    }
+                }
+                if self.overlay != Some(OverlayKind::Model) {
+                    return Vec::new();
+                }
+                self.rebuild_overlay_entries();
+                self.overlay_sel = overlays::first_model_row(self);
+                overlays::sync_model_scroll(self);
                 Vec::new()
             }
             AppMsg::SessionsLoaded(sessions) => {
@@ -2476,7 +2434,7 @@ impl App {
     fn after_models_dev_ready(&mut self) -> Vec<Effect> {
         match self.overlay {
             Some(OverlayKind::Providers) => {
-                self.overlay_providers = providers::list_addable_providers();
+                self.overlay_providers = self.providers_overlay_entries();
                 self.working_msg.clear();
                 self.overlay_sel = 0;
                 Vec::new()
@@ -2532,7 +2490,7 @@ impl App {
                 vec![Effect::FetchModels]
             }
             Some(OverlayKind::Providers) => {
-                self.overlay_providers = providers::list_addable_providers();
+                self.overlay_providers = self.providers_overlay_entries();
                 Vec::new()
             }
             _ => Vec::new(),
@@ -2865,7 +2823,7 @@ impl App {
                     self.open_overlay(OverlayKind::Providers);
                     self.overlay_q.clear();
                     self.overlay_sel = 0;
-                    self.overlay_providers = providers::list_addable_providers();
+                    self.overlay_providers = self.providers_overlay_entries();
                     return Vec::new();
                 }
                 self.open_models_for_provider("openai");
@@ -2876,7 +2834,7 @@ impl App {
         self.overlay_q.clear();
         self.overlay_sel = 0;
         self.overlay_auth_type.clear();
-        self.overlay_providers = providers::list_addable_providers();
+        self.overlay_providers = self.providers_overlay_entries();
         vec![Effect::ReloadProviders]
     }
 
@@ -3362,14 +3320,7 @@ impl App {
                 }
                 return self.handle_input(&text);
             }
-            // Shift+Tab (BackTab on most terminals) cycles agent
-            // profiles; plain Tab and Ctrl+T cycle the thinking level.
-            KeyCode::Tab if shift => {
-                return self.cycle_profile();
-            }
-            KeyCode::BackTab => {
-                return self.cycle_profile();
-            }
+            // Tab and Ctrl+T cycle the thinking level.
             KeyCode::Tab => {
                 self.cycle_thinking();
                 return self.commit_thinking();
@@ -3690,7 +3641,7 @@ impl App {
                         self.open_overlay(OverlayKind::Providers);
                         self.overlay_q.clear();
                         self.overlay_sel = 0;
-                        self.overlay_providers = providers::list_addable_providers();
+                        self.overlay_providers = self.providers_overlay_entries();
                     }
                     OverlayKind::WebSearch => {
                         self.open_overlay(OverlayKind::Settings);
@@ -3714,6 +3665,14 @@ impl App {
                     {
                         self.open_overlay(OverlayKind::Settings);
                         self.overlay_sel = 6;
+                        self.overlay_q.clear();
+                        self.working_msg.clear();
+                    }
+                    OverlayKind::Model
+                        if self.model_picker_purpose == overlays::ModelPickerPurpose::Subagent =>
+                    {
+                        self.open_overlay(OverlayKind::Settings);
+                        self.overlay_sel = 7;
                         self.overlay_q.clear();
                         self.working_msg.clear();
                     }
@@ -3990,12 +3949,139 @@ impl App {
         }
         let sel = self.overlay_sel.min(filtered.len() - 1);
         let e = filtered[sel].clone();
+        if let Some(agent) = e.id.strip_prefix("acp:") {
+            // ACP agents: disconnect removes the acp.json entry.
+            if let Err(err) = atom_tools::acp::remove_agent(agent) {
+                self.err_msg = err;
+            }
+            self.overlay_providers = self.providers_overlay_entries();
+            return Vec::new();
+        }
         if e.id == "ollama-local" || !e.connected || !e.stored {
             return Vec::new();
         }
         let _ = auth::remove_auth(&e.id);
         auth::remove_legacy_provider_key(&e.id);
         vec![Effect::ReloadProviders]
+    }
+
+    /// acp_model_entries builds the model-picker rows for ACP agents:
+    /// agents advertising `model` config options expose one row per
+    /// model value (`agent/value`); the rest a single `agent` row.
+    fn acp_model_entries(&self) -> Vec<ModelEntry> {
+        let mut out = Vec::new();
+        let provider = || atom_core::providers::providers::Provider {
+            name: atom_tools::acp::ACP_PROVIDER_NAME.into(),
+            ..Default::default()
+        };
+        for (name, cfg) in atom_tools::acp::load_acp_configs(&self.cwd) {
+            if cfg.disabled || cfg.command.is_empty() {
+                continue;
+            }
+            let options = self.acp_configs.get(&name);
+            let model_options =
+                options.and_then(|opts| atom_tools::acp::config_option_for_category(opts, "model"));
+            match model_options.filter(|o| !o.options.is_empty()) {
+                Some(option) => {
+                    for value in option.options {
+                        out.push(ModelEntry {
+                            provider: provider(),
+                            model: format!("{name}/{}", value.value),
+                        });
+                    }
+                }
+                None => {
+                    out.push(ModelEntry {
+                        provider: provider(),
+                        model: name,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// acp_model_parts splits an ACP `agent/value` model into the
+    /// agent's display name and the model's display name.
+    pub fn acp_model_parts(&self, model: &str) -> Option<(String, String)> {
+        let (agent, value) = model.split_once('/')?;
+        let option =
+            atom_tools::acp::config_option_for_category(self.acp_configs.get(agent)?, "model")?;
+        let entry = option.options.into_iter().find(|v| v.value == value)?;
+        let name = if value == "default" && !entry.description.is_empty() {
+            entry.description
+        } else {
+            entry.name.replace(" (recommended)", "")
+        };
+        let label = atom_tools::acp::bundled_acp_agents()
+            .into_iter()
+            .find(|(id, _, _)| *id == agent)
+            .map(|(_, label, _)| label.to_string())
+            .unwrap_or_else(|| agent.to_string());
+        Some((label, if name.is_empty() { value.into() } else { name }))
+    }
+
+    /// acp_model_label is the picker label for an ACP `agent/value` row.
+    pub fn acp_model_label(&self, model: &str) -> String {
+        match self.acp_model_parts(model) {
+            Some((agent, name)) => format!("{agent} {name}"),
+            None => model.to_string(),
+        }
+    }
+
+    /// rebuild_overlay_entries re-merges the provider catalog rows with
+    /// the ACP agent rows after either source changes.
+    fn rebuild_overlay_entries(&mut self) {
+        self.overlay_entries = self.model_entries_base.clone();
+        self.overlay_entries.extend(self.acp_model_entries());
+    }
+
+    /// providers_overlay_entries is the /providers row list: the
+    /// connectable providers plus ACP agents (Zed-style one-key setup).
+    /// Bundled agents always appear; user-configured extras show too.
+    fn providers_overlay_entries(&self) -> Vec<ProviderListEntry> {
+        let mut entries = providers::list_addable_providers();
+        let configured = atom_tools::acp::load_acp_configs(&self.cwd);
+        let mut acp_rows: Vec<ProviderListEntry> = Vec::new();
+        for (id, label, _default_cfg) in atom_tools::acp::bundled_acp_agents() {
+            let mut e = ProviderListEntry {
+                id: format!("acp:{id}"),
+                label: label.to_string(),
+                caps: vec!["ACP"],
+                ..Default::default()
+            };
+            if let Some(cfg) = configured.get(id) {
+                e.connected = true;
+                e.status = cfg.command.clone();
+            }
+            acp_rows.push(e);
+        }
+        for (name, cfg) in &configured {
+            if atom_tools::acp::bundled_acp_agents()
+                .iter()
+                .any(|(id, _, _)| id == name)
+            {
+                continue;
+            }
+            acp_rows.push(ProviderListEntry {
+                id: format!("acp:{name}"),
+                label: name.clone(),
+                caps: vec!["ACP"],
+                connected: true,
+                status: cfg.command.clone(),
+                ..Default::default()
+            });
+        }
+        // Same ordering as the provider list: connected first, then
+        // label, so ACP rows sort in naturally.
+        entries.extend(acp_rows);
+        entries.sort_by(|a, b| {
+            if a.connected != b.connected {
+                return b.connected.cmp(&a.connected);
+            }
+            a.label.to_lowercase().cmp(&b.label.to_lowercase())
+        });
+        entries
     }
 
     fn delete_selected_session(&mut self) -> Vec<Effect> {
@@ -4176,6 +4262,23 @@ impl App {
                     self.working_msg.clear();
                     return Vec::new();
                 }
+                if self.model_picker_purpose == overlays::ModelPickerPurpose::Subagent {
+                    self.atom_config.subagent = Some(atom_core::config::SubagentConfig {
+                        provider: if e.provider.id.is_empty() {
+                            e.provider.name.clone()
+                        } else {
+                            e.provider.id.clone()
+                        },
+                        model: e.model.clone(),
+                    });
+                    self.save_atom_config();
+                    self.model_picker_purpose = overlays::ModelPickerPurpose::Chat;
+                    self.open_overlay(OverlayKind::Settings);
+                    self.overlay_sel = 7;
+                    self.overlay_q.clear();
+                    self.working_msg.clear();
+                    return Vec::new();
+                }
                 let fx = self.use_model(e.provider.clone(), e.model.clone(), None);
                 self.picker_settings
                     .push_recent(crate::settings::PickerSettings::model_ref(
@@ -4231,6 +4334,43 @@ impl App {
                 }
                 let e = filtered[self.overlay_sel].clone();
                 if e.id == "ollama-local" {
+                    return Vec::new();
+                }
+                if let Some(agent) = e.id.strip_prefix("acp:") {
+                    // Zed-style one-key setup: writing the default
+                    // launch into acp.json is the whole flow — auth is
+                    // the agent CLI's own (e.g. `claude login`).
+                    if e.connected {
+                        self.copied_msg = format!(
+                            "{agent} is already configured — pick it from the model picker"
+                        );
+                        self.copied_at = Some(Instant::now());
+                        return Vec::new();
+                    }
+                    match atom_tools::acp::bundled_acp_agents()
+                        .into_iter()
+                        .find(|(bid, _, _)| *bid == agent)
+                    {
+                        Some((id, label, default_cfg)) => {
+                            match atom_tools::acp::add_agent(id, &default_cfg) {
+                                Ok(()) => {
+                                    self.overlay_providers = self.providers_overlay_entries();
+                                    self.copied_msg =
+                                        format!("{label} added — select it from the model picker");
+                                    self.copied_at = Some(Instant::now());
+                                }
+                                Err(err) => {
+                                    self.err_msg = format!("add agent: {err}");
+                                }
+                            }
+                        }
+                        None => {
+                            self.copied_msg =
+                                format!("{agent}: configure a launch in acp.json to enable");
+                            self.copied_at = Some(Instant::now());
+                        }
+                    }
+                    self.overlay_q.clear();
                     return Vec::new();
                 }
                 self.overlay_auth_id = e.id.clone();
@@ -4296,7 +4436,7 @@ impl App {
                     // Web-tool providers (search/fetch only) have no
                     // models: return to the providers list so the row
                     // now reads connected.
-                    self.overlay_providers = providers::list_addable_providers();
+                    self.overlay_providers = self.providers_overlay_entries();
                     self.open_overlay(OverlayKind::Providers);
                     self.overlay_q.clear();
                     self.overlay_sel = 0;
@@ -4349,6 +4489,15 @@ impl App {
                 }
                 6 => {
                     self.model_picker_purpose = overlays::ModelPickerPurpose::Reviewer;
+                    self.open_overlay(OverlayKind::Model);
+                    self.overlay_q.clear();
+                    self.overlay_sel = 0;
+                    self.overlay_scroll = 0;
+                    self.working_msg = "loading models...".into();
+                    vec![Effect::FetchModels]
+                }
+                7 => {
+                    self.model_picker_purpose = overlays::ModelPickerPurpose::Subagent;
                     self.open_overlay(OverlayKind::Model);
                     self.overlay_q.clear();
                     self.overlay_sel = 0;
@@ -5214,8 +5363,6 @@ struct LastModel {
     model: String,
     #[serde(default)]
     thinking: String,
-    #[serde(default)]
-    profile: String,
 }
 
 fn last_model_path() -> std::path::PathBuf {
@@ -5231,12 +5378,7 @@ pub(crate) fn load_last_model_thinking() -> Option<String> {
     Some(lm.thinking)
 }
 
-pub(crate) fn save_last_model_state(
-    provider_name: &str,
-    model: &str,
-    thinking: &str,
-    profile: &str,
-) {
+pub(crate) fn save_last_model_state(provider_name: &str, model: &str, thinking: &str) {
     if model.is_empty() {
         return;
     }
@@ -5244,7 +5386,6 @@ pub(crate) fn save_last_model_state(
         provider: provider_name.to_string(),
         model: model.to_string(),
         thinking: thinking.to_string(),
-        profile: profile.to_string(),
     };
     if lm.thinking.is_empty() {
         lm.thinking = load_last_model_thinking().unwrap_or_default();
@@ -6987,62 +7128,6 @@ mod tests {
         let reply = app.blocks.last().unwrap();
         assert_eq!(reply.model, "model-b");
         assert_eq!(reply.turn_duration, Some(Duration::from_millis(134_600)));
-    }
-
-    #[test]
-    fn profile_pinned_model_switches_provider_when_ids_match() {
-        let mut app = App::new_test(90, 30);
-        app.providers = vec![
-            Provider {
-                name: "ollama".into(),
-                ..Default::default()
-            },
-            Provider {
-                name: "second".into(),
-                ..Default::default()
-            },
-        ];
-        app.sel_provider = app.providers[0].clone();
-        app.sel_model = "shared-model".into();
-        app.profiles = vec![
-            atom_core::profiles::AgentProfile::default(),
-            atom_core::profiles::AgentProfile {
-                name: "pinned".into(),
-                model: "second/shared-model".into(),
-                ..Default::default()
-            },
-        ];
-        app.profile_idx = 1;
-
-        app.apply_profile();
-
-        assert_eq!(app.sel_provider.name, "second");
-        assert_eq!(app.sel_model, "shared-model");
-    }
-
-    #[test]
-    fn profile_pinned_model_keeps_current_provider_when_it_matches() {
-        let mut app = App::new_test(90, 30);
-        app.providers = vec![Provider {
-            name: "ollama".into(),
-            ..Default::default()
-        }];
-        app.sel_provider = app.providers[0].clone();
-        app.sel_model = "shared-model".into();
-        app.profiles = vec![
-            atom_core::profiles::AgentProfile::default(),
-            atom_core::profiles::AgentProfile {
-                name: "pinned".into(),
-                model: "ollama/shared-model".into(),
-                ..Default::default()
-            },
-        ];
-        app.profile_idx = 1;
-
-        app.apply_profile();
-
-        assert_eq!(app.sel_provider.name, "ollama");
-        assert_eq!(app.sel_model, "shared-model");
     }
 
     #[test]

@@ -5,11 +5,13 @@
 //! approval bridge all mirror the Go implementation; `client` is the
 //! self-contained unix-socket HTTP client used by the bin/TUI.
 
+pub mod acp_turn;
 pub mod cancel;
 pub mod client;
 pub mod dispatch;
 pub mod http;
 pub mod instructions;
+pub mod mcp_bridge;
 pub mod reviewer;
 pub mod state;
 pub mod turn;

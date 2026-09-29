@@ -281,6 +281,9 @@ pub fn usage_event(u: &atom_core::types::StreamUsage) -> Value {
             json!(u.cache_write_tokens.to_string()),
         );
     }
+    if u.context_window > 0 {
+        ev.insert("window".into(), json!(u.context_window.to_string()));
+    }
     if u.prompt_tokens_all > 0 {
         ev.insert("prompt_all".into(), json!(u.prompt_tokens_all.to_string()));
     }
@@ -1132,7 +1135,7 @@ fn turn_duration_ms(started_at: Instant) -> i64 {
         .min(i64::MAX as u128) as i64
 }
 
-fn done_event(duration_ms: i64, model: &str, tokens_per_sec: f64) -> Value {
+pub fn done_event(duration_ms: i64, model: &str, tokens_per_sec: f64) -> Value {
     let mut ev = json!({
         "type": "done",
         "duration_ms": duration_ms,
@@ -1146,7 +1149,7 @@ fn done_event(duration_ms: i64, model: &str, tokens_per_sec: f64) -> Value {
 
 /// lastTokensPerSec reads the speed off the most recent assistant or
 /// compaction message, for the `done` event's live-update payload.
-fn last_tokens_per_sec(sess: &Session) -> f64 {
+pub(crate) fn last_tokens_per_sec(sess: &Session) -> f64 {
     sess.messages
         .last()
         .map(|m| {
@@ -1257,6 +1260,19 @@ pub async fn run_session_turn(
         state
             .subs
             .broadcast(&parent_id, &json!({"type": "children"}));
+    }
+
+    // Agent-driven sessions (ACP): the external agent owns the model
+    // loop and its tools; run_acp_turn streams its updates as the same
+    // NDJSON events. Compaction is a no-op — the agent owns its context.
+    if sess.provider == atom_tools::acp::ACP_PROVIDER_NAME {
+        if opts.compact {
+            let done = done_event(turn_duration_ms(started_at), &sess.model, 0.0);
+            emit(state, &out, id, &done).await;
+            end_of_turn(state, sess, id, &ctx.handle, &sess.parent_id).await;
+            return;
+        }
+        return crate::acp_turn::run_acp_turn(state, sess, id, out, &ctx, started_at).await;
     }
 
     let cwd = PathBuf::from(sess.cwd.clone());
@@ -2538,38 +2554,28 @@ pub async fn run_session_turn(
             }
         }
 
-        // Commands are still running: park. The turn waits here — no
-        // further model rounds — until they exit (the real results then
-        // land in history and the model reports next round) or the user
-        // interjects (the prompt is answered against placeholder
-        // results without stopping the commands).
-        if !running.is_empty() {
-            match park_for_pending(state, sess, &out, id, &ctx, &mut running, &mut done_rx).await {
-                // Mid-loop park: the model called these tools and has not
-                // seen any results yet, so every exit here is followed by
-                // a round regardless of `all_quiet`.
-                ParkOutcome::AllDone { .. } => {}
-                ParkOutcome::Prompt { injected, compact } => {
-                    after_park_prompt(state, sess, &out, id, injected, compact).await;
-                }
-                ParkOutcome::Cancelled => {
-                    finish_paused_turn(
-                        state,
-                        sess,
-                        &out,
-                        id,
-                        &ctx,
-                        &parent_id,
-                        &opts,
-                        &key,
-                        &base_url,
-                        &mut running,
-                        &mut done_rx,
-                    )
-                    .await;
-                    return;
-                }
-            }
+        // Running commands do not park the loop here: the next round
+        // sees their live placeholders (refreshed below at round top)
+        // alongside the real tool results, so the model keeps working
+        // while they run. Parking is only for after a spoken answer,
+        // where a report round is all that is left.
+        if ctx.err() {
+            cancel_running(state, sess, &out, id, &mut running, &mut done_rx).await;
+            finish_paused_turn(
+                state,
+                sess,
+                &out,
+                id,
+                &ctx,
+                &parent_id,
+                &opts,
+                &key,
+                &base_url,
+                &mut running,
+                &mut done_rx,
+            )
+            .await;
+            return;
         }
         // Loop again: the model now sees the tool results.
     }
@@ -2605,7 +2611,7 @@ pub async fn run_session_turn(
 
 /// Shared tail of run_session_turn: deregister the turn and notify the
 /// parent session's viewers (Go's deferred endTurn/children broadcast).
-async fn end_of_turn(
+pub async fn end_of_turn(
     state: &Arc<AppState>,
     sess: &Session,
     id: &str,

@@ -285,6 +285,10 @@ pub struct StreamUsage {
     pub cache_write_tokens: i64,
     #[serde(skip_serializing_if = "is_zero_f")]
     pub cost: f64,
+    /// Window size reported by the provider itself (ACP agents); zero
+    /// means look it up in the models catalog.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub context_window: i64,
     /// Sum of prompt tokens across rounds in this session. Display-only;
     /// never serialized.
     #[serde(skip)]
@@ -312,6 +316,7 @@ impl<'de> Deserialize<'de> for StreamUsage {
             prompt_cache_hit_tokens: i64,
             prompt_cache_miss_tokens: i64,
             total_cost: f64,
+            context_window: i64,
             completion_tokens_details: Details,
             prompt_tokens_details: PromptDetails,
         }
@@ -338,6 +343,7 @@ impl<'de> Deserialize<'de> for StreamUsage {
             ]),
             cache_write_tokens: first_positive(&[r.cache_write_tokens, r.prompt_cache_miss_tokens]),
             cost: r.total_cost,
+            context_window: r.context_window,
             prompt_tokens_all: 0,
         })
     }

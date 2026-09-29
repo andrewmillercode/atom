@@ -404,12 +404,7 @@ mod tests {
     async fn dispatch_requires_spawner() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = test_ctx(dir.path());
-        let out = execute_tool(
-            &ctx,
-            "subagent",
-            r#"{"action":"spawn","model":"m","thinking":"low","tasks":["x"]}"#,
-        )
-        .await;
+        let out = execute_tool(&ctx, "subagent", r#"{"action":"spawn","tasks":["x"]}"#).await;
         assert_eq!(out.text, "error: subagent requires an active session");
     }
 
@@ -470,12 +465,7 @@ mod tests {
         let s = FakeSpawner::new();
 
         let ctx = spawner_ctx(&s);
-        let out = execute_tool(
-            &ctx,
-            "subagent",
-            r#"{"action":"spawn","model":"m","thinking":"low","tasks":["hi"]}"#,
-        )
-        .await;
+        let out = execute_tool(&ctx, "subagent", r#"{"action":"spawn","tasks":["hi"]}"#).await;
         assert!(out.text.contains("\"delegates\""), "{}", out.text);
         assert_eq!(s.spawned.lock().unwrap().len(), 1);
 
@@ -520,20 +510,18 @@ mod tests {
         let out = execute_tool(
             &ctx,
             "subagent",
-            r#"{"action":"spawn","provider":"shared-provider","model":"shared","thinking":"high","tasks":["one","two"]}"#,
+            r#"{"action":"spawn","tasks":["one","two"]}"#,
         )
         .await;
 
         assert!(out.text.contains("\"batch_id\""));
         let spawned = s.spawned.lock().unwrap();
         assert_eq!(spawned.len(), 2);
-        assert_eq!(spawned[0].provider, "shared-provider");
-        assert_eq!(spawned[0].model, "shared");
-        assert_eq!(spawned[0].thinking, "high");
+        // The model comes from the settings override when set; both
+        // children share whatever was resolved.
+        assert_eq!(spawned[0].provider, spawned[1].provider);
+        assert_eq!(spawned[0].model, spawned[1].model);
         assert_eq!(spawned[0].prompt, "one");
-        assert_eq!(spawned[1].provider, "shared-provider");
-        assert_eq!(spawned[1].model, "shared");
-        assert_eq!(spawned[1].thinking, "high");
         assert_eq!(spawned[1].prompt, "two");
         assert_eq!(spawned[0].batch_id, spawned[1].batch_id);
         assert_eq!((spawned[0].batch_index, spawned[1].batch_index), (1, 2));
@@ -543,20 +531,10 @@ mod tests {
     async fn dispatch_spawn_rejects_invalid_tasks() {
         let s = FakeSpawner::new();
         let ctx = spawner_ctx(&s);
-        let out = execute_tool(
-            &ctx,
-            "subagent",
-            r#"{"action":"spawn","thinking":"high","tasks":[]}"#,
-        )
-        .await;
+        let out = execute_tool(&ctx, "subagent", r#"{"action":"spawn","tasks":[]}"#).await;
         assert_eq!(out.text, "error: spawn requires at least one task");
 
-        let out = execute_tool(
-            &ctx,
-            "subagent",
-            r#"{"action":"spawn","thinking":"high","tasks":["  "]}"#,
-        )
-        .await;
+        let out = execute_tool(&ctx, "subagent", r#"{"action":"spawn","tasks":["  "]}"#).await;
         assert_eq!(out.text, "error: every task must be a non-empty string");
         assert!(s.spawned.lock().unwrap().is_empty());
     }
@@ -568,7 +546,7 @@ mod tests {
         let out = execute_tool(
             &ctx,
             "subagent",
-            r#"{"action":"spawn","thinking":"high","tasks":"just one task"}"#,
+            r#"{"action":"spawn","tasks":"just one task"}"#,
         )
         .await;
         assert!(!out.text.starts_with("error"));

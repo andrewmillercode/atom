@@ -65,10 +65,14 @@ pub async fn create_session(
     model: &str,
     cwd: &str,
     thinking: &str,
+    acp_selected: &serde_json::Value,
 ) -> Result<SessionInfo> {
     let mut body = json!({"provider": provider, "model": model, "cwd": cwd});
     if !thinking.is_empty() {
         body["thinking"] = json!(thinking);
+    }
+    if !acp_selected.is_null() {
+        body["acp_selected"] = acp_selected.clone();
     }
     let v = atom_server::client::post("/api/sessions", &body).await?;
     Ok(serde_json::from_value(v)?)
@@ -80,9 +84,19 @@ pub async fn patch_session_model(
     provider: &str,
     model: &str,
     thinking: &str,
+    acp_selected: &serde_json::Value,
 ) -> Result<Value> {
-    let body = json!({"provider": provider, "model": model, "thinking": thinking});
+    let mut body = json!({"provider": provider, "model": model, "thinking": thinking});
+    if !acp_selected.is_null() {
+        body["acp_selected"] = acp_selected.clone();
+    }
     atom_server::client::patch(&format!("/api/sessions/{id}"), &body).await
+}
+
+/// fetch_acp_config asks the server to launch (or reuse) an agent and
+/// report its session config options (model / thought level / modes).
+pub async fn fetch_acp_config(agent: &str, cwd: &str) -> Result<serde_json::Value> {
+    atom_server::client::post("/api/acp/config", &json!({"agent": agent, "cwd": cwd})).await
 }
 
 /// patchSessionThinking updates only the reasoning level.

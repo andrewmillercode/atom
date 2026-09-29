@@ -145,7 +145,6 @@ pub fn output_test_app(hot_state_path: Option<std::path::PathBuf>) -> App {
         started_at: None,
         started_instant: None,
         server_pid: None,
-        profile: String::new(),
     });
     m.test_mode = true;
     m.test_scene = OUTPUT_TEST_SCENE_WORKING;

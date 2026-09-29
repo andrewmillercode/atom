@@ -46,6 +46,7 @@ pub enum ModelPickerPurpose {
     Chat,
     Compaction,
     Reviewer,
+    Subagent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -484,6 +485,14 @@ pub fn settings_labels(app: &App) -> Vec<String> {
             )
         } else {
             "Auto-Review model  session default".to_string()
+        },
+        {
+            let subagent = app.atom_config.resolved_subagent();
+            if subagent.model.trim().is_empty() {
+                "Subagent model  session default".to_string()
+            } else {
+                format!("Subagent model  {} / {}", subagent.provider, subagent.model)
+            }
         },
         if app.settings_onboarding {
             "Continue with defaults / finish setup".into()
@@ -1293,7 +1302,11 @@ pub fn overlay_view_data(app: &App, kind: OverlayKind) -> OverlayViewData {
                 .map(|row| match &row.entry {
                     Some(entry) => ViewRow::Item(ViewItem {
                         id: Some(format!("{}/{}", entry.provider.name, entry.model)),
-                        label: entry.model.clone(),
+                        label: if entry.provider.name == atom_tools::acp::ACP_PROVIDER_NAME {
+                            app.acp_model_label(&entry.model)
+                        } else {
+                            entry.model.clone()
+                        },
                         trailing: entry.provider.name.clone(),
                         meta: String::new(),
                         marker: String::new(),
@@ -2130,15 +2143,16 @@ mod tests {
         app.overlay = Some(OverlayKind::Settings);
 
         let labels = settings_labels(&app);
-        assert_eq!(labels.len(), 8);
-        assert_eq!(overlay_count(&app), 8);
+        assert_eq!(labels.len(), 9);
+        assert_eq!(overlay_count(&app), 9);
         assert_eq!(labels[4], "Transparent background  off");
         // Auto-Review ships enabled, on the session's own model.
         assert_eq!(labels[5], "Auto-Review  on");
         assert_eq!(labels[6], "Auto-Review model  session default");
+        assert_eq!(labels[7], "Subagent model  session default");
 
         // Done stays the last row in both modes.
-        assert_eq!(labels[7], "Done");
+        assert_eq!(labels[8], "Done");
         let app_on = App {
             atom_config: atom_core::config::AtomConfig {
                 transparent_background: Some(true),

@@ -5,6 +5,7 @@ use crate::util::{add_stream_usage, sha256_hash};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
@@ -101,12 +102,49 @@ pub struct Session {
     pub batch_id: String,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub batch_index: i64,
+    /// The ACP agent's session id for agent-driven sessions (provider
+    /// "acp-agent"); lets later turns resume the agent-side session.
+    #[serde(
+        default,
+        skip_serializing_if = "String::is_empty",
+        rename = "acp_session_id"
+    )]
+    pub acp_session_id: String,
+    /// The agent's last-reported session config options (model /
+    /// thought_level / mode selectors), and the values atom selected.
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub acp_config_options: Value,
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub acp_selected: Value,
+    /// The spec's `models` object from session/new for agents that
+    /// expose model selection via session/set_model (Claude Code's
+    /// adapter); null when the agent speaks config options instead.
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub acp_models: Value,
+    /// The session's `modes` object, for agents whose mode selection
+    /// rides session/set_mode.
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub acp_modes: Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
 fn is_zero(n: &i64) -> bool {
     *n == 0
+}
+
+/// ACP JSON columns round-trip as TEXT; NULL for absent.
+fn json_value_text(v: &Value) -> Option<String> {
+    if v.is_null() {
+        None
+    } else {
+        serde_json::to_string(v).ok()
+    }
+}
+
+fn json_from_text(text: Option<String>) -> Value {
+    text.and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or(Value::Null)
 }
 
 impl Default for Session {
@@ -130,6 +168,11 @@ impl Default for Session {
             status: DelegateStatus::Done,
             batch_id: String::new(),
             batch_index: 0,
+            acp_session_id: String::new(),
+            acp_config_options: Value::Null,
+            acp_selected: Value::Null,
+            acp_models: Value::Null,
+            acp_modes: Value::Null,
             created_at: now,
             updated_at: now,
         }
@@ -288,6 +331,11 @@ impl SessionStore {
                  status TEXT NOT NULL,
                  batch_id TEXT NOT NULL,
                  batch_index INTEGER NOT NULL,
+                 acp_session_id TEXT NOT NULL DEFAULT '',
+                 acp_config_options TEXT,
+                 acp_selected TEXT,
+                 acp_models TEXT,
+                 acp_modes TEXT,
                  created_at TEXT NOT NULL,
                  updated_at TEXT NOT NULL,
                  message_count INTEGER NOT NULL
@@ -307,6 +355,23 @@ impl SessionStore {
              CREATE INDEX IF NOT EXISTS sessions_parent_id_idx ON sessions(parent_id);
              CREATE INDEX IF NOT EXISTS sessions_updated_at_idx ON sessions(updated_at DESC);",
         )?;
+        // Older databases predate the ACP columns; add them when missing.
+        for (name, ddl) in [
+            ("acp_session_id", "TEXT NOT NULL DEFAULT ''"),
+            ("acp_config_options", "TEXT"),
+            ("acp_selected", "TEXT"),
+            ("acp_models", "TEXT"),
+            ("acp_modes", "TEXT"),
+        ] {
+            let has_col: i64 = db.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = ?1",
+                [name],
+                |row| row.get(0),
+            )?;
+            if has_col == 0 {
+                db.execute(&format!("ALTER TABLE sessions ADD COLUMN {name} {ddl}"), [])?;
+            }
+        }
         let s = SessionStore {
             dir,
             db: Mutex::new(db),
@@ -521,6 +586,21 @@ impl SessionStore {
             sess.compaction_summary = snapshot.compaction_summary.clone();
             sess.compacted_through = snapshot.compacted_through;
             sess.thinking = snapshot.thinking.clone();
+            if !snapshot.acp_session_id.is_empty() {
+                sess.acp_session_id = snapshot.acp_session_id.clone();
+            }
+            if !snapshot.acp_config_options.is_null() {
+                sess.acp_config_options = snapshot.acp_config_options.clone();
+            }
+            if !snapshot.acp_selected.is_null() {
+                sess.acp_selected = snapshot.acp_selected.clone();
+            }
+            if !snapshot.acp_models.is_null() {
+                sess.acp_models = snapshot.acp_models.clone();
+            }
+            if !snapshot.acp_modes.is_null() {
+                sess.acp_modes = snapshot.acp_modes.clone();
+            }
             if !title.is_empty() && !sess.title_generated {
                 sess.title = title.to_string();
             } else if sess.title.is_empty() {
@@ -582,6 +662,17 @@ impl SessionStore {
     }
 
     /// UpdateProvider records the backend selected for a dispatched child.
+    /// update_acp_selected merges one ACP config-option selection into
+    /// the session's stored selection map.
+    pub fn update_acp_selected(&self, id: &str, config_id: &str, value: &str) {
+        self.mutate(id, |sess| {
+            let mut selected = sess.acp_selected.as_object().cloned().unwrap_or_default();
+            selected.insert(config_id.to_string(), Value::String(value.to_string()));
+            sess.acp_selected = Value::Object(selected);
+            sess.updated_at = Utc::now();
+        });
+    }
+
     pub fn update_provider(&self, id: &str, provider: &str) {
         let _mutation = self.mutation.lock().unwrap();
         if !self.index.read().unwrap().contains_key(id) {
@@ -814,7 +905,9 @@ impl SessionStore {
             .query_row(
                 "SELECT id, title, title_generated, model, provider, cwd, usage,
                         compaction_summary, compacted_through, parent_id, thinking,
-                        cancelled, status, batch_id, batch_index, created_at, updated_at
+                        cancelled, status, batch_id, batch_index, acp_session_id,
+                        acp_config_options, acp_selected, acp_models, acp_modes,
+                        created_at, updated_at
                  FROM sessions WHERE id = ?1",
                 [id],
                 session_from_row,
@@ -893,11 +986,12 @@ impl SessionStore {
             "INSERT INTO sessions (
                  id, title, title_generated, model, provider, cwd, usage,
                  compaction_summary, compacted_through, parent_id, thinking,
-                 cancelled, status, batch_id, batch_index, created_at, updated_at,
-                 message_count
+                 cancelled, status, batch_id, batch_index, acp_session_id,
+                 acp_config_options, acp_selected, acp_models, acp_modes,
+                 created_at, updated_at, message_count
              ) VALUES (
                  ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                 ?14, ?15, ?16, ?17, ?18
+                 ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23
              ) ON CONFLICT(id) DO UPDATE SET
                  title=excluded.title, title_generated=excluded.title_generated,
                  model=excluded.model, provider=excluded.provider, cwd=excluded.cwd,
@@ -906,6 +1000,10 @@ impl SessionStore {
                  parent_id=excluded.parent_id, thinking=excluded.thinking,
                  cancelled=excluded.cancelled, status=excluded.status,
                  batch_id=excluded.batch_id, batch_index=excluded.batch_index,
+                 acp_session_id=excluded.acp_session_id,
+                 acp_config_options=excluded.acp_config_options,
+                 acp_selected=excluded.acp_selected,
+                 acp_models=excluded.acp_models, acp_modes=excluded.acp_modes,
                  created_at=excluded.created_at, updated_at=excluded.updated_at,
                  message_count=excluded.message_count",
             params![
@@ -924,6 +1022,11 @@ impl SessionStore {
                 sess.status.as_str(),
                 sess.batch_id,
                 sess.batch_index,
+                sess.acp_session_id,
+                json_value_text(&sess.acp_config_options),
+                json_value_text(&sess.acp_selected),
+                json_value_text(&sess.acp_models),
+                json_value_text(&sess.acp_modes),
                 sess.created_at.to_rfc3339(),
                 sess.updated_at.to_rfc3339(),
                 sess.messages.len() as i64,
@@ -996,8 +1099,13 @@ fn session_from_row(row: &Row<'_>) -> rusqlite::Result<Session> {
         status: status_from_str(&row.get::<_, String>(12)?)?,
         batch_id: row.get(13)?,
         batch_index: row.get(14)?,
-        created_at: datetime_from_str(&row.get::<_, String>(15)?)?,
-        updated_at: datetime_from_str(&row.get::<_, String>(16)?)?,
+        acp_session_id: row.get(15)?,
+        acp_config_options: json_from_text(row.get(16)?),
+        acp_selected: json_from_text(row.get(17)?),
+        acp_models: json_from_text(row.get(18)?),
+        acp_modes: json_from_text(row.get(19)?),
+        created_at: datetime_from_str(&row.get::<_, String>(20)?)?,
+        updated_at: datetime_from_str(&row.get::<_, String>(21)?)?,
     })
 }
 

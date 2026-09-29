@@ -202,10 +202,20 @@ async fn read_chunk_size(stream: &mut UnixStream, buf: &mut Vec<u8>) -> std::io:
 
 /// One-shot request returning (status, body bytes).
 async fn request(method: &str, path: &str, body: Option<&[u8]>) -> Result<(u16, Vec<u8>)> {
-    match tokio::time::timeout(LOCAL_REQUEST_TIMEOUT, async {
-        let mut stream = dial()
+    request_on(&socket_path(), LOCAL_REQUEST_TIMEOUT, method, path, body).await
+}
+
+async fn request_on(
+    socket: &Path,
+    timeout: std::time::Duration,
+    method: &str,
+    path: &str,
+    body: Option<&[u8]>,
+) -> Result<(u16, Vec<u8>)> {
+    match tokio::time::timeout(timeout, async {
+        let mut stream = UnixStream::connect(socket)
             .await
-            .with_context(|| format!("dial {}", socket_path().display()))?;
+            .with_context(|| format!("dial {}", socket.display()))?;
         write_request(&mut stream, method, path, body).await?;
         let mut buf = Vec::new();
         let head = read_head(&mut stream, &mut buf)
@@ -245,6 +255,19 @@ pub async fn get(path: &str) -> Result<serde_json::Value> {
 pub async fn post(path: &str, json_body: &serde_json::Value) -> Result<serde_json::Value> {
     let payload = serde_json::to_vec(json_body)?;
     let (status, body) = request("POST", path, Some(&payload)).await?;
+    decode_json(status, &body)
+}
+
+/// post_on is `post` against an explicit socket with a caller-chosen
+/// timeout, for long-blocking calls like subagent waits.
+pub async fn post_on(
+    socket: &Path,
+    timeout: std::time::Duration,
+    path: &str,
+    json_body: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let payload = serde_json::to_vec(json_body)?;
+    let (status, body) = request_on(socket, timeout, "POST", path, Some(&payload)).await?;
     decode_json(status, &body)
 }
 

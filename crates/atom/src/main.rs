@@ -17,8 +17,6 @@ struct LastModel {
     model: String,
     #[serde(default)]
     thinking: String,
-    #[serde(default)]
-    profile: String,
 }
 
 fn last_model_path() -> PathBuf {
@@ -38,7 +36,7 @@ fn load_last_model() -> Option<LastModel> {
 
 /// saveLastModel records the model as the last used one. An empty model
 /// is ignored; an empty thinking keeps the previously saved level.
-fn save_last_model_state(provider_name: &str, model: &str, thinking: &str, profile: &str) {
+fn save_last_model_state(provider_name: &str, model: &str, thinking: &str) {
     if model.is_empty() {
         return;
     }
@@ -46,7 +44,6 @@ fn save_last_model_state(provider_name: &str, model: &str, thinking: &str, profi
         provider: provider_name.to_string(),
         model: model.to_string(),
         thinking: thinking.to_string(),
-        profile: profile.to_string(),
     };
     if lm.thinking.is_empty() {
         if let Some(prev) = load_last_model() {
@@ -89,6 +86,7 @@ struct Args {
     hot_state: Option<String>,
     no_deps: bool,
     serve: bool,
+    mcp_bridge: bool,
 }
 
 fn parse_args() -> Result<Args> {
@@ -104,6 +102,7 @@ fn parse_args() -> Result<Args> {
         hot_state: None,
         no_deps: false,
         serve: false,
+        mcp_bridge: false,
     };
     // -key defaults to $OLLAMA_API_KEY like the Go flag does.
     a.key = std::env::var("OLLAMA_API_KEY").unwrap_or_default();
@@ -133,6 +132,7 @@ fn parse_args() -> Result<Args> {
             "hot-state" => a.hot_state = Some(next_val()?),
             "no-deps" => a.no_deps = true,
             "serve" => a.serve = true,
+            "mcp-bridge" => a.mcp_bridge = true,
             "h" | "help" => {
                 println!("{}", help_text());
                 std::process::exit(0);
@@ -178,6 +178,21 @@ async fn run() -> Result<()> {
     }
 
     let args = parse_args()?;
+
+    // MCP bridge mode: an ACP agent launched by the server runs this to
+    // reach atom's subagent tool; the env it is given is the guard.
+    if args.mcp_bridge {
+        let (Ok(session), Ok(socket)) = (
+            std::env::var(atom_server::mcp_bridge::SESSION_ENV),
+            std::env::var(atom_server::mcp_bridge::SOCKET_ENV),
+        ) else {
+            eprintln!(
+                "atom -mcp-bridge: launched by an ACP agent inside atom; not for direct use."
+            );
+            std::process::exit(1);
+        };
+        return atom_server::mcp_bridge::run_mcp_bridge(session, PathBuf::from(socket)).await;
+    }
 
     // Server mode: the client spawns ITSELF with -serve and a launch
     // token, so client and server are one binary — one pkill shuts both
@@ -278,9 +293,6 @@ async fn run() -> Result<()> {
         reasoning_field: String::new(),
     };
     let mut sel_model = String::new();
-    // Agent profile persisted from the last run; restored only when
-    // booting into the saved model (no explicit flags).
-    let mut profile = String::new();
 
     // No flags at all: default to the last used model, else open the
     // model selector on startup (empty sel_model).
@@ -296,7 +308,6 @@ async fn run() -> Result<()> {
             {
                 sel_provider = p;
                 sel_model = lm.model;
-                profile = lm.profile;
                 defaulted = true;
             }
         }
@@ -370,8 +381,7 @@ async fn run() -> Result<()> {
             .as_ref()
             .map(|m| m.thinking.clone())
             .unwrap_or_default();
-        let saved_profile = last.as_ref().map(|m| m.profile.clone()).unwrap_or_default();
-        save_last_model_state(&sel_provider.name, &sel_model, &thinking, &saved_profile);
+        save_last_model_state(&sel_provider.name, &sel_model, &thinking);
     }
 
     // Create or resume a session.
@@ -409,7 +419,6 @@ async fn run() -> Result<()> {
         started_at_instant,
         started_at_wall,
         server_pid,
-        profile,
     )
     .await
 }
@@ -435,7 +444,6 @@ async fn launch_tui(
     started_at_instant: std::time::Instant,
     started_at_wall: std::time::SystemTime,
     server_pid: Option<i32>,
-    profile: String,
 ) -> Result<()> {
     let opts = atom_tui::app::RunOptions {
         providers,
@@ -451,7 +459,6 @@ async fn launch_tui(
         started_at: Some(started_at_wall),
         started_instant: Some(started_at_instant),
         server_pid,
-        profile,
     };
     atom_tui::run(opts, args.hot).await
 }

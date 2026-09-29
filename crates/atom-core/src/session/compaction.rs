@@ -546,9 +546,7 @@ pub(crate) async fn post_chat_completion(
         .post(format!("{base_url}/chat/completions"))
         .header("Content-Type", "application/json")
         .header("Authorization", format!("Bearer {key}"));
-    for (name, value) in
-        crate::providers::providers::opencode_headers(base_url, session_key)
-    {
+    for (name, value) in crate::providers::providers::opencode_headers(base_url, session_key) {
         request = request.header(name, value);
     }
     let mut attempt = 0usize;

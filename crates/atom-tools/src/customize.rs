@@ -57,8 +57,10 @@ Restart atom to apply.
 Each entry becomes model tools prefixed `mcp_<server>_<tool>`.
 
 - File: `<dir>/mcp.json`
-- Discovery: `<atom config>/mcp.json`, then `.atom/mcp.json` and
-  `.cursor/mcp.json` walking up from cwd.
+- Discovery: `<atom config>/mcp.json`, then `.atom/mcp.json`,
+  `.cursor/mcp.json`, and Claude Code's shared `.mcp.json` walking up
+  from cwd. Closest dir wins; within a dir `.atom` > `.cursor` >
+  `.mcp.json`.
 - Schema:
 
 ```json
@@ -82,7 +84,8 @@ Each entry becomes model tools prefixed `mcp_<server>_<tool>`.
 ```
 
 - `"disabled": true` skips the server without deleting it.
-- Env values support `{env:NAME}` token expansion.
+- Env values support `{env:NAME}`, `${VAR}`, and `${VAR:-default}`
+  token expansion.
 - Servers exposing >20 tools auto-defer to `find_tool`; set
   `"defer": true` to force, `false` to override.
 - `"auth": "oauth"` opts into interactive browser sign-in on 401.

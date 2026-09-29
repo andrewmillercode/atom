@@ -52,6 +52,16 @@ pub struct WebFetchConfig {
     pub tool: String,
 }
 
+/// Subagent model override. Empty `provider`/`model` means subagents
+/// inherit the session's model.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentConfig {
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub model: String,
+}
+
 /// Auto-review settings. Empty `provider`/`model` means the reviewer
 /// runs on the session's own model.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,6 +164,8 @@ pub struct AtomConfig {
     pub web_fetch: Option<WebFetchConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reviewer: Option<ReviewerConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent: Option<SubagentConfig>,
     /// `None` means auto-update is enabled (the default). Set to `false`
     /// to disable the startup auto-updater.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -183,6 +195,7 @@ impl Default for AtomConfig {
             web_search: None,
             web_fetch: None,
             reviewer: None,
+            subagent: None,
             auto_update: None,
             theme: None,
             transparent_background: None,
@@ -195,6 +208,12 @@ impl AtomConfig {
     /// and `Some(true)` both enable it; only an explicit `false` disables.
     pub fn resolved_auto_update(&self) -> bool {
         self.auto_update.unwrap_or(true)
+    }
+
+    /// The subagent model override, resolved to the empty (inherit)
+    /// default when unset.
+    pub fn resolved_subagent(&self) -> SubagentConfig {
+        self.subagent.clone().unwrap_or_default()
     }
 
     pub fn resolved_compaction(&self) -> CompactionConfig {

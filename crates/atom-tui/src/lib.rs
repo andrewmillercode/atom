@@ -732,6 +732,35 @@ async fn run_effects(
                     let _ = tx.send(AppMsg::ModelsLoaded(entries));
                 });
             }
+            Effect::FetchAcpConfigs => {
+                let cwd = app.cwd.clone();
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let agents = atom_tools::acp::load_acp_configs(&cwd);
+                    let mut results = Vec::new();
+                    for name in agents.keys() {
+                        let res = match api::fetch_acp_config(name, &cwd).await {
+                            Ok(v) => {
+                                let options = atom_tools::acp::parse_config_options(
+                                    v.get("configOptions").unwrap_or(&serde_json::Value::Null),
+                                );
+                                if v.get("error").is_some() && options.is_empty() {
+                                    Err(v
+                                        .get("error")
+                                        .and_then(|e| e.as_str())
+                                        .unwrap_or("failed")
+                                        .to_string())
+                                } else {
+                                    Ok(options)
+                                }
+                            }
+                            Err(e) => Err(e.to_string()),
+                        };
+                        results.push((name.clone(), res));
+                    }
+                    let _ = tx.send(AppMsg::AcpConfigsLoaded(results));
+                });
+            }
             Effect::FetchSessions => {
                 let tx = tx.clone();
                 tokio::spawn(async move {
@@ -854,11 +883,14 @@ async fn run_effects(
                 model,
                 cwd,
                 thinking,
+                acp_selected,
             } => {
                 let tx = tx.clone();
                 tokio::spawn(async move {
                     let _ = api::ensure_server().await;
-                    match api::create_session(&provider, &model, &cwd, &thinking).await {
+                    match api::create_session(&provider, &model, &cwd, &thinking, &acp_selected)
+                        .await
+                    {
                         Ok(info) => {
                             let _ = tx.send(AppMsg::CreatedSession(Box::new(info)));
                         }
@@ -872,12 +904,14 @@ async fn run_effects(
                 provider,
                 model,
                 thinking,
+                acp_selected,
             } => {
                 let id = app.session.id.clone();
                 let tx = tx.clone();
                 tokio::spawn(async move {
                     if let Err(e) =
-                        api::patch_session_model(&id, &provider, &model, &thinking).await
+                        api::patch_session_model(&id, &provider, &model, &thinking, &acp_selected)
+                            .await
                     {
                         let _ = tx.send(AppMsg::Errored(e.to_string()));
                     }

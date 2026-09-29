@@ -99,6 +99,10 @@ struct CreateBody {
     cwd: String,
     #[serde(default)]
     thinking: String,
+    /// ACP config-option selections ({configId: value}) applied by the
+    /// turn driver via session/set_config_option.
+    #[serde(default)]
+    acp_selected: Value,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -133,6 +137,8 @@ struct PatchBody {
     thinking: Option<String>,
     #[serde(default)]
     cwd: String,
+    #[serde(default)]
+    acp_selected: Value,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -219,6 +225,24 @@ async fn route(
                 .await;
             return full_body(serde_json::to_value(report).unwrap_or(Value::Null));
         }
+        "/api/acp/config" => {
+            if method != "POST" {
+                return error_resp(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+            }
+            #[derive(serde::Deserialize, Default)]
+            struct AcpConfigBody {
+                #[serde(default)]
+                agent: String,
+                #[serde(default)]
+                cwd: String,
+            }
+            let body: AcpConfigBody = decode(req).await.unwrap_or_default();
+            if body.agent.is_empty() {
+                return error_resp(StatusCode::BAD_REQUEST, "agent is required");
+            }
+            drop(guard);
+            return full_body(acp_config_probe(state, &body.agent, &body.cwd).await);
+        }
         "/api/keepalive" => {
             if method != "GET" {
                 return error_resp(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
@@ -295,6 +319,15 @@ async fn route(
                         r
                     }
                 }
+                "subagent" => {
+                    if method != "POST" {
+                        error_resp(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
+                    } else {
+                        let r = handle_subagent_call(state, req, id).await;
+                        drop(guard);
+                        r
+                    }
+                }
                 "children" => {
                     if method != "GET" {
                         error_resp(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
@@ -363,6 +396,17 @@ async fn sessions_index(
                         store.update_thinking(&sess.id, &thinking);
                         sess.thinking = thinking;
                     }
+                    if let Some(selected) = body.acp_selected.as_object() {
+                        for (config_id, value) in selected {
+                            if let Some(v) = value.as_str() {
+                                store.update_acp_selected(&sess.id, config_id, v);
+                                if let Some(selected) = sess.acp_selected.as_object_mut() {
+                                    selected
+                                        .insert(config_id.clone(), Value::String(v.to_string()));
+                                }
+                            }
+                        }
+                    }
                     sess
                 })
                 .await;
@@ -413,10 +457,11 @@ async fn session_item(
                 && body.provider.is_empty()
                 && body.thinking.is_none()
                 && body.cwd.is_empty()
+                && body.acp_selected.is_null()
             {
                 return error_resp(
                     StatusCode::BAD_REQUEST,
-                    "model, provider, thinking, or cwd is required",
+                    "model, provider, thinking, cwd, or acp_selected is required",
                 );
             }
             if !body.cwd.is_empty() && !std::path::Path::new(&body.cwd).is_absolute() {
@@ -436,6 +481,13 @@ async fn session_item(
                     }
                     if !body.cwd.is_empty() {
                         store.update_cwd(&patch_id, &body.cwd);
+                    }
+                    if let Some(selected) = body.acp_selected.as_object() {
+                        for (config_id, value) in selected {
+                            if let Some(v) = value.as_str() {
+                                store.update_acp_selected(&patch_id, config_id, v);
+                            }
+                        }
                     }
                 })
                 .await;
@@ -780,6 +832,80 @@ async fn handle_send(
     resp
 }
 
+/// GET /api/acp/config?agent=name[&cwd=…] launches (or reuses) the
+/// agent and returns its session config options, so the TUI can render
+/// model / thought-level selectors before a session exists. The probe
+/// drains the config_option_update notifications that race session/new,
+/// primes empty model options with a set round-trip, and folds in the
+/// agent's models_command catalog (Devin advertises only its account's
+/// current model). Results are cached per (agent, cwd) — a probe costs
+/// one agent-side session.
+async fn acp_config_probe(state: &Arc<AppState>, agent: &str, cwd: &str) -> Value {
+    static PROBES: once_cell::sync::Lazy<
+        std::sync::Mutex<std::collections::HashMap<String, Value>>,
+    > = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let cwd = if cwd.is_empty() {
+        std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default()
+    } else {
+        cwd.to_string()
+    };
+    let key = format!("{agent}\x00{cwd}");
+    if let Some(cached) = PROBES.lock().unwrap().get(&key) {
+        return cached.clone();
+    }
+    if !std::path::Path::new(&cwd).is_absolute() {
+        return json!({"error": "cwd must be absolute"});
+    }
+    let configs = atom_tools::acp::load_acp_configs(&cwd);
+    let Some(cfg) = configs.get(agent).cloned() else {
+        return json!({"error": format!("unknown ACP agent \"{agent}\"")});
+    };
+    let handler = crate::acp_turn::ServerAcpHandler::new(state.clone());
+    let agent_process = match atom_tools::acp::get_connection(
+        agent,
+        &cfg,
+        std::path::Path::new(&cwd),
+        Some(Arc::new(handler)),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(err) => return json!({"error": err}),
+    };
+    let result = match atom_tools::acp::probe_session_config(
+        &agent_process.conn,
+        json!({"cwd": cwd, "mcpServers": []}),
+    )
+    .await
+    {
+        Ok(probe) => {
+            let mut options = probe.picker_options();
+            if let Ok(catalog) = atom_tools::acp::fetch_model_catalog(&cfg).await {
+                options = atom_tools::acp::options_with_model_catalog(&options, &catalog);
+            }
+            let models = probe
+                .models
+                .as_ref()
+                .map(serde_json::to_value)
+                .unwrap_or(Ok(Value::Null))
+                .unwrap_or(Value::Null);
+            json!({
+                "agent": agent,
+                "configOptions": serde_json::to_value(&options).unwrap_or(Value::Null),
+                "models": models,
+                "modes": serde_json::to_value(&probe.modes).unwrap_or(Value::Null),
+            })
+        }
+        Err(err) => json!({"error": err}),
+    };
+    if result.get("error").is_none() {
+        PROBES.lock().unwrap().insert(key, result.clone());
+    }
+    result
+}
+
 /// POST /api/sessions/{id}/compact folds the session on demand. Unlike
 /// the auto path it ignores the token threshold. Optional JSON field
 /// "instructions" is forwarded to the summarizer as extra focus.
@@ -805,6 +931,12 @@ async fn handle_compact(state: &Arc<AppState>, req: &mut Request<Incoming>, id: 
     if compact_span(&sess).is_none() {
         return error_resp(StatusCode::BAD_REQUEST, "nothing to compact");
     }
+    if sess.provider == atom_tools::acp::ACP_PROVIDER_NAME {
+        return error_resp(
+            StatusCode::BAD_REQUEST,
+            "agent-driven sessions own their own context; compaction does not apply",
+        );
+    }
 
     let target = compaction_target().await;
     if let Err(err) = compact_session(
@@ -827,6 +959,57 @@ async fn handle_compact(state: &Arc<AppState>, req: &mut Request<Incoming>, id: 
         "summary": sess.compaction_summary,
         "compacted_through": sess.compacted_through,
     }))
+}
+
+/// POST /api/sessions/{id}/subagent — run the `subagent` tool on behalf
+/// of an ACP agent (via `atom -mcp-bridge`). Body `{"arguments": {…}}`;
+/// response `{"text": …}` is the tool's model-visible result.
+async fn handle_subagent_call(
+    state: &Arc<AppState>,
+    req: &mut Request<Incoming>,
+    id: &str,
+) -> Resp {
+    #[derive(serde::Deserialize, Default)]
+    struct SubagentBody {
+        #[serde(default)]
+        arguments: Value,
+    }
+    let Some(info) = state.store.get_info(id) else {
+        return error_resp(StatusCode::NOT_FOUND, "session not found");
+    };
+    if !info.parent_id.is_empty() {
+        return error_resp(
+            StatusCode::CONFLICT,
+            "subagents cannot dispatch nested subagents",
+        );
+    }
+    let body: SubagentBody = match decode(req).await {
+        Ok(body) => body,
+        Err(err) => return error_resp(StatusCode::BAD_REQUEST, &err.to_string()),
+    };
+    let cancel = crate::acp_turn::turn_cancel_for(id).unwrap_or_default();
+    let bridge = crate::dispatch::DispatchBridge::new(
+        state.clone(),
+        id.to_string(),
+        cancel,
+        String::new(),
+        String::new(),
+        String::new(),
+    );
+    let approver = crate::dispatch::ServerApprover::new(state.clone(), id.to_string());
+    let ctx = atom_tools::ToolCtx {
+        cwd: PathBuf::new(),
+        session_id: id.to_string(),
+        api_key: String::new(),
+        base_url: String::new(),
+        reasoning_field: String::new(),
+        sandbox_cfg: state.cfg.clone(),
+        approver: &approver,
+        spawner: Some(&bridge),
+        file_seen: None,
+    };
+    let text = atom_tools::dispatch::execute_dispatch(&ctx, &body.arguments.to_string()).await;
+    full_body(json!({"text": text}))
 }
 
 /// POST /api/sessions/{id}/fork — create a child session whose
@@ -898,6 +1081,11 @@ async fn handle_fork(state: &Arc<AppState>, req: &mut Request<Incoming>, id: &st
         parent_id: String::new(),
         thinking: source.thinking.clone(),
         cancelled: false,
+        acp_session_id: String::new(),
+        acp_config_options: Value::Null,
+        acp_selected: Value::Null,
+        acp_models: Value::Null,
+        acp_modes: Value::Null,
         status: DelegateStatus::Done,
         batch_id: String::new(),
         batch_index: 0,
@@ -996,6 +1184,7 @@ pub async fn idle_monitor(state: Arc<AppState>) {
         unlink_socket_if_no_listener(&socket_path());
         let _ = std::fs::remove_file(data_dir().join("server.pid"));
         atom_tools::close_all_mcp();
+        atom_tools::acp::close_all_acp();
         std::process::exit(0);
     }
 }
@@ -1021,6 +1210,7 @@ async fn signal_shutdown(socket: PathBuf) {
     let _ = std::fs::remove_file(&socket);
     let _ = std::fs::remove_file(data_dir().join("server.pid"));
     atom_tools::close_all_mcp();
+    atom_tools::acp::close_all_acp();
     std::process::exit(0);
 }
 

@@ -70,10 +70,14 @@ pub fn usage_string(app: &App, _inner_width: usize) -> String {
     if u.total_tokens <= 0 {
         return String::new();
     }
-    let w = atom_core::providers::modelsdev::context_window_tokens(
-        &app.sel_provider.name,
-        &app.sel_model,
-    );
+    let w = if u.context_window > 0 {
+        u.context_window
+    } else {
+        atom_core::providers::modelsdev::context_window_tokens(
+            &app.sel_provider.name,
+            &app.sel_model,
+        )
+    };
     let ctx = atom_core::util::format_tokens(u.total_tokens);
     if w > 0 {
         // Round to the nearest percent so 243.5K in a 400K window reads 61%.
@@ -130,16 +134,25 @@ fn head_from_spans(text: String, spans: Vec<Span<'static>>) -> Head {
 
 fn status_head(app: &App) -> Head {
     let lvl = app.thinking_level();
-    let profile = app.profile_name();
+    let acp_parts = (app.sel_provider.name == atom_tools::acp::ACP_PROVIDER_NAME)
+        .then(|| app.acp_model_parts(&app.sel_model))
+        .flatten();
     let mut text = String::new();
     let mut spans = Vec::new();
     for (label, style) in [
         // Provider first, in the muted style of the context meter.
-        (!app.sel_provider.name.is_empty())
+        (!app.sel_provider.name.is_empty() && acp_parts.is_none())
             .then(|| (app.sel_provider.name.clone(), ansi::style_dim())),
-        (!app.sel_model.is_empty()).then(|| (app.sel_model.clone(), ansi::style_foreground())),
+        acp_parts
+            .as_ref()
+            .map(|(agent, _)| (agent.clone(), ansi::style_dim())),
+        (!app.sel_model.is_empty()).then(|| {
+            let model = acp_parts
+                .as_ref()
+                .map_or_else(|| app.sel_model.clone(), |(_, name)| name.clone());
+            (model, ansi::style_foreground())
+        }),
         (!lvl.is_empty()).then(|| (lvl, ansi::style_primary())),
-        (!profile.is_empty()).then(|| (profile, ansi::style_dim())),
     ]
     .into_iter()
     .flatten()

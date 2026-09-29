@@ -143,6 +143,7 @@ pub fn parse_stream_event(v: &Value) -> StreamEvent {
                 cache_read_tokens: num("cache_read"),
                 cache_write_tokens: num("cache_write"),
                 prompt_tokens_all: num("prompt_all"),
+                context_window: num("window"),
                 ..Default::default()
             });
         }
@@ -188,6 +189,9 @@ pub enum Effect {
     Quit,
     EnsureCatalog,
     FetchModels,
+    /// Launch each configured ACP agent (reusing the server's hub) and
+    /// fetch its session config options; delivers AcpConfigsLoaded.
+    FetchAcpConfigs,
     FetchSessions,
     FetchStats {
         days: i64,
@@ -233,11 +237,13 @@ pub enum Effect {
         model: String,
         cwd: String,
         thinking: String,
+        acp_selected: serde_json::Value,
     },
     PatchSessionModel {
         provider: String,
         model: String,
         thinking: String,
+        acp_selected: serde_json::Value,
     },
     PatchSessionThinking,
     DeleteSession {
@@ -316,6 +322,8 @@ pub enum AppMsg {
     Resize(u16, u16),
     Paste(String),
     ModelsLoaded(Vec<ModelEntry>),
+    /// One entry per configured ACP agent: name → its config options.
+    AcpConfigsLoaded(Vec<(String, Result<Vec<atom_tools::acp::ConfigOption>, String>)>),
     SessionsLoaded(Vec<SessionInfo>),
     ChildrenLoaded {
         id: String,
@@ -432,6 +440,7 @@ impl std::fmt::Debug for AppMsg {
             AppMsg::Resize(w, h) => write!(f, "Resize({w},{h})"),
             AppMsg::Paste(_) => write!(f, "Paste(..)"),
             AppMsg::ModelsLoaded(n) => write!(f, "ModelsLoaded({n})", n = n.len()),
+            AppMsg::AcpConfigsLoaded(n) => write!(f, "AcpConfigsLoaded({n})", n = n.len()),
             AppMsg::SessionsLoaded(n) => write!(f, "SessionsLoaded({n})", n = n.len()),
             AppMsg::ChildrenLoaded { id, agents } => {
                 write!(f, "ChildrenLoaded({id}, {n})", n = agents.len())

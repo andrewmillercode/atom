@@ -20,7 +20,7 @@ pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// dispatch result: how long `wait:true` blocks for a subagent's turn to
 /// finish before returning the current state.
-const RESULT_WAIT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+pub(crate) const RESULT_WAIT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// dispatch result: poll interval while waiting.
 const RESULT_WAIT_POLL: Duration = Duration::from_millis(200);
 /// dispatch result: longest transcript tail returned to the main agent.
@@ -399,6 +399,20 @@ impl DispatchBridge {
             .ok_or_else(|| format!("error: provider \"{requested}\" is not configured"))
     }
 
+    /// provider_hosting finds a configured provider serving `model`, for
+    /// callers with no provider plumbing of their own (ACP sessions).
+    async fn provider_hosting(model: &str) -> Result<atom_core::providers::Provider, String> {
+        let providers = atom_core::providers::providers::build_providers().await;
+        atom_core::providers::providers::find_provider_for_model(&providers, model)
+            .await
+            .ok_or_else(|| {
+                format!(
+                    "error: no configured provider serves subagent model \"{model}\"; \
+                     set it as provider/model in /settings → Subagent model"
+                )
+            })
+    }
+
     fn catalog_provider(provider: &atom_core::providers::Provider) -> Option<String> {
         if matches!(provider.name.as_str(), "custom" | "ollama-local") {
             return None;
@@ -441,18 +455,27 @@ impl SubagentHandle for DispatchBridge {
     /// create the child with fresh instructions, append the prompt, and
     /// kick off a detached turn.
     async fn spawn(&self, plan: DispatchPlan) -> String {
-        // The daemon does not retain the multi-megabyte catalog at idle.
-        // Dispatch is the first server-only operation that needs it.
-        atom_core::providers::modelsdev::ensure_models_dev_catalog().await;
         let parent_id = self.parent_id.clone();
         let Some(parent) = self
             .state
             .store_call(move |store| store.get(&parent_id))
             .await
         else {
-            return "error: dispatch requires an active session".into();
+            return "error: subagent requires an active session".into();
         };
 
+        // An ACP agent's model lives behind its own process, so its
+        // subagents run on the settings model and never inherit.
+        let parent_is_acp = parent.provider == atom_tools::acp::ACP_PROVIDER_NAME;
+        if parent_is_acp && plan.model.is_empty() {
+            return "error: ACP agent sessions have no atom model for subagents to inherit; \
+                    ask the user to pick one in /settings → Subagent model"
+                .into();
+        }
+        // Cheap once the catalog is in memory (read-lock check); the
+        // server warmup at spawn usually filled it already. This is the
+        // fallback for a dispatch that races a first-ever run.
+        atom_core::providers::modelsdev::ensure_models_dev_catalog().await;
         // Go inherits the caller's model BEFORE validating it.
         let model = if plan.model.is_empty() {
             parent.model.trim().to_string()
@@ -462,16 +485,29 @@ impl SubagentHandle for DispatchBridge {
         if model.is_empty() {
             return "error: model is required (no caller model to inherit)".into();
         }
-        let provider = match self.resolve_provider(&plan.provider).await {
-            Ok(provider) => provider,
-            Err(err) => return err,
+        let provider = if parent_is_acp && plan.provider.is_empty() {
+            match Self::provider_hosting(&model).await {
+                Ok(provider) => provider,
+                Err(err) => return err,
+            }
+        } else {
+            match self.resolve_provider(&plan.provider).await {
+                Ok(provider) => provider,
+                Err(err) => return err,
+            }
         };
         let err = Self::validate_model(&provider, &model).await;
         if !err.is_empty() {
             return err;
         }
         let catalog_provider = Self::catalog_provider(&provider).unwrap_or_default();
-        if !atom_tools::dispatch::valid_thinking_level(&catalog_provider, &model, &plan.thinking) {
+        if !plan.thinking.is_empty()
+            && !atom_tools::dispatch::valid_thinking_level(
+                &catalog_provider,
+                &model,
+                &plan.thinking,
+            )
+        {
             let levels = atom_tools::dispatch::reasoning_levels_for(&catalog_provider, &model);
             if !levels.is_empty() {
                 return format!("error: thinking must be one of {}", levels.join(", "));
@@ -870,16 +906,21 @@ async fn maybe_auto_continue_parent(
         format!("all {total} done")
     };
 
-    let notification = format!(
-        "[system: your subagents have finished ({status_summary}). \
-         Use dispatch action=inspect to collect their results and report back to the user.]"
-    );
-
     let load_id = parent_id.to_string();
     let Some(mut parent_sess) = state.store_call(move |store| store.get(&load_id)).await else {
         state.turns.release_prepared(parent_id);
         return;
     };
+
+    let tool_name = if parent_sess.provider == atom_tools::acp::ACP_PROVIDER_NAME {
+        "mcp__atom__subagent"
+    } else {
+        "subagent"
+    };
+    let notification = format!(
+        "[system: your subagents have finished ({status_summary}). \
+         Use the {tool_name} tool with action=inspect to collect their results and report back to the user.]"
+    );
 
     let parent_thinking = parent_sess.thinking.clone();
     let parent_id_owned = parent_id.to_string();
@@ -951,6 +992,32 @@ mod tests {
             atom_sandbox::policy::SandboxConfig::default(),
             Arc::new(crate::state::ConnTracker::default()),
         ))
+    }
+
+    #[tokio::test]
+    async fn acp_parent_requires_settings_subagent_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        let parent = state.store.create("claude-code/opus", "/tmp", vec![]);
+        state
+            .store
+            .update_provider(&parent.id, atom_tools::acp::ACP_PROVIDER_NAME);
+        let bridge = DispatchBridge::new(
+            state.clone(),
+            parent.id.clone(),
+            crate::cancel::CancelToken::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        );
+        let out = bridge
+            .spawn(DispatchPlan {
+                prompt: "look around".into(),
+                ..Default::default()
+            })
+            .await;
+        assert!(out.contains("Subagent model"), "{out}");
+        assert!(state.store.children_info(&parent.id).is_empty());
     }
 
     #[tokio::test]
@@ -1109,9 +1176,11 @@ mod tests {
             session_id: child.id.clone(),
             command: "git push".into(),
             cwd: "/repo".into(),
+            workspace_root: "/repo".into(),
             rule_id: "git-push".into(),
             reason: "push to remote".into(),
             accept_all_preview: Some("git push *".into()),
+            flagged: false,
         };
 
         // A plain session's event carries no subagent identity.
@@ -1147,9 +1216,11 @@ mod tests {
             session_id: child.id.clone(),
             command: "rm -rf build".into(),
             cwd: "/work".into(),
+            workspace_root: "/work".into(),
             rule_id: "rm-rf".into(),
             reason: "clean build dir".into(),
             accept_all_preview: None,
+            flagged: false,
         };
         let (tx, _rx) = tokio::sync::oneshot::channel();
         state

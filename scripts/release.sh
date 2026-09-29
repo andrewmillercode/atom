@@ -64,8 +64,8 @@ fi
 TAG="v${VERSION}"
 
 # --- 2. build ---------------------------------------------------------------
-echo "==> building release binaries"
-cargo build --release --bin atom --bin atoms
+echo "==> building release binary"
+cargo build --release --bin atom
 ./target/release/atom -help >/dev/null
 
 # --- commit the bump so the tagged commit contains its own version ----------
@@ -132,7 +132,7 @@ fi
 # --- 5. package, tag, release -------------------------------------------------
 ASSET="atom-${TAG}-Darwin-${ARCH}.tar.gz"
 echo "==> packaging ${ASSET}"
-tar -czf "$ASSET" -C target/release atom atoms
+tar -czf "$ASSET" -C target/release atom
 
 echo "==> tagging ${TAG} at ${REF_SHA}"
 git tag "$TAG" "$REF_SHA"

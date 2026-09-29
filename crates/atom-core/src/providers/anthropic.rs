@@ -388,16 +388,21 @@ pub async fn stream_anthropic(
     msgs: &[Message],
     tools: &[ToolDef],
     thinking: &str,
+    session_key: &str,
 ) -> anyhow::Result<impl futures::Stream<Item = anyhow::Result<StreamChunk>>> {
     let url = format!("{}/messages", base_url.trim_end_matches('/'));
     let max_tokens = derive_max_tokens(super::context_window_tokens("", model));
     let body = serde_json::to_vec(&marshal_anthropic_request(
         model, msgs, tools, thinking, max_tokens,
     )?)?;
+    let opencode_headers = super::providers::opencode_headers(base_url, session_key);
     let resp = retry::do_http_with_retry(|| {
-        let builder = retry::long_timeout_client()
+        let mut builder = retry::long_timeout_client()
             .post(url.clone())
             .header("Content-Type", "application/json");
+        for (name, value) in &opencode_headers {
+            builder = builder.header(name, value);
+        }
         apply_auth_headers(builder, api_key)
             .body(body.clone())
             .send()

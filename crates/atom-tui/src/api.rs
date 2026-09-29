@@ -65,10 +65,14 @@ pub async fn create_session(
     model: &str,
     cwd: &str,
     thinking: &str,
+    acp_selected: &serde_json::Value,
 ) -> Result<SessionInfo> {
     let mut body = json!({"provider": provider, "model": model, "cwd": cwd});
     if !thinking.is_empty() {
         body["thinking"] = json!(thinking);
+    }
+    if !acp_selected.is_null() {
+        body["acp_selected"] = acp_selected.clone();
     }
     let v = atom_server::client::post("/api/sessions", &body).await?;
     Ok(serde_json::from_value(v)?)
@@ -80,9 +84,19 @@ pub async fn patch_session_model(
     provider: &str,
     model: &str,
     thinking: &str,
+    acp_selected: &serde_json::Value,
 ) -> Result<Value> {
-    let body = json!({"provider": provider, "model": model, "thinking": thinking});
+    let mut body = json!({"provider": provider, "model": model, "thinking": thinking});
+    if !acp_selected.is_null() {
+        body["acp_selected"] = acp_selected.clone();
+    }
     atom_server::client::patch(&format!("/api/sessions/{id}"), &body).await
+}
+
+/// fetch_acp_config asks the server to launch (or reuse) an agent and
+/// report its session config options (model / thought level / modes).
+pub async fn fetch_acp_config(agent: &str, cwd: &str) -> Result<serde_json::Value> {
+    atom_server::client::post("/api/acp/config", &json!({"agent": agent, "cwd": cwd})).await
 }
 
 /// patchSessionThinking updates only the reasoning level.
@@ -111,32 +125,22 @@ pub async fn pause_turn(id: &str, turn_id: &str) -> Result<()> {
 }
 
 /// isActiveTurnConflict reports whether a failed /send dial was rejected
-/// with 409 "session already has an active turn": the TUI believed the
-/// session idle, but the server still has a turn registered (a raced
-/// pause, a hung tool round, or a stale entry). Callers must never
-/// surface this; the recovery is exactly what the message asks for —
-/// pause the turn, then dial again.
+/// with 409 "session already has an active turn". With mid-turn
+/// injection the server no longer answers a live turn with 409 (it
+/// queues the prompt instead), so this can only fire against an older
+/// server. Kept for clients that classify dial errors.
 pub fn is_active_turn_conflict(err: &anyhow::Error) -> bool {
     err.to_string().contains("already has an active turn")
 }
 
-/// streamSendHealed dials /send and recovers from the 409
-/// active-turn conflict instead of surfacing it: pause every active
-/// turn of the session, then retry once. The pause waits server-side
-/// until the turn has fully unwound, so the retry starts from a clean
-/// idle state. Any other error (or a second 409, meaning the turn
-/// would not stop) is returned untouched.
-pub async fn stream_send_healed(
+/// send posts a turn to /send and returns the NDJSON event channel.
+/// When a turn is already active the server injects the prompt into it
+/// and answers with a tiny {"type":"injected"} stream that closes, so
+/// this never pauses anything and never sees a 409.
+pub async fn stream_send(
     req: &crate::events::SendRequest,
 ) -> Result<tokio::sync::mpsc::Receiver<Value>> {
-    match stream_send(req).await {
-        Ok(rx) => Ok(rx),
-        Err(e) if is_active_turn_conflict(&e) => {
-            let _ = pause_turn(&req.session_id, "").await;
-            stream_send(req).await
-        }
-        Err(e) => Err(e),
-    }
+    atom_server::client::stream_send(&req.session_id, &req.to_body()).await
 }
 
 /// compact folds history on an in-flight turn.
@@ -155,13 +159,6 @@ pub async fn fetch_stats_report(days: i64) -> Result<StatsReport> {
     };
     let v = atom_server::client::get(&path).await?;
     Ok(serde_json::from_value(v)?)
-}
-
-/// send posts a turn to /send and returns the NDJSON event channel.
-pub async fn stream_send(
-    req: &crate::events::SendRequest,
-) -> Result<tokio::sync::mpsc::Receiver<Value>> {
-    atom_server::client::stream_send(&req.session_id, &req.to_body()).await
 }
 
 /// subscribe opens the /events NDJSON channel.

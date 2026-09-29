@@ -1,7 +1,8 @@
-//! dispatch tool, ported from dispatch.go: argument validation
-//! (model catalog + thinking levels via an injectable ModelCatalog),
-//! session-id parsing helpers, and DispatchPlan routing through the
-//! ctx spawner. Session-store work (child creation, ownership checks,
+//! subagent tool (internally still dispatch, ported from dispatch.go):
+//! argument validation (model catalog + thinking levels via an
+//! injectable ModelCatalog), session-id parsing helpers, and
+//! DispatchPlan routing through the ctx spawner.
+//! Session-store work (child creation, ownership checks,
 //! nested-dispatch guard) lives behind SubagentHandle because Go's
 //! executeDispatch reaches into *SessionStore/*Session directly.
 
@@ -208,81 +209,6 @@ pub fn is_dispatch_session_id(id: &str) -> bool {
     id.len() == 16 && id.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-pub async fn execute_dispatch_models(ctx: &ToolCtx<'_>, arguments: &str) -> String {
-    #[derive(serde::Deserialize)]
-    struct Args {
-        #[serde(default)]
-        query: String,
-    }
-
-    if arguments.trim().is_empty() {
-        return crate::exec::empty_arguments_msg("dispatch_models");
-    }
-    let args: Args = match serde_json::from_str(arguments) {
-        Ok(args) => args,
-        Err(err) => return format!("error parsing arguments: {err}"),
-    };
-
-    atom_core::providers::modelsdev::ensure_models_dev_catalog().await;
-    let active_name = atom_core::providers::provider_name_for_url(&ctx.base_url);
-    let active_id = if matches!(active_name.as_str(), "custom" | "ollama-local") {
-        String::new()
-    } else {
-        atom_core::providers::modelsdev::models_dev_provider_id(&active_name)
-    };
-    let mut providers = atom_core::providers::providers::build_providers().await;
-    if !providers.iter().any(|provider| {
-        provider.base_url.trim_end_matches('/') == ctx.base_url.trim_end_matches('/')
-    }) {
-        providers.push(atom_core::providers::Provider {
-            name: active_name,
-            id: active_id,
-            base_url: ctx.base_url.clone(),
-            key: ctx.api_key.clone(),
-            reasoning_field: ctx.reasoning_field.clone(),
-        });
-    }
-
-    let results = futures::future::join_all(providers.into_iter().map(|provider| async move {
-        let models = atom_core::providers::providers::fetch_models(&provider).await;
-        (provider.name, models)
-    }))
-    .await;
-    let available = results
-        .into_iter()
-        .filter_map(|(provider, result)| result.ok().map(|models| (provider, models)))
-        .collect();
-    format_dispatch_models(&args.query, available)
-}
-
-fn format_dispatch_models(query: &str, providers: Vec<(String, Vec<String>)>) -> String {
-    let query = query.trim().to_lowercase();
-    let mut providers: Vec<(String, Vec<String>)> = providers
-        .into_iter()
-        .filter_map(|(provider, models)| {
-            let mut models: Vec<String> = models
-                .into_iter()
-                .filter(|model| query.is_empty() || model.to_lowercase().contains(&query))
-                .collect();
-            models.sort();
-            models.dedup();
-            (!models.is_empty()).then_some((provider, models))
-        })
-        .collect();
-    providers.sort_by(|a, b| a.0.cmp(&b.0));
-    serde_json::json!({
-        "query": query,
-        "providers": providers
-            .into_iter()
-            .map(|(provider, models)| serde_json::json!({
-                "provider": provider,
-                "models": models,
-            }))
-            .collect::<Vec<_>>(),
-    })
-    .to_string()
-}
-
 // ---------------------------------------------------------------------------
 // Tool body.
 // ---------------------------------------------------------------------------
@@ -294,12 +220,6 @@ const MAX_DISPATCH_BATCH: usize = 100;
 struct DispatchArgs {
     action: String,
     #[serde(default)]
-    provider: String,
-    #[serde(default)]
-    model: String,
-    #[serde(default)]
-    thinking: String,
-    #[serde(default)]
     prompt: String,
     #[serde(default, deserialize_with = "string_or_vec")]
     tasks: Vec<String>,
@@ -309,7 +229,6 @@ struct DispatchArgs {
     wait: String,
     results: Option<bool>,
     statuses: Vec<String>,
-    query: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -357,28 +276,21 @@ where
 /// store/parent error.
 pub async fn execute_dispatch(ctx: &ToolCtx<'_>, arguments: &str) -> String {
     if arguments.trim().is_empty() {
-        return crate::exec::empty_arguments_msg("dispatch");
+        return crate::exec::empty_arguments_msg("subagent");
     }
     let args: DispatchArgs = match serde_json::from_str(arguments) {
         Ok(a) => a,
         Err(e) => return format!("error parsing arguments: {e}"),
     };
     let Some(spawner) = ctx.spawner else {
-        return "error: dispatch requires an active session".to_string();
+        return "error: subagent requires an active session".to_string();
     };
     let action = args.action.trim();
-    if action == "models" {
-        return execute_dispatch_models(ctx, &serde_json::json!({"query": args.query}).to_string())
-            .await;
-    }
     if !matches!(args.wait.as_str(), "" | "none" | "any" | "all") {
         return "error: wait must be one of none, any, all".to_string();
     }
 
-    let base = DispatchPlan {
-        provider: args.provider.trim().to_string(),
-        model: args.model.trim().to_string(),
-        thinking: args.thinking.trim().to_string(),
+    let mut base = DispatchPlan {
         prompt: args.prompt.trim().to_string(),
         wait_mode: if args.wait.is_empty() {
             "none".into()
@@ -403,6 +315,23 @@ pub async fn execute_dispatch(ctx: &ToolCtx<'_>, arguments: &str) -> String {
             }
             if args.tasks.iter().any(|task| task.trim().is_empty()) {
                 return "error: every task must be a non-empty string".to_string();
+            }
+            // Subagent model override from settings (`provider/model`
+            // model id routes the child to that provider); empty means
+            // the child inherits the caller's model.
+            if base.model.is_empty() {
+                let subagent = atom_core::config::load().subagent.unwrap_or_default();
+                if !subagent.model.trim().is_empty() {
+                    base.model = subagent.model.trim().to_string();
+                    if subagent.provider.trim().is_empty() {
+                        if let Some((provider, model)) = base.model.split_once('/') {
+                            base.provider = provider.to_string();
+                            base.model = model.to_string();
+                        }
+                    } else {
+                        base.provider = subagent.provider.trim().to_string();
+                    }
+                }
             }
             let batch_id = atom_core::session::store::new_session_id();
             let plans = args
@@ -434,7 +363,6 @@ pub async fn execute_dispatch(ctx: &ToolCtx<'_>, arguments: &str) -> String {
                 plans.push(DispatchPlan {
                     session_id: message.id.trim().to_string(),
                     prompt: message.prompt.trim().to_string(),
-                    thinking: base.thinking.clone(),
                     ..Default::default()
                 });
             }
@@ -449,7 +377,6 @@ pub async fn execute_dispatch(ctx: &ToolCtx<'_>, arguments: &str) -> String {
                 plans.extend(ids.into_iter().map(|session_id| DispatchPlan {
                     session_id,
                     prompt: base.prompt.clone(),
-                    thinking: base.thinking.clone(),
                     ..Default::default()
                 }));
             }
@@ -498,7 +425,7 @@ pub async fn execute_dispatch(ctx: &ToolCtx<'_>, arguments: &str) -> String {
                 })
                 .await
         }
-        _ => "error: action must be one of models, spawn, inspect, send, cancel".to_string(),
+        _ => "error: action must be one of spawn, inspect, send, cancel".to_string(),
     }
 }
 
@@ -552,34 +479,6 @@ mod tests {
         assert!(!is_dispatch_session_id("short"));
         assert!(!is_dispatch_session_id("0123456789abcdeg"));
         assert!(!is_dispatch_session_id(""));
-    }
-
-    #[test]
-    fn dispatch_models_are_sorted_deduplicated_and_filtered() {
-        let output = format_dispatch_models(
-            "GPT",
-            vec![
-                ("z-provider".into(), vec!["other".into()]),
-                (
-                    "opencode-go".into(),
-                    vec!["gpt-5.6-sol".into(), "gpt-5.6-sol".into()],
-                ),
-            ],
-        );
-        let output: serde_json::Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(output["providers"][0]["provider"], "opencode-go");
-        assert_eq!(
-            output["providers"][0]["models"],
-            serde_json::json!(["gpt-5.6-sol"])
-        );
-
-        assert_eq!(
-            format_dispatch_models(
-                "missing",
-                vec![("opencode-go".into(), vec!["gpt-5.6-sol".into()])]
-            ),
-            r#"{"providers":[],"query":"missing"}"#
-        );
     }
 
     struct FakeCatalog {

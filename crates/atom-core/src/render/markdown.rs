@@ -25,7 +25,7 @@ use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Par
 
 use super::colors::{ansi_fg, COLOR_FOREGROUND, COLOR_MUTED, COLOR_SECONDARY, COLOR_SYNTAX_STRING};
 use super::highlight::highlight_code;
-use super::links::{ansi_wrap, osc8_close, osc8_open, visible_width};
+use super::links::{ansi_wrap, osc8_close, osc8_open, render_link, url_segments, visible_width};
 use super::math_inline;
 
 const BOLD: &str = "\x1b[1m";
@@ -274,8 +274,9 @@ struct Renderer<'a> {
     /// Base for resolving relative file paths in prose so the OSC 8
     /// URI is the absolute one the OS will open. Borrowed from the
     /// caller; lives for the render duration. Currently unused
-    /// because prose path/URL detection was removed, but kept on
-    /// the public `render_markdown` API for forward compat.
+    /// because prose path detection is not performed (web URLs need
+    /// no base), but kept on the public `render_markdown` API for
+    /// forward compat.
     #[allow(dead_code)]
     cwd: &'a str,
 }
@@ -303,12 +304,25 @@ impl<'a> Renderer<'a> {
             Event::Text(t) => {
                 if let Some(code) = self.code.as_mut() {
                     code.buf.push_str(&t);
+                } else if self.heading.is_some() || self.in_link() {
+                    // Headings and link display text stay verbatim: a
+                    // mid-heading link would reset the heading's bold,
+                    // and autolink bodies are already inside an OSC 8
+                    // region.
+                    self.sink().push_str(&t);
+                } else if t.contains("http://") || t.contains("https://") {
+                    for (chunk, is_url) in url_segments(&t) {
+                        if is_url {
+                            let sink = self.sink();
+                            sink.push_str(&render_link(chunk, chunk, "", ""));
+                            let reopened: Vec<String> =
+                                self.spans.iter().map(Active::open_repr).collect();
+                            self.sink().push_str(&reopened.concat());
+                        } else {
+                            self.sink().push_str(chunk);
+                        }
+                    }
                 } else {
-                    // Plain prose is emitted as-is. Markdown-style
-                    // `[label](url)` links are handled structurally by
-                    // the Tag::Link branch; bare URLs and paths in
-                    // prose are intentionally not auto-linked (see the
-                    // module doc on `render::links`).
                     self.sink().push_str(&t);
                 }
             }
@@ -611,6 +625,10 @@ impl<'a> Renderer<'a> {
     }
 
     // -- inline spans ------------------------------------------------------
+
+    fn in_link(&self) -> bool {
+        self.spans.iter().any(|s| matches!(s, Active::Link(_)))
+    }
 
     fn sink(&mut self) -> &mut String {
         if let Some(t) = self.table.as_mut() {
@@ -1058,9 +1076,62 @@ mod tests {
             "missing OSC 8 open for autolink: {got:?}"
         );
 
-        // Plain text never gains hyperlink wrappers.
         let got = render_markdown("no links here", 80, "");
         assert!(!got.contains("\x1b]8;;"), "{got:?}");
+    }
+
+    #[test]
+    fn bare_web_urls_in_prose_carry_osc8() {
+        let got = render_markdown("visit https://example.com/x today", 80, "");
+        assert!(
+            got.contains("\x1b]8;;https://example.com/x\x07"),
+            "bare URL not linked: {got:?}"
+        );
+        assert!(got.contains("https://example.com/x"));
+
+        // localhost and loopback hosts behave like any other host.
+        let got = render_markdown("run http://localhost:3000/health", 80, "");
+        assert!(
+            got.contains("\x1b]8;;http://localhost:3000/health\x07"),
+            "localhost URL not linked: {got:?}"
+        );
+
+        // A URL wrapped mid-way by the paragraph wrapper keeps its
+        // region on continuation rows (regions thread across lines).
+        let long = format!(
+            "prose {} tail",
+            "https://a.example.com/".to_string() + &"p".repeat(120)
+        );
+        let got = render_markdown(&long, 30, "");
+        assert!(
+            got.contains("\x1b]8;;"),
+            "wrapped bare URL lost its region: {got:?}"
+        );
+    }
+
+    #[test]
+    fn bare_urls_not_double_wrapped_or_linked_in_code() {
+        // Structural markdown link: exactly one region, the display
+        // text never nests a second wrapper.
+        let got = render_markdown("[docs](https://example.com/a)", 80, "");
+        assert_eq!(got.matches("\x1b]8;;").count(), 2, "{got:?}");
+
+        // Autolink display text is the URL itself: still one region.
+        let got = render_markdown("<https://example.com/a>", 80, "");
+        assert_eq!(got.matches("\x1b]8;;").count(), 2, "{got:?}");
+
+        // Code spans, fenced code, and headings stay verbatim.
+        for src in [
+            "`https://example.com`",
+            "```\nhttps://example.com\n```",
+            "# see https://example.com",
+        ] {
+            let got = render_markdown(src, 80, "");
+            assert!(
+                !got.contains("\x1b]8;;"),
+                "{src:?} leaked an OSC 8 region: {got:?}"
+            );
+        }
     }
 
     #[test]

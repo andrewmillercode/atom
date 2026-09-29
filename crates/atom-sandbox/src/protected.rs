@@ -242,10 +242,14 @@ mod tests {
 
     #[test]
     fn path_entries_protected() {
+        let _env = crate::testutil::env_lock();
         let home = tmpdir().join("home");
         // ~/.local/bin is on this machine's PATH in practice, but don't
-        // depend on the environment: point PATH at a known scratch dir.
+        // depend on the environment: point PATH at a known scratch dir,
+        // then restore — a clobbered PATH breaks command lookups in
+        // parallel tests (exec.rs spawns real commands).
         let bindir = tmpdir().join("bin");
+        let prev = std::env::var_os("PATH");
         unsafe {
             std::env::set_var("PATH", &bindir);
         }
@@ -255,6 +259,10 @@ mod tests {
             None,
             None
         ));
+        match prev {
+            Some(v) => unsafe { std::env::set_var("PATH", v) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
     }
 
     #[test]

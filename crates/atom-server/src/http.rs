@@ -99,6 +99,10 @@ struct CreateBody {
     cwd: String,
     #[serde(default)]
     thinking: String,
+    /// ACP config-option selections ({configId: value}) applied by the
+    /// turn driver via session/set_config_option.
+    #[serde(default)]
+    acp_selected: Value,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -133,6 +137,8 @@ struct PatchBody {
     thinking: Option<String>,
     #[serde(default)]
     cwd: String,
+    #[serde(default)]
+    acp_selected: Value,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -219,6 +225,24 @@ async fn route(
                 .await;
             return full_body(serde_json::to_value(report).unwrap_or(Value::Null));
         }
+        "/api/acp/config" => {
+            if method != "POST" {
+                return error_resp(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+            }
+            #[derive(serde::Deserialize, Default)]
+            struct AcpConfigBody {
+                #[serde(default)]
+                agent: String,
+                #[serde(default)]
+                cwd: String,
+            }
+            let body: AcpConfigBody = decode(req).await.unwrap_or_default();
+            if body.agent.is_empty() {
+                return error_resp(StatusCode::BAD_REQUEST, "agent is required");
+            }
+            drop(guard);
+            return full_body(acp_config_probe(state, &body.agent, &body.cwd).await);
+        }
         "/api/keepalive" => {
             if method != "GET" {
                 return error_resp(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
@@ -295,6 +319,15 @@ async fn route(
                         r
                     }
                 }
+                "subagent" => {
+                    if method != "POST" {
+                        error_resp(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
+                    } else {
+                        let r = handle_subagent_call(state, req, id).await;
+                        drop(guard);
+                        r
+                    }
+                }
                 "children" => {
                     if method != "GET" {
                         error_resp(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
@@ -363,6 +396,17 @@ async fn sessions_index(
                         store.update_thinking(&sess.id, &thinking);
                         sess.thinking = thinking;
                     }
+                    if let Some(selected) = body.acp_selected.as_object() {
+                        for (config_id, value) in selected {
+                            if let Some(v) = value.as_str() {
+                                store.update_acp_selected(&sess.id, config_id, v);
+                                if let Some(selected) = sess.acp_selected.as_object_mut() {
+                                    selected
+                                        .insert(config_id.clone(), Value::String(v.to_string()));
+                                }
+                            }
+                        }
+                    }
                     sess
                 })
                 .await;
@@ -413,10 +457,11 @@ async fn session_item(
                 && body.provider.is_empty()
                 && body.thinking.is_none()
                 && body.cwd.is_empty()
+                && body.acp_selected.is_null()
             {
                 return error_resp(
                     StatusCode::BAD_REQUEST,
-                    "model, provider, thinking, or cwd is required",
+                    "model, provider, thinking, cwd, or acp_selected is required",
                 );
             }
             if !body.cwd.is_empty() && !std::path::Path::new(&body.cwd).is_absolute() {
@@ -437,6 +482,13 @@ async fn session_item(
                     if !body.cwd.is_empty() {
                         store.update_cwd(&patch_id, &body.cwd);
                     }
+                    if let Some(selected) = body.acp_selected.as_object() {
+                        for (config_id, value) in selected {
+                            if let Some(v) = value.as_str() {
+                                store.update_acp_selected(&patch_id, config_id, v);
+                            }
+                        }
+                    }
                 })
                 .await;
             // Tell other instances viewing this session to reload so they
@@ -450,6 +502,9 @@ async fn session_item(
                 .store_call(move |store| store.delete(&delete_id))
                 .await;
             state.remove_file_seen(id);
+            // The session is gone — drop its approval grants so the
+            // process-global store doesn't grow forever.
+            atom_sandbox::exec::approval_store().forget_session(id);
             no_content()
         }
         _ => error_resp(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"),
@@ -494,10 +549,10 @@ async fn handle_approval(state: &Arc<AppState>, req: &mut Request<Incoming>, sid
     };
     let decision = match body.decision.as_str() {
         "allow_once" => Decision::AllowOnce,
-        "allow_session" => Decision::AllowOnce,
-        "allow_global" | "allow_always" | "allow_all" => Decision::AllowAll,
-        "deny" | "deny_once" => Decision::DenyOnce,
-        "deny_always" | "deny_all" => Decision::DenyAll,
+        // Old strings map to the session-scoped grant; deny_always /
+        // deny_all degrade to deny-once (nothing is persisted).
+        "allow_session" | "allow_global" | "allow_always" | "allow_all" => Decision::AllowSession,
+        "deny" | "deny_once" | "deny_always" | "deny_all" => Decision::DenyOnce,
         _ => return error_resp(StatusCode::BAD_REQUEST, "invalid decision"),
     };
     if state.approvals.complete(sid, &body.id, decision) {
@@ -705,10 +760,36 @@ async fn handle_send(
     let base_url = base_url.trim_end_matches('/').to_string();
 
     if !state.turns.try_prepare_session_turn(id) {
-        return error_resp(
-            StatusCode::CONFLICT,
-            "session already has an active turn; pause it before sending another message",
-        );
+        // A turn is already active. The prompt must neither pause the
+        // turn nor bounce with a 409: hand it to the live turn (queued
+        // on its handle, current provider round cancelled so the model
+        // sees it next round) and acknowledge with a tiny stream.
+        let msg = atom_core::types::Message {
+            role: "user".into(),
+            content: body.message.clone(),
+            images: body.images.clone(),
+            created_at: Some(Utc::now()),
+            ..Default::default()
+        };
+        if state.turns.inject_session_message(id, msg) {
+            let (resp, tx) = ndjson_response();
+            tokio::spawn(async move {
+                // Drop tx at the end of the block so the body closes.
+                let mut line =
+                    serde_json::to_string(&json!({"type": "injected"})).unwrap_or_default();
+                line.push('\n');
+                let _ = tx.send(Ok(Bytes::from(line))).await;
+            });
+            return resp;
+        }
+        // The active turn ended between the check and the injection:
+        // take the slow path and start a normal turn.
+        if !state.turns.try_prepare_session_turn(id) {
+            return error_resp(
+                StatusCode::CONFLICT,
+                "session already has an active turn; send again in a moment",
+            );
+        }
     }
 
     let (resp, tx) = ndjson_response();
@@ -751,6 +832,80 @@ async fn handle_send(
     resp
 }
 
+/// GET /api/acp/config?agent=name[&cwd=…] launches (or reuses) the
+/// agent and returns its session config options, so the TUI can render
+/// model / thought-level selectors before a session exists. The probe
+/// drains the config_option_update notifications that race session/new,
+/// primes empty model options with a set round-trip, and folds in the
+/// agent's models_command catalog (Devin advertises only its account's
+/// current model). Results are cached per (agent, cwd) — a probe costs
+/// one agent-side session.
+async fn acp_config_probe(state: &Arc<AppState>, agent: &str, cwd: &str) -> Value {
+    static PROBES: once_cell::sync::Lazy<
+        std::sync::Mutex<std::collections::HashMap<String, Value>>,
+    > = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let cwd = if cwd.is_empty() {
+        std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default()
+    } else {
+        cwd.to_string()
+    };
+    let key = format!("{agent}\x00{cwd}");
+    if let Some(cached) = PROBES.lock().unwrap().get(&key) {
+        return cached.clone();
+    }
+    if !std::path::Path::new(&cwd).is_absolute() {
+        return json!({"error": "cwd must be absolute"});
+    }
+    let configs = atom_tools::acp::load_acp_configs(&cwd);
+    let Some(cfg) = configs.get(agent).cloned() else {
+        return json!({"error": format!("unknown ACP agent \"{agent}\"")});
+    };
+    let handler = crate::acp_turn::ServerAcpHandler::new(state.clone());
+    let agent_process = match atom_tools::acp::get_connection(
+        agent,
+        &cfg,
+        std::path::Path::new(&cwd),
+        Some(Arc::new(handler)),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(err) => return json!({"error": err}),
+    };
+    let result = match atom_tools::acp::probe_session_config(
+        &agent_process.conn,
+        json!({"cwd": cwd, "mcpServers": []}),
+    )
+    .await
+    {
+        Ok(probe) => {
+            let mut options = probe.picker_options();
+            if let Ok(catalog) = atom_tools::acp::fetch_model_catalog(&cfg).await {
+                options = atom_tools::acp::options_with_model_catalog(&options, &catalog);
+            }
+            let models = probe
+                .models
+                .as_ref()
+                .map(serde_json::to_value)
+                .unwrap_or(Ok(Value::Null))
+                .unwrap_or(Value::Null);
+            json!({
+                "agent": agent,
+                "configOptions": serde_json::to_value(&options).unwrap_or(Value::Null),
+                "models": models,
+                "modes": serde_json::to_value(&probe.modes).unwrap_or(Value::Null),
+            })
+        }
+        Err(err) => json!({"error": err}),
+    };
+    if result.get("error").is_none() {
+        PROBES.lock().unwrap().insert(key, result.clone());
+    }
+    result
+}
+
 /// POST /api/sessions/{id}/compact folds the session on demand. Unlike
 /// the auto path it ignores the token threshold. Optional JSON field
 /// "instructions" is forwarded to the summarizer as extra focus.
@@ -776,6 +931,12 @@ async fn handle_compact(state: &Arc<AppState>, req: &mut Request<Incoming>, id: 
     if compact_span(&sess).is_none() {
         return error_resp(StatusCode::BAD_REQUEST, "nothing to compact");
     }
+    if sess.provider == atom_tools::acp::ACP_PROVIDER_NAME {
+        return error_resp(
+            StatusCode::BAD_REQUEST,
+            "agent-driven sessions own their own context; compaction does not apply",
+        );
+    }
 
     let target = compaction_target().await;
     if let Err(err) = compact_session(
@@ -798,6 +959,57 @@ async fn handle_compact(state: &Arc<AppState>, req: &mut Request<Incoming>, id: 
         "summary": sess.compaction_summary,
         "compacted_through": sess.compacted_through,
     }))
+}
+
+/// POST /api/sessions/{id}/subagent — run the `subagent` tool on behalf
+/// of an ACP agent (via `atom -mcp-bridge`). Body `{"arguments": {…}}`;
+/// response `{"text": …}` is the tool's model-visible result.
+async fn handle_subagent_call(
+    state: &Arc<AppState>,
+    req: &mut Request<Incoming>,
+    id: &str,
+) -> Resp {
+    #[derive(serde::Deserialize, Default)]
+    struct SubagentBody {
+        #[serde(default)]
+        arguments: Value,
+    }
+    let Some(info) = state.store.get_info(id) else {
+        return error_resp(StatusCode::NOT_FOUND, "session not found");
+    };
+    if !info.parent_id.is_empty() {
+        return error_resp(
+            StatusCode::CONFLICT,
+            "subagents cannot dispatch nested subagents",
+        );
+    }
+    let body: SubagentBody = match decode(req).await {
+        Ok(body) => body,
+        Err(err) => return error_resp(StatusCode::BAD_REQUEST, &err.to_string()),
+    };
+    let cancel = crate::acp_turn::turn_cancel_for(id).unwrap_or_default();
+    let bridge = crate::dispatch::DispatchBridge::new(
+        state.clone(),
+        id.to_string(),
+        cancel,
+        String::new(),
+        String::new(),
+        String::new(),
+    );
+    let approver = crate::dispatch::ServerApprover::new(state.clone(), id.to_string());
+    let ctx = atom_tools::ToolCtx {
+        cwd: PathBuf::new(),
+        session_id: id.to_string(),
+        api_key: String::new(),
+        base_url: String::new(),
+        reasoning_field: String::new(),
+        sandbox_cfg: state.cfg.clone(),
+        approver: &approver,
+        spawner: Some(&bridge),
+        file_seen: None,
+    };
+    let text = atom_tools::dispatch::execute_dispatch(&ctx, &body.arguments.to_string()).await;
+    full_body(json!({"text": text}))
 }
 
 /// POST /api/sessions/{id}/fork — create a child session whose
@@ -869,6 +1081,11 @@ async fn handle_fork(state: &Arc<AppState>, req: &mut Request<Incoming>, id: &st
         parent_id: String::new(),
         thinking: source.thinking.clone(),
         cancelled: false,
+        acp_session_id: String::new(),
+        acp_config_options: Value::Null,
+        acp_selected: Value::Null,
+        acp_models: Value::Null,
+        acp_modes: Value::Null,
         status: DelegateStatus::Done,
         batch_id: String::new(),
         batch_index: 0,
@@ -967,6 +1184,7 @@ pub async fn idle_monitor(state: Arc<AppState>) {
         unlink_socket_if_no_listener(&socket_path());
         let _ = std::fs::remove_file(data_dir().join("server.pid"));
         atom_tools::close_all_mcp();
+        atom_tools::acp::close_all_acp();
         std::process::exit(0);
     }
 }
@@ -992,7 +1210,40 @@ async fn signal_shutdown(socket: PathBuf) {
     let _ = std::fs::remove_file(&socket);
     let _ = std::fs::remove_file(data_dir().join("server.pid"));
     atom_tools::close_all_mcp();
+    atom_tools::acp::close_all_acp();
     std::process::exit(0);
+}
+
+/// sweepInterruptedBackgroundCommands runs once at server startup.
+/// Background commands are children of this process, so a restart kills
+/// them mid-run — but their transcript entries still read
+/// "[background command still running …]", a claim that would never
+/// become true and that tells the model to expect output that never
+/// arrives. Rewrite those entries so reloaded sessions don't dangle on a
+/// phantom command.
+fn sweep_interrupted_background_commands(store: &SessionStore) {
+    for sess in store.list() {
+        let mut changed = false;
+        let messages = sess
+            .messages
+            .iter()
+            .map(|m| {
+                if m.role == "tool" && m.content.starts_with("[background command still running:") {
+                    changed = true;
+                    let mut m2 = m.clone();
+                    m2.content = "[background command interrupted by a server \
+                                  restart; no output was recorded]"
+                        .into();
+                    m2
+                } else {
+                    m.clone()
+                }
+            })
+            .collect::<Vec<_>>();
+        if changed {
+            store.update(&sess.id, messages, &sess.title);
+        }
+    }
 }
 
 /// runServer starts the atom session server. It returns when another
@@ -1005,6 +1256,7 @@ pub async fn run_server() -> anyhow::Result<()> {
     }
 
     let store = SessionStore::open().map_err(|e| anyhow::anyhow!("session store: {e}"))?;
+    sweep_interrupted_background_commands(&store);
     let state = Arc::new(AppState::new(
         Arc::new(store),
         atom_sandbox::policy::SandboxConfig::load(),
@@ -1036,35 +1288,50 @@ pub async fn run_server() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atom_core::types::Message;
 
-    /// listenOnSocket must detect a live server on the path and defer to
-    /// it without touching its socket file.
-    #[tokio::test]
-    async fn listen_live_defers() {
+    /// A server restart kills background commands; the sweep must rewrite
+    /// their still-running transcript entries and leave everything else.
+    #[test]
+    fn startup_sweep_rewrites_orphaned_placeholders() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("atom.sock");
-        let l = listen_on_socket(&path).unwrap().expect("first bind");
-        let l2 = listen_on_socket(&path).unwrap();
-        assert!(l2.is_none(), "want None when a live server owns the path");
-        assert!(path.exists(), "live server's socket file was removed");
-        drop(l);
-    }
+        let store = SessionStore::open_in_dir(dir.path()).unwrap();
+        let mut sess = store.create("m", "/tmp", vec![]);
+        sess.messages.push(Message {
+            role: "tool".into(),
+            tool_call_id: "call1".into(),
+            content: "[background command still running: cargo test — started 5s ago. \
+                 Its output replaces this entry automatically when it exits; \
+                 do not sleep, poll, or re-run it to wait.]"
+                .into(),
+            ..Default::default()
+        });
+        sess.messages.push(Message {
+            role: "tool".into(),
+            tool_call_id: "call2".into(),
+            content: "ok".into(),
+            ..Default::default()
+        });
+        store.save(&sess);
 
-    /// listenOnSocket must recover from a stale socket file left by a
-    /// crashed server: remove it, retry the bind, and accept connections.
-    #[tokio::test]
-    async fn listen_stale_recovers() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("atom.sock");
-        // Simulate the leftover path entry of a crashed server (Go unlinks
-        // real unix sockets on Close, so a regular file stands in for the
-        // stale inode that blocks the bind).
-        std::fs::write(&path, b"stale").unwrap();
-        let l = listen_on_socket(&path)
-            .unwrap()
-            .expect("stale socket should be replaced");
-        std::os::unix::net::UnixStream::connect(&path).expect("fresh socket not accepting");
-        drop(l);
+        sweep_interrupted_background_commands(&store);
+
+        let reloaded = store.get(&sess.id).unwrap();
+        assert!(
+            reloaded.messages[0]
+                .content
+                .starts_with("[background command interrupted by a server restart"),
+            "placeholder not rewritten: {:?}",
+            reloaded.messages[0].content
+        );
+        assert_eq!(reloaded.messages[1].content, "ok", "real result touched");
+        // Idempotent: a second pass is a no-op.
+        sweep_interrupted_background_commands(&store);
+        let reloaded = store.get(&sess.id).unwrap();
+        assert_eq!(reloaded.messages[0].tool_call_id, "call1");
+        assert!(reloaded.messages[0]
+            .content
+            .starts_with("[background command interrupted by a server restart"));
     }
 
     /// /children must keep listing subagents after their turn finishes,

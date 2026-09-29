@@ -83,11 +83,11 @@ fn main() {
 
     // Cargo re-runs this script only when the package sources change, so
     // ATOM_BUILD_ID is stable across rebuilds of identical sources and
-    // changes whenever the code does. atom, atoms, atomdev, and atomsdev
-    // all link this one atom-core, so a single build shares one ID —
-    // clients compare it with the server's via /api/capabilities to
-    // recycle a server built from older code. Keep the ATOM_BUILD format
-    // in sync with what the `-help` text advertises.
+    // changes whenever the code does. Client and server are one binary
+    // (the client re-execs itself with -serve), so a single build shares
+    // one ID — clients compare it with the server's via
+    // /api/capabilities to recycle a server built from older code. Keep
+    // the ATOM_BUILD format in sync with what the `-help` text advertises.
     println!("cargo:rustc-env=ATOM_BUILD={commit} ({profile})");
     println!("cargo:rustc-env=ATOM_BUILD_ID={commit}.{profile}.{stamp}");
 }

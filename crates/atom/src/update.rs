@@ -327,29 +327,27 @@ async fn download(url: &str, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Move both staged binaries over the live ones. POSIX rename over a
-/// running binary is safe; if the stage dir is on a different filesystem
-/// (EXDEV), fall back to copy + rename per binary.
+/// Move the staged binary over the live one. POSIX rename over a
+/// running binary is safe; if the stage dir is on a different
+/// filesystem (EXDEV), fall back to copy + rename.
 fn install_binaries(stage: &Path, exe_dir: &Path) -> std::io::Result<()> {
-    for name in ["atom", "atoms"] {
-        let staged = stage.join(name);
-        let live = exe_dir.join(name);
-        match std::fs::rename(&staged, &live) {
-            Ok(()) => {}
-            Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
-                // Different filesystem: copy to a temp file next to the
-                // target, then rename. Never write the live path directly:
-                // copy+truncate is non-atomic and ETXTBSYs on Linux when
-                // the binary is running.
-                let tmp = exe_dir.join(format!(".{}.new-{}", name, std::process::id()));
-                std::fs::copy(&staged, &tmp)?;
-                std::fs::rename(&tmp, &live)?;
-                std::fs::remove_file(&staged)?;
-            }
-            Err(e) => return Err(e),
+    let staged = stage.join("atom");
+    let live = exe_dir.join("atom");
+    match std::fs::rename(&staged, &live) {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
+            // Different filesystem: copy to a temp file next to the
+            // target, then rename. Never write the live path directly:
+            // copy+truncate is non-atomic and ETXTBSYs on Linux when
+            // the binary is running.
+            let tmp = exe_dir.join(format!(".atom.new-{}", std::process::id()));
+            std::fs::copy(&staged, &tmp)?;
+            std::fs::rename(&tmp, &live)?;
+            std::fs::remove_file(&staged)?;
+            Ok(())
         }
+        Err(e) => Err(e),
     }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------

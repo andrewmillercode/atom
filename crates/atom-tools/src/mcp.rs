@@ -89,6 +89,9 @@ fn server_deferred(cfg: &MCPServerConfig, tool_count: usize) -> bool {
 pub struct McpToolRef {
     pub server: String,
     pub name: String,
+    /// The tool's declared inputSchema, kept so arguments can be coerced
+    /// to the server's expected types before the call.
+    pub input_schema: Option<serde_json::Value>,
 }
 
 /// One listed remote tool before name conversion.
@@ -131,8 +134,11 @@ pub fn load_mcp_configs_in(
     }
     let dirs = crate::skills::walk_project_dirs_in(cwd, home);
     for d in dirs.iter().rev() {
-        merge_mcp_file(&mut out, &d.join(".atom").join("mcp.json"));
+        // Within a dir, later merges win: the shared Claude Code file
+        // first, tool-specific configs last.
+        merge_mcp_file(&mut out, &d.join(".mcp.json"));
         merge_mcp_file(&mut out, &d.join(".cursor").join("mcp.json"));
+        merge_mcp_file(&mut out, &d.join(".atom").join("mcp.json"));
     }
     out
 }
@@ -165,22 +171,54 @@ fn merge_mcp_file(out: &mut BTreeMap<String, MCPServerConfig>, path: &Path) {
     }
 }
 
-/// expandEnvRefs replaces OpenCode-style {env:NAME} tokens with the
-/// matching process environment value.
+/// expand_env_refs replaces OpenCode-style {env:NAME} tokens and the
+/// Claude/Devin-style ${VAR}, ${env:VAR}, and ${VAR:-default} tokens
+/// with the matching process environment value. An unset ${VAR} without
+/// a default stays literal; {env:NAME} expands to empty when unset.
 pub fn expand_env_refs(s: &str) -> String {
-    let mut s = s.to_string();
-    loop {
-        let Some(i) = s.find("{env:") else {
-            return s;
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while !rest.is_empty() {
+        let start = match (rest.find("{env:"), rest.find("${")) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (None, None) => {
+                out.push_str(rest);
+                break;
+            }
         };
-        let Some(rel) = s[i..].find('}') else {
-            return s;
+        let Some(rel) = rest[start..].find('}') else {
+            out.push_str(rest);
+            break;
         };
-        let j = i + rel;
-        let name = &s[i + 5..j];
-        let value = std::env::var(name).unwrap_or_default();
-        s = format!("{}{}{}", &s[..i], value, &s[j + 1..]);
+        let close = start + rel;
+        out.push_str(&rest[..start]);
+        // "${VAR" / "{env:VAR" between the token start and the closing
+        // brace; drop the "$"/"{" prefix characters.
+        let token = rest[start..close].trim_start_matches(['$', '{']);
+        if let Some(name) = token.strip_prefix("env:") {
+            out.push_str(&std::env::var(name).unwrap_or_default());
+        } else {
+            let (name, default) = match token.split_once(":-") {
+                Some((n, d)) => (n, Some(d)),
+                None => (token, None),
+            };
+            let (set, value) = match std::env::var(name) {
+                Ok(v) => (true, v),
+                Err(_) => (false, String::new()),
+            };
+            if set && !value.is_empty() {
+                out.push_str(&value);
+            } else if let Some(d) = default.filter(|_| !set || value.is_empty()) {
+                out.push_str(d);
+            } else if !set {
+                out.push_str(&rest[start..=close]);
+            }
+        }
+        rest = &rest[close + 1..];
     }
+    out
 }
 
 pub fn expand_env_map(in_map: &BTreeMap<String, String>) -> BTreeMap<String, String> {
@@ -289,10 +327,95 @@ pub fn convert_mcp_tools(
             McpToolRef {
                 server: server.to_string(),
                 name: t.name.clone(),
+                input_schema: t.input_schema.clone(),
             },
         );
     }
     (out, mapping)
+}
+
+// ---------------------------------------------------------------------------
+// Argument type coercion.
+// ---------------------------------------------------------------------------
+
+/// Coerce model-supplied arguments to the types a tool's inputSchema
+/// declares. Provider layers may serialize every tool-call parameter as
+/// a JSON string; strict MCP servers (zod-based ones especially) then
+/// reject `"100"` for a number, `"true"` for a boolean, or `"{...}"`
+/// for an object parameter. Only converts values whose declared type
+/// disagrees with string and that parse cleanly; everything else passes
+/// through untouched.
+pub(crate) fn coerce_args_to_schema(
+    args: serde_json::Value,
+    schema: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let Some(schema) = schema else {
+        return args;
+    };
+    let Some(props) = schema.get("properties").and_then(|p| p.as_object()) else {
+        return args;
+    };
+    let mut args = args;
+    if let Some(obj) = args.as_object_mut() {
+        for (key, val) in obj.iter_mut() {
+            if let Some(prop_schema) = props.get(key) {
+                coerce_value(val, prop_schema);
+            }
+        }
+    }
+    args
+}
+
+fn schema_type_names(schema: &serde_json::Value) -> Vec<&str> {
+    match schema.get("type") {
+        Some(serde_json::Value::String(t)) => vec![t.as_str()],
+        Some(serde_json::Value::Array(names)) => names.iter().filter_map(|t| t.as_str()).collect(),
+        _ => vec![],
+    }
+}
+
+fn coerce_value(val: &mut serde_json::Value, schema: &serde_json::Value) {
+    let types = schema_type_names(schema);
+    // A bare string is always acceptable when the schema allows strings
+    // or declares no type at all — leave those alone.
+    if !types.is_empty() && !types.iter().any(|t| *t == "string") {
+        let parsed = match val {
+            serde_json::Value::String(s) => serde_json::from_str::<serde_json::Value>(s).ok(),
+            _ => None,
+        };
+        if let Some(parsed) = parsed {
+            let fits = types.iter().any(|t| match *t {
+                "object" => parsed.is_object(),
+                "array" => parsed.is_array(),
+                "integer" => parsed.as_i64().is_some() || parsed.as_u64().is_some(),
+                "number" => parsed.is_number(),
+                "boolean" => parsed.is_boolean(),
+                _ => false,
+            });
+            if fits {
+                *val = parsed;
+            }
+        }
+    }
+    match val {
+        serde_json::Value::Object(map) => {
+            if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
+                for (k, v) in map.iter_mut() {
+                    if let Some(ps) = props.get(k) {
+                        coerce_value(v, ps);
+                    }
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            if let Some(item_schema) = schema.get("items") {
+                for item in items.iter_mut() {
+                    coerce_value(item, item_schema);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -688,7 +811,7 @@ async fn connect_transport(
     }
     match typ.as_str() {
         "local" => typ = "stdio".to_string(),
-        "remote" => typ = "http".to_string(),
+        "remote" | "streamable-http" => typ = "http".to_string(),
         _ => {}
     }
     if typ.is_empty() {
@@ -1225,6 +1348,11 @@ pub async fn execute_mcp_selection(
     };
     match tokio::time::timeout(MCP_CALL_TIMEOUT, async {
         let (session, tools) = connect_and_list(server, &cwd_str, &cfg).await?;
+        let schema = tools
+            .iter()
+            .find(|candidate| candidate.name == tool)
+            .and_then(|t| t.input_schema.clone());
+        let arguments = coerce_args_to_schema(arguments, schema.as_ref());
         if !tools.iter().any(|candidate| candidate.name == tool) {
             return Err(format!("server \"{server}\" has no tool \"{tool}\""));
         }
@@ -1256,6 +1384,7 @@ pub async fn execute_mcp_tool(name: &str, arguments: &str, cwd: &Path) -> String
             Err(e) => return format!("error parsing arguments: {e}"),
         }
     };
+    let args = coerce_args_to_schema(args, ref_.input_schema.as_ref());
     let call = tokio::time::timeout(MCP_CALL_TIMEOUT, async move {
         let mut guard = session.lock().await;
         guard.call_tool(&ref_.name, args).await
@@ -1325,8 +1454,52 @@ mod tests {
     }
 
     #[test]
+    fn coerces_strings_to_declared_schema_types() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer"},
+                "flag": {"type": "boolean"},
+                "selector": {"type": "object"},
+                "ids": {"type": "array", "items": {"type": ["string", "number"]}},
+                "text": {"type": "string"}
+            }
+        });
+        let args = serde_json::json!({
+            "limit": "100",
+            "flag": "true",
+            "selector": "{\"conditions\": []}",
+            "ids": ["1", "abc"],
+            "text": "42"
+        });
+        let got = coerce_args_to_schema(args, Some(&schema));
+        assert_eq!(got["limit"], serde_json::json!(100));
+        assert_eq!(got["flag"], serde_json::json!(true));
+        assert_eq!(got["selector"]["conditions"], serde_json::json!([]));
+        // items type union allows strings: values pass through unchanged.
+        assert_eq!(got["ids"], serde_json::json!(["1", "abc"]));
+        // Strings declared as strings stay strings.
+        assert_eq!(got["text"], serde_json::json!("42"));
+    }
+
+    #[test]
+    fn coercion_leaves_unparseable_values_alone() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"count": {"type": "integer"}}
+        });
+        let args = serde_json::json!({"count": "not-a-number"});
+        let got = coerce_args_to_schema(args.clone(), Some(&schema));
+        assert_eq!(got, args);
+    }
+
+    #[test]
     fn expands_env_refs() {
-        std::env::set_var("ASA_CLIENT_ID_TEST_TOOLS", "cid-1");
+        let _env = crate::testutil::env_lock();
+        let prev = std::env::var_os("ASA_CLIENT_ID_TEST_TOOLS");
+        unsafe {
+            std::env::set_var("ASA_CLIENT_ID_TEST_TOOLS", "cid-1");
+        }
         assert_eq!(expand_env_refs("{env:ASA_CLIENT_ID_TEST_TOOLS}"), "cid-1");
         let mut m = BTreeMap::new();
         m.insert(
@@ -1339,6 +1512,48 @@ mod tests {
         assert_eq!(m["plain"], "x");
         // Unclosed token passes through untouched (like Go).
         assert_eq!(expand_env_refs("{env:NOPE_X"), "{env:NOPE_X");
+        match prev {
+            Some(v) => unsafe { std::env::set_var("ASA_CLIENT_ID_TEST_TOOLS", v) },
+            None => unsafe { std::env::remove_var("ASA_CLIENT_ID_TEST_TOOLS") },
+        }
+    }
+
+    #[test]
+    fn expands_claude_style_env_tokens() {
+        let _env = crate::testutil::env_lock();
+        let prev = std::env::var_os("ATOM_MCP_TEST_VAR");
+        unsafe {
+            std::env::set_var("ATOM_MCP_TEST_VAR", "val1");
+        }
+        assert_eq!(expand_env_refs("${ATOM_MCP_TEST_VAR}"), "val1");
+        assert_eq!(expand_env_refs("x${ATOM_MCP_TEST_VAR}y"), "xval1y");
+        // Both syntaxes mix in one string.
+        assert_eq!(
+            expand_env_refs("{env:ATOM_MCP_TEST_VAR}/${ATOM_MCP_TEST_VAR}"),
+            "val1/val1"
+        );
+        // Devin's ${env:VAR} form expands like {env:NAME}.
+        assert_eq!(expand_env_refs("${env:ATOM_MCP_TEST_VAR}"), "val1");
+        // Default applies when unset; the value wins when set.
+        assert_eq!(
+            expand_env_refs("${ATOM_MCP_TEST_UNSET:-fallback}"),
+            "fallback"
+        );
+        assert_eq!(expand_env_refs("${ATOM_MCP_TEST_VAR:-fallback}"), "val1");
+        // Unset without a default stays literal.
+        assert_eq!(
+            expand_env_refs("${ATOM_MCP_TEST_UNSET}"),
+            "${ATOM_MCP_TEST_UNSET}"
+        );
+        // Unclosed tokens pass through untouched.
+        assert_eq!(
+            expand_env_refs("${ATOM_MCP_TEST_VAR"),
+            "${ATOM_MCP_TEST_VAR"
+        );
+        match prev {
+            Some(v) => unsafe { std::env::set_var("ATOM_MCP_TEST_VAR", v) },
+            None => unsafe { std::env::remove_var("ATOM_MCP_TEST_VAR") },
+        }
     }
 
     #[test]
@@ -1378,6 +1593,81 @@ mod tests {
         );
         assert_eq!(cfgs["github"].command, "other", "project overrides user");
         assert_eq!(cfgs["remote"].url, "https://example.com/mcp");
+    }
+
+    #[test]
+    fn shared_mcp_json_loses_to_tool_specific_files() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = home.path().join("proj");
+        std::fs::create_dir_all(cwd.join(".atom")).unwrap();
+        std::fs::write(
+            cwd.join(".mcp.json"),
+            r#"{"mcpServers":{
+                "a":{"command":"shared"},
+                "b":{"command":"shared-only"}
+            }}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cwd.join(".atom").join("mcp.json"),
+            r#"{"mcpServers":{"a":{"command":"atom-file"}}}"#,
+        )
+        .unwrap();
+
+        let cfgs = load_mcp_configs_in(&cwd.display().to_string(), None, Some(home.path()));
+        assert_eq!(cfgs["a"].command, "atom-file", ".atom beats .mcp.json");
+        assert_eq!(cfgs["b"].command, "shared-only");
+    }
+
+    #[test]
+    fn closest_project_dir_wins_for_shared_mcp_json() {
+        let home = tempfile::tempdir().unwrap();
+        let parent = home.path().join("proj");
+        let child = parent.join("sub");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(
+            parent.join(".mcp.json"),
+            r#"{"mcpServers":{"a":{"command":"parent-shared"},"b":{"command":"parent-only"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            child.join(".mcp.json"),
+            r#"{"mcpServers":{"a":{"command":"child-shared"}}}"#,
+        )
+        .unwrap();
+        // Within the parent dir, .atom beats that dir's shared file too.
+        std::fs::create_dir_all(parent.join(".atom")).unwrap();
+        std::fs::write(
+            parent.join(".atom").join("mcp.json"),
+            r#"{"mcpServers":{"b":{"command":"parent-atom"}}}"#,
+        )
+        .unwrap();
+
+        let cfgs = load_mcp_configs_in(&child.display().to_string(), None, Some(home.path()));
+        assert_eq!(cfgs["a"].command, "child-shared", "closest dir wins");
+        assert_eq!(cfgs["b"].command, "parent-atom");
+    }
+
+    #[test]
+    fn streamable_http_alias_maps_to_http() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            // The alias dispatches to the http branch: same "missing url"
+            // error an http-typed server gets, not "unsupported type".
+            match connect_transport(
+                "x",
+                "/",
+                &MCPServerConfig {
+                    typ: "streamable-http".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            {
+                Err(e) => assert_eq!(e, "missing url"),
+                Ok(_) => panic!("expected error missing url"),
+            }
+        });
     }
 
     #[test]
@@ -1495,6 +1785,9 @@ mod tests {
 
     #[tokio::test]
     async fn stdio_roundtrip_against_fake_server() {
+        // The default hub is process-global: a parallel hub test calling
+        // close_all() would drop this test's live connection mid-flight.
+        let _env = crate::testutil::env_lock();
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("fake-mcp.sh");
         std::fs::write(
@@ -1604,6 +1897,8 @@ done
 
     #[tokio::test]
     async fn deferred_server_hides_tools_until_find_tool() {
+        // Shared default hub — serialize against the other hub test.
+        let _env = crate::testutil::env_lock();
         let dir = tempfile::tempdir().unwrap();
         let mut tools = Vec::new();
         for i in 1..=21 {

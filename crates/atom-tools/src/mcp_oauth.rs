@@ -797,6 +797,15 @@ mod tests {
     fn mcp_auth_display_reflects_oauth_state() {
         use atom_core::providers::auth::{set_auth, AuthEntry};
 
+        // Run against a scratch auth store: the real one needs flock
+        // (denied in confined runs) and must not be written anyway.
+        let _env = crate::testutil::env_lock();
+        let xdg = std::env::temp_dir().join(format!("atom-tools-xdg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&xdg);
+        std::fs::create_dir_all(&xdg).unwrap();
+        let prev_xdg = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_DATA_HOME", &xdg);
+
         // Use an isolated key so the test cannot clobber a real entry.
         let server = "auth-display-isolated";
         let key = auth_key(server);
@@ -895,6 +904,12 @@ mod tests {
 
         // Non-OAuth config: helper returns None (caller shows URL).
         assert_eq!(mcp_auth_display(&stdio_cfg, server), None);
+
+        match prev_xdg {
+            Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&xdg);
     }
 
     /// Fake authorization server exercising the full login: discovery,
